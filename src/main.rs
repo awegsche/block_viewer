@@ -1,8 +1,26 @@
 use bevy::{
-    asset::RenderAssetUsages, image::{ImageLoaderSettings, ImageSampler}, input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll}, prelude::*, render::mesh::Indices
+    asset::RenderAssetUsages,
+    image::{ImageLoaderSettings, ImageSampler},
+    input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll},
+    prelude::*,
+    render::mesh::Indices,
 };
-use mc_anvil::{Save, get_saves};
+use chunks::{check_block_texture_loading, create_block_mesh, load_block_textures, Chunk, RenderBlock};
+use ranvil::{get_saves, Save};
+use rnbt::{from_bytes, NbtField, NbtList, NbtValue};
 use std::{f32::consts::FRAC_PI_2, ops::Range};
+
+mod chunks;
+
+#[derive(Debug, States, Default, Clone, Eq, PartialEq, Hash)]
+enum AppState {
+    #[default]
+    LoadingTextures,
+    Running,
+}
+
+#[derive(Component)]
+struct StateText;
 
 fn main() {
     println!("Hello, world!");
@@ -10,13 +28,17 @@ fn main() {
     let mut saves = get_saves().unwrap();
 
     for save in saves.iter() {
-        println!("{:?}", save);
+        println!("{}", save);
     }
 
     App::new()
         .add_plugins(DefaultPlugins)
+        .init_state::<AppState>()
         .init_resource::<CameraSettings>()
+        .add_systems(OnEnter(AppState::LoadingTextures), load_block_textures)
+        .add_systems(Update, check_block_texture_loading.run_if(in_state(AppState::LoadingTextures)))
         .add_systems(Startup, setup)
+        //.add_systems(OnEnter(AppState::Running), setup)
         .add_systems(Update, orbit)
         .run();
 }
@@ -26,13 +48,12 @@ struct BlockMesh;
 
 #[derive(Debug, Resource)]
 struct CameraSettings {
-    pub orbit_distance: f32,
+    //pub orbit_distance: f32,
     pub pitch_speed: f32,
     // Clamp pitch to this range
     pub pitch_range: Range<f32>,
     pub roll_speed: f32,
     pub yaw_speed: f32,
-    pub is_roatatin: bool,
 }
 
 impl Default for CameraSettings {
@@ -42,12 +63,11 @@ impl Default for CameraSettings {
         Self {
             // These values are completely arbitrary, chosen because they seem to produce
             // "sensible" results for this example. Adjust as required.
-            orbit_distance: 20.0,
+            //orbit_distance: 20.0,
             pitch_speed: 0.003,
             pitch_range: -pitch_limit..pitch_limit,
             roll_speed: 1.0,
             yaw_speed: 0.004,
-            is_roatatin: false,
         }
     }
 }
@@ -78,16 +98,22 @@ fn setup(
 
     // Transform for the camera and lighting, looking at (0,0,0) (the position of the mesh).
     let camera_and_light_transform =
-        Transform::from_xyz(10.8, 10.8, 10.8).looking_at(Vec3::ZERO, Vec3::Y);
+        Transform::from_xyz(100.8, 400.0, 100.8).looking_at(Vec3::ZERO, Vec3::Y);
 
     commands.spawn((
         Name::new("Camera"),
         Camera3d::default(),
-        Transform::from_xyz(10.0, 5.0, 10.0).looking_at(Vec3::ZERO, Vec3::Y),
+        Transform::from_xyz(50.0, 200.0, 50.0).looking_at(Vec3::new(0.0, 200.0, 0.0), Vec3::Y),
     ));
 
     // Light up the scene.
-    commands.spawn((PointLight::default(), camera_and_light_transform));
+    commands.spawn((DirectionalLight::default(), camera_and_light_transform));
+
+    commands.spawn((
+            Text::new("Startup"),
+            TextFont::default(),
+            StateText,
+    ));
 }
 
 fn orbit(
@@ -101,7 +127,7 @@ fn orbit(
     let delta = mouse_motion.delta;
     let mut delta_roll = 0.0;
 
-    let target = Vec3::ZERO;
+    let target = Vec3::new(0.0, 140.0, 0.0);
     let distance = (camera.translation - target).length();
 
     if mouse_buttons.pressed(MouseButton::Left) {
@@ -151,172 +177,4 @@ pub enum Side {
     Front,
     Back,
     None,
-}
-
-fn get_bottom_tris(x: i32, y: i32, z: i32) -> [[f32; 3]; 4] {
-    [
-        [x as f32 - 0.5, y as f32 - 0.5, z as f32 - 0.5], // vertex with index 0
-        [x as f32 + 0.5, y as f32 - 0.5, z as f32 - 0.5], // vertex with index 1
-        [x as f32 + 0.5, y as f32 - 0.5, z as f32 + 0.5], // etc. until 23
-        [x as f32 - 0.5, y as f32 - 0.5, z as f32 + 0.5],
-    ]
-}
-
-fn get_top_tris(x: i32, y: i32, z: i32) -> [[f32; 3]; 4] {
-    [
-        [x as f32 - 0.5, y as f32 + 0.5, z as f32 - 0.5], // vertex with index 0
-        [x as f32 + 0.5, y as f32 + 0.5, z as f32 - 0.5], // vertex with index 1
-        [x as f32 + 0.5, y as f32 + 0.5, z as f32 + 0.5], // etc. until 23
-        [x as f32 - 0.5, y as f32 + 0.5, z as f32 + 0.5],
-    ]
-}
-
-fn get_left_tris(x: i32, y: i32, z: i32) -> [[f32; 3]; 4] {
-    [
-        [x as f32 - 0.5, y as f32 - 0.5, z as f32 - 0.5],
-        [x as f32 - 0.5, y as f32 - 0.5, z as f32 + 0.5],
-        [x as f32 - 0.5, y as f32 + 0.5, z as f32 + 0.5],
-        [x as f32 - 0.5, y as f32 + 0.5, z as f32 - 0.5],
-    ]
-}
-
-fn get_right_tris(x: i32, y: i32, z: i32) -> [[f32; 3]; 4] {
-    [
-        [x as f32 + 0.5, y as f32 - 0.5, z as f32 - 0.5],
-        [x as f32 + 0.5, y as f32 - 0.5, z as f32 + 0.5],
-        [x as f32 + 0.5, y as f32 + 0.5, z as f32 + 0.5], // This vertex is at the same position as vertex with index 2, but they'll have different UV and normal
-        [x as f32 + 0.5, y as f32 + 0.5, z as f32 - 0.5],
-    ]
-}
-
-fn get_front_tris(x: i32, y: i32, z: i32) -> [[f32; 3]; 4] {
-    [
-        [x as f32 - 0.5, y as f32 - 0.5, z as f32 - 0.5],
-        [x as f32 - 0.5, y as f32 + 0.5, z as f32 - 0.5],
-        [x as f32 + 0.5, y as f32 + 0.5, z as f32 - 0.5],
-        [x as f32 + 0.5, y as f32 - 0.5, z as f32 - 0.5],
-    ]
-}
-
-fn get_back_tris(x: i32, y: i32, z: i32) -> [[f32; 3]; 4] {
-    [
-        [x as f32 - 0.5, y as f32 - 0.5, z as f32 + 0.5],
-        [x as f32 - 0.5, y as f32 + 0.5, z as f32 + 0.5],
-        [x as f32 + 0.5, y as f32 + 0.5, z as f32 + 0.5],
-        [x as f32 + 0.5, y as f32 - 0.5, z as f32 + 0.5],
-    ]
-}
-
-fn create_block_mesh() -> Mesh {
-    // let's test our edge finding algorithm.
-    //
-    const WIDTH: i32 = 8;
-    const DEPTH: i32 = 8;
-    const HEIGHT: i32 = 8;
-    let mut blocks = vec![0; (WIDTH * DEPTH * HEIGHT) as usize];
-
-    blocks[coord_to_idx(1, 0, 1, WIDTH, DEPTH)] = 1;
-    blocks[coord_to_idx(1, 1, 1, WIDTH, DEPTH)] = 1;
-    blocks[coord_to_idx(1, 2, 1, WIDTH, DEPTH)] = 1;
-    blocks[coord_to_idx(0, 2, 1, WIDTH, DEPTH)] = 1;
-    blocks[coord_to_idx(2, 2, 1, WIDTH, DEPTH)] = 1;
-    blocks[coord_to_idx(1, 3, 1, WIDTH, DEPTH)] = 1;
-
-    let mut vertices = Vec::new();
-    let mut normals = Vec::new();
-    let mut uvs = Vec::new();
-    let mut indices = Vec::new();
-
-    for x in 0..WIDTH {
-        for z in 0..DEPTH {
-            for y in 0..HEIGHT {
-                if blocks[coord_to_idx(x, y, z, WIDTH, DEPTH)] == 0 {
-                    continue;
-                }
-
-                if x == 0 || blocks[coord_to_idx(x - 1, y, z, WIDTH, DEPTH)] == 0 {
-                    let n = vertices.len() as u32;
-                    indices.extend_from_slice(&[n, n + 1, n + 3, n + 1, n + 2, n + 3]);
-                    vertices.extend_from_slice(&get_left_tris(x, y, z));
-                    uvs.extend_from_slice(&[[0.0, 1.0], [0.0, 0.0], [1.0, 0.0], [1.0, 1.0]]);
-                    normals.extend_from_slice(&[
-                        [-1.0, 0.0, 0.0],
-                        [-1.0, 0.0, 0.0],
-                        [-1.0, 0.0, 0.0],
-                        [-1.0, 0.0, 0.0],
-                    ]);
-                }
-                if x == WIDTH - 1 || blocks[coord_to_idx(x + 1, y, z, WIDTH, DEPTH)] == 0 {
-                    let n = vertices.len() as u32;
-                    vertices.extend_from_slice(&get_right_tris(x, y, z));
-                    indices.extend_from_slice(&[n, n + 3, n + 1, n + 1, n + 3, n + 2]);
-                    //indices.extend_from_slice(&[n, n + 1, n + 3, n + 1, n + 2, n + 3]);
-                    uvs.extend_from_slice(&[[0.0, 1.0], [0.0, 0.0], [1.0, 0.0], [1.0, 1.0]]);
-                    normals.extend_from_slice(&[
-                        [1.0, 0.0, 0.0],
-                        [1.0, 0.0, 0.0],
-                        [1.0, 0.0, 0.0],
-                        [1.0, 0.0, 0.0],
-                    ]);
-                }
-                if z == 0 || blocks[coord_to_idx(x, y, z - 1, WIDTH, DEPTH)] == 0 {
-                    let n = vertices.len() as u32;
-                    vertices.extend_from_slice(&get_front_tris(x, y, z));
-                    indices.extend_from_slice(&[n, n + 1, n + 3, n + 1, n + 2, n + 3]);
-                    uvs.extend_from_slice(&[[0.0, 1.0], [0.0, 0.0], [1.0, 0.0], [1.0, 1.0]]);
-                    normals.extend_from_slice(&[
-                        [0.0, 0.0, -1.0],
-                        [0.0, 0.0, -1.0],
-                        [0.0, 0.0, -1.0],
-                        [0.0, 0.0, -1.0],
-                    ]);
-                }
-                if z == DEPTH - 1 || blocks[coord_to_idx(x, y, z + 1, WIDTH, DEPTH)] == 0 {
-                    let n = vertices.len() as u32;
-                    vertices.extend_from_slice(&get_back_tris(x, y, z));
-                    indices.extend_from_slice(&[n, n + 3, n + 1, n + 1, n + 3, n + 2]);
-                    uvs.extend_from_slice(&[[0.0, 1.0], [0.0, 0.0], [1.0, 0.0], [1.0, 1.0]]);
-                    normals.extend_from_slice(&[
-                        [0.0, 0.0, 1.0],
-                        [0.0, 0.0, 1.0],
-                        [0.0, 0.0, 1.0],
-                        [0.0, 0.0, 1.0],
-                    ]);
-                }
-                if y == 0 || blocks[coord_to_idx(x, y - 1, z, WIDTH, DEPTH)] == 0 {
-                    let n = vertices.len() as u32;
-                    vertices.extend_from_slice(&get_bottom_tris(x, y, z));
-                    indices.extend_from_slice(&[n, n + 1, n + 3, n + 1, n + 2, n + 3]);
-                    uvs.extend_from_slice(&[[0.0, 1.0], [0.0, 0.0], [1.0, 0.0], [1.0, 1.0]]);
-                    normals.extend_from_slice(&[
-                        [0.0, -1.0, 0.0],
-                        [0.0, -1.0, 0.0],
-                        [0.0, -1.0, 0.0],
-                        [0.0, -1.0, 0.0],
-                    ]);
-                }
-                if y == HEIGHT - 1 || blocks[coord_to_idx(x, y + 1, z, WIDTH, DEPTH)] == 0 {
-                    let n = vertices.len() as u32;
-                    vertices.extend_from_slice(&get_top_tris(x, y, z));
-                    indices.extend_from_slice(&[n, n + 3, n + 1, n + 1, n + 3, n + 2]);
-                    uvs.extend_from_slice(&[[0.0, 1.0], [0.0, 0.0], [1.0, 0.0], [1.0, 1.0]]);
-                    normals.extend_from_slice(&[
-                        [0.0, 1.0, 0.0],
-                        [0.0, 1.0, 0.0],
-                        [0.0, 1.0, 0.0],
-                        [0.0, 1.0, 0.0],
-                    ]);
-                }
-            }
-        }
-    }
-
-    Mesh::new(
-        bevy::render::mesh::PrimitiveTopology::TriangleList,
-        RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
-    )
-    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, vertices)
-    .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
-    .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
-    .with_inserted_indices(Indices::U32(indices))
 }

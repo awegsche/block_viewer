@@ -1,14 +1,16 @@
 [package]
 name = "block_viewer"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
 bevy = "0.15.0"
 bevy_egui = "0.31.1"
 dirs = "5.0.1"
-mc_anvil = { version = "0.1.0", path = "../mc_anvil" }
-rnbt = { version = "0.1.0", path = "../rnbt" }
+rnbt = { git = "https://github.com/awegsche/rnbt.git", version = "0.1.0" }
+ranvil = { git = "https://github.com/awegsche/ranvil.git", version = "0.1.0" }
+component = "0.1.1"
+rust-analyzer = "0.0.1"
 
 # Enable a small amount of optimization in the dev profile.
 [profile.dev]
