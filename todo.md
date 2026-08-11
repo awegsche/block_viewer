@@ -38,3 +38,12 @@ these itself (see CLAUDE.md's "Manual/visual verification").
   seam there should close within the one frame the new chunk is
   legitimately still in flight, not visibly trail the camera. Checklist:
   `finished_tickets/005-f-boundary-reseam.manual-verification.md`.
+- [ ] **007 egui explorer UI: save picker, coordinate jump, block
+  inspector, status panel — and that egui doesn't fight the camera.**
+  `cargo run` (debug build) against the real save(s). Covers switching
+  saves at runtime, clicking a region to teleport there, jumping to typed
+  coordinates, the block inspector matching rendered terrain, the status
+  panel's FPS/chunk counts/render-distance slider, and that dragging a
+  slider or typing into a field doesn't also spin the view or fly the
+  camera. Checklist:
+  `finished_tickets/007-egui-explorer-ui.manual-verification.md`.

@@ -28,7 +28,7 @@ use bevy::{
 };
 use std::ops::Range;
 
-use crate::{world, DecodedWorld};
+use crate::{streaming, world, DecodedWorld};
 
 /// Fly speed (blocks/sec) a freshly spawned rig starts at — brisk enough to
 /// cross a chunk in well under a second without being uncontrollable.
@@ -46,8 +46,34 @@ pub struct CameraControllerPlugin;
 impl Plugin for CameraControllerPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<CameraSettings>()
-            .add_systems(Update, drive_camera);
+            .init_resource::<EguiInputCapture>()
+            .add_systems(
+                Update,
+                (drive_camera.in_set(CameraSet), sync_render_distance_effects),
+            );
     }
+}
+
+/// Marker [`SystemSet`] for [`drive_camera`] — `main.rs` orders this
+/// `.after()` the UI plugin's own panel-drawing set (ticket 007) so
+/// [`EguiInputCapture`], which the UI updates once per frame right after it
+/// finishes drawing, reflects *this* frame's panels by the time
+/// [`drive_camera`] reads it rather than lagging a frame behind.
+#[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CameraSet;
+
+/// Whether egui claimed this frame's pointer/keyboard input, set once per
+/// frame by the UI layer (ticket 007, `ui::sync_egui_input_capture`) after
+/// it finishes drawing every panel. [`drive_camera`] checks this so
+/// dragging a slider or typing into a coordinate field doesn't also spin
+/// the view or fly the camera — see the parent ticket's "watch out" note.
+/// Defaults to `false` (nothing captured) so the camera behaves normally
+/// before the UI plugin's first frame, and degrades the same way if the UI
+/// plugin isn't present at all.
+#[derive(Resource, Debug, Default, Clone, Copy)]
+pub struct EguiInputCapture {
+    pub pointer: bool,
+    pub keyboard: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,6 +177,7 @@ fn drive_camera(
     rig: Single<(&mut CameraRig, &mut Transform, &Camera, &GlobalTransform)>,
     settings: Res<CameraSettings>,
     decoded_world: Res<DecodedWorld>,
+    egui_input: Res<EguiInputCapture>,
     keys: Res<ButtonInput<KeyCode>>,
     mouse_buttons: Res<ButtonInput<MouseButton>>,
     mouse_motion: Res<AccumulatedMouseMotion>,
@@ -161,7 +188,14 @@ fn drive_camera(
     let (mut rig, mut transform, camera, camera_transform) = rig.into_inner();
     let mut window = windows.get_single_mut().ok();
 
-    if keys.just_pressed(KeyCode::Tab) {
+    // Ticket 007: while egui has keyboard/pointer focus (typing into a
+    // coordinate field, dragging a slider, ...), the same key/mouse state
+    // this system reads is also what egui just consumed — skip driving the
+    // camera from it so e.g. dragging the render-distance slider doesn't
+    // also spin the view. `just_released` stays ungated below so a grab
+    // that started before a panel opened over the cursor still lets go
+    // cleanly.
+    if !egui_input.keyboard && keys.just_pressed(KeyCode::Tab) {
         toggle_mode(
             &mut rig,
             &transform,
@@ -179,7 +213,7 @@ fn drive_camera(
     }
 
     if rig.mode == CameraMode::Fly {
-        if mouse_buttons.just_pressed(MouseButton::Right) {
+        if !egui_input.pointer && mouse_buttons.just_pressed(MouseButton::Right) {
             set_cursor_grab(window.as_deref_mut(), true);
         }
         if mouse_buttons.just_released(MouseButton::Right) {
@@ -191,7 +225,7 @@ fn drive_camera(
         CameraMode::Fly => MouseButton::Right,
         CameraMode::Orbit => MouseButton::Left,
     };
-    if mouse_buttons.pressed(look_button) {
+    if !egui_input.pointer && mouse_buttons.pressed(look_button) {
         let delta = mouse_motion.delta;
         rig.yaw -= delta.x * settings.mouse_sensitivity;
         rig.pitch = (rig.pitch - delta.y * settings.mouse_sensitivity)
@@ -200,7 +234,7 @@ fn drive_camera(
     let rotation = Quat::from_euler(EulerRot::YXZ, rig.yaw, rig.pitch, 0.0);
     transform.rotation = rotation;
 
-    let scroll = mouse_scroll.delta.y;
+    let scroll = if egui_input.pointer { 0.0 } else { mouse_scroll.delta.y };
     match rig.mode {
         CameraMode::Fly => {
             if scroll != 0.0 {
@@ -209,27 +243,29 @@ fn drive_camera(
             }
 
             let mut move_dir = Vec3::ZERO;
-            if keys.pressed(KeyCode::KeyW) {
-                move_dir += rotation * Vec3::NEG_Z;
-            }
-            if keys.pressed(KeyCode::KeyS) {
-                move_dir += rotation * Vec3::Z;
-            }
-            if keys.pressed(KeyCode::KeyD) {
-                move_dir += rotation * Vec3::X;
-            }
-            if keys.pressed(KeyCode::KeyA) {
-                move_dir += rotation * Vec3::NEG_X;
-            }
-            // Q/E move straight up/down in world space regardless of pitch,
-            // rather than along the (possibly tilted) view direction like
-            // WASD does — keeping a way to gain/lose altitude on command
-            // even while looking level.
-            if keys.pressed(KeyCode::KeyE) {
-                move_dir += Vec3::Y;
-            }
-            if keys.pressed(KeyCode::KeyQ) {
-                move_dir += Vec3::NEG_Y;
+            if !egui_input.keyboard {
+                if keys.pressed(KeyCode::KeyW) {
+                    move_dir += rotation * Vec3::NEG_Z;
+                }
+                if keys.pressed(KeyCode::KeyS) {
+                    move_dir += rotation * Vec3::Z;
+                }
+                if keys.pressed(KeyCode::KeyD) {
+                    move_dir += rotation * Vec3::X;
+                }
+                if keys.pressed(KeyCode::KeyA) {
+                    move_dir += rotation * Vec3::NEG_X;
+                }
+                // Q/E move straight up/down in world space regardless of
+                // pitch, rather than along the (possibly tilted) view
+                // direction like WASD does — keeping a way to gain/lose
+                // altitude on command even while looking level.
+                if keys.pressed(KeyCode::KeyE) {
+                    move_dir += Vec3::Y;
+                }
+                if keys.pressed(KeyCode::KeyQ) {
+                    move_dir += Vec3::NEG_Y;
+                }
             }
 
             if move_dir != Vec3::ZERO {
@@ -250,6 +286,26 @@ fn drive_camera(
             }
             transform.translation = rig.orbit_target + rotation * Vec3::new(0.0, 0.0, rig.orbit_radius);
         }
+    }
+}
+
+/// Keeps the camera's far clip plane and distance fog matched to
+/// [`streaming::RenderDistance`] whenever it changes at runtime (ticket
+/// 007's status-panel slider) — without this, widening the render distance
+/// would stream terrain in past the old, now-stale far plane, where it
+/// would simply never be drawn.
+fn sync_render_distance_effects(
+    render_distance: Res<streaming::RenderDistance>,
+    mut query: Query<(&mut Projection, &mut DistanceFog), With<CameraRig>>,
+) {
+    if !render_distance.is_changed() {
+        return;
+    }
+    for (mut projection, mut fog) in &mut query {
+        if let Projection::Perspective(perspective) = projection.as_mut() {
+            perspective.far = far_plane_distance(render_distance.0);
+        }
+        *fog = atmosphere_fog(render_distance.0);
     }
 }
 
@@ -280,11 +336,29 @@ fn toggle_mode(
     };
 
     let target = raycast_terrain(ray.origin, *ray.direction, settings.max_ray_distance, decoded_world)
+        .map(|(_voxel, hit)| hit)
         .unwrap_or_else(|| ray.origin + *ray.direction * settings.max_ray_distance);
 
     rig.orbit_radius = transform.translation.distance(target).max(settings.min_orbit_radius);
     rig.orbit_target = target;
     rig.mode = CameraMode::Orbit;
+}
+
+/// Minecraft block coordinates of the solid block the camera ray through
+/// `cursor` (window pixel coordinates) first hits within `max_ray_distance`
+/// — the block inspector panel's (ticket 007) "what's under the cursor",
+/// sharing [`raycast_terrain`] with [`toggle_mode`]'s orbit re-aiming so
+/// both agree on what block the cursor is over.
+pub(crate) fn block_under_cursor(
+    camera: &Camera,
+    camera_transform: &GlobalTransform,
+    cursor: Vec2,
+    max_ray_distance: f32,
+    decoded_world: &DecodedWorld,
+) -> Option<IVec3> {
+    let ray = camera.viewport_to_world(camera_transform, cursor).ok()?;
+    raycast_terrain(ray.origin, *ray.direction, max_ray_distance, decoded_world)
+        .map(|(voxel, _hit)| voxel)
 }
 
 fn set_cursor_grab(window: Option<&mut Window>, grab: bool) {
@@ -300,14 +374,15 @@ fn set_cursor_grab(window: Option<&mut Window>, grab: bool) {
 
 /// Steps a ray (Bevy space, `direction` normalized) through the loaded
 /// voxel grid one block at a time (Amanatides-Woo DDA) and returns the
-/// world-space entry point of the first solid block hit, or `None` if
-/// nothing solid is within `max_distance`.
+/// Minecraft-space block coordinate of the first solid block hit, together
+/// with the world-space entry point on its surface — or `None` if nothing
+/// solid is within `max_distance`.
 fn raycast_terrain(
     origin: Vec3,
     direction: Vec3,
     max_distance: f32,
     decoded_world: &DecodedWorld,
-) -> Option<Vec3> {
+) -> Option<(IVec3, Vec3)> {
     // The decoded grid is addressed in Minecraft block coordinates; bevy.z
     // = -mc.z (see `world::mesh` docs) is the only axis that flips.
     let mc_origin = Vec3::new(origin.x, origin.y, -origin.z);
@@ -338,7 +413,7 @@ fn raycast_terrain(
             &registry,
         ) {
             let hit = mc_origin + mc_dir * traveled;
-            return Some(Vec3::new(hit.x, hit.y, -hit.z));
+            return Some((voxel, Vec3::new(hit.x, hit.y, -hit.z)));
         }
 
         traveled = if t_max.x < t_max.y && t_max.x < t_max.z {
@@ -437,7 +512,9 @@ mod tests {
         let origin = Vec3::new(-10.0, 10.5, -5.5);
         let direction = Vec3::new(1.0, 0.0, 0.0);
 
-        let hit = raycast_terrain(origin, direction, 100.0, &decoded).expect("should hit the block");
+        let (voxel, hit) =
+            raycast_terrain(origin, direction, 100.0, &decoded).expect("should hit the block");
+        assert_eq!(voxel, IVec3::new(5, 10, 5));
         // Entry point is the block's west face, at mc.x = 5.
         assert_eq!(hit.x.floor() as i32, 5);
     }

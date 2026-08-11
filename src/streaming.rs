@@ -35,8 +35,14 @@ impl Default for RenderDistance {
 /// The chunk coordinate the camera occupied as of the last recompute, so
 /// [`update_pending_chunk_work`] can skip re-diffing every frame and only
 /// act when the camera actually crosses into a new chunk.
+///
+/// `pub(crate)` (rather than private) so the UI layer (ticket 007) can
+/// force a fresh recompute by resetting this to its `Default` — e.g. after
+/// switching saves, where the camera may land in the same chunk coordinate
+/// it started in (a fresh save's streaming state still needs rebuilding
+/// even though the camera didn't "enter" a new chunk).
 #[derive(Resource, Debug, Default)]
-struct LastCameraChunk(Option<(i32, i32)>);
+pub(crate) struct LastCameraChunk(Option<(i32, i32)>);
 
 /// The chunk load/unload delta computed by [`update_pending_chunk_work`].
 /// Later tickets (005-b onward) drain this to actually load/spawn/unload
@@ -103,8 +109,11 @@ pub(crate) fn camera_chunk_coord(translation: Vec3) -> (i32, i32) {
 }
 
 /// Recomputes [`PendingChunkWork`] whenever the camera's chunk coordinate
-/// changes. Does not act on the delta — loading/spawning/unloading is
-/// 005-b onward.
+/// changes, or whenever [`RenderDistance`] itself changes (ticket 007's
+/// status-panel slider) — the camera can sit in the same chunk while the
+/// desired radius around it grows or shrinks, and that needs the same
+/// re-diff a chunk crossing does. Otherwise does not act on the delta —
+/// loading/spawning/unloading is 005-b onward.
 fn update_pending_chunk_work(
     camera: Query<&Transform, With<camera::CameraRig>>,
     render_distance: Res<RenderDistance>,
@@ -117,8 +126,8 @@ fn update_pending_chunk_work(
     };
 
     let center = camera_chunk_coord(transform.translation);
-    if last_chunk.0 == Some(center) {
-        return; // Still inside the same chunk; the delta hasn't changed.
+    if last_chunk.0 == Some(center) && !render_distance.is_changed() {
+        return; // Same chunk, same render distance; the delta hasn't changed.
     }
     last_chunk.0 = Some(center);
 

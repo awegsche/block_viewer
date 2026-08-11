@@ -101,6 +101,13 @@ impl InFlightChunkLoads {
     pub(crate) fn cancel_out_of_range(&mut self, desired: &HashSet<(i32, i32)>) {
         self.0.retain(|coord, _| desired.contains(coord));
     }
+
+    /// Number of load tasks currently in flight — ticket 007's status panel
+    /// folds this into "queued chunks" alongside
+    /// [`PendingChunkWork::to_load`] (coordinates not yet started).
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
 }
 
 /// Chunk coordinate -> spawned chunk-mesh entity, so

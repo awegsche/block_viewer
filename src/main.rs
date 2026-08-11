@@ -10,13 +10,16 @@ mod camera;
 mod chunk_pipeline;
 mod region_cache;
 mod streaming;
+mod ui;
 mod unload;
 mod world;
 
 /// The currently loaded Minecraft save, populated at startup from a real
-/// save directory (`%AppData%\.minecraft\saves` on Windows).
+/// save directory (`%AppData%\.minecraft\saves` on Windows). `pub(crate)`
+/// (field included) so the UI's save picker (ticket 007) can swap it out at
+/// runtime without restarting.
 #[derive(Resource)]
-struct LoadedSave(Save);
+pub(crate) struct LoadedSave(pub(crate) Save);
 
 /// Every chunk column decoded so far (ticket 002), keyed by world chunk
 /// coordinates, plus the [`world::BlockRegistry`] their block names were
@@ -65,10 +68,16 @@ fn main() {
 
     App::new()
         .add_plugins(DefaultPlugins)
+        .add_plugins(bevy::diagnostic::FrameTimeDiagnosticsPlugin)
         .add_plugins(camera::CameraControllerPlugin)
         .add_plugins(streaming::ChunkStreamingPlugin)
         .add_plugins(chunk_pipeline::ChunkLoadPipelinePlugin)
         .add_plugins(unload::ChunkUnloadPlugin)
+        .add_plugins(ui::UiPlugin)
+        // The UI plugin's panels (ticket 007) need to have drawn this
+        // frame before `drive_camera` reads whether egui claimed pointer/
+        // keyboard input — see `camera::CameraSet`'s docs.
+        .configure_sets(Update, camera::CameraSet.after(ui::UiPanelSet))
         .insert_resource(LoadedSave(save))
         .insert_resource(decoded_world)
         .add_systems(Startup, setup)
@@ -156,27 +165,39 @@ fn setup(
     ));
 }
 
-/// Bevy-space point used to place the camera at startup: the horizontal
-/// middle of the save's region footprint (metadata only — `SaveMeta`'s
-/// region-coordinate list, no chunk I/O — so this is safe to call before any
-/// streaming has happened), at a fixed height generally above ground level.
-/// Real saves are rarely centred on (0,0); landing the camera near where
-/// regions actually exist means streaming has something to load in view
-/// immediately, rather than the camera free-flying over empty space until
-/// it happens to reach one.
-fn spawn_point(meta: &SaveMeta) -> Vec3 {
-    const DEFAULT_HEIGHT: f32 = 100.0;
+/// Bevy-space height every camera placement in this module uses. Real saves
+/// are rarely centred on (0,0), and nothing is decoded yet at startup (or
+/// right after the UI switches saves, ticket 007) to read real terrain
+/// height from, so every placement lands here instead — generally above
+/// ground level — rather than on the surface.
+const DEFAULT_CAMERA_HEIGHT: f32 = 100.0;
 
-    let Some((rx, rz)) = region_centroid(&meta.regions) else {
-        return Vec3::new(0.0, DEFAULT_HEIGHT, 0.0);
-    };
-
+/// Bevy-space point at the horizontal middle of region `(rx, rz)`, at
+/// [`DEFAULT_CAMERA_HEIGHT`]. Shared by [`spawn_point`] (the save's overall
+/// region centroid) and the UI's region-grid click-to-teleport (ticket
+/// 007), so both land on the same convention for "where a region is".
+pub(crate) fn region_center_point(rx: i32, rz: i32) -> Vec3 {
     let region_size = REGION_WIDTH_IN_CHUNKS as i32 * world::SECTION_SIZE as i32;
     let mc_x = rx * region_size + region_size / 2;
     let mc_z = rz * region_size + region_size / 2;
 
     // bevy.x = mc.x, bevy.z = -mc.z — see `world::mesh` docs.
-    Vec3::new(mc_x as f32, DEFAULT_HEIGHT, -(mc_z as f32))
+    Vec3::new(mc_x as f32, DEFAULT_CAMERA_HEIGHT, -(mc_z as f32))
+}
+
+/// Bevy-space point used to place the camera at startup, and by the UI's
+/// save picker (ticket 007) after switching to a different save: the
+/// horizontal middle of the save's region footprint (metadata only —
+/// `SaveMeta`'s region-coordinate list, no chunk I/O — so this is safe to
+/// call before any streaming has happened). Real saves are rarely centred
+/// on (0,0); landing the camera near where regions actually exist means
+/// streaming has something to load in view immediately, rather than the
+/// camera free-flying over empty space until it happens to reach one.
+pub(crate) fn spawn_point(meta: &SaveMeta) -> Vec3 {
+    let Some((rx, rz)) = region_centroid(&meta.regions) else {
+        return Vec3::new(0.0, DEFAULT_CAMERA_HEIGHT, 0.0);
+    };
+    region_center_point(rx, rz)
 }
 
 /// The save's region closest to the horizontal centroid of every region it
