@@ -50,6 +50,22 @@ impl BlockRegistry {
     pub fn name(&self, id: BlockId) -> &str {
         &self.names[id.0 as usize]
     }
+
+    /// Number of distinct names interned so far. [`BlockId`]s handed out by
+    /// this registry are exactly `0..len()`, so callers (ticket 004's atlas
+    /// UV table) can build a `Vec` indexed directly by `BlockId::0`.
+    pub fn len(&self) -> usize {
+        self.names.len()
+    }
+
+    /// Always false: [`BlockRegistry::new`] interns `"minecraft:air"` up
+    /// front, so a registry is never empty. No caller yet — kept alongside
+    /// `len` per the standard `len`/`is_empty` pairing (clippy's
+    /// `len_without_is_empty`).
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.names.is_empty()
+    }
 }
 
 impl Default for BlockRegistry {

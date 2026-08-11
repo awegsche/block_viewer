@@ -32,6 +32,7 @@
 
 use bevy::{asset::RenderAssetUsages, prelude::*, render::mesh::Indices};
 
+use super::atlas::{BlockFaces, UvRect};
 use super::block::{BlockId, BlockRegistry};
 use super::decode::{ChunkColumn, SECTION_SIZE};
 
@@ -48,6 +49,21 @@ const NON_SOLID: [&str; 3] = [
     "minecraft:cave_air",
     "minecraft:void_air",
 ];
+
+/// Whole-atlas UV rect used only as a last-resort fallback if `uv_table`
+/// passed to [`mesh_chunk_column`] is shorter than the registry it was
+/// built from — should never trigger in practice (see the call site).
+const FALLBACK_UV: UvRect = UvRect {
+    u0: 0.0,
+    v0: 0.0,
+    u1: 1.0,
+    v1: 1.0,
+};
+const FALLBACK_FACES: BlockFaces = BlockFaces {
+    top: FALLBACK_UV,
+    bottom: FALLBACK_UV,
+    side: FALLBACK_UV,
+};
 
 /// Whether `id` should count as "there" for face-culling purposes.
 pub fn is_solid(id: BlockId, registry: &BlockRegistry) -> bool {
@@ -133,6 +149,19 @@ enum Face {
     North,
 }
 
+impl Face {
+    /// Which of a block's three distinct textures (ticket 004) this face
+    /// samples: `Up`/`Down` get the top/bottom texture, every horizontal
+    /// face shares the side texture.
+    fn uv_rect(self, faces: &BlockFaces) -> UvRect {
+        match self {
+            Face::Up => faces.top,
+            Face::Down => faces.bottom,
+            Face::East | Face::West | Face::South | Face::North => faces.side,
+        }
+    }
+}
+
 /// The four corners (CCW from outside) and outward normal, in Bevy space,
 /// of `face` for the unit block at chunk-local `(dx, world_y, dz)`.
 fn face_geometry(face: Face, dx: i32, world_y: i32, dz: i32) -> ([Vec3; 4], Vec3) {
@@ -213,6 +242,7 @@ fn push_quad(
     dx: i32,
     world_y: i32,
     dz: i32,
+    uv_rect: UvRect,
 ) {
     let (corners, normal) = face_geometry(face, dx, world_y, dz);
     let base = vertices.len() as u32;
@@ -220,7 +250,15 @@ fn push_quad(
         vertices.push(corner.into());
         normals.push(normal.into());
     }
-    uvs.extend_from_slice(&[[0.0, 1.0], [0.0, 0.0], [1.0, 0.0], [1.0, 1.0]]);
+    // Same corner-to-corner pattern the placeholder single-texture UVs used
+    // (full 0..1 per face) — just scaled/offset into this face's atlas tile
+    // (ticket 004) instead of the whole image.
+    uvs.extend_from_slice(&[
+        [uv_rect.u0, uv_rect.v1],
+        [uv_rect.u0, uv_rect.v0],
+        [uv_rect.u1, uv_rect.v0],
+        [uv_rect.u1, uv_rect.v1],
+    ]);
     indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
 }
 
@@ -235,10 +273,15 @@ fn push_quad(
 ///
 /// Returns `None` if the column has no exposed faces at all (e.g. an
 /// entirely air column), so callers can skip spawning a pointless entity.
+///
+/// `uv_table` gives each block's per-face atlas rect (ticket 004),
+/// indexed directly by [`BlockId`] — build it once per save with
+/// [`super::atlas::build_block_uv_table`] and reuse it across every column.
 pub fn mesh_chunk_column(
     column: &ChunkColumn,
     registry: &BlockRegistry,
     neighbors: &Neighbors,
+    uv_table: &[BlockFaces],
 ) -> Option<Mesh> {
     let mut vertices = Vec::new();
     let mut normals = Vec::new();
@@ -257,10 +300,25 @@ pub fn mesh_chunk_column(
                     }
                     let dx = lx as i32;
                     let dz = lz as i32;
+                    // `uv_table` is built from the same registry these ids
+                    // came from, so this is always in range in practice;
+                    // fall back to the whole-atlas rect rather than panic
+                    // if a caller ever passes a mismatched table.
+                    let faces = uv_table.get(id.0 as usize).copied().unwrap_or(FALLBACK_FACES);
 
                     let mut face = |f: Face, exposed: bool| {
                         if exposed {
-                            push_quad(&mut vertices, &mut normals, &mut uvs, &mut indices, f, dx, world_y, dz);
+                            push_quad(
+                                &mut vertices,
+                                &mut normals,
+                                &mut uvs,
+                                &mut indices,
+                                f,
+                                dx,
+                                world_y,
+                                dz,
+                                f.uv_rect(&faces),
+                            );
                         }
                     };
 
@@ -339,6 +397,13 @@ mod tests {
         (registry, stone)
     }
 
+    /// Face-culling geometry is what these tests check, not UVs — a
+    /// same-for-every-block table (whole-atlas rect) sidesteps building a
+    /// real [`super::super::atlas::TextureAtlas`] in unit tests.
+    fn uv_table_for(registry: &BlockRegistry) -> Vec<BlockFaces> {
+        vec![FALLBACK_FACES; registry.len()]
+    }
+
     #[test]
     fn isolated_block_emits_all_six_faces() {
         let (registry, stone) = stone_registry();
@@ -347,7 +412,7 @@ mod tests {
         let column = column_with(0, 0, vec![section_with(0, &[((5, 5, 5), stone)])]);
         let neighbors = Neighbors::default();
 
-        let mesh = mesh_chunk_column(&column, &registry, &neighbors).unwrap();
+        let mesh = mesh_chunk_column(&column, &registry, &neighbors, &uv_table_for(&registry)).unwrap();
         let Indices::U32(indices) = mesh.indices().unwrap() else {
             panic!("expected U32 indices");
         };
@@ -367,7 +432,7 @@ mod tests {
         );
         let neighbors = Neighbors::default();
 
-        let mesh = mesh_chunk_column(&column, &registry, &neighbors).unwrap();
+        let mesh = mesh_chunk_column(&column, &registry, &neighbors, &uv_table_for(&registry)).unwrap();
         let Indices::U32(indices) = mesh.indices().unwrap() else {
             panic!("expected U32 indices");
         };
@@ -383,7 +448,7 @@ mod tests {
         let column = column_with(0, 0, vec![section_with(-4, &[((5, 0, 5), stone)])]);
         let neighbors = Neighbors::default();
 
-        let mesh = mesh_chunk_column(&column, &registry, &neighbors).unwrap();
+        let mesh = mesh_chunk_column(&column, &registry, &neighbors, &uv_table_for(&registry)).unwrap();
         let Indices::U32(indices) = mesh.indices().unwrap() else {
             panic!("expected U32 indices");
         };
@@ -398,7 +463,7 @@ mod tests {
         let column = column_with(0, 0, vec![section_with(0, &[((15, 5, 0), stone)])]);
         let neighbors = Neighbors::default();
 
-        let mesh = mesh_chunk_column(&column, &registry, &neighbors).unwrap();
+        let mesh = mesh_chunk_column(&column, &registry, &neighbors, &uv_table_for(&registry)).unwrap();
         let Indices::U32(indices) = mesh.indices().unwrap() else {
             panic!("expected U32 indices");
         };
@@ -417,7 +482,7 @@ mod tests {
             ..Default::default()
         };
 
-        let mesh = mesh_chunk_column(&column, &registry, &neighbors).unwrap();
+        let mesh = mesh_chunk_column(&column, &registry, &neighbors, &uv_table_for(&registry)).unwrap();
         let Indices::U32(indices) = mesh.indices().unwrap() else {
             panic!("expected U32 indices");
         };
@@ -430,6 +495,6 @@ mod tests {
         let (registry, _) = stone_registry();
         let column = column_with(0, 0, vec![]);
         let neighbors = Neighbors::default();
-        assert!(mesh_chunk_column(&column, &registry, &neighbors).is_none());
+        assert!(mesh_chunk_column(&column, &registry, &neighbors, &uv_table_for(&registry)).is_none());
     }
 }

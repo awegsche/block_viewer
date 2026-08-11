@@ -7,6 +7,10 @@ edition = "2024"
 bevy = "0.15.0"
 bevy_egui = "0.31.1"
 dirs = "5.0.1"
+# Only for decoding the vanilla resource pack's PNGs into the startup atlas
+# (ticket 004) — bevy_image/arboard already pull in `image` with `png`
+# support, so this adds no new download.
+image = { version = "0.25.5", default-features = false, features = ["png"] }
 mc_anvil = { package = "ranvil", version = "0.1.0", path = "../ranvil" }
 rnbt = { version = "0.1.0", path = "../rnbt" }
 

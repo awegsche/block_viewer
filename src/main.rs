@@ -1,11 +1,8 @@
-use bevy::{
-    image::{ImageLoaderSettings, ImageSampler},
-    input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll},
-    prelude::*,
-};
+use bevy::prelude::*;
 use mc_anvil::{chunkregion::ChunkRegion, Save, get_saves};
-use std::{collections::HashMap, f32::consts::FRAC_PI_2, ops::Range, time::Instant};
+use std::{collections::HashMap, path::Path, time::Instant};
 
+mod camera;
 mod world;
 
 /// The currently loaded Minecraft save, populated at startup from a real
@@ -16,11 +13,12 @@ struct LoadedSave(Save);
 /// Every chunk column decoded from the loaded save's first region (ticket
 /// 002), keyed by world chunk coordinates, plus the [`world::BlockRegistry`]
 /// their block names were interned into. Consumed by [`setup`] to mesh one
-/// entity per chunk column (ticket 003).
+/// entity per chunk column (ticket 003), and by [`camera`]'s
+/// under-the-cursor ray-march for orbit targeting (ticket 006).
 #[derive(Resource)]
-struct DecodedWorld {
-    registry: world::BlockRegistry,
-    columns: HashMap<(i32, i32), world::ChunkColumn>,
+pub(crate) struct DecodedWorld {
+    pub(crate) registry: world::BlockRegistry,
+    pub(crate) columns: HashMap<(i32, i32), world::ChunkColumn>,
 }
 
 /// Loads the first save found under the Minecraft saves directory
@@ -104,50 +102,21 @@ fn main() {
 
     App::new()
         .add_plugins(DefaultPlugins)
-        .init_resource::<CameraSettings>()
+        .add_plugins(camera::CameraControllerPlugin)
         .insert_resource(LoadedSave(save))
         .insert_resource(decoded_world)
         .add_systems(Startup, setup)
-        .add_systems(Update, orbit)
         .run();
 }
 
 #[derive(Component)]
 struct BlockMesh;
 
-#[derive(Debug, Resource)]
-struct CameraSettings {
-    pub orbit_distance: f32,
-    pub pitch_speed: f32,
-    // Clamp pitch to this range
-    pub pitch_range: Range<f32>,
-    pub roll_speed: f32,
-    pub yaw_speed: f32,
-    pub is_roatatin: bool,
-}
-
-impl Default for CameraSettings {
-    fn default() -> Self {
-        // Limiting pitch stops some unexpected rotation past 90° up or down.
-        let pitch_limit = FRAC_PI_2 - 0.01;
-        Self {
-            // These values are completely arbitrary, chosen because they seem to produce
-            // "sensible" results for this example. Adjust as required.
-            orbit_distance: 20.0,
-            pitch_speed: 0.003,
-            pitch_range: -pitch_limit..pitch_limit,
-            roll_speed: 1.0,
-            yaw_speed: 0.004,
-            is_roatatin: false,
-        }
-    }
-}
-
 fn setup(
     mut commands: Commands,
-    asset_server: Res<AssetServer>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut meshes: ResMut<Assets<Mesh>>,
+    mut images: ResMut<Assets<Image>>,
     loaded_save: Res<LoadedSave>,
     decoded_world: Res<DecodedWorld>,
 ) {
@@ -157,15 +126,16 @@ fn setup(
         loaded_save.0.meta.regions.len()
     );
 
-    let block_texture_handle: Handle<Image> = asset_server.load_with_settings(
-        "minecraft/textures/block/stone.png",
-        |settings: &mut ImageLoaderSettings| {
-            // Need to use nearest filtering to avoid bleeding between the slices with tiling
-            settings.sampler = ImageSampler::nearest();
-        },
-    );
+    // Pack every block texture into one atlas and resolve each interned
+    // block name to its per-face atlas rect (ticket 004) — replaces the
+    // single hardcoded stone.png the mesher previously stretched over
+    // every face.
+    let atlas = world::atlas::build(Path::new("assets/minecraft/textures/block"))
+        .expect("failed to build the block texture atlas");
+    let uv_table = world::atlas::build_block_uv_table(&decoded_world.registry, &atlas);
+    let atlas_handle = images.add(atlas.image);
     let material_handle = materials.add(StandardMaterial {
-        base_color_texture: Some(block_texture_handle),
+        base_color_texture: Some(atlas_handle),
         ..default()
     });
 
@@ -179,7 +149,8 @@ fn setup(
             east: decoded_world.columns.get(&(cx + 1, cz)),
             west: decoded_world.columns.get(&(cx - 1, cz)),
         };
-        let Some(mesh) = world::mesh_chunk_column(column, &decoded_world.registry, &neighbors)
+        let Some(mesh) =
+            world::mesh_chunk_column(column, &decoded_world.registry, &neighbors, &uv_table)
         else {
             continue; // fully-air column: nothing to render
         };
@@ -200,94 +171,73 @@ fn setup(
         decoded_world.columns.len()
     );
 
-    // Aim the (still-fixed, ticket 006 will make this real navigation)
-    // camera at the middle of the loaded terrain instead of world origin —
-    // real saves are rarely centred on (0,0).
-    let target = column_center(&decoded_world.columns);
-    let camera_and_light_transform =
-        Transform::from_xyz(target.x + 10.8, target.y + 30.0, target.z + 10.8)
-            .looking_at(target, Vec3::Y);
+    // Place the camera above the terrain surface near the middle of the
+    // loaded columns (ticket 006) instead of a fixed point like the old
+    // `(10, 5, 10)`, which on a real save may well be underground.
+    let target = spawn_point(&decoded_world.columns);
+    let eye = target + Vec3::new(-24.0, 20.0, 24.0);
 
     commands.spawn((
         Name::new("Camera"),
         Camera3d::default(),
-        Transform::from_xyz(target.x + 40.0, target.y + 60.0, target.z + 40.0)
-            .looking_at(target, Vec3::Y),
+        Projection::Perspective(PerspectiveProjection {
+            far: camera::far_plane_distance(),
+            ..default()
+        }),
+        camera::atmosphere_fog(),
+        Transform::from_translation(eye).looking_at(target, Vec3::Y),
+        camera::CameraRig::looking_at(eye, target),
     ));
 
     // Light up the scene.
-    commands.spawn((PointLight::default(), camera_and_light_transform));
+    commands.spawn((
+        PointLight::default(),
+        Transform::from_xyz(target.x + 10.8, target.y + 30.0, target.z + 10.8)
+            .looking_at(target, Vec3::Y),
+    ));
 }
 
-fn orbit(
-    mut camera: Single<&mut Transform, With<Camera>>,
-    camera_settings: Res<CameraSettings>,
-    mouse_buttons: Res<ButtonInput<MouseButton>>,
-    mouse_motion: Res<AccumulatedMouseMotion>,
-    mouse_scroll: Res<AccumulatedMouseScroll>,
-    time: Res<Time>,
-) {
-    let delta = mouse_motion.delta;
-    let mut delta_roll = 0.0;
+/// Bevy-space point on (or just above) the terrain surface near the middle
+/// of the loaded columns — used to place the camera somewhere sensible at
+/// startup and as its initial orbit target. Real saves are rarely centred
+/// on (0,0), and a fixed height would just as easily land underground.
+fn spawn_point(columns: &HashMap<(i32, i32), world::ChunkColumn>) -> Vec3 {
+    let Some((&(cx, cz), column)) = nearest_to_average(columns) else {
+        return Vec3::new(0.0, 80.0, 0.0);
+    };
 
-    let target = Vec3::ZERO;
-    let distance = (camera.translation - target).length();
+    let size = world::SECTION_SIZE as i32;
+    let local = world::SECTION_SIZE / 2;
+    // Fall back to a plausible sea-level-ish height if the centre column
+    // happens to be a void (e.g. an unloaded/void chunk in a partial save).
+    let world_y = column.topmost_non_air(local, local).map_or(72, |(y, _)| y);
 
-    if mouse_buttons.pressed(MouseButton::Left) {
-        delta_roll -= 1.0;
-    }
-    if mouse_buttons.pressed(MouseButton::Right) {
-        delta_roll += 1.0;
-    }
-
-    if mouse_buttons.pressed(MouseButton::Middle) {
-        // Mouse motion is one of the few inputs that should not be multiplied by delta time,
-        // as we are already receiving the full movement since the last frame was rendered. Multiplying
-        // by delta time here would make the movement slower that it should be.
-        let delta_pitch = -delta.y * camera_settings.pitch_speed;
-        let delta_yaw = -delta.x * camera_settings.yaw_speed;
-
-        // Conversely, we DO need to factor in delta time for mouse button inputs.
-        delta_roll *= camera_settings.roll_speed * time.delta_secs();
-
-        // Obtain the existing pitch, yaw, and roll values from the transform.
-        let (yaw, pitch, roll) = camera.rotation.to_euler(EulerRot::YXZ);
-
-        // Establish the new yaw and pitch, preventing the pitch value from exceeding our limits.
-        let pitch = (pitch + delta_pitch).clamp(
-            camera_settings.pitch_range.start,
-            camera_settings.pitch_range.end,
-        );
-        let roll = roll + delta_roll;
-        let yaw = yaw + delta_yaw;
-        camera.rotation = Quat::from_euler(EulerRot::YXZ, yaw, pitch, roll);
-    }
-
-    // Adjust the translation to maintain the correct orientation toward the orbit target.
-    // In our example it's a static target, but this could easily be customized.
-    camera.translation = target - camera.forward() * distance * (1.0 - mouse_scroll.delta.y * 0.1);
+    Vec3::new(
+        (cx * size + local as i32) as f32,
+        world_y as f32 + 2.0, // stand a couple of blocks above the surface
+        -(cz * size + local as i32) as f32,
+    )
 }
 
-/// World-space (Bevy axes, see `world::mesh` docs) centre of the horizontal
-/// span of the decoded columns, at Y=0 — a reasonable point for the
-/// placeholder camera to orbit until ticket 006 replaces it with real
-/// navigation.
-fn column_center(columns: &HashMap<(i32, i32), world::ChunkColumn>) -> Vec3 {
+/// The loaded column closest to the horizontal centroid of every loaded
+/// column — the centroid itself may land on a gap (an unloaded or void
+/// chunk), so this snaps to whatever's actually there.
+fn nearest_to_average(
+    columns: &HashMap<(i32, i32), world::ChunkColumn>,
+) -> Option<(&(i32, i32), &world::ChunkColumn)> {
     if columns.is_empty() {
-        return Vec3::ZERO;
+        return None;
     }
-    let n = columns.len() as f32;
+    let n = columns.len() as f64;
     let (sum_x, sum_z) = columns.keys().fold((0i64, 0i64), |(sx, sz), &(cx, cz)| {
         (sx + cx as i64, sz + cz as i64)
     });
-    let avg_cx = sum_x as f32 / n;
-    let avg_cz = sum_z as f32 / n;
-    let size = world::SECTION_SIZE as f32;
-    // Chunk-centre in Minecraft blocks, then through the same x/-z mapping
-    // as chunk-entity transforms.
-    Vec3::new(
-        avg_cx * size + size / 2.0,
-        0.0,
-        -(avg_cz * size + size / 2.0),
-    )
+    let avg_cx = sum_x as f64 / n;
+    let avg_cz = sum_z as f64 / n;
+
+    columns.iter().min_by(|a, b| {
+        let dist2 =
+            |&(cx, cz): &(i32, i32)| (cx as f64 - avg_cx).powi(2) + (cz as f64 - avg_cz).powi(2);
+        dist2(a.0).total_cmp(&dist2(b.0))
+    })
 }
