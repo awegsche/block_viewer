@@ -1404,7 +1404,7 @@ dependencies = [
  "bevy_egui",
  "dirs",
  "ranvil",
- "rnbt 0.1.0",
+ "rnbt",
 ]
 
 [[package]]
@@ -3713,7 +3713,7 @@ dependencies = [
  "flate2",
  "once_cell",
  "regex",
- "rnbt 0.1.0 (git+https://github.com/awegsche/rnbt.git)",
+ "rnbt",
  "serde",
 ]
 
@@ -3841,14 +3841,6 @@ checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
 [[package]]
 name = "rnbt"
 version = "0.1.0"
-dependencies = [
- "byteorder",
-]
-
-[[package]]
-name = "rnbt"
-version = "0.1.0"
-source = "git+https://github.com/awegsche/rnbt.git#01eaedb1b0fe48c90851f5173117c82dfb06c829"
 dependencies = [
  "byteorder",
 ]

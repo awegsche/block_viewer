@@ -4,18 +4,88 @@ use bevy::{
 use mc_anvil::{Save, get_saves};
 use std::{f32::consts::FRAC_PI_2, ops::Range};
 
-fn main() {
-    println!("Hello, world!");
+mod world;
 
-    let mut saves = get_saves().unwrap();
+/// The currently loaded Minecraft save, populated at startup from a real
+/// save directory (`%AppData%\.minecraft\saves` on Windows).
+#[derive(Resource)]
+struct LoadedSave(Save);
 
-    for save in saves.iter() {
-        println!("{:?}", save);
+/// Loads the first save found under the Minecraft saves directory
+/// (`dirs::config_dir()/.minecraft/saves`, i.e.
+/// `C:\Users\<user>\AppData\Roaming\.minecraft\saves` on Windows) and eagerly
+/// parses the chunks of its first region so we know real save data is
+/// reachable.
+fn load_real_save() -> Save {
+    let saves = get_saves().expect("could not read the Minecraft saves directory");
+    let meta = saves
+        .into_iter()
+        .next()
+        .expect("no Minecraft saves found in the saves directory");
+
+    println!("Loading save {}", meta.get_grid_view());
+
+    let mut save: Save = meta.into();
+    if let Some(first_region) = save.regions.first_mut() {
+        first_region
+            .load_chunks()
+            .expect("failed to load chunks for the first region");
+        let chunk_count = first_region
+            .chunks
+            .as_ref()
+            .map(|chunks| chunks.iter().filter(|c| c.is_some()).count())
+            .unwrap_or(0);
+        println!(
+            "Loaded {} chunks from region ({}, {})",
+            chunk_count,
+            first_region.region.get_x_coord(),
+            first_region.region.get_z_coord()
+        );
+
+        // TODO(ticket 002): temporary sanity log — remove once the mesher
+        // (ticket 003) actually consumes decoded chunk columns.
+        log_decoded_chunk_samples(first_region);
     }
+
+    save
+}
+
+/// Decodes a handful of populated chunks and prints the topmost non-air
+/// block at their (0,0) corner, as a sanity check that `decode_chunk`
+/// produces plausible block names rather than garbage.
+fn log_decoded_chunk_samples(region: &mc_anvil::chunkregion::ChunkRegion) {
+    let Some(chunks) = &region.chunks else {
+        return;
+    };
+
+    let mut registry = world::BlockRegistry::new();
+    for chunk in chunks.iter().flatten().take(3) {
+        match world::decode_chunk(chunk, &mut registry) {
+            Ok(column) => match column.topmost_non_air(0, 0) {
+                Some((y, id)) => println!(
+                    "  chunk ({}, {}): topmost block at (0,0) is {} @ y={}",
+                    column.x,
+                    column.z,
+                    registry.name(id),
+                    y
+                ),
+                None => println!(
+                    "  chunk ({}, {}): column (0,0) is all air",
+                    column.x, column.z
+                ),
+            },
+            Err(e) => println!("  chunk decode skipped: {e}"),
+        }
+    }
+}
+
+fn main() {
+    let save = load_real_save();
 
     App::new()
         .add_plugins(DefaultPlugins)
         .init_resource::<CameraSettings>()
+        .insert_resource(LoadedSave(save))
         .add_systems(Startup, setup)
         .add_systems(Update, orbit)
         .run();
@@ -57,7 +127,17 @@ fn setup(
     asset_server: Res<AssetServer>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut meshes: ResMut<Assets<Mesh>>,
+    loaded_save: Res<LoadedSave>,
 ) {
+    // TODO: mesh the real block data from `loaded_save` instead of the
+    // placeholder test cube below, once `ChunkRegion::get_block` in `ranvil`
+    // is able to actually resolve block states from the palette.
+    println!(
+        "Active save: {} ({} regions)",
+        loaded_save.0.meta.name,
+        loaded_save.0.meta.regions.len()
+    );
+
     let block_texture_handle: Handle<Image> = asset_server.load_with_settings(
         "minecraft/textures/block/stone.png",
         |settings: &mut ImageLoaderSettings| {
