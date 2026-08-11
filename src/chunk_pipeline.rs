@@ -546,7 +546,18 @@ fn load_and_mesh_chunk(
     };
 
     let mut registry = registry.lock().expect("block registry mutex poisoned");
-    let column = world::decode_chunk(&nbt, &mut registry).ok()?;
+    let column = match world::decode_chunk(&nbt, &mut registry) {
+        Ok(column) => column,
+        // Not fully generated is routine at the edge of explored terrain —
+        // every real save has plenty of these, so logging it would just be
+        // startup-log noise, not a problem to report (ticket 008 only asks
+        // for genuine failures — corrupt/unexpected NBT — to be logged).
+        Err(world::DecodeError::NotFullyGenerated(_)) => return None,
+        Err(err) => {
+            println!("block_viewer: skipping chunk {coord:?} — failed to decode: {err}");
+            return None;
+        }
+    };
     let mesh = mesh_column_with_neighbors(&column, &registry, &atlas, &neighbors);
 
     Some(ChunkLoadResult { coord, column, mesh })

@@ -47,3 +47,10 @@ these itself (see CLAUDE.md's "Manual/visual verification").
   slider or typing into a field doesn't also spin the view or fly the
   camera. Checklist:
   `finished_tickets/007-egui-explorer-ui.manual-verification.md`.
+- [ ] **008 graceful startup errors: no panic on a missing/empty saves
+  directory or a corrupted region file.** Needs a human to run `cargo run`
+  a few different ways (pointing it at a nonexistent directory, an empty
+  directory, and against a deliberately truncated `.mca` file) and confirm
+  the window still opens and the reason shows up in the UI/console each
+  time rather than a crash. Full steps and what to look for:
+  `finished_tickets/008-graceful-startup-errors.manual-verification.md`.

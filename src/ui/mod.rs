@@ -81,8 +81,14 @@ impl Plugin for UiPlugin {
 /// its own "Refresh" affordance for re-running this later, since a saves
 /// directory the process started without (or with different contents in)
 /// can change while the viewer is running.
+///
+/// Scans [`crate::saves_directory`] — the same CLI-arg-or-default directory
+/// `main.rs`'s startup pick uses (ticket 008) — so this list always matches
+/// where the app actually looked, rather than silently falling back to the
+/// default `.minecraft/saves` if a custom instance directory was given.
 fn scan_saves(mut available: ResMut<AvailableSaves>) {
-    available.0 = mc_anvil::get_saves().map_err(|e| e.to_string());
+    available.0 =
+        mc_anvil::get_saves_from_instance(crate::saves_directory()).map_err(|e| e.to_string());
 }
 
 /// Reads whether egui claimed this frame's pointer/keyboard input, once

@@ -11,7 +11,7 @@
 //! decode) — [`crate::chunk_pipeline`] (005-c) is what puts calls to it on
 //! a background task, sharing one instance across every task via
 //! `Arc<Mutex<RegionCache>>` rather than giving each task its own.
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use mc_anvil::chunkregion::ChunkRegion;
@@ -60,6 +60,13 @@ pub struct RegionCache {
     /// remove+push on every access is cheap — not worth a real intrusive
     /// LRU list at this size.
     order: Vec<(i32, i32)>,
+    /// Regions whose `load_chunks` has already failed once (truncated or
+    /// otherwise corrupt `.mca`, ticket 008) — remembered so a bad region is
+    /// only attempted, and logged, once; every later request for the same
+    /// coordinate fails fast without re-touching disk or logging again.
+    /// Deliberately separate from `entries`, which only ever holds
+    /// successfully loaded regions.
+    failed: HashSet<(i32, i32)>,
 }
 
 impl RegionCache {
@@ -71,6 +78,7 @@ impl RegionCache {
             capacity: capacity.max(1),
             entries: HashMap::new(),
             order: Vec::new(),
+            failed: HashSet::new(),
         }
     }
 
@@ -95,8 +103,15 @@ impl RegionCache {
     /// `capacity`.
     ///
     /// Errors if the save has no region at `region_coord`, or if loading it
-    /// fails (missing/corrupt file, unsupported compression, ...).
+    /// fails (missing/corrupt file, unsupported compression, ...) — the
+    /// latter is remembered in `failed` (ticket 008) so a permanently broken
+    /// region only gets logged, and its file re-read, once rather than on
+    /// every chunk that lands inside it.
     pub fn get_or_load(&mut self, region_coord: (i32, i32)) -> Result<&ChunkRegion, MCLoadError> {
+        if self.failed.contains(&region_coord) {
+            return Err(MCLoadError::PathNotFoundError);
+        }
+
         if !self.entries.contains_key(&region_coord) {
             let (rx, rz) = region_coord;
             if !self.save_meta.has_region(rx, rz) {
@@ -108,8 +123,15 @@ impl RegionCache {
             }
 
             let path = self.region_path(region_coord);
+            let path_display = path.display().to_string();
             let mut region: ChunkRegion = Region::new(rx, rz, path).into();
-            region.load_chunks()?;
+            if let Err(err) = region.load_chunks() {
+                self.failed.insert(region_coord);
+                println!(
+                    "block_viewer: skipping region ({rx}, {rz}) — failed to load {path_display}: {err}"
+                );
+                return Err(err);
+            }
             self.entries.insert(region_coord, region);
         }
 
@@ -201,6 +223,26 @@ mod tests {
 
         let mut cache = RegionCache::new(meta, 4);
         assert!(cache.get_or_load(missing).is_err());
+    }
+
+    /// Ticket 008: unlike a region the save's metadata never listed (above),
+    /// this simulates a region the save *claims* to have but whose `.mca`
+    /// file is missing/corrupt on disk — `get_or_load` should fail cleanly
+    /// (not panic), and a repeat request for the same coordinate should keep
+    /// failing cleanly too rather than somehow succeeding once the failure
+    /// is remembered in `failed`.
+    #[test]
+    fn get_or_load_remembers_a_load_failure_instead_of_retrying_forever() {
+        let meta = SaveMeta {
+            name: "broken".to_string(),
+            path: std::path::PathBuf::from("does-not-exist-on-disk"),
+            regions: vec![(0, 0)],
+        };
+        let mut cache = RegionCache::new(meta, 4);
+
+        assert!(cache.get_or_load((0, 0)).is_err());
+        assert!(cache.get_or_load((0, 0)).is_err());
+        assert_eq!(cache.len(), 0, "a failed region must never end up cached as loaded");
     }
 
     #[test]

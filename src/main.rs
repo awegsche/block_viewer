@@ -1,8 +1,8 @@
 use bevy::prelude::*;
-use mc_anvil::{get_saves, region::REGION_WIDTH_IN_CHUNKS, Save, SaveMeta};
+use mc_anvil::{get_saves_from_instance, region::REGION_WIDTH_IN_CHUNKS, Save, SaveMeta};
 use std::{
     collections::HashMap,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
@@ -18,8 +18,38 @@ mod world;
 /// save directory (`%AppData%\.minecraft\saves` on Windows). `pub(crate)`
 /// (field included) so the UI's save picker (ticket 007) can swap it out at
 /// runtime without restarting.
+///
+/// Always holds a real (if possibly empty-of-regions) [`Save`] — never
+/// `Option`/`Result` — so every reader (`setup`, the save picker) can read
+/// `.0.meta` unconditionally. When nothing could actually be loaded at
+/// startup (ticket 008: no `.minecraft` directory, an empty `saves/`
+/// folder, ...) this holds [`empty_save`] instead of panicking, and
+/// [`StartupIssue`] carries the reason for the UI to show.
 #[derive(Resource)]
 pub(crate) struct LoadedSave(pub(crate) Save);
+
+/// The reason [`LoadedSave`] is empty at startup, if any (ticket 008) —
+/// `None` once a real save has loaded (startup found one, or the save
+/// picker loaded one at runtime). Read by the save picker panel to show the
+/// problem instead of the app just silently sitting on an empty world.
+#[derive(Resource, Default)]
+pub(crate) struct StartupIssue(pub(crate) Option<String>);
+
+/// A [`Save`] with no regions and no on-disk backing — what [`LoadedSave`]
+/// holds when startup couldn't find a real one (ticket 008). Safe to treat
+/// like any other loaded save: an empty `regions` list means the streaming
+/// pipeline simply has nothing to load, the same as a real save the camera
+/// hasn't flown into any generated terrain of yet.
+fn empty_save() -> Save {
+    Save {
+        meta: SaveMeta {
+            name: "(no save loaded)".to_string(),
+            path: PathBuf::new(),
+            regions: Vec::new(),
+        },
+        regions: Vec::new(),
+    }
+}
 
 /// Every chunk column decoded so far (ticket 002), keyed by world chunk
 /// coordinates, plus the [`world::BlockRegistry`] their block names were
@@ -40,27 +70,76 @@ pub(crate) struct DecodedWorld {
     pub(crate) columns: HashMap<(i32, i32), world::ChunkColumn>,
 }
 
-/// Picks the first save found under the Minecraft saves directory
-/// (`dirs::config_dir()/.minecraft/saves`, i.e.
-/// `C:\Users\<user>\AppData\Roaming\.minecraft\saves` on Windows). Metadata
-/// only (`get_saves`/`SaveMeta` -> `Save`) — cheap and synchronous, unlike
-/// chunk data, which streams in after `App::run()` via the async pipeline
-/// (ticket 005-c) instead of being loaded here (ticket 005-e removed the old
-/// eager pre-`App::run()` region load).
-fn load_real_save() -> Save {
-    let saves = get_saves().expect("could not read the Minecraft saves directory");
-    let meta = saves
-        .into_iter()
-        .next()
-        .expect("no Minecraft saves found in the saves directory");
+/// Directory to scan for Minecraft saves: the first CLI argument if one was
+/// given (ticket 008 — pointing at a CurseForge/MultiMC instance elsewhere
+/// on disk, since those don't live under the default directory), else
+/// `dirs::config_dir()/.minecraft/saves`
+/// (`C:\Users\<user>\AppData\Roaming\.minecraft\saves` on Windows). Shared by
+/// startup ([`try_load_real_save`]) and the UI's save picker
+/// ([`ui::scan_saves`]) so both agree on where "the saves directory" is.
+pub(crate) fn saves_directory() -> PathBuf {
+    saves_directory_from(std::env::args().nth(1))
+}
+
+/// The actual logic behind [`saves_directory`], taking the CLI arg (if any)
+/// as a plain `Option<String>` rather than reading `std::env::args()`
+/// directly — real process args can't be overridden per-test, so tests
+/// exercise this instead.
+fn saves_directory_from(cli_arg: Option<String>) -> PathBuf {
+    if let Some(dir) = cli_arg {
+        return PathBuf::from(dir);
+    }
+    dirs::config_dir()
+        .unwrap_or_default()
+        .join(".minecraft/saves")
+}
+
+/// Picks the first save found under `dir`. Metadata only
+/// (`get_saves_from_instance`/`SaveMeta` -> `Save`) — cheap and synchronous,
+/// unlike chunk data, which streams in after `App::run()` via the async
+/// pipeline (ticket 005-c) instead of being loaded here (ticket 005-e
+/// removed the old eager pre-`App::run()` region load).
+///
+/// `Err` covers every unhappy path ticket 008 calls out — no `.minecraft`
+/// directory, an empty `saves/` folder, or any other I/O failure listing
+/// it — as a message for [`load_real_save`] to log and show in the UI,
+/// rather than a panic that kills the process before the window opens.
+/// Takes `dir` as a parameter (rather than calling [`saves_directory`]
+/// itself) purely so tests can point it at a fixture directory.
+fn try_load_save_from(dir: &Path) -> Result<Save, String> {
+    let saves = get_saves_from_instance(dir)
+        .map_err(|e| format!("could not read saves directory {}: {e}", dir.display()))?;
+    let meta = saves.into_iter().next().ok_or_else(|| {
+        format!("no Minecraft saves found under {}", dir.display())
+    })?;
 
     println!("Loading save {}", meta.get_grid_view());
 
-    meta.into()
+    Ok(meta.into())
+}
+
+/// [`try_load_save_from`] against [`saves_directory`] — the real entry point
+/// [`load_real_save`] uses at startup.
+fn try_load_real_save() -> Result<Save, String> {
+    try_load_save_from(&saves_directory())
+}
+
+/// Always returns a usable [`Save`] — [`empty_save`] plus a logged reason
+/// when [`try_load_real_save`] couldn't find a real one (ticket 008), rather
+/// than the panics that used to kill the process before the window ever
+/// opened.
+fn load_real_save() -> (Save, Option<String>) {
+    match try_load_real_save() {
+        Ok(save) => (save, None),
+        Err(reason) => {
+            println!("block_viewer: {reason}");
+            (empty_save(), Some(reason))
+        }
+    }
 }
 
 fn main() {
-    let save = load_real_save();
+    let (save, startup_issue) = load_real_save();
     let decoded_world = DecodedWorld {
         registry: Arc::new(Mutex::new(world::BlockRegistry::new())),
         columns: HashMap::new(),
@@ -79,6 +158,7 @@ fn main() {
         // keyboard input — see `camera::CameraSet`'s docs.
         .configure_sets(Update, camera::CameraSet.after(ui::UiPanelSet))
         .insert_resource(LoadedSave(save))
+        .insert_resource(StartupIssue(startup_issue))
         .insert_resource(decoded_world)
         .add_systems(Startup, setup)
         .run();
@@ -220,4 +300,60 @@ fn region_centroid(regions: &[(i32, i32)]) -> Option<(i32, i32)> {
             |&(rx, rz): &(i32, i32)| (rx as f64 - avg_x).powi(2) + (rz as f64 - avg_z).powi(2);
         dist2(a).total_cmp(&dist2(b))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn saves_directory_from_prefers_the_cli_arg_over_the_default() {
+        let dir = saves_directory_from(Some("some/other/instance".to_string()));
+        assert_eq!(dir, Path::new("some/other/instance"));
+    }
+
+    #[test]
+    fn saves_directory_from_falls_back_to_the_default_minecraft_layout() {
+        let dir = saves_directory_from(None);
+        assert!(
+            dir.ends_with(Path::new(".minecraft/saves")),
+            "expected a `.minecraft/saves` suffix, got {}",
+            dir.display()
+        );
+    }
+
+    /// Ticket 008: no such directory at all (the "no Minecraft installed"
+    /// case) should come back as an `Err` with a message, never panic.
+    #[test]
+    fn try_load_save_from_errors_cleanly_when_the_directory_does_not_exist() {
+        let err = try_load_save_from(Path::new(
+            "definitely-does-not-exist-anywhere/.minecraft/saves",
+        ))
+        .unwrap_err();
+        assert!(!err.is_empty());
+    }
+
+    /// Ticket 008: a saves directory that exists but has nothing under it
+    /// (the "empty saves folder" case) should also come back as a clean
+    /// `Err`, not a panic — distinct from the directory not existing at all.
+    #[test]
+    fn try_load_save_from_errors_cleanly_for_an_empty_directory() {
+        let empty_dir = std::env::temp_dir().join(format!(
+            "block_viewer_test_empty_saves_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&empty_dir).expect("should be able to create a temp dir");
+
+        let err = try_load_save_from(&empty_dir).unwrap_err();
+        assert!(err.contains("no Minecraft saves found"));
+
+        std::fs::remove_dir_all(&empty_dir).ok();
+    }
+
+    #[test]
+    fn empty_save_has_no_regions_to_stream() {
+        let save = empty_save();
+        assert!(save.meta.regions.is_empty());
+        assert!(save.regions.is_empty());
+    }
 }

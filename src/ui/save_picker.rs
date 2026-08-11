@@ -10,7 +10,9 @@ use crate::chunk_pipeline::{
     SpawnedChunkEntities,
 };
 use crate::streaming::{self, PendingChunkWork, RenderDistance};
-use crate::{camera, region_cache, region_center_point, BlockMesh, DecodedWorld, LoadedSave};
+use crate::{
+    camera, region_cache, region_center_point, BlockMesh, DecodedWorld, LoadedSave, StartupIssue,
+};
 
 use super::AvailableSaves;
 
@@ -22,6 +24,7 @@ use super::AvailableSaves;
 pub(crate) struct WorldReset<'w, 's> {
     commands: Commands<'w, 's>,
     loaded_save: ResMut<'w, LoadedSave>,
+    startup_issue: ResMut<'w, StartupIssue>,
     decoded_world: ResMut<'w, DecodedWorld>,
     spawned_meshes: Query<'w, 's, (Entity, &'static Mesh3d), With<BlockMesh>>,
     meshes: ResMut<'w, Assets<Mesh>>,
@@ -77,6 +80,9 @@ impl WorldReset<'_, '_> {
 
         self.teleport_camera(crate::spawn_point(&meta));
         self.loaded_save.0 = meta.into();
+        // A real save just loaded successfully — whatever kept startup from
+        // finding one on its own (ticket 008) no longer applies.
+        self.startup_issue.0 = None;
     }
 }
 
@@ -93,11 +99,22 @@ pub(crate) fn save_picker_panel(
     // a borrow of `reset` across the same window it may end up calling
     // `reset.switch_save`/`teleport_camera` from.
     let current_meta = reset.loaded_save.0.meta.clone();
+    let startup_issue = reset.startup_issue.0.clone();
 
     let mut to_load: Option<SaveMeta> = None;
     let mut to_teleport: Option<Vec3> = None;
 
     egui::Window::new("Save").show(contexts.ctx_mut(), |ui| {
+        // Ticket 008: startup couldn't find/load a save on its own (no
+        // `.minecraft` directory, an empty `saves/` folder, ...) — say so
+        // here instead of the app just silently sitting on an empty world.
+        // Stays until a save is actually picked below (`switch_save` clears
+        // it), so it doesn't need re-checking every frame.
+        if let Some(reason) = &startup_issue {
+            ui.colored_label(egui::Color32::RED, reason);
+            ui.separator();
+        }
+
         ui.label(format!(
             "Active: {} ({} regions)",
             current_meta.name,
