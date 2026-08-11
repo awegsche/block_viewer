@@ -1,7 +1,7 @@
 # 005-b - Region LRU cache
 
 ## Status
-Open
+Done — implemented in `src/region_cache.rs`.
 
 ## Part of
 [005 - Stream chunks around the camera](005-chunk-streaming.md).
@@ -61,9 +61,25 @@ streaming system (005-c/005-d).
 
 ## Done when
 
-- `get_or_load` returns correct chunk data for a region coordinate against
-  the real save directory.
-- A capacity-exceeding sequence of accesses evicts the actual
+- [x] `get_or_load` returns correct chunk data for a region coordinate
+  against the real save directory.
+- [x] A capacity-exceeding sequence of accesses evicts the actual
   least-recently-used region, verified by a test or a log.
-- The single-region load+decode timing from "Watch out" is measured and
+- [x] The single-region load+decode timing from "Watch out" is measured and
   written down (in this file or the commit message) for 005-c to use.
+
+## Notes
+
+- Measured on the dev machine, real save (`nbt_test`), region `(-1, -1)`:
+  **`ChunkRegion::load_chunks()` took ~153ms for 1024 chunk slots**
+  (`region_cache::tests::measure_single_region_load_time`, run with
+  `cargo test --bin block_viewer region_cache -- --nocapture`). That's a
+  chunky unit of work for one background task (005-c) but not pathological
+  — no upstream `../ranvil` ticket needed for a per-chunk load path yet.
+- No `chunk-coord -> region-coord` helper existed in `ranvil` (only
+  filename <-> region-coord parsing) — added `chunk_to_region_coord` in
+  `region_cache.rs` rather than upstream, since it's a one-line
+  `div_euclid`.
+- `RegionCache`, `chunk_to_region_coord`, and `recommended_capacity` aren't
+  called anywhere yet (`#![allow(dead_code)]` on the module) — 005-c wires
+  the cache into the async pipeline, 005-e wires that into `main.rs`.

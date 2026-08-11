@@ -3,6 +3,7 @@ use mc_anvil::{chunkregion::ChunkRegion, Save, get_saves};
 use std::{collections::HashMap, path::Path, time::Instant};
 
 mod camera;
+mod region_cache;
 mod streaming;
 mod world;
 
