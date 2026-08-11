@@ -31,3 +31,10 @@ these itself (see CLAUDE.md's "Manual/visual verification").
   confirm no chunk mesh pops in behind the camera's current render
   distance right after the reversal. Checklist:
   `finished_tickets/005-d-unload-and-budget.manual-verification.md`.
+- [ ] **005-f boundary re-mesh: no lingering seam at the loading
+  frontier.** `cargo run` (debug build) against the real save, fly past
+  the loading frontier at normal fly speed. Watch the boundary between a
+  chunk that just finished loading and its already-loaded neighbour — any
+  seam there should close within the one frame the new chunk is
+  legitimately still in flight, not visibly trail the camera. Checklist:
+  `finished_tickets/005-f-boundary-reseam.manual-verification.md`.

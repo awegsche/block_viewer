@@ -1,7 +1,10 @@
 # 005-f - Re-mesh at the loading frontier
 
 ## Status
-Open (deferrable — see note at the end)
+Implemented. `cargo build`/`cargo test` clean (42 tests, including new
+coverage for the re-mesh task and its cancellation/dedupe). The "Done when"
+criterion is a visual check that needs a human at the window — see
+`005-f-boundary-reseam.manual-verification.md` / `todo.md`.
 
 ## Part of
 [005 - Stream chunks around the camera](005-chunk-streaming.md).
