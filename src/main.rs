@@ -1,8 +1,10 @@
 use bevy::{
-    asset::RenderAssetUsages, image::{ImageLoaderSettings, ImageSampler}, input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll}, prelude::*, render::mesh::Indices
+    image::{ImageLoaderSettings, ImageSampler},
+    input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll},
+    prelude::*,
 };
-use mc_anvil::{Save, get_saves};
-use std::{f32::consts::FRAC_PI_2, ops::Range};
+use mc_anvil::{chunkregion::ChunkRegion, Save, get_saves};
+use std::{collections::HashMap, f32::consts::FRAC_PI_2, ops::Range, time::Instant};
 
 mod world;
 
@@ -10,6 +12,16 @@ mod world;
 /// save directory (`%AppData%\.minecraft\saves` on Windows).
 #[derive(Resource)]
 struct LoadedSave(Save);
+
+/// Every chunk column decoded from the loaded save's first region (ticket
+/// 002), keyed by world chunk coordinates, plus the [`world::BlockRegistry`]
+/// their block names were interned into. Consumed by [`setup`] to mesh one
+/// entity per chunk column (ticket 003).
+#[derive(Resource)]
+struct DecodedWorld {
+    registry: world::BlockRegistry,
+    columns: HashMap<(i32, i32), world::ChunkColumn>,
+}
 
 /// Loads the first save found under the Minecraft saves directory
 /// (`dirs::config_dir()/.minecraft/saves`, i.e.
@@ -41,51 +53,60 @@ fn load_real_save() -> Save {
             first_region.region.get_x_coord(),
             first_region.region.get_z_coord()
         );
-
-        // TODO(ticket 002): temporary sanity log — remove once the mesher
-        // (ticket 003) actually consumes decoded chunk columns.
-        log_decoded_chunk_samples(first_region);
     }
 
     save
 }
 
-/// Decodes a handful of populated chunks and prints the topmost non-air
-/// block at their (0,0) corner, as a sanity check that `decode_chunk`
-/// produces plausible block names rather than garbage.
-fn log_decoded_chunk_samples(region: &mc_anvil::chunkregion::ChunkRegion) {
+/// Decodes every populated, fully-generated chunk in `region` into a
+/// [`world::ChunkColumn`], sharing one [`world::BlockRegistry`] across all
+/// of them so [`world::BlockId`]s stay comparable.
+fn decode_region(region: &ChunkRegion) -> DecodedWorld {
+    let mut registry = world::BlockRegistry::new();
+    let mut columns = HashMap::new();
+
     let Some(chunks) = &region.chunks else {
-        return;
+        return DecodedWorld { registry, columns };
     };
 
-    let mut registry = world::BlockRegistry::new();
-    for chunk in chunks.iter().flatten().take(3) {
+    let start = Instant::now();
+    let mut skipped = 0usize;
+    for chunk in chunks.iter().flatten() {
         match world::decode_chunk(chunk, &mut registry) {
-            Ok(column) => match column.topmost_non_air(0, 0) {
-                Some((y, id)) => println!(
-                    "  chunk ({}, {}): topmost block at (0,0) is {} @ y={}",
-                    column.x,
-                    column.z,
-                    registry.name(id),
-                    y
-                ),
-                None => println!(
-                    "  chunk ({}, {}): column (0,0) is all air",
-                    column.x, column.z
-                ),
-            },
-            Err(e) => println!("  chunk decode skipped: {e}"),
+            Ok(column) => {
+                columns.insert((column.x, column.z), column);
+            }
+            Err(_) => skipped += 1,
         }
     }
+    println!(
+        "Decoded {} chunk columns ({} skipped) from region ({}, {}) in {:?}",
+        columns.len(),
+        skipped,
+        region.region.get_x_coord(),
+        region.region.get_z_coord(),
+        start.elapsed()
+    );
+
+    DecodedWorld { registry, columns }
 }
 
 fn main() {
     let save = load_real_save();
+    let decoded_world = save
+        .regions
+        .first()
+        .map(decode_region)
+        .unwrap_or_else(|| DecodedWorld {
+            registry: world::BlockRegistry::new(),
+            columns: HashMap::new(),
+        });
 
     App::new()
         .add_plugins(DefaultPlugins)
         .init_resource::<CameraSettings>()
         .insert_resource(LoadedSave(save))
+        .insert_resource(decoded_world)
         .add_systems(Startup, setup)
         .add_systems(Update, orbit)
         .run();
@@ -128,10 +149,8 @@ fn setup(
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut meshes: ResMut<Assets<Mesh>>,
     loaded_save: Res<LoadedSave>,
+    decoded_world: Res<DecodedWorld>,
 ) {
-    // TODO: mesh the real block data from `loaded_save` instead of the
-    // placeholder test cube below, once `ChunkRegion::get_block` in `ranvil`
-    // is able to actually resolve block states from the palette.
     println!(
         "Active save: {} ({} regions)",
         loaded_save.0.meta.name,
@@ -145,25 +164,55 @@ fn setup(
             settings.sampler = ImageSampler::nearest();
         },
     );
-    let mesh_handle: Handle<Mesh> = meshes.add(create_block_mesh());
+    let material_handle = materials.add(StandardMaterial {
+        base_color_texture: Some(block_texture_handle),
+        ..default()
+    });
 
-    commands.spawn((
-        Mesh3d(mesh_handle),
-        MeshMaterial3d(materials.add(StandardMaterial {
-            base_color_texture: Some(block_texture_handle),
-            ..default()
-        })),
-        BlockMesh,
-    ));
+    // One entity per chunk column (ticket 003) — never one mesh for a whole
+    // region, that would be a single giant draw call with no culling.
+    let mut spawned = 0usize;
+    for (&(cx, cz), column) in &decoded_world.columns {
+        let neighbors = world::Neighbors {
+            north: decoded_world.columns.get(&(cx, cz - 1)),
+            south: decoded_world.columns.get(&(cx, cz + 1)),
+            east: decoded_world.columns.get(&(cx + 1, cz)),
+            west: decoded_world.columns.get(&(cx - 1, cz)),
+        };
+        let Some(mesh) = world::mesh_chunk_column(column, &decoded_world.registry, &neighbors)
+        else {
+            continue; // fully-air column: nothing to render
+        };
 
-    // Transform for the camera and lighting, looking at (0,0,0) (the position of the mesh).
+        commands.spawn((
+            Mesh3d(meshes.add(mesh)),
+            MeshMaterial3d(material_handle.clone()),
+            // Chunk mesh vertices are chunk-local; place the entity at the
+            // chunk's world origin under this module's axis mapping
+            // (bevy.x = mc.x, bevy.z = -mc.z — see `world::mesh` docs).
+            Transform::from_xyz(cx as f32 * world::SECTION_SIZE as f32, 0.0, -(cz as f32 * world::SECTION_SIZE as f32)),
+            BlockMesh,
+        ));
+        spawned += 1;
+    }
+    println!(
+        "Spawned {spawned} chunk mesh entities ({} columns decoded)",
+        decoded_world.columns.len()
+    );
+
+    // Aim the (still-fixed, ticket 006 will make this real navigation)
+    // camera at the middle of the loaded terrain instead of world origin —
+    // real saves are rarely centred on (0,0).
+    let target = column_center(&decoded_world.columns);
     let camera_and_light_transform =
-        Transform::from_xyz(10.8, 10.8, 10.8).looking_at(Vec3::ZERO, Vec3::Y);
+        Transform::from_xyz(target.x + 10.8, target.y + 30.0, target.z + 10.8)
+            .looking_at(target, Vec3::Y);
 
     commands.spawn((
         Name::new("Camera"),
         Camera3d::default(),
-        Transform::from_xyz(10.0, 5.0, 10.0).looking_at(Vec3::ZERO, Vec3::Y),
+        Transform::from_xyz(target.x + 40.0, target.y + 60.0, target.z + 40.0)
+            .looking_at(target, Vec3::Y),
     ));
 
     // Light up the scene.
@@ -219,184 +268,26 @@ fn orbit(
     camera.translation = target - camera.forward() * distance * (1.0 - mouse_scroll.delta.y * 0.1);
 }
 
-fn coord_to_idx(x: i32, y: i32, z: i32, width: i32, depth: i32) -> usize {
-    (x + z * width + y * width * depth) as usize
-}
-
-pub enum Side {
-    Top,
-    Bottom,
-    Left,
-    Right,
-    Front,
-    Back,
-    None,
-}
-
-fn get_bottom_tris(x: i32, y: i32, z: i32) -> [[f32; 3]; 4] {
-    [
-        [x as f32 - 0.5, y as f32 - 0.5, z as f32 - 0.5], // vertex with index 0
-        [x as f32 + 0.5, y as f32 - 0.5, z as f32 - 0.5], // vertex with index 1
-        [x as f32 + 0.5, y as f32 - 0.5, z as f32 + 0.5], // etc. until 23
-        [x as f32 - 0.5, y as f32 - 0.5, z as f32 + 0.5],
-    ]
-}
-
-fn get_top_tris(x: i32, y: i32, z: i32) -> [[f32; 3]; 4] {
-    [
-        [x as f32 - 0.5, y as f32 + 0.5, z as f32 - 0.5], // vertex with index 0
-        [x as f32 + 0.5, y as f32 + 0.5, z as f32 - 0.5], // vertex with index 1
-        [x as f32 + 0.5, y as f32 + 0.5, z as f32 + 0.5], // etc. until 23
-        [x as f32 - 0.5, y as f32 + 0.5, z as f32 + 0.5],
-    ]
-}
-
-fn get_left_tris(x: i32, y: i32, z: i32) -> [[f32; 3]; 4] {
-    [
-        [x as f32 - 0.5, y as f32 - 0.5, z as f32 - 0.5],
-        [x as f32 - 0.5, y as f32 - 0.5, z as f32 + 0.5],
-        [x as f32 - 0.5, y as f32 + 0.5, z as f32 + 0.5],
-        [x as f32 - 0.5, y as f32 + 0.5, z as f32 - 0.5],
-    ]
-}
-
-fn get_right_tris(x: i32, y: i32, z: i32) -> [[f32; 3]; 4] {
-    [
-        [x as f32 + 0.5, y as f32 - 0.5, z as f32 - 0.5],
-        [x as f32 + 0.5, y as f32 - 0.5, z as f32 + 0.5],
-        [x as f32 + 0.5, y as f32 + 0.5, z as f32 + 0.5], // This vertex is at the same position as vertex with index 2, but they'll have different UV and normal
-        [x as f32 + 0.5, y as f32 + 0.5, z as f32 - 0.5],
-    ]
-}
-
-fn get_front_tris(x: i32, y: i32, z: i32) -> [[f32; 3]; 4] {
-    [
-        [x as f32 - 0.5, y as f32 - 0.5, z as f32 - 0.5],
-        [x as f32 - 0.5, y as f32 + 0.5, z as f32 - 0.5],
-        [x as f32 + 0.5, y as f32 + 0.5, z as f32 - 0.5],
-        [x as f32 + 0.5, y as f32 - 0.5, z as f32 - 0.5],
-    ]
-}
-
-fn get_back_tris(x: i32, y: i32, z: i32) -> [[f32; 3]; 4] {
-    [
-        [x as f32 - 0.5, y as f32 - 0.5, z as f32 + 0.5],
-        [x as f32 - 0.5, y as f32 + 0.5, z as f32 + 0.5],
-        [x as f32 + 0.5, y as f32 + 0.5, z as f32 + 0.5],
-        [x as f32 + 0.5, y as f32 - 0.5, z as f32 + 0.5],
-    ]
-}
-
-fn create_block_mesh() -> Mesh {
-    // let's test our edge finding algorithm.
-    //
-    const WIDTH: i32 = 8;
-    const DEPTH: i32 = 8;
-    const HEIGHT: i32 = 8;
-    let mut blocks = vec![0; (WIDTH * DEPTH * HEIGHT) as usize];
-
-    blocks[coord_to_idx(1, 0, 1, WIDTH, DEPTH)] = 1;
-    blocks[coord_to_idx(1, 1, 1, WIDTH, DEPTH)] = 1;
-    blocks[coord_to_idx(1, 2, 1, WIDTH, DEPTH)] = 1;
-    blocks[coord_to_idx(0, 2, 1, WIDTH, DEPTH)] = 1;
-    blocks[coord_to_idx(2, 2, 1, WIDTH, DEPTH)] = 1;
-    blocks[coord_to_idx(1, 3, 1, WIDTH, DEPTH)] = 1;
-
-    let mut vertices = Vec::new();
-    let mut normals = Vec::new();
-    let mut uvs = Vec::new();
-    let mut indices = Vec::new();
-
-    for x in 0..WIDTH {
-        for z in 0..DEPTH {
-            for y in 0..HEIGHT {
-                if blocks[coord_to_idx(x, y, z, WIDTH, DEPTH)] == 0 {
-                    continue;
-                }
-
-                if x == 0 || blocks[coord_to_idx(x - 1, y, z, WIDTH, DEPTH)] == 0 {
-                    let n = vertices.len() as u32;
-                    indices.extend_from_slice(&[n, n + 1, n + 3, n + 1, n + 2, n + 3]);
-                    vertices.extend_from_slice(&get_left_tris(x, y, z));
-                    uvs.extend_from_slice(&[[0.0, 1.0], [0.0, 0.0], [1.0, 0.0], [1.0, 1.0]]);
-                    normals.extend_from_slice(&[
-                        [-1.0, 0.0, 0.0],
-                        [-1.0, 0.0, 0.0],
-                        [-1.0, 0.0, 0.0],
-                        [-1.0, 0.0, 0.0],
-                    ]);
-                }
-                if x == WIDTH - 1 || blocks[coord_to_idx(x + 1, y, z, WIDTH, DEPTH)] == 0 {
-                    let n = vertices.len() as u32;
-                    vertices.extend_from_slice(&get_right_tris(x, y, z));
-                    indices.extend_from_slice(&[n, n + 3, n + 1, n + 1, n + 3, n + 2]);
-                    //indices.extend_from_slice(&[n, n + 1, n + 3, n + 1, n + 2, n + 3]);
-                    uvs.extend_from_slice(&[[0.0, 1.0], [0.0, 0.0], [1.0, 0.0], [1.0, 1.0]]);
-                    normals.extend_from_slice(&[
-                        [1.0, 0.0, 0.0],
-                        [1.0, 0.0, 0.0],
-                        [1.0, 0.0, 0.0],
-                        [1.0, 0.0, 0.0],
-                    ]);
-                }
-                if z == 0 || blocks[coord_to_idx(x, y, z - 1, WIDTH, DEPTH)] == 0 {
-                    let n = vertices.len() as u32;
-                    vertices.extend_from_slice(&get_front_tris(x, y, z));
-                    indices.extend_from_slice(&[n, n + 1, n + 3, n + 1, n + 2, n + 3]);
-                    uvs.extend_from_slice(&[[0.0, 1.0], [0.0, 0.0], [1.0, 0.0], [1.0, 1.0]]);
-                    normals.extend_from_slice(&[
-                        [0.0, 0.0, -1.0],
-                        [0.0, 0.0, -1.0],
-                        [0.0, 0.0, -1.0],
-                        [0.0, 0.0, -1.0],
-                    ]);
-                }
-                if z == DEPTH - 1 || blocks[coord_to_idx(x, y, z + 1, WIDTH, DEPTH)] == 0 {
-                    let n = vertices.len() as u32;
-                    vertices.extend_from_slice(&get_back_tris(x, y, z));
-                    indices.extend_from_slice(&[n, n + 3, n + 1, n + 1, n + 3, n + 2]);
-                    uvs.extend_from_slice(&[[0.0, 1.0], [0.0, 0.0], [1.0, 0.0], [1.0, 1.0]]);
-                    normals.extend_from_slice(&[
-                        [0.0, 0.0, 1.0],
-                        [0.0, 0.0, 1.0],
-                        [0.0, 0.0, 1.0],
-                        [0.0, 0.0, 1.0],
-                    ]);
-                }
-                if y == 0 || blocks[coord_to_idx(x, y - 1, z, WIDTH, DEPTH)] == 0 {
-                    let n = vertices.len() as u32;
-                    vertices.extend_from_slice(&get_bottom_tris(x, y, z));
-                    indices.extend_from_slice(&[n, n + 1, n + 3, n + 1, n + 2, n + 3]);
-                    uvs.extend_from_slice(&[[0.0, 1.0], [0.0, 0.0], [1.0, 0.0], [1.0, 1.0]]);
-                    normals.extend_from_slice(&[
-                        [0.0, -1.0, 0.0],
-                        [0.0, -1.0, 0.0],
-                        [0.0, -1.0, 0.0],
-                        [0.0, -1.0, 0.0],
-                    ]);
-                }
-                if y == HEIGHT - 1 || blocks[coord_to_idx(x, y + 1, z, WIDTH, DEPTH)] == 0 {
-                    let n = vertices.len() as u32;
-                    vertices.extend_from_slice(&get_top_tris(x, y, z));
-                    indices.extend_from_slice(&[n, n + 3, n + 1, n + 1, n + 3, n + 2]);
-                    uvs.extend_from_slice(&[[0.0, 1.0], [0.0, 0.0], [1.0, 0.0], [1.0, 1.0]]);
-                    normals.extend_from_slice(&[
-                        [0.0, 1.0, 0.0],
-                        [0.0, 1.0, 0.0],
-                        [0.0, 1.0, 0.0],
-                        [0.0, 1.0, 0.0],
-                    ]);
-                }
-            }
-        }
+/// World-space (Bevy axes, see `world::mesh` docs) centre of the horizontal
+/// span of the decoded columns, at Y=0 — a reasonable point for the
+/// placeholder camera to orbit until ticket 006 replaces it with real
+/// navigation.
+fn column_center(columns: &HashMap<(i32, i32), world::ChunkColumn>) -> Vec3 {
+    if columns.is_empty() {
+        return Vec3::ZERO;
     }
-
-    Mesh::new(
-        bevy::render::mesh::PrimitiveTopology::TriangleList,
-        RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
+    let n = columns.len() as f32;
+    let (sum_x, sum_z) = columns.keys().fold((0i64, 0i64), |(sx, sz), &(cx, cz)| {
+        (sx + cx as i64, sz + cz as i64)
+    });
+    let avg_cx = sum_x as f32 / n;
+    let avg_cz = sum_z as f32 / n;
+    let size = world::SECTION_SIZE as f32;
+    // Chunk-centre in Minecraft blocks, then through the same x/-z mapping
+    // as chunk-entity transforms.
+    Vec3::new(
+        avg_cx * size + size / 2.0,
+        0.0,
+        -(avg_cz * size + size / 2.0),
     )
-    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, vertices)
-    .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
-    .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
-    .with_inserted_indices(Indices::U32(indices))
 }

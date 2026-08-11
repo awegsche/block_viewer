@@ -41,3 +41,15 @@ This repo uses a simple file-based ticket protocol for tracking work:
   delete it.
 
 Both directories are created on demand if they don't exist yet.
+
+### Commit message format
+
+Commits that implement a numbered ticket use:
+
+```
+<ticket_number> - short title
+```
+
+e.g. `003 - chunk mesher: block grids to Bevy meshes`. A commit spanning
+multiple tickets joins the numbers with ` -- `, e.g.
+`001 -- 002 - block states bit width and decode layer`.

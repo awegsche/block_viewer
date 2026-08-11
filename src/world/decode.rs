@@ -54,6 +54,10 @@ pub struct ChunkColumn {
 impl ChunkColumn {
     /// Topmost non-air block at local column `(local_x, local_z)` (each
     /// 0..16), scanning sections top-down. Returns `(world_y, block_id)`.
+    ///
+    /// No caller yet in this repo (the mesher doesn't need it) — kept for
+    /// the block-under-cursor readout planned in ticket 007.
+    #[allow(dead_code)]
     pub fn topmost_non_air(&self, local_x: usize, local_z: usize) -> Option<(i32, BlockId)> {
         let mut by_height: Vec<&ChunkSection> = self.sections.iter().collect();
         by_height.sort_by(|a, b| b.y.cmp(&a.y));
