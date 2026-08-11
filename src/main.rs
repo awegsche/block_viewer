@@ -1,10 +1,9 @@
 use bevy::prelude::*;
-use mc_anvil::{chunkregion::ChunkRegion, Save, get_saves};
+use mc_anvil::{get_saves, region::REGION_WIDTH_IN_CHUNKS, Save, SaveMeta};
 use std::{
     collections::HashMap,
     path::Path,
     sync::{Arc, Mutex},
-    time::Instant,
 };
 
 mod camera;
@@ -19,12 +18,13 @@ mod world;
 #[derive(Resource)]
 struct LoadedSave(Save);
 
-/// Every chunk column decoded from the loaded save's first region (ticket
-/// 002), keyed by world chunk coordinates, plus the [`world::BlockRegistry`]
-/// their block names were interned into. Consumed by [`setup`] to mesh one
-/// entity per chunk column (ticket 003), by [`camera`]'s under-the-cursor
-/// ray-march for orbit targeting (ticket 006), and by [`chunk_pipeline`]'s
-/// background chunk-load tasks (ticket 005-c).
+/// Every chunk column decoded so far (ticket 002), keyed by world chunk
+/// coordinates, plus the [`world::BlockRegistry`] their block names were
+/// interned into. Starts empty at startup (ticket 005-e deleted the old
+/// eager pre-`App::run()` load) and fills in as [`chunk_pipeline`]'s
+/// background chunk-load tasks (ticket 005-c) stream columns in around the
+/// camera; also read by [`camera`]'s under-the-cursor ray-march for orbit
+/// targeting (ticket 006).
 ///
 /// `registry` is behind an `Arc<Mutex<_>>` — not just an owned
 /// [`world::BlockRegistry`] — because those background tasks intern newly
@@ -37,11 +37,13 @@ pub(crate) struct DecodedWorld {
     pub(crate) columns: HashMap<(i32, i32), world::ChunkColumn>,
 }
 
-/// Loads the first save found under the Minecraft saves directory
+/// Picks the first save found under the Minecraft saves directory
 /// (`dirs::config_dir()/.minecraft/saves`, i.e.
-/// `C:\Users\<user>\AppData\Roaming\.minecraft\saves` on Windows) and eagerly
-/// parses the chunks of its first region so we know real save data is
-/// reachable.
+/// `C:\Users\<user>\AppData\Roaming\.minecraft\saves` on Windows). Metadata
+/// only (`get_saves`/`SaveMeta` -> `Save`) — cheap and synchronous, unlike
+/// chunk data, which streams in after `App::run()` via the async pipeline
+/// (ticket 005-c) instead of being loaded here (ticket 005-e removed the old
+/// eager pre-`App::run()` region load).
 fn load_real_save() -> Save {
     let saves = get_saves().expect("could not read the Minecraft saves directory");
     let meta = saves
@@ -51,76 +53,15 @@ fn load_real_save() -> Save {
 
     println!("Loading save {}", meta.get_grid_view());
 
-    let mut save: Save = meta.into();
-    if let Some(first_region) = save.regions.first_mut() {
-        first_region
-            .load_chunks()
-            .expect("failed to load chunks for the first region");
-        let chunk_count = first_region
-            .chunks
-            .as_ref()
-            .map(|chunks| chunks.iter().filter(|c| c.is_some()).count())
-            .unwrap_or(0);
-        println!(
-            "Loaded {} chunks from region ({}, {})",
-            chunk_count,
-            first_region.region.get_x_coord(),
-            first_region.region.get_z_coord()
-        );
-    }
-
-    save
-}
-
-/// Decodes every populated, fully-generated chunk in `region` into a
-/// [`world::ChunkColumn`], sharing one [`world::BlockRegistry`] across all
-/// of them so [`world::BlockId`]s stay comparable.
-fn decode_region(region: &ChunkRegion) -> DecodedWorld {
-    let mut registry = world::BlockRegistry::new();
-    let mut columns = HashMap::new();
-
-    let Some(chunks) = &region.chunks else {
-        return DecodedWorld {
-            registry: Arc::new(Mutex::new(registry)),
-            columns,
-        };
-    };
-
-    let start = Instant::now();
-    let mut skipped = 0usize;
-    for chunk in chunks.iter().flatten() {
-        match world::decode_chunk(chunk, &mut registry) {
-            Ok(column) => {
-                columns.insert((column.x, column.z), column);
-            }
-            Err(_) => skipped += 1,
-        }
-    }
-    println!(
-        "Decoded {} chunk columns ({} skipped) from region ({}, {}) in {:?}",
-        columns.len(),
-        skipped,
-        region.region.get_x_coord(),
-        region.region.get_z_coord(),
-        start.elapsed()
-    );
-
-    DecodedWorld {
-        registry: Arc::new(Mutex::new(registry)),
-        columns,
-    }
+    meta.into()
 }
 
 fn main() {
     let save = load_real_save();
-    let decoded_world = save
-        .regions
-        .first()
-        .map(decode_region)
-        .unwrap_or_else(|| DecodedWorld {
-            registry: Arc::new(Mutex::new(world::BlockRegistry::new())),
-            columns: HashMap::new(),
-        });
+    let decoded_world = DecodedWorld {
+        registry: Arc::new(Mutex::new(world::BlockRegistry::new())),
+        columns: HashMap::new(),
+    };
 
     App::new()
         .add_plugins(DefaultPlugins)
@@ -143,12 +84,9 @@ pub(crate) struct BlockMesh;
 fn setup(
     mut commands: Commands,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    mut meshes: ResMut<Assets<Mesh>>,
     mut images: ResMut<Assets<Image>>,
     loaded_save: Res<LoadedSave>,
-    decoded_world: Res<DecodedWorld>,
     render_distance: Res<streaming::RenderDistance>,
-    mut spawned_entities: ResMut<chunk_pipeline::SpawnedChunkEntities>,
 ) {
     println!(
         "Active save: {} ({} regions)",
@@ -156,67 +94,29 @@ fn setup(
         loaded_save.0.meta.regions.len()
     );
 
-    // Pack every block texture into one atlas and resolve each interned
-    // block name to its per-face atlas rect (ticket 004) — replaces the
-    // single hardcoded stone.png the mesher previously stretched over
-    // every face.
+    // Pack every block texture into one atlas (ticket 004) — replaces the
+    // single hardcoded stone.png the mesher previously stretched over every
+    // face. Per-block-id UV resolution (`build_block_uv_table`) happens
+    // per-chunk inside `chunk_pipeline`'s background tasks instead of once
+    // here, against whatever names are interned into the registry *at the
+    // moment that chunk decodes* — block names get interned over the app's
+    // whole lifetime as streaming loads new chunks (ticket 005-e), not just
+    // once at startup like the old eager decode, so there's no fixed set of
+    // names to build a table from up front.
     let atlas = world::atlas::build(Path::new("assets/minecraft/textures/block"))
         .expect("failed to build the block texture atlas");
     let uv_index = atlas.uv_index();
-    let registry = decoded_world
-        .registry
-        .lock()
-        .expect("block registry mutex poisoned");
-    let uv_table = world::atlas::build_block_uv_table(&registry, &uv_index);
     let atlas_handle = images.add(atlas.image);
     let material_handle = materials.add(StandardMaterial {
         base_color_texture: Some(atlas_handle),
         ..default()
     });
 
-    // One entity per chunk column (ticket 003) — never one mesh for a whole
-    // region, that would be a single giant draw call with no culling.
-    let mut spawned = 0usize;
-    for (&(cx, cz), column) in &decoded_world.columns {
-        let neighbors = world::Neighbors {
-            north: decoded_world.columns.get(&(cx, cz - 1)),
-            south: decoded_world.columns.get(&(cx, cz + 1)),
-            east: decoded_world.columns.get(&(cx + 1, cz)),
-            west: decoded_world.columns.get(&(cx - 1, cz)),
-        };
-        let Some(mesh) = world::mesh_chunk_column(column, &registry, &neighbors, &uv_table)
-        else {
-            continue; // fully-air column: nothing to render
-        };
-
-        let entity = commands
-            .spawn((
-                Mesh3d(meshes.add(mesh)),
-                MeshMaterial3d(material_handle.clone()),
-                // Chunk mesh vertices are chunk-local; place the entity at the
-                // chunk's world origin under this module's axis mapping
-                // (bevy.x = mc.x, bevy.z = -mc.z — see `world::mesh` docs).
-                Transform::from_xyz(cx as f32 * world::SECTION_SIZE as f32, 0.0, -(cz as f32 * world::SECTION_SIZE as f32)),
-                BlockMesh,
-            ))
-            .id();
-        // So `unload` (005-d) can despawn this entity too, not just ones
-        // spawned later by the streaming pipeline (005-c).
-        spawned_entities.0.insert((cx, cz), entity);
-        spawned += 1;
-    }
-    println!(
-        "Spawned {spawned} chunk mesh entities ({} columns decoded)",
-        decoded_world.columns.len()
-    );
-    drop(registry); // nothing below needs the lock
-
-    // Chunks outside this eagerly-loaded region stream in via the async
-    // pipeline (ticket 005-c) as the camera moves — sharing this same save
-    // metadata and registry so streamed-in block ids/regions stay
-    // consistent with what was just spawned above. Replacing this eager
-    // load with streaming as the *only* way the world populates is 005-e's
-    // job, not this one.
+    // Nothing is decoded yet — chunks stream in via the async pipeline
+    // (ticket 005-c) as the camera moves, driven by these three resources
+    // plus `DecodedWorld` (already inserted in `main()`). Ticket 005-e
+    // deleted the old eager single-region load and per-column spawn loop
+    // that used to populate the world here.
     let region_cache = region_cache::RegionCache::new(
         loaded_save.0.meta.clone(),
         region_cache::recommended_capacity(render_distance.0),
@@ -227,20 +127,23 @@ fn setup(
     commands.insert_resource(chunk_pipeline::SharedAtlasIndex(Arc::new(uv_index)));
     commands.insert_resource(chunk_pipeline::TerrainMaterial(material_handle));
 
-    // Place the camera above the terrain surface near the middle of the
-    // loaded columns (ticket 006) instead of a fixed point like the old
-    // `(10, 5, 10)`, which on a real save may well be underground.
-    let target = spawn_point(&decoded_world.columns);
+    // Place the camera near the middle of the save's region footprint
+    // (ticket 005-e) instead of reading real terrain height like the old
+    // eager-decode version did — nothing is decoded yet at startup to read
+    // a height from. The camera free-flies at a fixed, generally-safe
+    // height while terrain streams in underneath, per the ticket's
+    // preference over deferring camera spawn until the first chunk loads.
+    let target = spawn_point(&loaded_save.0.meta);
     let eye = target + Vec3::new(-24.0, 20.0, 24.0);
 
     commands.spawn((
         Name::new("Camera"),
         Camera3d::default(),
         Projection::Perspective(PerspectiveProjection {
-            far: camera::far_plane_distance(),
+            far: camera::far_plane_distance(render_distance.0),
             ..default()
         }),
-        camera::atmosphere_fog(),
+        camera::atmosphere_fog(render_distance.0),
         Transform::from_translation(eye).looking_at(target, Vec3::Y),
         camera::CameraRig::looking_at(eye, target),
     ));
@@ -253,47 +156,47 @@ fn setup(
     ));
 }
 
-/// Bevy-space point on (or just above) the terrain surface near the middle
-/// of the loaded columns — used to place the camera somewhere sensible at
-/// startup and as its initial orbit target. Real saves are rarely centred
-/// on (0,0), and a fixed height would just as easily land underground.
-fn spawn_point(columns: &HashMap<(i32, i32), world::ChunkColumn>) -> Vec3 {
-    let Some((&(cx, cz), column)) = nearest_to_average(columns) else {
-        return Vec3::new(0.0, 80.0, 0.0);
+/// Bevy-space point used to place the camera at startup: the horizontal
+/// middle of the save's region footprint (metadata only — `SaveMeta`'s
+/// region-coordinate list, no chunk I/O — so this is safe to call before any
+/// streaming has happened), at a fixed height generally above ground level.
+/// Real saves are rarely centred on (0,0); landing the camera near where
+/// regions actually exist means streaming has something to load in view
+/// immediately, rather than the camera free-flying over empty space until
+/// it happens to reach one.
+fn spawn_point(meta: &SaveMeta) -> Vec3 {
+    const DEFAULT_HEIGHT: f32 = 100.0;
+
+    let Some((rx, rz)) = region_centroid(&meta.regions) else {
+        return Vec3::new(0.0, DEFAULT_HEIGHT, 0.0);
     };
 
-    let size = world::SECTION_SIZE as i32;
-    let local = world::SECTION_SIZE / 2;
-    // Fall back to a plausible sea-level-ish height if the centre column
-    // happens to be a void (e.g. an unloaded/void chunk in a partial save).
-    let world_y = column.topmost_non_air(local, local).map_or(72, |(y, _)| y);
+    let region_size = REGION_WIDTH_IN_CHUNKS as i32 * world::SECTION_SIZE as i32;
+    let mc_x = rx * region_size + region_size / 2;
+    let mc_z = rz * region_size + region_size / 2;
 
-    Vec3::new(
-        (cx * size + local as i32) as f32,
-        world_y as f32 + 2.0, // stand a couple of blocks above the surface
-        -(cz * size + local as i32) as f32,
-    )
+    // bevy.x = mc.x, bevy.z = -mc.z — see `world::mesh` docs.
+    Vec3::new(mc_x as f32, DEFAULT_HEIGHT, -(mc_z as f32))
 }
 
-/// The loaded column closest to the horizontal centroid of every loaded
-/// column — the centroid itself may land on a gap (an unloaded or void
-/// chunk), so this snaps to whatever's actually there.
-fn nearest_to_average(
-    columns: &HashMap<(i32, i32), world::ChunkColumn>,
-) -> Option<(&(i32, i32), &world::ChunkColumn)> {
-    if columns.is_empty() {
+/// The save's region closest to the horizontal centroid of every region it
+/// has — the centroid itself may land on a coordinate that isn't actually a
+/// region (a save's regions needn't form a filled rectangle), so this snaps
+/// to whatever region is actually there.
+fn region_centroid(regions: &[(i32, i32)]) -> Option<(i32, i32)> {
+    if regions.is_empty() {
         return None;
     }
-    let n = columns.len() as f64;
-    let (sum_x, sum_z) = columns.keys().fold((0i64, 0i64), |(sx, sz), &(cx, cz)| {
-        (sx + cx as i64, sz + cz as i64)
+    let n = regions.len() as f64;
+    let (sum_x, sum_z) = regions.iter().fold((0i64, 0i64), |(sx, sz), &(rx, rz)| {
+        (sx + rx as i64, sz + rz as i64)
     });
-    let avg_cx = sum_x as f64 / n;
-    let avg_cz = sum_z as f64 / n;
+    let avg_x = sum_x as f64 / n;
+    let avg_z = sum_z as f64 / n;
 
-    columns.iter().min_by(|a, b| {
+    regions.iter().copied().min_by(|a, b| {
         let dist2 =
-            |&(cx, cz): &(i32, i32)| (cx as f64 - avg_cx).powi(2) + (cz as f64 - avg_cz).powi(2);
-        dist2(a.0).total_cmp(&dist2(b.0))
+            |&(rx, rz): &(i32, i32)| (rx as f64 - avg_x).powi(2) + (rz as f64 - avg_z).powi(2);
+        dist2(a).total_cmp(&dist2(b))
     })
 }

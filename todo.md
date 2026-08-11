@@ -5,12 +5,22 @@ these itself (see CLAUDE.md's "Manual/visual verification").
 
 - [ ] **005-c async pipeline: chunks stream in without stutter.**
   `cargo run` (debug build) against the real save, fly the camera away
-  from the eagerly-loaded startup region (past its edges) for a minute or
-  two. Confirm: new chunk mesh entities appear within a few frames of
-  entering render distance (watch the console for the pipeline picking up
-  `to_load` coordinates), the frame rate doesn't visibly hitch when a
-  batch of chunks completes, and nothing panics. Checklist:
+  from its streamed-in startup position for a minute or two (005-e deleted
+  the old eagerly-loaded startup region — everything, including what's
+  under the camera at spawn, now streams in via the pipeline). Confirm:
+  new chunk mesh entities appear within a few frames of entering render
+  distance (watch the console for the pipeline picking up `to_load`
+  coordinates), the frame rate doesn't visibly hitch when a batch of
+  chunks completes, and nothing panics. Checklist:
   `finished_tickets/005-c-async-pipeline.manual-verification.md`.
+- [ ] **005-e startup wiring: window opens immediately, terrain streams in
+  from a cold start.** `cargo run` (debug build) against the real save.
+  Confirm the window appears immediately (no multi-second blank/frozen
+  startup — nothing loads before `App::run()` anymore), and that terrain
+  visibly streams in around the camera's fixed startup position (near the
+  save's region-footprint centroid, ~100 blocks up) rather than starting
+  from an empty world. Checklist:
+  `finished_tickets/005-e-startup-wiring.manual-verification.md`.
 - [ ] **005-d unload path: memory stays flat, no stale spawns on
   reversal.** `cargo run` (debug build) against the real save. (1) Fly in
   one direction for a few minutes past several render-distance widths of

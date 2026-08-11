@@ -36,12 +36,6 @@ const DEFAULT_FLY_SPEED: f32 = 24.0;
 const MIN_FLY_SPEED: f32 = 2.0;
 const MAX_FLY_SPEED: f32 = 400.0;
 
-/// Chunk radius assumed when picking the far clip plane and fog falloff.
-/// Ticket 005 will introduce a real, tunable `render_distance` resource;
-/// until chunk streaming lands there's nothing to read, so this mirrors the
-/// modest default (8-12 chunks) that ticket documents for itself.
-const PLACEHOLDER_RENDER_DISTANCE_CHUNKS: f32 = 12.0;
-
 /// Adds [`CameraSettings`] and the system that drives every
 /// [`CameraRig`]-tagged camera. Spawn the camera itself (with [`CameraRig`],
 /// [`far_plane_distance`] wired into its `Projection`, and [`atmosphere_fog`])
@@ -130,19 +124,18 @@ impl Default for CameraSettings {
 }
 
 /// Far clip plane distance (world units) that comfortably covers
-/// [`PLACEHOLDER_RENDER_DISTANCE_CHUNKS`] chunks in every horizontal
-/// direction, including the diagonal — Bevy's default (1000) happens to
-/// already clear this, but wiring it through explicitly keeps the far plane
-/// correct once ticket 005 makes render distance real and tunable.
-pub fn far_plane_distance() -> f32 {
-    PLACEHOLDER_RENDER_DISTANCE_CHUNKS * world::SECTION_SIZE as f32 * std::f32::consts::SQRT_2
-        + 32.0
+/// `render_distance_chunks` chunks in every horizontal direction, including
+/// the diagonal — wired to the real, tunable
+/// [`RenderDistance`](crate::streaming::RenderDistance) resource (ticket
+/// 005-e) rather than a fixed placeholder.
+pub fn far_plane_distance(render_distance_chunks: u32) -> f32 {
+    render_distance_chunks as f32 * world::SECTION_SIZE as f32 * std::f32::consts::SQRT_2 + 32.0
 }
 
 /// A soft distance fog fading terrain out before the far plane, so chunks
 /// don't visibly pop out of existence at the render-distance edge.
-pub fn atmosphere_fog() -> DistanceFog {
-    let far = far_plane_distance();
+pub fn atmosphere_fog(render_distance_chunks: u32) -> DistanceFog {
+    let far = far_plane_distance(render_distance_chunks);
     DistanceFog {
         color: Color::srgb(0.7, 0.8, 0.92),
         falloff: FogFalloff::Linear {

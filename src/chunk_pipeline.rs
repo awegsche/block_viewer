@@ -255,9 +255,9 @@ pub(crate) fn poll_completed_chunk_loads(
 /// the shared [`RegionCache`] (005-b), decodes the chunk (002) if it hasn't
 /// been already, and meshes it (003) against whatever neighbour columns
 /// were already loaded when the task was kicked off. Returns `None` if the
-/// chunk doesn't exist in the save or fails to decode (not fully
-/// generated, missing/malformed NBT — the same cases `main.rs::decode_region`
-/// already skips over).
+/// chunk doesn't exist in the save or fails to decode (not fully generated,
+/// missing/malformed NBT — the same cases [`world::decode_chunk`] itself
+/// reports as an `Err` for the caller to skip).
 fn load_and_mesh_chunk(
     coord: (i32, i32),
     region_cache: Arc<Mutex<RegionCache>>,
