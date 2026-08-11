@@ -90,7 +90,12 @@ pub fn diff_chunks(
 /// Converts a Bevy-space translation into the Minecraft chunk coordinate it
 /// falls in. `bevy.x = mc.x`, `bevy.z = -mc.z` (see `world::mesh` docs) is
 /// the only axis that flips.
-fn camera_chunk_coord(translation: Vec3) -> (i32, i32) {
+///
+/// `pub(crate)` (rather than private) so [`crate::unload`] (005-d) can
+/// recompute the same desired set this module diffs against, to catch
+/// in-flight loads (005-c) for coordinates the camera has since left — see
+/// that module's docs for why `to_unload` alone can't see those.
+pub(crate) fn camera_chunk_coord(translation: Vec3) -> (i32, i32) {
     let size = world::SECTION_SIZE as f32;
     let mc_x = translation.x;
     let mc_z = -translation.z;

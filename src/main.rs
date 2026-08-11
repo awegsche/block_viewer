@@ -11,6 +11,7 @@ mod camera;
 mod chunk_pipeline;
 mod region_cache;
 mod streaming;
+mod unload;
 mod world;
 
 /// The currently loaded Minecraft save, populated at startup from a real
@@ -126,6 +127,7 @@ fn main() {
         .add_plugins(camera::CameraControllerPlugin)
         .add_plugins(streaming::ChunkStreamingPlugin)
         .add_plugins(chunk_pipeline::ChunkLoadPipelinePlugin)
+        .add_plugins(unload::ChunkUnloadPlugin)
         .insert_resource(LoadedSave(save))
         .insert_resource(decoded_world)
         .add_systems(Startup, setup)
@@ -146,6 +148,7 @@ fn setup(
     loaded_save: Res<LoadedSave>,
     decoded_world: Res<DecodedWorld>,
     render_distance: Res<streaming::RenderDistance>,
+    mut spawned_entities: ResMut<chunk_pipeline::SpawnedChunkEntities>,
 ) {
     println!(
         "Active save: {} ({} regions)",
@@ -186,15 +189,20 @@ fn setup(
             continue; // fully-air column: nothing to render
         };
 
-        commands.spawn((
-            Mesh3d(meshes.add(mesh)),
-            MeshMaterial3d(material_handle.clone()),
-            // Chunk mesh vertices are chunk-local; place the entity at the
-            // chunk's world origin under this module's axis mapping
-            // (bevy.x = mc.x, bevy.z = -mc.z — see `world::mesh` docs).
-            Transform::from_xyz(cx as f32 * world::SECTION_SIZE as f32, 0.0, -(cz as f32 * world::SECTION_SIZE as f32)),
-            BlockMesh,
-        ));
+        let entity = commands
+            .spawn((
+                Mesh3d(meshes.add(mesh)),
+                MeshMaterial3d(material_handle.clone()),
+                // Chunk mesh vertices are chunk-local; place the entity at the
+                // chunk's world origin under this module's axis mapping
+                // (bevy.x = mc.x, bevy.z = -mc.z — see `world::mesh` docs).
+                Transform::from_xyz(cx as f32 * world::SECTION_SIZE as f32, 0.0, -(cz as f32 * world::SECTION_SIZE as f32)),
+                BlockMesh,
+            ))
+            .id();
+        // So `unload` (005-d) can despawn this entity too, not just ones
+        // spawned later by the streaming pipeline (005-c).
+        spawned_entities.0.insert((cx, cz), entity);
         spawned += 1;
     }
     println!(

@@ -27,7 +27,7 @@
 //! poll) would restore inter-task parallelism if this ever shows up in a
 //! profile; not worth the complexity yet at one save's worth of block names.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use bevy::prelude::*;
@@ -79,6 +79,31 @@ impl Default for ChunkUploadBudget {
 #[derive(Resource, Default)]
 pub struct InFlightChunkLoads(HashMap<(i32, i32), Task<Option<ChunkLoadResult>>>);
 
+impl InFlightChunkLoads {
+    /// Drops every in-flight task whose coordinate is no longer in
+    /// `desired` — e.g. the camera reversed near the loading edge before
+    /// the task finished (005-d). Simply dropping a [`Task`] cancels it;
+    /// see `bevy_tasks::Task::cancel`'s doc comment ("it's possible to
+    /// simply drop the `Task` to cancel it"), so no `.await` is needed
+    /// here to actually stop the work.
+    pub(crate) fn cancel_out_of_range(&mut self, desired: &HashSet<(i32, i32)>) {
+        self.0.retain(|coord, _| desired.contains(coord));
+    }
+}
+
+/// Chunk coordinate -> spawned chunk-mesh entity, so
+/// [`crate::unload`] (005-d) knows which entity to despawn for a
+/// coordinate leaving render distance. Populated here in
+/// [`poll_completed_chunk_loads`] and by `main.rs::setup`'s eager startup
+/// spawn — until 005-e deletes that eager path, both need to register into
+/// this the same way for unload to work regardless of which one spawned a
+/// given chunk. A coordinate with no entry either hasn't spawned yet or was
+/// a fully-air column with nothing to render (see
+/// [`world::mesh_chunk_column`]'s `None` case) — either way, nothing for
+/// unload to despawn.
+#[derive(Resource, Default)]
+pub struct SpawnedChunkEntities(pub HashMap<(i32, i32), Entity>);
+
 /// The four already-loaded neighbour columns available at the moment a
 /// chunk's load task was kicked off — an owned snapshot (cloned out of
 /// [`DecodedWorld`] on the main thread before spawning the task), since a
@@ -115,6 +140,7 @@ impl Plugin for ChunkLoadPipelinePlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<InFlightChunkLoads>()
             .init_resource::<ChunkUploadBudget>()
+            .init_resource::<SpawnedChunkEntities>()
             .add_systems(
                 Update,
                 (poll_completed_chunk_loads, start_chunk_loads).chain(),
@@ -126,7 +152,10 @@ impl Plugin for ChunkLoadPipelinePlugin {
 /// [`PendingChunkWork::to_load`] coordinate that isn't already loaded or
 /// already in flight — re-requesting a coordinate that's already loading
 /// never spawns a duplicate task.
-fn start_chunk_loads(
+///
+/// `pub(crate)` so [`crate::unload`] (005-d) can order its own systems
+/// `.before()` this one.
+pub(crate) fn start_chunk_loads(
     pending: Res<PendingChunkWork>,
     mut in_flight: ResMut<InFlightChunkLoads>,
     decoded_world: Res<DecodedWorld>,
@@ -169,9 +198,13 @@ fn start_chunk_loads(
 /// uploads the mesh and spawns the entity (mirroring `main.rs::setup`'s
 /// eager spawn: `Mesh3d`/`MeshMaterial3d`/`Transform`/[`BlockMesh`]) and
 /// records the decoded column into [`DecodedWorld`] either way.
-fn poll_completed_chunk_loads(
+///
+/// `pub(crate)` so [`crate::unload`] (005-d) can order its own systems
+/// `.before()` this one.
+pub(crate) fn poll_completed_chunk_loads(
     mut in_flight: ResMut<InFlightChunkLoads>,
     mut decoded_world: ResMut<DecodedWorld>,
+    mut spawned: ResMut<SpawnedChunkEntities>,
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     material: Option<Res<TerrainMaterial>>,
@@ -197,19 +230,22 @@ fn poll_completed_chunk_loads(
 
         if let Some(mesh) = result.mesh {
             let (cx, cz) = result.coord;
-            commands.spawn((
-                Mesh3d(meshes.add(mesh)),
-                MeshMaterial3d(material.0.clone()),
-                // Chunk mesh vertices are chunk-local; place the entity at
-                // the chunk's world origin (bevy.x = mc.x, bevy.z = -mc.z —
-                // see `world::mesh` docs), same as `main.rs::setup`.
-                Transform::from_xyz(
-                    cx as f32 * world::SECTION_SIZE as f32,
-                    0.0,
-                    -(cz as f32 * world::SECTION_SIZE as f32),
-                ),
-                BlockMesh,
-            ));
+            let entity = commands
+                .spawn((
+                    Mesh3d(meshes.add(mesh)),
+                    MeshMaterial3d(material.0.clone()),
+                    // Chunk mesh vertices are chunk-local; place the entity at
+                    // the chunk's world origin (bevy.x = mc.x, bevy.z = -mc.z —
+                    // see `world::mesh` docs), same as `main.rs::setup`.
+                    Transform::from_xyz(
+                        cx as f32 * world::SECTION_SIZE as f32,
+                        0.0,
+                        -(cz as f32 * world::SECTION_SIZE as f32),
+                    ),
+                    BlockMesh,
+                ))
+                .id();
+            spawned.0.insert(result.coord, entity);
         }
         decoded_world.columns.insert(result.coord, result.column);
     }
@@ -272,6 +308,29 @@ mod tests {
         assert_eq!(local_chunk_index((32, 0), (1, 0)), (0, 0));
         assert_eq!(local_chunk_index((-1, 0), (-1, 0)), (31, 0));
         assert_eq!(local_chunk_index((-32, -33), (-1, -2)), (0, 31));
+    }
+
+    /// 005-d: a coordinate that leaves the desired set (the camera reversed
+    /// near the loading edge) should have its in-flight task dropped —
+    /// dropping cancels it, per `bevy_tasks::Task::cancel`'s doc comment —
+    /// while one still inside the desired set is left running.
+    #[test]
+    fn cancel_out_of_range_drops_tasks_outside_the_desired_set() {
+        use bevy::tasks::{AsyncComputeTaskPool, TaskPool};
+
+        let pool = AsyncComputeTaskPool::get_or_init(TaskPool::new);
+        let mut in_flight = InFlightChunkLoads::default();
+        in_flight.0.insert((0, 0), pool.spawn(async { None }));
+        in_flight.0.insert((5, 5), pool.spawn(async { None }));
+
+        let desired: HashSet<(i32, i32)> = HashSet::from([(0, 0)]);
+        in_flight.cancel_out_of_range(&desired);
+
+        assert!(in_flight.0.contains_key(&(0, 0)), "still desired, should survive");
+        assert!(
+            !in_flight.0.contains_key(&(5, 5)),
+            "left the desired set, should have been canceled"
+        );
     }
 
     /// End-to-end against the real save (see `region_cache.rs`'s tests for
