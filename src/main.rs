@@ -1,8 +1,14 @@
 use bevy::prelude::*;
 use mc_anvil::{chunkregion::ChunkRegion, Save, get_saves};
-use std::{collections::HashMap, path::Path, time::Instant};
+use std::{
+    collections::HashMap,
+    path::Path,
+    sync::{Arc, Mutex},
+    time::Instant,
+};
 
 mod camera;
+mod chunk_pipeline;
 mod region_cache;
 mod streaming;
 mod world;
@@ -15,11 +21,18 @@ struct LoadedSave(Save);
 /// Every chunk column decoded from the loaded save's first region (ticket
 /// 002), keyed by world chunk coordinates, plus the [`world::BlockRegistry`]
 /// their block names were interned into. Consumed by [`setup`] to mesh one
-/// entity per chunk column (ticket 003), and by [`camera`]'s
-/// under-the-cursor ray-march for orbit targeting (ticket 006).
+/// entity per chunk column (ticket 003), by [`camera`]'s under-the-cursor
+/// ray-march for orbit targeting (ticket 006), and by [`chunk_pipeline`]'s
+/// background chunk-load tasks (ticket 005-c).
+///
+/// `registry` is behind an `Arc<Mutex<_>>` — not just an owned
+/// [`world::BlockRegistry`] — because those background tasks intern newly
+/// decoded chunks' block names directly into it, off the main thread, and
+/// [`world::BlockId`]s need to stay globally stable regardless of whether a
+/// chunk was decoded eagerly at startup or streamed in later.
 #[derive(Resource)]
 pub(crate) struct DecodedWorld {
-    pub(crate) registry: world::BlockRegistry,
+    pub(crate) registry: Arc<Mutex<world::BlockRegistry>>,
     pub(crate) columns: HashMap<(i32, i32), world::ChunkColumn>,
 }
 
@@ -66,7 +79,10 @@ fn decode_region(region: &ChunkRegion) -> DecodedWorld {
     let mut columns = HashMap::new();
 
     let Some(chunks) = &region.chunks else {
-        return DecodedWorld { registry, columns };
+        return DecodedWorld {
+            registry: Arc::new(Mutex::new(registry)),
+            columns,
+        };
     };
 
     let start = Instant::now();
@@ -88,7 +104,10 @@ fn decode_region(region: &ChunkRegion) -> DecodedWorld {
         start.elapsed()
     );
 
-    DecodedWorld { registry, columns }
+    DecodedWorld {
+        registry: Arc::new(Mutex::new(registry)),
+        columns,
+    }
 }
 
 fn main() {
@@ -98,7 +117,7 @@ fn main() {
         .first()
         .map(decode_region)
         .unwrap_or_else(|| DecodedWorld {
-            registry: world::BlockRegistry::new(),
+            registry: Arc::new(Mutex::new(world::BlockRegistry::new())),
             columns: HashMap::new(),
         });
 
@@ -106,14 +125,18 @@ fn main() {
         .add_plugins(DefaultPlugins)
         .add_plugins(camera::CameraControllerPlugin)
         .add_plugins(streaming::ChunkStreamingPlugin)
+        .add_plugins(chunk_pipeline::ChunkLoadPipelinePlugin)
         .insert_resource(LoadedSave(save))
         .insert_resource(decoded_world)
         .add_systems(Startup, setup)
         .run();
 }
 
+/// Marker on every spawned chunk mesh entity — `pub(crate)` so
+/// [`chunk_pipeline`]'s polling system can tag entities it spawns the same
+/// way [`setup`]'s eager spawn does.
 #[derive(Component)]
-struct BlockMesh;
+pub(crate) struct BlockMesh;
 
 fn setup(
     mut commands: Commands,
@@ -122,6 +145,7 @@ fn setup(
     mut images: ResMut<Assets<Image>>,
     loaded_save: Res<LoadedSave>,
     decoded_world: Res<DecodedWorld>,
+    render_distance: Res<streaming::RenderDistance>,
 ) {
     println!(
         "Active save: {} ({} regions)",
@@ -135,7 +159,12 @@ fn setup(
     // every face.
     let atlas = world::atlas::build(Path::new("assets/minecraft/textures/block"))
         .expect("failed to build the block texture atlas");
-    let uv_table = world::atlas::build_block_uv_table(&decoded_world.registry, &atlas);
+    let uv_index = atlas.uv_index();
+    let registry = decoded_world
+        .registry
+        .lock()
+        .expect("block registry mutex poisoned");
+    let uv_table = world::atlas::build_block_uv_table(&registry, &uv_index);
     let atlas_handle = images.add(atlas.image);
     let material_handle = materials.add(StandardMaterial {
         base_color_texture: Some(atlas_handle),
@@ -152,8 +181,7 @@ fn setup(
             east: decoded_world.columns.get(&(cx + 1, cz)),
             west: decoded_world.columns.get(&(cx - 1, cz)),
         };
-        let Some(mesh) =
-            world::mesh_chunk_column(column, &decoded_world.registry, &neighbors, &uv_table)
+        let Some(mesh) = world::mesh_chunk_column(column, &registry, &neighbors, &uv_table)
         else {
             continue; // fully-air column: nothing to render
         };
@@ -173,6 +201,23 @@ fn setup(
         "Spawned {spawned} chunk mesh entities ({} columns decoded)",
         decoded_world.columns.len()
     );
+    drop(registry); // nothing below needs the lock
+
+    // Chunks outside this eagerly-loaded region stream in via the async
+    // pipeline (ticket 005-c) as the camera moves — sharing this same save
+    // metadata and registry so streamed-in block ids/regions stay
+    // consistent with what was just spawned above. Replacing this eager
+    // load with streaming as the *only* way the world populates is 005-e's
+    // job, not this one.
+    let region_cache = region_cache::RegionCache::new(
+        loaded_save.0.meta.clone(),
+        region_cache::recommended_capacity(render_distance.0),
+    );
+    commands.insert_resource(chunk_pipeline::SharedRegionCache(Arc::new(Mutex::new(
+        region_cache,
+    ))));
+    commands.insert_resource(chunk_pipeline::SharedAtlasIndex(Arc::new(uv_index)));
+    commands.insert_resource(chunk_pipeline::TerrainMaterial(material_handle));
 
     // Place the camera above the terrain surface near the middle of the
     // loaded columns (ticket 006) instead of a fixed point like the old

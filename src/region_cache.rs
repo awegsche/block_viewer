@@ -7,16 +7,10 @@
 //! chunk that needs them, and evicted (actually freeing the decoded NBT,
 //! not just unlinking a pointer) once nothing does.
 //!
-//! This cache is synchronous — 005-c is what moves [`RegionCache::get_or_load`]
-//! calls onto a background task.
-//!
-//! Nothing calls this module yet — 005-c wires it into the async pipeline
-//! and 005-e wires that into `main.rs` — so `allow(dead_code)` covers the
-//! gap rather than trimming the public API down to today's only caller
-//! (its own tests), matching `world/mod.rs`'s convention for the same
-//! situation.
-#![allow(dead_code)]
-
+//! This cache is internally synchronous (`get_or_load` blocks on file I/O +
+//! decode) — [`crate::chunk_pipeline`] (005-c) is what puts calls to it on
+//! a background task, sharing one instance across every task via
+//! `Arc<Mutex<RegionCache>>` rather than giving each task its own.
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -80,11 +74,17 @@ impl RegionCache {
         }
     }
 
-    /// Number of regions currently resident.
+    /// Number of regions currently resident. No caller outside this
+    /// module's own tests yet.
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
+    /// Kept alongside `len` per the standard `len`/`is_empty` pairing
+    /// (clippy's `len_without_is_empty`) — no caller yet, same as
+    /// `BlockRegistry::is_empty`.
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }

@@ -329,11 +329,20 @@ fn raycast_terrain(
         next_boundary_t(mc_origin.z, voxel.z, step.z, mc_dir.z),
     );
 
+    // Locked once up front rather than per voxel step — background
+    // chunk-load tasks (005-c) hold this lock only briefly (one chunk's
+    // decode+mesh at a time), so a raycast spanning a few hundred voxels
+    // holding it for its whole walk is a non-issue in practice.
+    let registry = decoded_world
+        .registry
+        .lock()
+        .expect("block registry mutex poisoned");
+
     let mut traveled = 0.0f32;
     loop {
         if world::is_solid(
             block_at_world(decoded_world, voxel.x, voxel.y, voxel.z),
-            &decoded_world.registry,
+            &registry,
         ) {
             let hit = mc_origin + mc_dir * traveled;
             return Some(Vec3::new(hit.x, hit.y, -hit.z));
@@ -420,7 +429,10 @@ mod tests {
                 sections: vec![ChunkSection { y: section_y, blocks }],
             },
         );
-        DecodedWorld { registry, columns }
+        DecodedWorld {
+            registry: std::sync::Arc::new(std::sync::Mutex::new(registry)),
+            columns,
+        }
     }
 
     #[test]

@@ -60,6 +60,56 @@ pub struct TextureAtlas {
 impl TextureAtlas {
     /// The atlas rect for a source file's stem (e.g. `"stone"`,
     /// `"oak_log_top"`), if that texture existed in the packed directory.
+    /// Face resolution itself now goes through [`AtlasUvIndex::tile`] (see
+    /// [`TextureAtlas::uv_index`]) — this is only a spot-check in tests
+    /// that a real packed atlas contains the tiles it should.
+    #[allow(dead_code)]
+    fn tile(&self, name: &str) -> Option<UvRect> {
+        self.tiles.get(name).copied()
+    }
+
+    /// The name -> UV-rect lookup this atlas resolves faces with, without
+    /// the packed [`Image`] alongside it. [`Image`] is render-side data
+    /// meant to stay on the main thread (wrapped into a GPU texture once at
+    /// startup); [`AtlasUvIndex`] is the small, plain-data subset background
+    /// chunk-load tasks (ticket 005-c) need to resolve a newly-decoded
+    /// block's per-face UVs without touching render types at all.
+    pub fn uv_index(&self) -> AtlasUvIndex {
+        AtlasUvIndex {
+            tiles: self.tiles.clone(),
+            fallback: self.fallback,
+        }
+    }
+}
+
+/// The name -> UV-rect half of [`TextureAtlas`], without the packed
+/// [`Image`] — see [`TextureAtlas::uv_index`]. Cheap to clone and share
+/// (`Arc`) across [`AsyncComputeTaskPool`](bevy::tasks::AsyncComputeTaskPool)
+/// tasks (ticket 005-c), unlike the full atlas.
+#[derive(Debug, Clone)]
+pub struct AtlasUvIndex {
+    tiles: std::collections::HashMap<String, UvRect>,
+    fallback: UvRect,
+}
+
+impl Default for AtlasUvIndex {
+    /// No tiles at all — every name resolves to the whole-image fallback
+    /// rect. Only meaningful in tests that don't care about real UVs (e.g.
+    /// exercising a load failure path before any atlas exists).
+    fn default() -> Self {
+        Self {
+            tiles: std::collections::HashMap::new(),
+            fallback: UvRect {
+                u0: 0.0,
+                v0: 0.0,
+                u1: 1.0,
+                v1: 1.0,
+            },
+        }
+    }
+}
+
+impl AtlasUvIndex {
     fn tile(&self, name: &str) -> Option<UvRect> {
         self.tiles.get(name).copied()
     }
@@ -224,7 +274,7 @@ const OVERRIDES: &[(&str, &str, &str, &str)] = &[
     ("lava", "lava_still", "lava_still", "lava_still"),
 ];
 
-fn resolve_faces(name: &str, atlas: &TextureAtlas, warned: &mut HashSet<String>) -> BlockFaces {
+fn resolve_faces(name: &str, atlas: &AtlasUvIndex, warned: &mut HashSet<String>) -> BlockFaces {
     if let Some(&(_, top, bottom, side)) = OVERRIDES.iter().find(|&&(n, ..)| n == name) {
         return BlockFaces {
             top: atlas.tile(top).unwrap_or(atlas.fallback),
@@ -253,7 +303,11 @@ fn resolve_faces(name: &str, atlas: &TextureAtlas, warned: &mut HashSet<String>)
 /// directly by [`BlockId`] (i.e. `table[id.0 as usize]` — valid because
 /// [`BlockRegistry`] hands out ids `0..len()`). Unmapped names are logged
 /// once each, not once per block instance, so the gaps stay enumerable.
-pub fn build_block_uv_table(registry: &BlockRegistry, atlas: &TextureAtlas) -> Vec<BlockFaces> {
+///
+/// Takes the atlas's [`AtlasUvIndex`] rather than the full [`TextureAtlas`]
+/// so this can run inside a background chunk-load task (ticket 005-c)
+/// without dragging the packed [`Image`] across the `Send` boundary.
+pub fn build_block_uv_table(registry: &BlockRegistry, atlas: &AtlasUvIndex) -> Vec<BlockFaces> {
     let mut warned = HashSet::new();
     (0..registry.len())
         .map(|i| {
@@ -280,12 +334,11 @@ mod tests {
         }
     }
 
-    /// A [`TextureAtlas`] with the given named tiles, skipping the real
+    /// An [`AtlasUvIndex`] with the given named tiles, skipping the real
     /// file-packing [`build`] does — these tests are about
     /// [`resolve_faces`]'s naming rules, not pixel packing.
-    fn atlas_with(named: &[(&str, UvRect)]) -> TextureAtlas {
-        TextureAtlas {
-            image: Image::default(),
+    fn atlas_with(named: &[(&str, UvRect)]) -> AtlasUvIndex {
+        AtlasUvIndex {
             tiles: named.iter().map(|&(k, v)| (k.to_string(), v)).collect(),
             fallback: rect(999.0),
         }
