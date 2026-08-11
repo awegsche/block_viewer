@@ -3,6 +3,7 @@ use mc_anvil::{chunkregion::ChunkRegion, Save, get_saves};
 use std::{collections::HashMap, path::Path, time::Instant};
 
 mod camera;
+mod streaming;
 mod world;
 
 /// The currently loaded Minecraft save, populated at startup from a real
@@ -103,6 +104,7 @@ fn main() {
     App::new()
         .add_plugins(DefaultPlugins)
         .add_plugins(camera::CameraControllerPlugin)
+        .add_plugins(streaming::ChunkStreamingPlugin)
         .insert_resource(LoadedSave(save))
         .insert_resource(decoded_world)
         .add_systems(Startup, setup)
