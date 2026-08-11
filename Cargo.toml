@@ -7,7 +7,7 @@ edition = "2024"
 bevy = "0.15.0"
 bevy_egui = "0.31.1"
 dirs = "5.0.1"
-mc_anvil = { version = "0.1.0", path = "../mc_anvil" }
+mc_anvil = { package = "ranvil", version = "0.1.0", path = "../ranvil" }
 rnbt = { version = "0.1.0", path = "../rnbt" }
 
 # Enable a small amount of optimization in the dev profile.
