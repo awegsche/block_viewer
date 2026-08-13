@@ -9,6 +9,7 @@ use std::{
 mod camera;
 mod chunk_pipeline;
 mod region_cache;
+mod selection;
 mod sky;
 mod streaming;
 mod ui;
@@ -160,11 +161,16 @@ fn main() {
         .add_plugins(streaming::ChunkStreamingPlugin)
         .add_plugins(chunk_pipeline::ChunkLoadPipelinePlugin)
         .add_plugins(unload::ChunkUnloadPlugin)
+        .add_plugins(selection::SelectionPlugin)
         .add_plugins(ui::UiPlugin)
         // The UI plugin's panels (ticket 007) need to have drawn this
-        // frame before `drive_camera` reads whether egui claimed pointer/
-        // keyboard input — see `camera::CameraSet`'s docs.
-        .configure_sets(Update, camera::CameraSet.after(ui::UiPanelSet))
+        // frame before `drive_camera` — and, ticket 020, the selection's
+        // click/key handling — read whether egui claimed pointer/keyboard
+        // input. See `camera::CameraSet`'s docs.
+        .configure_sets(
+            Update,
+            (camera::CameraSet, selection::SelectionInputSet).after(ui::UiPanelSet),
+        )
         .insert_resource(LoadedSave(save))
         .insert_resource(StartupIssue(startup_issue))
         .insert_resource(decoded_world)

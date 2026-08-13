@@ -46,6 +46,19 @@ clear colour with no sky, and with no shadows.
             016  skybox: gradient dome, sun, moon
             017  shadows: cascades, bias, a toggle
             018  day/night cycle: TimeOfDay -> palette + sun angle
+
+      selection & blueprints (this group):
+      |
+      019  selection volume: state, coord rules, gizmo box  <- substrate
+      |     |
+      |     020  input: click to anchor, keys to extend faces
+      |     021  panel: bounds readout, typed edits, Export button
+      |
+      022  extraction: selected volume -> palette + blocks
+            |
+            023  writer: Blueprint -> vanilla structure .nbt
+                  |
+                  024  native save dialog, wired end to end
 ```
 
 ## The colour & atmosphere group (011–018)
@@ -95,6 +108,34 @@ colour channel 011 adds and multiplies with 013's tint. Whoever picks it up
 should read 011's composition rule first. Arguably the highest-value item
 left in 010 once this group lands.
 
+## The selection & blueprint group (019–024)
+
+Select a 3D region of the world and save the blocks in it as a file the game
+can load back. Independent of 009–018 — it touches input, UI and the raw NBT
+read path, none of which the rendering work does.
+
+Two tracks off the same substrate. **019 first, always**: it fixes the
+coordinate rules (inclusive bounds; `bevy.z = -mc.z`; a block occupies
+`x..x+1` from its coordinate) that five later tickets would otherwise each
+decide for themselves, which is how off-by-one and mirrored blueprints
+happen.
+
+- **Interaction (020, 021)** — clicking and keying the box around, and
+  showing what's selected. 020's real difficulty is that the camera
+  controller already owns WASD/QE/Shift/Tab and both mouse buttons; the
+  ticket lists what's free.
+- **Data (022 → 023 → 024)** — the pipeline out to disk. 022 is the one with
+  a real design constraint: it must **not** read `DecodedWorld`, because
+  `BlockRegistry` interns only a block's `Name` and drops its `Properties`,
+  so every stair and log would come back in its default orientation. It goes
+  through the raw NBT path (`SharedRegionCache` → `ChunkRegion::get_block`)
+  instead — which also means a selection can extend past the render
+  distance. 023 writes the vanilla structure format, the first thing in this
+  repo ever to call `rnbt::write_nbt` (expect to fix bugs in `../rnbt`).
+
+The two tracks meet only at 021's Export button. 022 and 023 can be built
+and tested against hand-built bounds before 020 exists.
+
 ## Suggested milestones
 
 1. **M1 — "it's my world"**: 001, 002, 003. ✔
@@ -105,3 +146,6 @@ left in 010 once this group lands.
    right colour; track B gives it a sky and a sun. A good stopping point
    after 013 + 015 if the rest gets deprioritised — those two alone cover
    most of the visible gap.
+6. **M6 — "I can take things out of it"**: 019–024. Select a region and
+   export it as a structure file. This is where the app stops being a
+   viewer.

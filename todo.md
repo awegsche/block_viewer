@@ -153,3 +153,145 @@ these itself (see CLAUDE.md's "Manual/visual verification").
   fixed render distance/camera position — record the before/after numbers
   in the same resolution section (the ticket flagged this as potentially
   the single most expensive item in the whole lighting group).
+- [ ] **025 side-face UV winding fix: side textures read right-way-round,
+  not rotated/mirrored, on every face.** `cargo run` (debug build) against
+  the real save. Look at a block with an asymmetric or directional side
+  texture from multiple angles (a log's bark grain, a crafting table, a
+  furnace's front — anything where a mirror or a 90° rotation would be
+  visible) and confirm it looks the same "handedness" on every side, not
+  flipped/rotated on some faces relative to others (this was the original
+  "side textures seem rotated by 90 degrees" report). Grass side overlays
+  (014) are drawn through the same per-face UV path — worth a glance too,
+  though they're mostly symmetric noise so a regression there would be
+  subtler. Checklist: `finished_tickets/025-side-face-uv-winding-fix.md`.
+- [ ] **018 day/night cycle: the slider actually looks like a day, and
+  nothing fights the camera.** `cargo run` (debug build) against the real
+  save. In the status panel's new "Time of day" section: (1) drag the
+  slider across its full range and watch for colour *discontinuities* —
+  the sky/fog/ambient should read as one smooth gradient through dawn,
+  noon, dusk, and night, with no visible pop at any keyframe tick (0, 3000,
+  6000, 9000, 12000, 13500, 18000, 22500) and no seam at the 24000->0 wrap.
+  (2) Watch the sun/moon handover specifically: as the slider crosses dawn
+  (ticks 0) and dusk (ticks 12000), confirm the shadow direction swings
+  smoothly rather than snapping 180° in one frame, and that the world
+  doesn't flash black or produce a garbage shadow direction right at the
+  crossover (`time_of_day::moon_handover_direction`'s "never degenerates"
+  test only checks the math stays non-zero, not that it *looks* right).
+  (3) Set the slider to early morning (~ticks 1000-2000) and confirm
+  shadows fall to the west, matching `tests::morning_shadows_fall_west`.
+  (4) Confirm night is dark but still legible (not black) — per the
+  ticket's deliberate "moonlight ~50-100 lux" choice, not a bug. (5) Try
+  play/pause and each speed multiplier, and the four quick-jump buttons.
+  (6) Confirm dragging the slider (and clicking play/pause/speed/quick-jump)
+  doesn't also spin or fly the camera — same input-capture plumbing as the
+  render-distance slider (007), should just work, but this is the first
+  new panel control since that was wired up. If step (1) or (2) shows a
+  discontinuity, the fix is almost certainly tuning
+  `src/sky/time_of_day.rs`'s `keyframes()` table or `HANDOVER_WIDTH` — record
+  whatever changes in `finished_tickets/018-day-night-cycle.md`'s
+  resolution, since none of this was tuned by eye. Checklist:
+  `finished_tickets/018-day-night-cycle.md`.
+- [ ] **019 selection box: nothing to see yet — this check rides along with
+  020.** 019 landed the `Selection` resource, the coordinate rules and the
+  gizmo drawing, but nothing sets a selection until 020's click handler, so
+  there is deliberately nothing on screen after 019 alone (see that
+  ticket's "Deviation" note for why no throwaway hardcoded box was
+  committed). When 020 lands, check these *019* concerns as part of its
+  pass: (1) the box's faces sit exactly on block edges — not half a block
+  off, not one block short — with the far faces covering the max block
+  rather than stopping at its near corner; (2) the same box read from the
+  north and then from the south looks identically placed, which is the
+  check for the `bevy.z = -mc.z` sign (a flipped Z puts the box one block
+  off in Z and only in Z, which is near-invisible from one viewpoint);
+  (3) the depth-bias look — `src/selection/gizmo.rs`'s `DEPTH_BIAS` is
+  currently `-1.0`, i.e. the box always draws in front of terrain. Decide
+  whether that's right or whether terrain should occlude it (a small
+  negative bias instead, e.g. `-0.01`, which still avoids z-fighting where
+  the box is coplanar with block faces). Also judge `LINE_WIDTH`,
+  `BOX_COLOR` and `ANCHOR_COLOR` against real terrain — the yellow/orange
+  pair was picked without ever being looked at. Record whatever they end up
+  at, and why, in `finished_tickets/019-selection-volume.md`'s resolution.
+- [ ] **020 selection input: click anchors a box, the six keys push the face
+  you pressed, and nothing fights the camera or egui.** `cargo run` (debug
+  build) against the real save. Do 019's three checks above in the same pass
+  — this is what finally puts a box on screen. Then:
+  (1) **Anchor.** Left-click a block you can identify (a corner of a roof,
+  a lone tree trunk) and confirm a 1x1x1 box lands on *that* block, with the
+  orange anchor cube inside it, not on its neighbour and not one block
+  toward the camera.
+  (2) **Each direction, twice.** Facing **north**, press each of `→` `←` `↑`
+  `↓` `PageUp` `PageDown` in turn and confirm the box grows on the side you
+  pressed — `↑` must push the box *away* from you (north = −Z), `↓` toward
+  you. Then turn the camera to face **south** and repeat the whole set: the
+  keys must still move the same world-absolute faces, so now `↑` grows the
+  box toward you. That reversal is the point of the check — it's both the
+  test for the Z sign and the honest test of whether world-absolute arrows
+  are usable at all. If facing south feels genuinely disorienting rather than
+  merely unfamiliar, that's the signal to add the camera-relative remap the
+  ticket deferred (it goes in front of `input::move_face`, which already
+  takes a `Face` rather than a `KeyCode` for exactly this).
+  (3) **Modifiers.** `AltLeft` + a direction pulls that face back in; hold it
+  past the far side and confirm the box stops at a single block rather than
+  inverting or vanishing. `ControlLeft` + a direction steps 16 blocks —
+  eyeball it against chunk boundaries if you can see any. `Ctrl`+`Alt`
+  together retracts a chunk at a time.
+  (4) **Repeat rate.** Hold a direction key and confirm it starts repeating
+  after a beat and then runs at a comfortable speed — fast enough to grow a
+  40-block box without letting go, slow enough to stop on a block you want.
+  If it's wrong, `REPEAT_DELAY` (0.3 s) and `REPEAT_INTERVAL` (0.05 s) in
+  `src/selection/input.rs` are the knobs; record what they end up at in
+  `finished_tickets/020-selection-input.md`'s resolution, since neither was
+  tuned by eye.
+  (5) **Build limits.** Hold `PageUp` until the top face stops, and
+  `PageDown` until the bottom does — they should stop dead at y=319 and
+  y=−64 rather than running away.
+  (6) **Nothing fights.** Type into the coordinate-jump panel's fields and
+  drag the render-distance and time-of-day sliders: the selection must not
+  move at all. In orbit mode (`Tab`), drag the view around with left mouse
+  and release over terrain — the selection must not re-anchor. Click a
+  button in any panel with terrain behind it — same. Click at open sky and
+  confirm the existing box *survives* (a missed click deliberately does
+  nothing rather than clearing). `Escape` clears it.
+  (7) **Legibility.** With a box grown well away from its anchor, judge
+  whether it's clear which face the next keystroke will move. If it isn't,
+  019 left face highlighting on the table for this ticket and it's still
+  available as a follow-up.
+- [ ] **021 selection panel: typed bounds move the box, and the panel doesn't
+  fight 020's keys or the anchor click.** `cargo run` (debug build) against
+  the real save; do this in the same pass as 020, since the panel is the
+  fastest way to read whether the keys are doing what you think.
+  (1) **Live readout.** Click a block, then press the face keys and watch the
+  "Selection" panel: min/max, size, volume and anchor should all track the box
+  every keystroke, and the anchor should stay put while min/max move.
+  (2) **Typed edits.** Type a new min/max pair and press `Enter` (and again
+  with the "Set bounds" button) — the box should jump to it. Type a min
+  *above* the max on one axis and confirm the box comes out the right way
+  round and the fields refill sorted. Type garbage (`abc`, `12.5`, an empty
+  field) and confirm the red "Bounds must be whole numbers." line appears and
+  the box does **not** move. Type a Y past the build limits (say `9999`) and
+  confirm it comes back clamped to 319/−64.
+  (3) **Arrow keys while typing** — the one this ticket most needs a human
+  for. Click into any of the six fields and press `←`/`→`/`↑`/`↓`/`PageUp`/
+  `PageDown`: they must move the *text cursor* and leave the selection box
+  completely still. Then click away from the field and confirm the same keys
+  move the faces again. (Same for `Escape` with a field focused: it should not
+  clear the selection.) This is `EguiInputCapture::keyboard` doing its job;
+  if it isn't, the gate in `src/selection/input.rs::drive_selection_keys` is
+  where to look, not the panel.
+  (4) **Clicking the panel over terrain.** Position the "Selection" window so
+  terrain is behind it, then click its buttons, drag its title bar, and
+  click-drag inside a text field to select text — the selection must never
+  re-anchor to the block behind the panel. Same for the "Clear" button:
+  it should clear the box and nothing else.
+  (5) **Volume warning and the cap.** Hold `Ctrl`+a direction to grow a big
+  box and watch the volume line: it should turn yellow with a "will be slow"
+  note past 1,000,000 blocks (100x100x100), and red with "too large to
+  export" past 16,000,000, at which point the "Export…" button greys out
+  (it does nothing when enabled either — that's ticket 024). Judge whether
+  those two thresholds are in the right place once 022 gives real extraction
+  timings; they're `VOLUME_WARN`/`VOLUME_CAP` in
+  `src/ui/selection_panel.rs`, chosen without measurement.
+  (6) **The key legend.** Expand the "Keys" header and check the arrow
+  glyphs render (`→ (Right)` etc.) rather than showing tofu boxes in egui's
+  default font — if any do, the fix is dropping the arrow from
+  `Face::key_label` in `src/selection/input.rs` and keeping the word.

@@ -1,7 +1,9 @@
 //! egui-based explorer UI (ticket 007): a save picker with a clickable
 //! region grid, a coordinate jump + readout, a block inspector, and a
-//! status panel. Every panel is read-only — this is a viewer, not an editor
-//! (see the ticket's "out of scope").
+//! status panel. Every panel is read-only *as far as the world goes* — this
+//! is a viewer, not an editor (see the ticket's "out of scope"). Ticket 021's
+//! [`selection_panel`] does write, but only to [`crate::selection::Selection`],
+//! which is a view onto the world rather than part of it.
 //!
 //! Each panel is its own system in its own submodule; this module only
 //! wires them into the app and owns the two small pieces of state they
@@ -10,6 +12,7 @@
 mod block_inspector;
 mod navigate;
 mod save_picker;
+mod selection_panel;
 mod status;
 
 use bevy::prelude::*;
@@ -70,6 +73,7 @@ impl Plugin for UiPlugin {
                     navigate::navigate_panel,
                     block_inspector::block_inspector_panel,
                     status::status_panel,
+                    selection_panel::selection_panel,
                 )
                     .in_set(UiPanelSet),
             )
