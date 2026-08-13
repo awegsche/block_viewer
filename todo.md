@@ -93,3 +93,22 @@ these itself (see CLAUDE.md's "Manual/visual verification").
   solid green block — but note looking *through* a leaf into the canopy
   will show missing geometry behind it (leaves still cull neighbouring
   faces; that's 010's transparency work, out of scope here per the ticket).
+- [ ] **015 sun rig and sky colour: lighting doesn't fall off far from
+  spawn, no seam at the fog/sky boundary, world isn't bleached out.**
+  `cargo run` (debug build) against the real save. Fly a few hundred
+  blocks from spawn and confirm terrain out there is lit the same as
+  terrain near spawn — the old `PointLight` only lit a small sphere near
+  its spawn point, so this checks the `DirectionalLight` replacement
+  actually reaches everywhere. Look toward the render-distance edge and
+  confirm there's no visible band where terrain fades into fog and fog
+  meets the clear-colour "sky" — they should read as one continuous
+  colour (`SkyPalette::horizon_color` drives both). Also move the render-
+  distance slider and confirm the horizon colour does *not* change (only
+  the fog's falloff distance should react — a regression here would look
+  like "the horizon goes blue-grey when I move the slider"). Finally,
+  check the world doesn't read as washed out/bleached under the
+  ~10,000-lux noon sun — if it does, `src/sky.rs`'s `SkyPalette::default`
+  needs a lower `sun_illuminance`, or `main.rs`'s camera needs a
+  `Tonemapping` other than the default `TonyMcMapface` (try
+  `ReinhardLuminance` before reaching for `Exposure` changes — see the
+  ticket's "Tone mapping" section for the full order to try).

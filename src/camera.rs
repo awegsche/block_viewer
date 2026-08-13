@@ -158,16 +158,31 @@ pub fn far_plane_distance(render_distance_chunks: u32) -> f32 {
     render_distance_chunks as f32 * world::SECTION_SIZE as f32 * std::f32::consts::SQRT_2 + 32.0
 }
 
-/// A soft distance fog fading terrain out before the far plane, so chunks
-/// don't visibly pop out of existence at the render-distance edge.
-pub fn atmosphere_fog(render_distance_chunks: u32) -> DistanceFog {
+/// The falloff half of [`atmosphere_fog`] — split out so
+/// [`sync_render_distance_effects`] can update just this when
+/// [`streaming::RenderDistance`] changes, without touching `DistanceFog`'s
+/// colour. That colour belongs to [`crate::sky::SkyPalette`] (ticket 015)
+/// now; rebuilding the whole `DistanceFog` here would clobber it back to
+/// whatever `color` was passed in every time the render-distance slider
+/// moved.
+fn fog_falloff(render_distance_chunks: u32) -> FogFalloff {
     let far = far_plane_distance(render_distance_chunks);
+    FogFalloff::Linear {
+        start: far * 0.6,
+        end: far,
+    }
+}
+
+/// A soft distance fog fading terrain out before the far plane, so chunks
+/// don't visibly pop out of existence at the render-distance edge. `color`
+/// is a caller-supplied starting value (`main.rs::setup` passes
+/// [`crate::sky::SkyPalette::horizon_color`]) — [`crate::sky::sync_sky_palette`]
+/// keeps it in sync with the palette from then on, and
+/// [`sync_render_distance_effects`] never touches it, only the falloff.
+pub fn atmosphere_fog(render_distance_chunks: u32, color: Color) -> DistanceFog {
     DistanceFog {
-        color: Color::srgb(0.7, 0.8, 0.92),
-        falloff: FogFalloff::Linear {
-            start: far * 0.6,
-            end: far,
-        },
+        color,
+        falloff: fog_falloff(render_distance_chunks),
         ..default()
     }
 }
@@ -305,7 +320,9 @@ fn sync_render_distance_effects(
         if let Projection::Perspective(perspective) = projection.as_mut() {
             perspective.far = far_plane_distance(render_distance.0);
         }
-        *fog = atmosphere_fog(render_distance.0);
+        // Falloff only — `fog.color` belongs to `SkyPalette` (ticket 015),
+        // see `fog_falloff`'s docs.
+        fog.falloff = fog_falloff(render_distance.0);
     }
 }
 
@@ -541,6 +558,51 @@ mod tests {
         let direction = Vec3::new(1.0, 0.0, 0.0);
 
         assert!(raycast_terrain(origin, direction, 5.0, &decoded).is_none());
+    }
+
+    /// Ticket 015: `sync_render_distance_effects` used to rebuild the whole
+    /// `DistanceFog` (colour included) on every render-distance change,
+    /// clobbering whatever `SkyPalette` had set — "the horizon went
+    /// blue-grey again after I moved the slider". It should only ever touch
+    /// `falloff`.
+    #[test]
+    fn render_distance_change_updates_falloff_but_leaves_fog_color_alone() {
+        let mut app = App::new();
+        app.add_systems(Update, sync_render_distance_effects);
+        app.insert_resource(streaming::RenderDistance(4));
+
+        let custom_color = Color::srgb(0.1, 0.2, 0.3);
+        let camera = app
+            .world_mut()
+            .spawn((
+                CameraRig::looking_at(Vec3::ZERO, Vec3::new(0.0, 0.0, -1.0)),
+                Projection::Perspective(PerspectiveProjection::default()),
+                atmosphere_fog(4, custom_color),
+            ))
+            .id();
+
+        // First tick applies the just-inserted RenderDistance.
+        app.update();
+        app.world_mut().resource_mut::<streaming::RenderDistance>().0 = 8;
+        app.update();
+
+        let fog = app.world().get::<DistanceFog>(camera).unwrap();
+        assert_eq!(fog.color, custom_color, "fog color must not follow RenderDistance");
+
+        let far = far_plane_distance(8);
+        match &fog.falloff {
+            FogFalloff::Linear { start, end } => {
+                assert_eq!(*start, far * 0.6);
+                assert_eq!(*end, far);
+            }
+            other => panic!("expected linear falloff, got {other:?}"),
+        }
+
+        let projection = app.world().get::<Projection>(camera).unwrap();
+        match projection {
+            Projection::Perspective(perspective) => assert_eq!(perspective.far, far),
+            other => panic!("expected a perspective projection, got {other:?}"),
+        }
     }
 }
 

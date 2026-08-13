@@ -9,6 +9,7 @@ use std::{
 mod camera;
 mod chunk_pipeline;
 mod region_cache;
+mod sky;
 mod streaming;
 mod ui;
 mod unload;
@@ -155,6 +156,7 @@ fn main() {
         .add_plugins(DefaultPlugins)
         .add_plugins(bevy::diagnostic::FrameTimeDiagnosticsPlugin)
         .add_plugins(camera::CameraControllerPlugin)
+        .add_plugins(sky::SkyPlugin)
         .add_plugins(streaming::ChunkStreamingPlugin)
         .add_plugins(chunk_pipeline::ChunkLoadPipelinePlugin)
         .add_plugins(unload::ChunkUnloadPlugin)
@@ -182,6 +184,7 @@ fn setup(
     mut images: ResMut<Assets<Image>>,
     loaded_save: Res<LoadedSave>,
     render_distance: Res<streaming::RenderDistance>,
+    sky_palette: Res<sky::SkyPalette>,
 ) {
     println!(
         "Active save: {} ({} regions)",
@@ -253,16 +256,24 @@ fn setup(
             far: camera::far_plane_distance(render_distance.0),
             ..default()
         }),
-        camera::atmosphere_fog(render_distance.0),
+        camera::atmosphere_fog(render_distance.0, sky_palette.horizon_color),
         Transform::from_translation(eye).looking_at(target, Vec3::Y),
         camera::CameraRig::looking_at(eye, target),
     ));
 
-    // Light up the scene.
+    // Ticket 015: a directional light replaces the old `PointLight`, which
+    // lit only a small sphere near spawn and left the rest of a streaming
+    // voxel world flat. Only its rotation matters (set by `sky::sync_sky_palette`
+    // from `SkyPalette::sun_direction`), so it needs no particular position
+    // or offset from `target` — unlike the point light, it isn't local to
+    // anywhere. Shadows off for now; ticket 017 turns them on.
     commands.spawn((
-        PointLight::default(),
-        Transform::from_xyz(target.x + 10.8, target.y + 30.0, target.z + 10.8)
-            .looking_at(target, Vec3::Y),
+        Name::new("Sun"),
+        DirectionalLight {
+            shadows_enabled: false,
+            ..default()
+        },
+        Transform::default(),
     ));
 }
 

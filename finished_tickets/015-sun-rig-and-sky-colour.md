@@ -1,7 +1,21 @@
 # 015 - Sun rig and a single source of truth for sky colour
 
 ## Status
-Open
+Done
+
+## Resolution
+
+Implemented as `src/sky.rs`'s `SkyPlugin`/`SkyPalette`/`sync_sky_palette`,
+wired into `main.rs` (directional-light spawn replaces the old `PointLight`,
+`setup` reads `SkyPalette::horizon_color` for the camera's initial fog) and
+`camera.rs` (`atmosphere_fog` takes a `color` param; `fog_falloff` factors
+out the falloff-only half so `sync_render_distance_effects` never touches
+fog colour). Tone mapping was left at the default (`TonyMcMapface`) and
+`sun_illuminance` at the ticket's suggested `AMBIENT_DAYLIGHT` (~10,000 lux)
+— whether that reads as bleached is a visual call that needs the manual
+check in `todo.md` (015's entry); if it does, that entry documents the
+tuning order (`sun_illuminance` → `Tonemapping::ReinhardLuminance` →
+`Exposure`) to try, in place of guessing blind here.
 
 ## Depends on
 Nothing. Independent of the biome-tint track (011–014); the two can land in
