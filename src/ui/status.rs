@@ -6,6 +6,7 @@ use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts};
 
 use crate::chunk_pipeline::{InFlightChunkLoads, SharedRegionCache};
+use crate::sky::{self, ShadowSettings};
 use crate::streaming::{PendingChunkWork, RenderDistance};
 use crate::{world, DecodedWorld};
 
@@ -13,6 +14,7 @@ use crate::{world, DecodedWorld};
 /// for here — a render distance slider (mutating [`RenderDistance`] drives
 /// `streaming`/`chunk_pipeline`/`camera` the same way any other change to
 /// it does, via `RenderDistance::is_changed()`).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn status_panel(
     mut contexts: EguiContexts,
     diagnostics: Res<DiagnosticsStore>,
@@ -21,6 +23,7 @@ pub(crate) fn status_panel(
     in_flight_loads: Res<InFlightChunkLoads>,
     region_cache: Option<Res<SharedRegionCache>>,
     mut render_distance: ResMut<RenderDistance>,
+    mut shadow_settings: ResMut<ShadowSettings>,
 ) {
     egui::Window::new("Status").show(contexts.ctx_mut(), |ui| {
         let fps = diagnostics
@@ -71,6 +74,20 @@ pub(crate) fn status_panel(
         ui.horizontal(|ui| {
             ui.label("Render distance");
             ui.add(egui::Slider::new(&mut render_distance.0, 2..=32));
+        });
+
+        // Ticket 017: this is also the fastest way for a human to measure
+        // shadows' cost — flip it and watch the FPS label above. The
+        // distance shown is derived (`sky::shadow_cascade_distance`), not a
+        // separate control — it tracks the render-distance slider the same
+        // way the far plane and fog already do (capped well below it; see
+        // that function's docs for why).
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut shadow_settings.enabled, "Shadows");
+            ui.label(format!(
+                "(cascades out to {:.0} blocks)",
+                sky::shadow_cascade_distance(render_distance.0)
+            ));
         });
     });
 }

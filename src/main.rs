@@ -274,15 +274,9 @@ fn setup(
     // voxel world flat. Only its rotation matters (set by `sky::sync_sky_palette`
     // from `SkyPalette::sun_direction`), so it needs no particular position
     // or offset from `target` — unlike the point light, it isn't local to
-    // anywhere. Shadows off for now; ticket 017 turns them on.
-    commands.spawn((
-        Name::new("Sun"),
-        DirectionalLight {
-            shadows_enabled: false,
-            ..default()
-        },
-        Transform::default(),
-    ));
+    // anywhere. Ticket 017: shadows on, sized for the current render
+    // distance — see `sky::spawn_sun`'s docs.
+    sky::spawn_sun(&mut commands, render_distance.0);
 
     // Ticket 016: the sky camera, gradient dome, and sun/moon billboards —
     // see `sky::SkyPlugin`'s docs for why this is called from here rather

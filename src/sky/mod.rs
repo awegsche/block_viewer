@@ -20,16 +20,22 @@
 //! the two cameras together: it copies the main camera's *rotation* (never
 //! its translation) onto the sky camera every frame.
 //!
-//! 017 adds shadows to the sun light this plugin spawns, 018 animates the
-//! palette over a day/night cycle — both build on top of this rather than
-//! re-deriving their own lighting or sky-drawing state.
+//! [`shadows`] (017) owns everything about the sun casting shadows: the
+//! bias constants and cascade config [`spawn_sun`] gives the light at
+//! startup, keeping the cascade config in step with render distance from
+//! then on, and the status panel's on/off toggle. 018 will animate the
+//! palette over a day/night cycle, building on top of this rather than
+//! re-deriving its own lighting or sky-drawing state.
 
 mod bodies;
 mod dome;
+mod shadows;
 
-use bevy::pbr::{NotShadowCaster, NotShadowReceiver};
+use bevy::pbr::{DirectionalLightShadowMap, NotShadowCaster, NotShadowReceiver};
 use bevy::prelude::*;
 use bevy::render::view::RenderLayers;
+
+pub use shadows::ShadowSettings;
 
 /// Everything visual about the atmosphere, in one place. `Default` is a
 /// fixed noon — there is no day/night animation yet (that's ticket 018);
@@ -89,9 +95,12 @@ pub(crate) const SKY_LAYER: usize = 1;
 #[derive(Component)]
 pub(crate) struct SkyCamera;
 
-/// Adds [`SkyPalette`] (defaulting to noon), [`sync_sky_palette`], and (016)
-/// the systems that keep the dome's colours and the sun/moon's positions
-/// following it, plus the sky camera's rotation following the main camera.
+/// Adds [`SkyPalette`] (defaulting to noon), [`ShadowSettings`] (defaulting
+/// to on), [`sync_sky_palette`], and (016) the systems that keep the dome's
+/// colours and the sun/moon's positions following the palette, plus (017)
+/// the sun's shadow cascade config following render distance and its
+/// `shadows_enabled` following [`ShadowSettings`], plus the sky camera's
+/// rotation following the main camera.
 ///
 /// Does **not** spawn the sky camera/dome/sun/moon itself — those need
 /// [`Assets<Image>`] loaded from disk the same eager, panic-on-failure way
@@ -99,23 +108,69 @@ pub(crate) struct SkyCamera;
 /// that kind of I/O from inside a `Startup` system that `cargo test` would
 /// also execute (see `world::atlas`'s own tests for why: relative asset
 /// paths only resolve from the crate root, which is true for `cargo run`
-/// but not guaranteed for every test harness). Call [`spawn_sky_scene`] from
-/// `main.rs::setup` instead, right alongside the atlas/colormap loads it
-/// already does.
+/// but not guaranteed for every test harness). Call [`spawn_sky_scene`] and
+/// [`spawn_sun`] from `main.rs::setup` instead, right alongside the atlas/
+/// colormap loads it already does.
 pub struct SkyPlugin;
 
 impl Plugin for SkyPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<SkyPalette>().add_systems(
-            Update,
-            (
-                sync_sky_palette,
-                dome::rebuild_dome_on_palette_change,
-                bodies::sync_celestial_positions,
-                sync_sky_camera_rotation,
-            ),
-        );
+        app.init_resource::<SkyPalette>()
+            .init_resource::<ShadowSettings>()
+            // Explicit rather than relying on `PbrPlugin`'s own default
+            // (also 2048) — this is the knob the ticket calls out as the
+            // quality/VRAM trade to reach for first (4096) if shadow
+            // resolution turns out to be the problem, so it's spelled out
+            // here rather than left implicit.
+            .insert_resource(DirectionalLightShadowMap { size: 2048 })
+            .add_systems(
+                Update,
+                (
+                    sync_sky_palette,
+                    dome::rebuild_dome_on_palette_change,
+                    bodies::sync_celestial_positions,
+                    sync_sky_camera_rotation,
+                    shadows::sync_shadow_cascades,
+                    shadows::sync_shadow_settings,
+                ),
+            );
     }
+}
+
+/// Spawns the sun's `DirectionalLight` with shadows configured for
+/// `render_distance_chunks` (ticket 017) — a plain function `main.rs::setup`
+/// calls, for the same reason [`spawn_sky_scene`] is (see [`SkyPlugin`]'s
+/// docs). Kept separate from [`spawn_sky_scene`] because it needs no image/
+/// mesh assets, and because `main.rs::setup` spawns the sun before the sky
+/// scene.
+///
+/// Only sets the fields [`sync_sky_palette`] doesn't already own on the very
+/// next tick (colour, illuminance, rotation): the shadow bias constants
+/// ([`shadows::SHADOW_DEPTH_BIAS`], [`shadows::SHADOW_NORMAL_BIAS`]), the
+/// initial cascade config ([`shadows::cascade_config`] — the same shape
+/// [`shadows::sync_shadow_cascades`] rebuilds at runtime), and
+/// `shadows_enabled` matching [`ShadowSettings::default`] (owned by
+/// [`shadows::sync_shadow_settings`] from then on).
+pub(crate) fn spawn_sun(commands: &mut Commands, render_distance_chunks: u32) {
+    commands.spawn((
+        Name::new("Sun"),
+        DirectionalLight {
+            shadows_enabled: ShadowSettings::default().enabled,
+            shadow_depth_bias: shadows::SHADOW_DEPTH_BIAS,
+            shadow_normal_bias: shadows::SHADOW_NORMAL_BIAS,
+            ..default()
+        },
+        shadows::cascade_config(render_distance_chunks),
+        Transform::default(),
+    ));
+}
+
+/// Shadow cascade far distance for `render_distance_chunks` — what the
+/// status panel shows next to the shadows checkbox (ticket 017), computed
+/// the same way [`spawn_sun`]'s initial cascade config and
+/// [`shadows::sync_shadow_cascades`]'s rebuilt one both do.
+pub(crate) fn shadow_cascade_distance(render_distance_chunks: u32) -> f32 {
+    shadows::max_distance(render_distance_chunks)
 }
 
 /// Spawns the sky camera, the gradient dome, and the sun/moon billboards —

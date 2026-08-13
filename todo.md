@@ -133,3 +133,23 @@ these itself (see CLAUDE.md's "Manual/visual verification").
   everything with the second camera and the main camera's `ClearColorConfig::None`
   in place — nothing should look like it's rendering underneath the UI or
   vanishing behind the sky pass.
+- [ ] **017 sun shadows: no acne, no peter-panning, and the toggle's cost is
+  real.** `cargo run` (debug build) against the real save. Look at a wide
+  stretch of flat ground at midday (default noon `SkyPalette`) and confirm
+  it's clean — no moiré/banding patterns of self-shadowing on lit ground.
+  Then look at flat ground with the sun near the horizon (rotate
+  `SkyPalette::sun_direction` in code for now, or wait for 018's time
+  slider if that lands first) and check again — grazing angles are where
+  acne shows up worst. Separately, find a single block sitting on flat
+  ground (a 1-block-tall step) and confirm its shadow touches the block,
+  not detached/floating off to one side (peter-panning). If either shows
+  up, `src/sky/shadows.rs`'s `SHADOW_NORMAL_BIAS` (raise for acne, the
+  starting value is `3.0` against Bevy's default `1.8`) or
+  `SHADOW_DEPTH_BIAS` (raise for peter-panning, starting value is Bevy's
+  default `0.02`) needs adjusting — record whatever it ends up at, and why,
+  in `finished_tickets/017-shadows.md`'s resolution, since these were
+  chosen without ever being looked at. Finally, toggle the new "Shadows"
+  checkbox in the status panel and read the FPS counter both ways at a
+  fixed render distance/camera position — record the before/after numbers
+  in the same resolution section (the ticket flagged this as potentially
+  the single most expensive item in the whole lighting group).

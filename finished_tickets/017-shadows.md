@@ -1,7 +1,53 @@
 # 017 - Sun shadows
 
 ## Status
-Open
+Done
+
+## Resolution
+
+Implemented as `src/sky/shadows.rs`, wired into `sky::SkyPlugin` and called
+from `main.rs::setup` via the new `sky::spawn_sun` (which replaces the old
+inline `DirectionalLight` spawn — shadows now on by default instead of the
+`shadows_enabled: false` placeholder 015 left).
+
+- **Cascade config**: `num_cascades: 4`, `minimum_distance: 0.1`,
+  `first_cascade_far_bound: 32.0`, `overlap_proportion: 0.2`,
+  `maximum_distance: camera::far_plane_distance(render_distance).min(250.0)`
+  — exactly the ticket's suggested shape. `shadows::sync_shadow_cascades`
+  rebuilds it whenever `RenderDistance` changes, the same pattern
+  `camera::sync_render_distance_effects` uses for the far plane/fog.
+- **`DirectionalLightShadowMap { size: 2048 }`**: inserted explicitly by
+  `SkyPlugin` (matches Bevy's own default, but spelled out since 4096 is
+  the first knob to reach for if resolution turns out to be the problem).
+- **Bias values**: `shadow_depth_bias` left at Bevy's default (`0.02`);
+  `shadow_normal_bias` raised from Bevy's default `1.8` to `3.0` — voxel
+  terrain's large coplanar axis-aligned faces at grazing sun angles is
+  exactly where normal bias (not depth bias) earns its keep, per the
+  ticket's own framing. **These are starting values, not measured ones** —
+  per CLAUDE.md's manual/visual-verification policy, nothing in this
+  session ran the app to actually look at a low sun angle for banding or a
+  single block for peter-panning. `todo.md` carries that check (017's
+  entry); if it finds banding, raise `SHADOW_NORMAL_BIAS`
+  (`src/sky/shadows.rs`) further before touching depth bias. If it finds
+  peter-panning instead, that's the depth-bias knob.
+- **Skybox exclusion**: already done by 016 — the sky dome (`sky/mod.rs`)
+  and sun/moon billboards (`sky/bodies.rs`) already carry
+  `NotShadowCaster`/`NotShadowReceiver`, so there was nothing left to do
+  here.
+- **Toggle**: `sky::ShadowSettings { enabled: bool }` (default `true`),
+  a checkbox in the status panel (`src/ui/status.rs`) next to the render-
+  distance slider, plus a derived read-only label showing the current
+  cascade `maximum_distance` (`sky::shadow_cascade_distance`) rather than a
+  second slider, since it's fully determined by render distance.
+- **Before/after FPS**: not measured — same reason as the bias values,
+  this needs a human actually running the app with the checkbox. `todo.md`'s
+  017 entry asks for it (toggle the checkbox, read the status panel's
+  existing FPS counter both ways).
+
+Tests (`src/sky/shadows.rs`): cascade config tracks `RenderDistance`
+(including that `maximum_distance` stays capped at 250 blocks well past
+where the far plane alone would put it), and the toggle flips
+`DirectionalLight::shadows_enabled` and nothing else.
 
 ## Depends on
 015 (there has to be a directional light to cast them). Best done after
