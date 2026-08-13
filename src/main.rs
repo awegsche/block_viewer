@@ -1,124 +1,181 @@
 use bevy::prelude::*;
-use mc_anvil::{chunkregion::ChunkRegion, Save, get_saves};
-use std::{collections::HashMap, path::Path, time::Instant};
+use mc_anvil::{get_saves_from_instance, region::REGION_WIDTH_IN_CHUNKS, Save, SaveMeta};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+};
 
 mod camera;
+mod chunk_pipeline;
+mod region_cache;
+mod streaming;
+mod ui;
+mod unload;
 mod world;
 
 /// The currently loaded Minecraft save, populated at startup from a real
-/// save directory (`%AppData%\.minecraft\saves` on Windows).
+/// save directory (`%AppData%\.minecraft\saves` on Windows). `pub(crate)`
+/// (field included) so the UI's save picker (ticket 007) can swap it out at
+/// runtime without restarting.
+///
+/// Always holds a real (if possibly empty-of-regions) [`Save`] — never
+/// `Option`/`Result` — so every reader (`setup`, the save picker) can read
+/// `.0.meta` unconditionally. When nothing could actually be loaded at
+/// startup (ticket 008: no `.minecraft` directory, an empty `saves/`
+/// folder, ...) this holds [`empty_save`] instead of panicking, and
+/// [`StartupIssue`] carries the reason for the UI to show.
 #[derive(Resource)]
-struct LoadedSave(Save);
+pub(crate) struct LoadedSave(pub(crate) Save);
 
-/// Every chunk column decoded from the loaded save's first region (ticket
-/// 002), keyed by world chunk coordinates, plus the [`world::BlockRegistry`]
-/// their block names were interned into. Consumed by [`setup`] to mesh one
-/// entity per chunk column (ticket 003), and by [`camera`]'s
-/// under-the-cursor ray-march for orbit targeting (ticket 006).
+/// The reason [`LoadedSave`] is empty at startup, if any (ticket 008) —
+/// `None` once a real save has loaded (startup found one, or the save
+/// picker loaded one at runtime). Read by the save picker panel to show the
+/// problem instead of the app just silently sitting on an empty world.
+#[derive(Resource, Default)]
+pub(crate) struct StartupIssue(pub(crate) Option<String>);
+
+/// A [`Save`] with no regions and no on-disk backing — what [`LoadedSave`]
+/// holds when startup couldn't find a real one (ticket 008). Safe to treat
+/// like any other loaded save: an empty `regions` list means the streaming
+/// pipeline simply has nothing to load, the same as a real save the camera
+/// hasn't flown into any generated terrain of yet.
+fn empty_save() -> Save {
+    Save {
+        meta: SaveMeta {
+            name: "(no save loaded)".to_string(),
+            path: PathBuf::new(),
+            regions: Vec::new(),
+        },
+        regions: Vec::new(),
+    }
+}
+
+/// Every chunk column decoded so far (ticket 002), keyed by world chunk
+/// coordinates, plus the [`world::BlockRegistry`] their block names were
+/// interned into. Starts empty at startup (ticket 005-e deleted the old
+/// eager pre-`App::run()` load) and fills in as [`chunk_pipeline`]'s
+/// background chunk-load tasks (ticket 005-c) stream columns in around the
+/// camera; also read by [`camera`]'s under-the-cursor ray-march for orbit
+/// targeting (ticket 006).
+///
+/// `registry` is behind an `Arc<Mutex<_>>` — not just an owned
+/// [`world::BlockRegistry`] — because those background tasks intern newly
+/// decoded chunks' block names directly into it, off the main thread, and
+/// [`world::BlockId`]s need to stay globally stable regardless of whether a
+/// chunk was decoded eagerly at startup or streamed in later.
 #[derive(Resource)]
 pub(crate) struct DecodedWorld {
-    pub(crate) registry: world::BlockRegistry,
+    pub(crate) registry: Arc<Mutex<world::BlockRegistry>>,
     pub(crate) columns: HashMap<(i32, i32), world::ChunkColumn>,
 }
 
-/// Loads the first save found under the Minecraft saves directory
-/// (`dirs::config_dir()/.minecraft/saves`, i.e.
-/// `C:\Users\<user>\AppData\Roaming\.minecraft\saves` on Windows) and eagerly
-/// parses the chunks of its first region so we know real save data is
-/// reachable.
-fn load_real_save() -> Save {
-    let saves = get_saves().expect("could not read the Minecraft saves directory");
-    let meta = saves
-        .into_iter()
-        .next()
-        .expect("no Minecraft saves found in the saves directory");
+/// Directory to scan for Minecraft saves: the first CLI argument if one was
+/// given (ticket 008 — pointing at a CurseForge/MultiMC instance elsewhere
+/// on disk, since those don't live under the default directory), else
+/// `dirs::config_dir()/.minecraft/saves`
+/// (`C:\Users\<user>\AppData\Roaming\.minecraft\saves` on Windows). Shared by
+/// startup ([`try_load_real_save`]) and the UI's save picker
+/// ([`ui::scan_saves`]) so both agree on where "the saves directory" is.
+pub(crate) fn saves_directory() -> PathBuf {
+    saves_directory_from(std::env::args().nth(1))
+}
+
+/// The actual logic behind [`saves_directory`], taking the CLI arg (if any)
+/// as a plain `Option<String>` rather than reading `std::env::args()`
+/// directly — real process args can't be overridden per-test, so tests
+/// exercise this instead.
+fn saves_directory_from(cli_arg: Option<String>) -> PathBuf {
+    if let Some(dir) = cli_arg {
+        return PathBuf::from(dir);
+    }
+    dirs::config_dir()
+        .unwrap_or_default()
+        .join(".minecraft/saves")
+}
+
+/// Picks the first save found under `dir`. Metadata only
+/// (`get_saves_from_instance`/`SaveMeta` -> `Save`) — cheap and synchronous,
+/// unlike chunk data, which streams in after `App::run()` via the async
+/// pipeline (ticket 005-c) instead of being loaded here (ticket 005-e
+/// removed the old eager pre-`App::run()` region load).
+///
+/// `Err` covers every unhappy path ticket 008 calls out — no `.minecraft`
+/// directory, an empty `saves/` folder, or any other I/O failure listing
+/// it — as a message for [`load_real_save`] to log and show in the UI,
+/// rather than a panic that kills the process before the window opens.
+/// Takes `dir` as a parameter (rather than calling [`saves_directory`]
+/// itself) purely so tests can point it at a fixture directory.
+fn try_load_save_from(dir: &Path) -> Result<Save, String> {
+    let saves = get_saves_from_instance(dir)
+        .map_err(|e| format!("could not read saves directory {}: {e}", dir.display()))?;
+    let meta = saves.into_iter().next().ok_or_else(|| {
+        format!("no Minecraft saves found under {}", dir.display())
+    })?;
 
     println!("Loading save {}", meta.get_grid_view());
 
-    let mut save: Save = meta.into();
-    if let Some(first_region) = save.regions.first_mut() {
-        first_region
-            .load_chunks()
-            .expect("failed to load chunks for the first region");
-        let chunk_count = first_region
-            .chunks
-            .as_ref()
-            .map(|chunks| chunks.iter().filter(|c| c.is_some()).count())
-            .unwrap_or(0);
-        println!(
-            "Loaded {} chunks from region ({}, {})",
-            chunk_count,
-            first_region.region.get_x_coord(),
-            first_region.region.get_z_coord()
-        );
-    }
-
-    save
+    Ok(meta.into())
 }
 
-/// Decodes every populated, fully-generated chunk in `region` into a
-/// [`world::ChunkColumn`], sharing one [`world::BlockRegistry`] across all
-/// of them so [`world::BlockId`]s stay comparable.
-fn decode_region(region: &ChunkRegion) -> DecodedWorld {
-    let mut registry = world::BlockRegistry::new();
-    let mut columns = HashMap::new();
+/// [`try_load_save_from`] against [`saves_directory`] — the real entry point
+/// [`load_real_save`] uses at startup.
+fn try_load_real_save() -> Result<Save, String> {
+    try_load_save_from(&saves_directory())
+}
 
-    let Some(chunks) = &region.chunks else {
-        return DecodedWorld { registry, columns };
-    };
-
-    let start = Instant::now();
-    let mut skipped = 0usize;
-    for chunk in chunks.iter().flatten() {
-        match world::decode_chunk(chunk, &mut registry) {
-            Ok(column) => {
-                columns.insert((column.x, column.z), column);
-            }
-            Err(_) => skipped += 1,
+/// Always returns a usable [`Save`] — [`empty_save`] plus a logged reason
+/// when [`try_load_real_save`] couldn't find a real one (ticket 008), rather
+/// than the panics that used to kill the process before the window ever
+/// opened.
+fn load_real_save() -> (Save, Option<String>) {
+    match try_load_real_save() {
+        Ok(save) => (save, None),
+        Err(reason) => {
+            println!("block_viewer: {reason}");
+            (empty_save(), Some(reason))
         }
     }
-    println!(
-        "Decoded {} chunk columns ({} skipped) from region ({}, {}) in {:?}",
-        columns.len(),
-        skipped,
-        region.region.get_x_coord(),
-        region.region.get_z_coord(),
-        start.elapsed()
-    );
-
-    DecodedWorld { registry, columns }
 }
 
 fn main() {
-    let save = load_real_save();
-    let decoded_world = save
-        .regions
-        .first()
-        .map(decode_region)
-        .unwrap_or_else(|| DecodedWorld {
-            registry: world::BlockRegistry::new(),
-            columns: HashMap::new(),
-        });
+    let (save, startup_issue) = load_real_save();
+    let decoded_world = DecodedWorld {
+        registry: Arc::new(Mutex::new(world::BlockRegistry::new())),
+        columns: HashMap::new(),
+    };
 
     App::new()
         .add_plugins(DefaultPlugins)
+        .add_plugins(bevy::diagnostic::FrameTimeDiagnosticsPlugin)
         .add_plugins(camera::CameraControllerPlugin)
+        .add_plugins(streaming::ChunkStreamingPlugin)
+        .add_plugins(chunk_pipeline::ChunkLoadPipelinePlugin)
+        .add_plugins(unload::ChunkUnloadPlugin)
+        .add_plugins(ui::UiPlugin)
+        // The UI plugin's panels (ticket 007) need to have drawn this
+        // frame before `drive_camera` reads whether egui claimed pointer/
+        // keyboard input — see `camera::CameraSet`'s docs.
+        .configure_sets(Update, camera::CameraSet.after(ui::UiPanelSet))
         .insert_resource(LoadedSave(save))
+        .insert_resource(StartupIssue(startup_issue))
         .insert_resource(decoded_world)
         .add_systems(Startup, setup)
         .run();
 }
 
+/// Marker on every spawned chunk mesh entity — `pub(crate)` so
+/// [`chunk_pipeline`]'s polling system can tag entities it spawns the same
+/// way [`setup`]'s eager spawn does.
 #[derive(Component)]
-struct BlockMesh;
+pub(crate) struct BlockMesh;
 
 fn setup(
     mut commands: Commands,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    mut meshes: ResMut<Assets<Mesh>>,
     mut images: ResMut<Assets<Image>>,
     loaded_save: Res<LoadedSave>,
-    decoded_world: Res<DecodedWorld>,
+    render_distance: Res<streaming::RenderDistance>,
 ) {
     println!(
         "Active save: {} ({} regions)",
@@ -126,65 +183,56 @@ fn setup(
         loaded_save.0.meta.regions.len()
     );
 
-    // Pack every block texture into one atlas and resolve each interned
-    // block name to its per-face atlas rect (ticket 004) — replaces the
-    // single hardcoded stone.png the mesher previously stretched over
-    // every face.
+    // Pack every block texture into one atlas (ticket 004) — replaces the
+    // single hardcoded stone.png the mesher previously stretched over every
+    // face. Per-block-id UV resolution (`build_block_uv_table`) happens
+    // per-chunk inside `chunk_pipeline`'s background tasks instead of once
+    // here, against whatever names are interned into the registry *at the
+    // moment that chunk decodes* — block names get interned over the app's
+    // whole lifetime as streaming loads new chunks (ticket 005-e), not just
+    // once at startup like the old eager decode, so there's no fixed set of
+    // names to build a table from up front.
     let atlas = world::atlas::build(Path::new("assets/minecraft/textures/block"))
         .expect("failed to build the block texture atlas");
-    let uv_table = world::atlas::build_block_uv_table(&decoded_world.registry, &atlas);
+    let uv_index = atlas.uv_index();
     let atlas_handle = images.add(atlas.image);
     let material_handle = materials.add(StandardMaterial {
         base_color_texture: Some(atlas_handle),
         ..default()
     });
 
-    // One entity per chunk column (ticket 003) — never one mesh for a whole
-    // region, that would be a single giant draw call with no culling.
-    let mut spawned = 0usize;
-    for (&(cx, cz), column) in &decoded_world.columns {
-        let neighbors = world::Neighbors {
-            north: decoded_world.columns.get(&(cx, cz - 1)),
-            south: decoded_world.columns.get(&(cx, cz + 1)),
-            east: decoded_world.columns.get(&(cx + 1, cz)),
-            west: decoded_world.columns.get(&(cx - 1, cz)),
-        };
-        let Some(mesh) =
-            world::mesh_chunk_column(column, &decoded_world.registry, &neighbors, &uv_table)
-        else {
-            continue; // fully-air column: nothing to render
-        };
-
-        commands.spawn((
-            Mesh3d(meshes.add(mesh)),
-            MeshMaterial3d(material_handle.clone()),
-            // Chunk mesh vertices are chunk-local; place the entity at the
-            // chunk's world origin under this module's axis mapping
-            // (bevy.x = mc.x, bevy.z = -mc.z — see `world::mesh` docs).
-            Transform::from_xyz(cx as f32 * world::SECTION_SIZE as f32, 0.0, -(cz as f32 * world::SECTION_SIZE as f32)),
-            BlockMesh,
-        ));
-        spawned += 1;
-    }
-    println!(
-        "Spawned {spawned} chunk mesh entities ({} columns decoded)",
-        decoded_world.columns.len()
+    // Nothing is decoded yet — chunks stream in via the async pipeline
+    // (ticket 005-c) as the camera moves, driven by these three resources
+    // plus `DecodedWorld` (already inserted in `main()`). Ticket 005-e
+    // deleted the old eager single-region load and per-column spawn loop
+    // that used to populate the world here.
+    let region_cache = region_cache::RegionCache::new(
+        loaded_save.0.meta.clone(),
+        region_cache::recommended_capacity(render_distance.0),
     );
+    commands.insert_resource(chunk_pipeline::SharedRegionCache(Arc::new(Mutex::new(
+        region_cache,
+    ))));
+    commands.insert_resource(chunk_pipeline::SharedAtlasIndex(Arc::new(uv_index)));
+    commands.insert_resource(chunk_pipeline::TerrainMaterial(material_handle));
 
-    // Place the camera above the terrain surface near the middle of the
-    // loaded columns (ticket 006) instead of a fixed point like the old
-    // `(10, 5, 10)`, which on a real save may well be underground.
-    let target = spawn_point(&decoded_world.columns);
+    // Place the camera near the middle of the save's region footprint
+    // (ticket 005-e) instead of reading real terrain height like the old
+    // eager-decode version did — nothing is decoded yet at startup to read
+    // a height from. The camera free-flies at a fixed, generally-safe
+    // height while terrain streams in underneath, per the ticket's
+    // preference over deferring camera spawn until the first chunk loads.
+    let target = spawn_point(&loaded_save.0.meta);
     let eye = target + Vec3::new(-24.0, 20.0, 24.0);
 
     commands.spawn((
         Name::new("Camera"),
         Camera3d::default(),
         Projection::Perspective(PerspectiveProjection {
-            far: camera::far_plane_distance(),
+            far: camera::far_plane_distance(render_distance.0),
             ..default()
         }),
-        camera::atmosphere_fog(),
+        camera::atmosphere_fog(render_distance.0),
         Transform::from_translation(eye).looking_at(target, Vec3::Y),
         camera::CameraRig::looking_at(eye, target),
     ));
@@ -197,47 +245,115 @@ fn setup(
     ));
 }
 
-/// Bevy-space point on (or just above) the terrain surface near the middle
-/// of the loaded columns — used to place the camera somewhere sensible at
-/// startup and as its initial orbit target. Real saves are rarely centred
-/// on (0,0), and a fixed height would just as easily land underground.
-fn spawn_point(columns: &HashMap<(i32, i32), world::ChunkColumn>) -> Vec3 {
-    let Some((&(cx, cz), column)) = nearest_to_average(columns) else {
-        return Vec3::new(0.0, 80.0, 0.0);
-    };
+/// Bevy-space height every camera placement in this module uses. Real saves
+/// are rarely centred on (0,0), and nothing is decoded yet at startup (or
+/// right after the UI switches saves, ticket 007) to read real terrain
+/// height from, so every placement lands here instead — generally above
+/// ground level — rather than on the surface.
+const DEFAULT_CAMERA_HEIGHT: f32 = 100.0;
 
-    let size = world::SECTION_SIZE as i32;
-    let local = world::SECTION_SIZE / 2;
-    // Fall back to a plausible sea-level-ish height if the centre column
-    // happens to be a void (e.g. an unloaded/void chunk in a partial save).
-    let world_y = column.topmost_non_air(local, local).map_or(72, |(y, _)| y);
+/// Bevy-space point at the horizontal middle of region `(rx, rz)`, at
+/// [`DEFAULT_CAMERA_HEIGHT`]. Shared by [`spawn_point`] (the save's overall
+/// region centroid) and the UI's region-grid click-to-teleport (ticket
+/// 007), so both land on the same convention for "where a region is".
+pub(crate) fn region_center_point(rx: i32, rz: i32) -> Vec3 {
+    let region_size = REGION_WIDTH_IN_CHUNKS as i32 * world::SECTION_SIZE as i32;
+    let mc_x = rx * region_size + region_size / 2;
+    let mc_z = rz * region_size + region_size / 2;
 
-    Vec3::new(
-        (cx * size + local as i32) as f32,
-        world_y as f32 + 2.0, // stand a couple of blocks above the surface
-        -(cz * size + local as i32) as f32,
-    )
+    // bevy.x = mc.x, bevy.z = -mc.z — see `world::mesh` docs.
+    Vec3::new(mc_x as f32, DEFAULT_CAMERA_HEIGHT, -(mc_z as f32))
 }
 
-/// The loaded column closest to the horizontal centroid of every loaded
-/// column — the centroid itself may land on a gap (an unloaded or void
-/// chunk), so this snaps to whatever's actually there.
-fn nearest_to_average(
-    columns: &HashMap<(i32, i32), world::ChunkColumn>,
-) -> Option<(&(i32, i32), &world::ChunkColumn)> {
-    if columns.is_empty() {
+/// Bevy-space point used to place the camera at startup, and by the UI's
+/// save picker (ticket 007) after switching to a different save: the
+/// horizontal middle of the save's region footprint (metadata only —
+/// `SaveMeta`'s region-coordinate list, no chunk I/O — so this is safe to
+/// call before any streaming has happened). Real saves are rarely centred
+/// on (0,0); landing the camera near where regions actually exist means
+/// streaming has something to load in view immediately, rather than the
+/// camera free-flying over empty space until it happens to reach one.
+pub(crate) fn spawn_point(meta: &SaveMeta) -> Vec3 {
+    let Some((rx, rz)) = region_centroid(&meta.regions) else {
+        return Vec3::new(0.0, DEFAULT_CAMERA_HEIGHT, 0.0);
+    };
+    region_center_point(rx, rz)
+}
+
+/// The save's region closest to the horizontal centroid of every region it
+/// has — the centroid itself may land on a coordinate that isn't actually a
+/// region (a save's regions needn't form a filled rectangle), so this snaps
+/// to whatever region is actually there.
+fn region_centroid(regions: &[(i32, i32)]) -> Option<(i32, i32)> {
+    if regions.is_empty() {
         return None;
     }
-    let n = columns.len() as f64;
-    let (sum_x, sum_z) = columns.keys().fold((0i64, 0i64), |(sx, sz), &(cx, cz)| {
-        (sx + cx as i64, sz + cz as i64)
+    let n = regions.len() as f64;
+    let (sum_x, sum_z) = regions.iter().fold((0i64, 0i64), |(sx, sz), &(rx, rz)| {
+        (sx + rx as i64, sz + rz as i64)
     });
-    let avg_cx = sum_x as f64 / n;
-    let avg_cz = sum_z as f64 / n;
+    let avg_x = sum_x as f64 / n;
+    let avg_z = sum_z as f64 / n;
 
-    columns.iter().min_by(|a, b| {
+    regions.iter().copied().min_by(|a, b| {
         let dist2 =
-            |&(cx, cz): &(i32, i32)| (cx as f64 - avg_cx).powi(2) + (cz as f64 - avg_cz).powi(2);
-        dist2(a.0).total_cmp(&dist2(b.0))
+            |&(rx, rz): &(i32, i32)| (rx as f64 - avg_x).powi(2) + (rz as f64 - avg_z).powi(2);
+        dist2(a).total_cmp(&dist2(b))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn saves_directory_from_prefers_the_cli_arg_over_the_default() {
+        let dir = saves_directory_from(Some("some/other/instance".to_string()));
+        assert_eq!(dir, Path::new("some/other/instance"));
+    }
+
+    #[test]
+    fn saves_directory_from_falls_back_to_the_default_minecraft_layout() {
+        let dir = saves_directory_from(None);
+        assert!(
+            dir.ends_with(Path::new(".minecraft/saves")),
+            "expected a `.minecraft/saves` suffix, got {}",
+            dir.display()
+        );
+    }
+
+    /// Ticket 008: no such directory at all (the "no Minecraft installed"
+    /// case) should come back as an `Err` with a message, never panic.
+    #[test]
+    fn try_load_save_from_errors_cleanly_when_the_directory_does_not_exist() {
+        let err = try_load_save_from(Path::new(
+            "definitely-does-not-exist-anywhere/.minecraft/saves",
+        ))
+        .unwrap_err();
+        assert!(!err.is_empty());
+    }
+
+    /// Ticket 008: a saves directory that exists but has nothing under it
+    /// (the "empty saves folder" case) should also come back as a clean
+    /// `Err`, not a panic — distinct from the directory not existing at all.
+    #[test]
+    fn try_load_save_from_errors_cleanly_for_an_empty_directory() {
+        let empty_dir = std::env::temp_dir().join(format!(
+            "block_viewer_test_empty_saves_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&empty_dir).expect("should be able to create a temp dir");
+
+        let err = try_load_save_from(&empty_dir).unwrap_err();
+        assert!(err.contains("no Minecraft saves found"));
+
+        std::fs::remove_dir_all(&empty_dir).ok();
+    }
+
+    #[test]
+    fn empty_save_has_no_regions_to_stream() {
+        let save = empty_save();
+        assert!(save.meta.regions.is_empty());
+        assert!(save.regions.is_empty());
+    }
 }

@@ -17,7 +17,7 @@ pub mod mesh;
 // callers like ticket 007, not dead weight) — allow the unused ones rather
 // than trim the API down to today's only caller (`main.rs`).
 #[allow(unused_imports)]
-pub use atlas::{build_block_uv_table, BlockFaces, TextureAtlas, UvRect};
+pub use atlas::{build_block_uv_table, AtlasUvIndex, BlockFaces, TextureAtlas, UvRect};
 #[allow(unused_imports)]
 pub use block::{BlockId, BlockRegistry};
 #[allow(unused_imports)]

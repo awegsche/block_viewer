@@ -1,7 +1,18 @@
 # 005 - Stream chunks around the camera
 
 ## Status
-Open
+Open — split into subtickets, listed below in dependency order. This file
+is now an index; implement against the lettered tickets, not this one.
+
+- [x] [005-a - render distance resource + desired/loaded chunk diff](../finished_tickets/005-a-render-distance-and-diff.md)
+- [x] [005-b - region LRU cache](../finished_tickets/005-b-region-lru-cache.md)
+- [x] [005-c - async load/decode/mesh pipeline](../finished_tickets/005-c-async-pipeline.md)
+- [x] [005-d - unload path + memory budget](../finished_tickets/005-d-unload-and-budget.md)
+- [x] [005-e - startup wiring: delete the eager load, plug in streaming](../finished_tickets/005-e-startup-wiring.md)
+- [x] [005-f - re-mesh at the loading frontier](../finished_tickets/005-f-boundary-reseam.md)
+
+Move this file to `../finished_tickets/` once every subticket above has
+moved (005-f may be deliberately dropped per its own note — see that file).
 
 ## Depends on
 003 (something to spawn), 006 (a camera worth following) in practice.

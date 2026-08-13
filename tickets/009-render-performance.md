@@ -34,7 +34,20 @@ build (003), mesh upload, or draw calls? Fix in that order.
   can skip whole sections at decode time.
 - **Vertex format**: positions/normals/UVs as f32 arrays are generous for
   block-aligned geometry; packing into a smaller vertex layout is a real win
-  but only worth it once vertex count is the proven bottleneck.
+  but only worth it once vertex count is the proven bottleneck. Ticket 011
+  adds a `Float32x4` vertex colour channel (+16 bytes/vertex on top of the
+  current 32) which `VertexAttributeValues::Unorm8x4` cuts to 4 with no
+  shader change — the cheapest item on this bullet, and the one with a
+  known number attached.
+- **Alpha testing**: ticket 014 puts the terrain material on
+  `AlphaMode::Mask(0.5)` for leaves and the grass side overlay, which
+  defeats early-Z for the ~99% of terrain that is fully opaque. If frames
+  turn out fragment-bound, splitting opaque from cutout geometry is the fix
+  — and it's the same split the transparency work (010) needs anyway.
+- **Shadows**: ticket 017 can multiply draw calls by up to 5x (one pass per
+  cascade) on a renderer that draws one un-batched entity per chunk column.
+  Profile before enabling it, and keep its status-panel toggle as the
+  measurement tool.
 
 ## Also
 

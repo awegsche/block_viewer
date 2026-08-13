@@ -45,8 +45,16 @@ impl ChunkSection {
 #[derive(Debug, Clone)]
 pub struct ChunkColumn {
     /// World chunk coordinates (this column covers block x in
-    /// `x*16..x*16+16`, and likewise for z).
+    /// `x*16..x*16+16`, and likewise for z). Nothing outside tests reads
+    /// these directly since ticket 005-e — every caller already has the
+    /// coordinate from whatever key it looked the column up by (a
+    /// `DecodedWorld.columns` key, a `ChunkLoadResult.coord`, ...) — but
+    /// they stay on the decoded value itself as a sanity-checkable source of
+    /// truth (see `chunk_pipeline`'s tests) rather than something only ever
+    /// inferred from a map key.
+    #[allow(dead_code)]
     pub x: i32,
+    #[allow(dead_code)]
     pub z: i32,
     pub sections: Vec<ChunkSection>,
 }
@@ -55,9 +63,12 @@ impl ChunkColumn {
     /// Topmost non-air block at local column `(local_x, local_z)` (each
     /// 0..16), scanning sections top-down. Returns `(world_y, block_id)`.
     ///
-    /// Used to place the camera above the terrain surface at startup
-    /// (ticket 006); also useful for the block-under-cursor readout planned
-    /// in ticket 007.
+    /// Used to place the camera above the terrain surface at startup by
+    /// ticket 006's original eager-decode version of `main.rs::spawn_point`;
+    /// ticket 005-e's streaming startup can no longer do that (nothing is
+    /// decoded yet at startup), but this stays for the block-under-cursor
+    /// readout planned in ticket 007.
+    #[allow(dead_code)]
     pub fn topmost_non_air(&self, local_x: usize, local_z: usize) -> Option<(i32, BlockId)> {
         let mut by_height: Vec<&ChunkSection> = self.sections.iter().collect();
         by_height.sort_by(|a, b| b.y.cmp(&a.y));

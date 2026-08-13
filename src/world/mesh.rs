@@ -29,6 +29,30 @@
 //! the face's normal points), so every face triangulates as `(0,1,2,0,2,3)`
 //! with no special-casing per direction — the placeholder mesher this
 //! replaced mixed two different winding conventions across faces.
+//!
+//! ## Vertex colour channel (ticket 011)
+//!
+//! Every mesh carries `Mesh::ATTRIBUTE_COLOR`, a **multiplicative
+//! modulation** of the sampled atlas texel, in **linear** (not sRGB) space.
+//! White (`[1.0, 1.0, 1.0, 1.0]`) means unmodified. Contributors multiply
+//! into it independently:
+//!
+//! ```text
+//! vertex_color = biome_tint (013) * baked_light (010) * ao (010)
+//! ```
+//!
+//! Anything writing this channel converts from sRGB itself — colours read
+//! out of a PNG or written as a hex literal are sRGB and must go through
+//! `Color::srgb_u8(..).to_linear()` before they land here. Feeding sRGB
+//! values in directly makes tinted surfaces visibly too bright and washed
+//! out, since `StandardMaterial` multiplies vertex colour into an
+//! already-linearised base colour — there's no error, just a wrong-looking
+//! world.
+//!
+//! The attribute is emitted unconditionally, even for chunks with nothing
+//! to tint: Bevy specialises the render pipeline on the mesh's vertex
+//! layout, so a mix of with-colour and without-colour chunk meshes would
+//! mean two pipelines and two draw-call batches for the same material.
 
 use bevy::{asset::RenderAssetUsages, prelude::*, render::mesh::Indices};
 
@@ -237,18 +261,21 @@ fn push_quad(
     vertices: &mut Vec<[f32; 3]>,
     normals: &mut Vec<[f32; 3]>,
     uvs: &mut Vec<[f32; 2]>,
+    colors: &mut Vec<[f32; 4]>,
     indices: &mut Vec<u32>,
     face: Face,
     dx: i32,
     world_y: i32,
     dz: i32,
     uv_rect: UvRect,
+    color: [f32; 4],
 ) {
     let (corners, normal) = face_geometry(face, dx, world_y, dz);
     let base = vertices.len() as u32;
     for corner in corners {
         vertices.push(corner.into());
         normals.push(normal.into());
+        colors.push(color);
     }
     // Same corner-to-corner pattern the placeholder single-texture UVs used
     // (full 0..1 per face) — just scaled/offset into this face's atlas tile
@@ -261,6 +288,11 @@ fn push_quad(
     ]);
     indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
 }
+
+/// Opaque white — the identity value for the multiplicative vertex colour
+/// channel (see the module docs). Every call site passes this until 013
+/// (biome tint) and 010 (baked light / AO) start computing real factors.
+const WHITE: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
 
 /// Meshes one chunk column into a single Bevy [`Mesh`], with a quad per
 /// block face whose neighbour is non-solid (see [`is_solid`]).
@@ -286,6 +318,7 @@ pub fn mesh_chunk_column(
     let mut vertices = Vec::new();
     let mut normals = Vec::new();
     let mut uvs = Vec::new();
+    let mut colors = Vec::new();
     let mut indices = Vec::new();
 
     for section in &column.sections {
@@ -312,12 +345,14 @@ pub fn mesh_chunk_column(
                                 &mut vertices,
                                 &mut normals,
                                 &mut uvs,
+                                &mut colors,
                                 &mut indices,
                                 f,
                                 dx,
                                 world_y,
                                 dz,
                                 f.uv_rect(&faces),
+                                WHITE,
                             );
                         }
                     };
@@ -369,6 +404,7 @@ pub fn mesh_chunk_column(
         .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, vertices)
         .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
         .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, colors)
         .with_inserted_indices(Indices::U32(indices)),
     )
 }
@@ -496,5 +532,25 @@ mod tests {
         let column = column_with(0, 0, vec![]);
         let neighbors = Neighbors::default();
         assert!(mesh_chunk_column(&column, &registry, &neighbors, &uv_table_for(&registry)).is_none());
+    }
+
+    #[test]
+    fn vertex_colors_are_opaque_white() {
+        let (registry, stone) = stone_registry();
+        let column = column_with(0, 0, vec![section_with(0, &[((5, 5, 5), stone)])]);
+        let neighbors = Neighbors::default();
+
+        let mesh = mesh_chunk_column(&column, &registry, &neighbors, &uv_table_for(&registry)).unwrap();
+
+        let position_count = mesh.attribute(Mesh::ATTRIBUTE_POSITION).unwrap().len();
+        let color_attr = mesh
+            .attribute(Mesh::ATTRIBUTE_COLOR)
+            .expect("mesh should carry a vertex colour attribute");
+        let bevy::render::mesh::VertexAttributeValues::Float32x4(colors) = color_attr else {
+            panic!("expected vertex colour attribute to be Float32x4");
+        };
+
+        assert_eq!(colors.len(), position_count);
+        assert!(colors.iter().all(|&c| c == [1.0, 1.0, 1.0, 1.0]));
     }
 }

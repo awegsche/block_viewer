@@ -53,3 +53,13 @@ Commits that implement a numbered ticket use:
 e.g. `003 - chunk mesher: block grids to Bevy meshes`. A commit spanning
 multiple tickets joins the numbers with ` -- `, e.g.
 `001 -- 002 - block states bit width and decode layer`.
+
+### Manual/visual verification
+
+Claude does not run `cargo run` (or otherwise drive the app) to eyeball
+behavior — things like frame stutter, visual seams, or "does the window
+open and look right" need a human actually watching the window. Don't
+attempt this kind of check yourself; instead note it as a to-do in
+`./todo.md` (create it if missing) with enough context (what to run, what
+to look for) for the user to check off later, and say so in your reply
+rather than reporting the check as done.
