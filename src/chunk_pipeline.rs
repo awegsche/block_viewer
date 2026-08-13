@@ -538,7 +538,7 @@ fn mesh_column_with_neighbors(
     neighbors: &OwnedNeighbors,
 ) -> Option<Mesh> {
     let uv_table = world::build_block_uv_table(registry, atlas);
-    let block_tint = world::build_block_tint_table(registry);
+    let block_tint = world::build_block_tint_table(registry, atlas);
     let biome_colors = world::build_biome_tint_table(biome_registry, color_maps);
     let borrowed_neighbors = world::Neighbors {
         north: neighbors.north.as_ref(),

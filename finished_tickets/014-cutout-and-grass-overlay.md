@@ -1,7 +1,31 @@
 # 014 - Alpha-masked cutouts and the grass side overlay
 
 ## Status
-Open
+Done
+
+## Resolution
+
+Implemented as designed: `main.rs`'s one terrain `StandardMaterial` is now
+`AlphaMode::Mask(0.5)`; `BlockTint` (`src/world/tint.rs`) gained
+`side_overlay: Option<(UvRect, TintSource)>`, resolved for `grass_block` by
+looking up `grass_block_side_overlay`'s atlas rect (`build_block_tint_table`
+now takes `&AtlasUvIndex` to do that lookup); and `mesh_chunk_column`
+(`src/world/mesh.rs`) emits the overlay as an extra quad — via a new
+`push_quad_offset` alongside the existing `push_quad` — right after each
+emitted side face, nudged outward by `OVERLAY_EPSILON` (0.001) along the
+shared face normal. `podzol`/`mycelium` correctly get no overlay (their
+`resolve_block_tint` branches never set one). `cargo test` passes (73
+tests, including 6 new ones covering quad count, colour independence, the
+epsilon offset, and culling inheritance).
+
+**Confirmed out of scope, as flagged in the ticket**: leaves still occlude
+neighbouring faces (`mesh::NON_SOLID` untouched) — with alpha holes now
+visible, looking *through* a leaf shows missing geometry behind it rather
+than more foliage. Matching vanilla's "fancy leaves" is 010's transparency
+category change, not this ticket. Snowy grass (`snowy=true`) also stays out
+of scope; the decoder still discards that block-state property.
+
+Needs a human check — see `todo.md`.
 
 ## Depends on
 013 (biome tint). Small on its own; finishes the job 013 starts.

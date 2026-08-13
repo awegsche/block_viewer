@@ -110,8 +110,22 @@ impl Default for AtlasUvIndex {
 }
 
 impl AtlasUvIndex {
-    fn tile(&self, name: &str) -> Option<UvRect> {
+    /// `pub(crate)`, not private: [`super::tint`] (014) also resolves a
+    /// single named tile directly — the grass-side overlay texture, which
+    /// isn't part of any [`BlockFaces`]'s top/bottom/side split.
+    pub(crate) fn tile(&self, name: &str) -> Option<UvRect> {
         self.tiles.get(name).copied()
+    }
+
+    /// Test-only constructor mirroring this module's own `atlas_with` test
+    /// helper — lets [`super::tint`]'s tests exercise overlay UV resolution
+    /// without packing a real atlas.
+    #[cfg(test)]
+    pub(crate) fn for_test(named: &[(&str, UvRect)]) -> Self {
+        Self {
+            tiles: named.iter().map(|&(k, v)| (k.to_string(), v)).collect(),
+            fallback: UvRect { u0: 0.0, v0: 0.0, u1: 1.0, v1: 1.0 },
+        }
     }
 }
 
@@ -408,6 +422,10 @@ mod tests {
             "oak_log_top",
             "grass_block_top",
             "grass_block_side",
+            // 014: grass's green side fringe — a separate texture from
+            // grass_block_side, composited over it at mesh time.
+            "grass_block_side_overlay",
+            "oak_leaves",
             "water_still",
         ] {
             assert!(atlas.tile(name).is_some(), "expected a packed tile for {name}");

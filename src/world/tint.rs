@@ -25,6 +25,7 @@ use std::path::Path;
 
 use bevy::prelude::*;
 
+use super::atlas::{AtlasUvIndex, UvRect};
 use super::biome::{BiomeId, BiomeRegistry};
 use super::biome_data;
 use super::block::{BlockId, BlockRegistry};
@@ -56,6 +57,12 @@ pub struct BlockTint {
     pub top: TintSource,
     pub bottom: TintSource,
     pub side: TintSource,
+    /// Extra tinted quad emitted over each *emitted* side face (014) — the
+    /// atlas tile to draw it with, and what tints it. `grass_block` is the
+    /// only entry using this today (`grass_block_side_overlay.png`, the
+    /// green fringe over its dirt sides); `podzol`/`mycelium` have no
+    /// overlay in vanilla (their side textures are pre-coloured).
+    pub side_overlay: Option<(UvRect, TintSource)>,
 }
 
 impl BlockTint {
@@ -65,12 +72,13 @@ impl BlockTint {
         top: TintSource::None,
         bottom: TintSource::None,
         side: TintSource::None,
+        side_overlay: None,
     };
 
-    /// The same source on every face — every tinted block except
-    /// `grass_block` (see the struct docs).
+    /// The same source on every face, no side overlay — every tinted block
+    /// except `grass_block` (see the struct docs).
     fn uniform(source: TintSource) -> BlockTint {
-        BlockTint { top: source, bottom: source, side: source }
+        BlockTint { top: source, bottom: source, side: source, side_overlay: None }
     }
 }
 
@@ -210,11 +218,27 @@ const NO_TINT_LEAVES: &[&str] = &[
 /// Block names tinted by [`TintSource::Water`] on every face.
 const WATER_TINTED: &[&str] = &["water", "water_cauldron", "bubble_column"];
 
-fn resolve_block_tint(name: &str, warned: &mut HashSet<String>) -> BlockTint {
+/// Source file stem of grass's green side fringe (014) — a separate texture
+/// vanilla composites over `grass_block_side`, not part of the top/bottom/
+/// side split [`super::atlas::resolve_faces`] resolves.
+const GRASS_SIDE_OVERLAY: &str = "grass_block_side_overlay";
+
+fn resolve_block_tint(name: &str, atlas: &AtlasUvIndex, warned: &mut HashSet<String>) -> BlockTint {
     if name == "grass_block" {
-        // Bottom is dirt, side is dirt (+ 014's overlay) — only the top
-        // face is grass texture at all.
-        return BlockTint { top: TintSource::Grass, bottom: TintSource::None, side: TintSource::None };
+        // Bottom is dirt, side is dirt + 014's green fringe overlay — only
+        // the top face is grass texture at all.
+        let side_overlay = atlas.tile(GRASS_SIDE_OVERLAY).map(|uv| (uv, TintSource::Grass));
+        if side_overlay.is_none() && warned.insert(GRASS_SIDE_OVERLAY.to_string()) {
+            println!(
+                "block_viewer: no '{GRASS_SIDE_OVERLAY}' texture found — grass blocks will have plain dirt sides"
+            );
+        }
+        return BlockTint {
+            top: TintSource::Grass,
+            bottom: TintSource::None,
+            side: TintSource::None,
+            side_overlay,
+        };
     }
     if GRASS_TINTED.contains(&name) {
         return BlockTint::uniform(TintSource::Grass);
@@ -246,15 +270,19 @@ fn resolve_block_tint(name: &str, warned: &mut HashSet<String>) -> BlockTint {
 
 /// Resolves every name interned in `registry` to a [`BlockTint`], indexed
 /// directly by [`BlockId`] (i.e. `table[id.0 as usize]`), mirroring
-/// [`super::atlas::build_block_uv_table`].
-pub fn build_block_tint_table(registry: &BlockRegistry) -> Vec<BlockTint> {
+/// [`super::atlas::build_block_uv_table`]. Takes `atlas` (rather than just
+/// the registry, like 013 originally had it) because grass's side-overlay
+/// entry (014) needs to resolve `grass_block_side_overlay`'s atlas rect —
+/// a texture lookup outside any [`super::atlas::BlockFaces`]'s top/bottom/
+/// side split, so it can't come from `uv_table` the way other UVs do.
+pub fn build_block_tint_table(registry: &BlockRegistry, atlas: &AtlasUvIndex) -> Vec<BlockTint> {
     let mut warned = HashSet::new();
     (0..registry.len())
         .map(|i| {
             let id = BlockId(i as u16);
             let full_name = registry.name(id);
             let name = full_name.strip_prefix("minecraft:").unwrap_or(full_name);
-            resolve_block_tint(name, &mut warned)
+            resolve_block_tint(name, atlas, &mut warned)
         })
         .collect()
 }
@@ -387,12 +415,47 @@ mod tests {
     fn grass_blocks_top_is_tinted_and_its_bottom_and_side_are_not() {
         let mut registry = BlockRegistry::new();
         let grass_block = registry.intern("minecraft:grass_block");
+        // No `grass_block_side_overlay` tile in this atlas — irrelevant to
+        // what this test checks (see `grass_blocks_side_overlay_resolves_to_the_atlas_tile`
+        // for that).
+        let atlas = AtlasUvIndex::for_test(&[]);
 
-        let table = build_block_tint_table(&registry);
+        let table = build_block_tint_table(&registry, &atlas);
         let tint = table[grass_block.0 as usize];
         assert_eq!(tint.top, TintSource::Grass);
         assert_eq!(tint.bottom, TintSource::None);
         assert_eq!(tint.side, TintSource::None);
+    }
+
+    /// Ticket 014: `grass_block`'s side overlay resolves to whatever atlas
+    /// rect the packed atlas gave `grass_block_side_overlay`, tinted by the
+    /// biome's grass colour (the same source as the top face).
+    #[test]
+    fn grass_blocks_side_overlay_resolves_to_the_atlas_tile() {
+        let mut registry = BlockRegistry::new();
+        let grass_block = registry.intern("minecraft:grass_block");
+        let overlay_rect = UvRect { u0: 0.5, v0: 0.5, u1: 0.6, v1: 0.6 };
+        let atlas = AtlasUvIndex::for_test(&[("grass_block_side_overlay", overlay_rect)]);
+
+        let table = build_block_tint_table(&registry, &atlas);
+        let (uv, source) = table[grass_block.0 as usize]
+            .side_overlay
+            .expect("grass_block should carry a side overlay when the atlas has the tile");
+        assert_eq!(uv, overlay_rect);
+        assert_eq!(source, TintSource::Grass);
+    }
+
+    /// If the atlas ever lacks the overlay tile (a stripped/incomplete
+    /// resource pack), grass falls back to no overlay rather than panicking
+    /// or guessing a fallback rect that would be silently wrong.
+    #[test]
+    fn grass_blocks_side_overlay_is_none_when_the_atlas_lacks_the_tile() {
+        let mut registry = BlockRegistry::new();
+        let grass_block = registry.intern("minecraft:grass_block");
+        let atlas = AtlasUvIndex::for_test(&[]);
+
+        let table = build_block_tint_table(&registry, &atlas);
+        assert_eq!(table[grass_block.0 as usize].side_overlay, None);
     }
 
     #[test]

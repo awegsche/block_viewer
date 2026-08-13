@@ -204,6 +204,13 @@ fn setup(
     let atlas_handle = images.add(atlas.image);
     let material_handle = materials.add(StandardMaterial {
         base_color_texture: Some(atlas_handle),
+        // Ticket 014: discard transparent fragments instead of the default
+        // `AlphaMode::Opaque`, which ignored the alpha channel entirely and
+        // rendered leaves as solid bricks. `Mask(0.5)` is a hard cutout
+        // (no partial blending, no back-to-front sort needed) — the right
+        // trade for leaves/the grass overlay; real translucency (water,
+        // glass) is a second material, deferred to 010.
+        alpha_mode: AlphaMode::Mask(0.5),
         ..default()
     });
 

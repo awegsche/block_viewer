@@ -82,3 +82,14 @@ these itself (see CLAUDE.md's "Manual/visual verification").
   `src/world/tint.rs`). Also confirm nothing looks unnaturally bright or
   pastel/washed-out — that would mean the sRGB→linear conversion regressed
   (see `src/world/tint.rs`'s module docs).
+- [ ] **014 cutouts and grass overlay: leaves have holes, grass sides are
+  green.** `cargo run` (debug build) against the real save. Stand at ground
+  level in a grassy biome: grass blocks should read green on top *and*
+  around their sides (biome-tinted, matching 013), with brown dirt visible
+  below the green fringe. Fly to the render-distance edge and watch the
+  overlay quads on distant grass blocks for shimmering/z-fighting (would
+  mean `OVERLAY_EPSILON` in `src/world/mesh.rs` needs revisiting). Look at
+  a tree: leaves should read as foliage you can see holes through, not a
+  solid green block — but note looking *through* a leaf into the canopy
+  will show missing geometry behind it (leaves still cull neighbouring
+  faces; that's 010's transparency work, out of scope here per the ticket).

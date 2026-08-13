@@ -195,6 +195,12 @@ impl Face {
             Face::East | Face::West | Face::South | Face::North => tint.side,
         }
     }
+
+    /// Whether this is one of the four horizontal faces — the only ones a
+    /// [`BlockTint::side_overlay`] (014) can apply to.
+    fn is_side(self) -> bool {
+        matches!(self, Face::East | Face::West | Face::South | Face::North)
+    }
 }
 
 /// The four corners (CCW from outside) and outward normal, in Bevy space,
@@ -281,10 +287,34 @@ fn push_quad(
     uv_rect: UvRect,
     color: [f32; 4],
 ) {
+    push_quad_offset(
+        vertices, normals, uvs, colors, indices, face, dx, world_y, dz, uv_rect, color, 0.0,
+    );
+}
+
+/// Same as [`push_quad`] but displaces every corner outward along the face
+/// normal by `offset` blocks before pushing it — used for 014's grass-side
+/// overlay quad, which is coplanar with the base side quad it sits on and
+/// needs a small nudge to avoid z-fighting (see [`OVERLAY_EPSILON`]).
+#[allow(clippy::too_many_arguments)]
+fn push_quad_offset(
+    vertices: &mut Vec<[f32; 3]>,
+    normals: &mut Vec<[f32; 3]>,
+    uvs: &mut Vec<[f32; 2]>,
+    colors: &mut Vec<[f32; 4]>,
+    indices: &mut Vec<u32>,
+    face: Face,
+    dx: i32,
+    world_y: i32,
+    dz: i32,
+    uv_rect: UvRect,
+    color: [f32; 4],
+    offset: f32,
+) {
     let (corners, normal) = face_geometry(face, dx, world_y, dz);
     let base = vertices.len() as u32;
     for corner in corners {
-        vertices.push(corner.into());
+        vertices.push((corner + normal * offset).into());
         normals.push(normal.into());
         colors.push(color);
     }
@@ -299,6 +329,15 @@ fn push_quad(
     ]);
     indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
 }
+
+/// World-space nudge applied to 014's grass-side overlay quad, pushed
+/// outward from its coplanar base quad along their shared face normal to
+/// avoid z-fighting. Bevy's reversed-Z depth buffer concentrates precision
+/// near the camera, so a fixed world-space epsilon stays well-behaved out to
+/// the far plane at this project's render distances — see ticket 014's
+/// "epsilon offset" section for the number to revisit if shimmering shows up
+/// at the render-distance edge (the manual check in `todo.md`).
+const OVERLAY_EPSILON: f32 = 0.001;
 
 /// Opaque white — the identity value for the multiplicative vertex colour
 /// channel (see the module docs), and what [`TintSource::None`] resolves to.
@@ -396,20 +435,44 @@ pub fn mesh_chunk_column(
                         .unwrap_or(FALLBACK_BIOME_COLORS);
 
                     let mut face = |f: Face, exposed: bool| {
-                        if exposed {
-                            push_quad(
-                                &mut vertices,
-                                &mut normals,
-                                &mut uvs,
-                                &mut colors,
-                                &mut indices,
-                                f,
-                                dx,
-                                world_y,
-                                dz,
-                                f.uv_rect(&faces),
-                                resolve_tint_color(f.tint_source(&tint), biome),
-                            );
+                        if !exposed {
+                            return;
+                        }
+                        push_quad(
+                            &mut vertices,
+                            &mut normals,
+                            &mut uvs,
+                            &mut colors,
+                            &mut indices,
+                            f,
+                            dx,
+                            world_y,
+                            dz,
+                            f.uv_rect(&faces),
+                            resolve_tint_color(f.tint_source(&tint), biome),
+                        );
+                        // 014: an extra tinted quad over the side faces —
+                        // only for blocks whose tint table says so
+                        // (grass_block today), and only where the base side
+                        // quad above was actually emitted, so it inherits
+                        // face culling for free.
+                        if f.is_side() {
+                            if let Some((overlay_uv, overlay_source)) = tint.side_overlay {
+                                push_quad_offset(
+                                    &mut vertices,
+                                    &mut normals,
+                                    &mut uvs,
+                                    &mut colors,
+                                    &mut indices,
+                                    f,
+                                    dx,
+                                    world_y,
+                                    dz,
+                                    overlay_uv,
+                                    resolve_tint_color(overlay_source, biome),
+                                    OVERLAY_EPSILON,
+                                );
+                            }
                         }
                     };
 
@@ -651,6 +714,7 @@ mod tests {
             top: TintSource::Grass,
             bottom: TintSource::None,
             side: TintSource::None,
+            side_overlay: None,
         };
         let green = bevy::color::LinearRgba {
             red: 0.2,
@@ -682,5 +746,204 @@ mod tests {
             colors.iter().any(|&c| c == WHITE),
             "expected at least one vertex (bottom/side faces) left untinted"
         );
+    }
+
+    /// A fixed, easy-to-assert-on overlay colour/rect pair, distinct from
+    /// [`WHITE`] and [`FALLBACK_UV`] so mixing it up with the base side
+    /// quad's colour/UV is obvious in a failing assertion.
+    fn overlay_green() -> bevy::color::LinearRgba {
+        bevy::color::LinearRgba { red: 0.0, green: 1.0, blue: 0.0, alpha: 1.0 }
+    }
+
+    fn overlay_uv() -> UvRect {
+        UvRect { u0: 0.25, v0: 0.25, u1: 0.5, v1: 0.5 }
+    }
+
+    /// Ticket 014: a block whose tint has a `side_overlay` emits one extra
+    /// quad per emitted side face (4 of its 6 faces are sides), on top of
+    /// the usual 6 base quads.
+    #[test]
+    fn side_overlay_emits_one_extra_quad_per_side_face() {
+        let mut registry = BlockRegistry::new();
+        let grass_block = registry.intern("minecraft:grass_block");
+        // Isolated in open air so all 6 base faces (and so all 4 side
+        // overlays) are emitted.
+        let column = column_with(0, 0, vec![section_with(0, &[((5, 5, 5), grass_block)])]);
+        let neighbors = Neighbors::default();
+
+        let uv_table = uv_table_for(&registry);
+        let mut block_tint = no_tint_table_for(&registry);
+        block_tint[grass_block.0 as usize] = BlockTint {
+            top: TintSource::None,
+            bottom: TintSource::None,
+            side: TintSource::None,
+            side_overlay: Some((overlay_uv(), TintSource::Fixed(overlay_green()))),
+        };
+
+        let mesh = mesh_chunk_column(
+            &column,
+            &registry,
+            &neighbors,
+            &uv_table,
+            &block_tint,
+            &white_biome_colors(),
+        )
+        .unwrap();
+        let Indices::U32(indices) = mesh.indices().unwrap() else {
+            panic!("expected U32 indices");
+        };
+        // 6 base quads + 4 side-overlay quads = 10 quads.
+        assert_eq!(indices.len(), 10 * 6);
+    }
+
+    /// The overlay quad carries its own tint (the biome's grass colour, via
+    /// `TintSource::Fixed` here), while the base side quad underneath it
+    /// stays at whatever the block's own `side` tint source resolves to
+    /// (`None` -> white) — the two colours are independent.
+    #[test]
+    fn side_overlay_quad_carries_its_own_colour_independent_of_the_base_quad() {
+        let mut registry = BlockRegistry::new();
+        let grass_block = registry.intern("minecraft:grass_block");
+        let column = column_with(0, 0, vec![section_with(0, &[((5, 5, 5), grass_block)])]);
+        let neighbors = Neighbors::default();
+
+        let uv_table = uv_table_for(&registry);
+        let mut block_tint = no_tint_table_for(&registry);
+        block_tint[grass_block.0 as usize] = BlockTint {
+            top: TintSource::None,
+            bottom: TintSource::None,
+            side: TintSource::None,
+            side_overlay: Some((overlay_uv(), TintSource::Fixed(overlay_green()))),
+        };
+
+        let mesh = mesh_chunk_column(
+            &column,
+            &registry,
+            &neighbors,
+            &uv_table,
+            &block_tint,
+            &white_biome_colors(),
+        )
+        .unwrap();
+        let bevy::render::mesh::VertexAttributeValues::Float32x4(colors) =
+            mesh.attribute(Mesh::ATTRIBUTE_COLOR).unwrap()
+        else {
+            panic!("expected vertex colour attribute to be Float32x4");
+        };
+
+        let green = overlay_green();
+        let green_arr = [green.red, green.green, green.blue, green.alpha];
+        assert!(
+            colors.iter().any(|&c| c == green_arr),
+            "expected at least one vertex (an overlay quad) tinted green"
+        );
+        assert!(
+            colors.iter().any(|&c| c == WHITE),
+            "expected at least one vertex (a base side quad) to stay white"
+        );
+    }
+
+    /// Ticket 014: the overlay quad is coplanar with the base side quad it
+    /// sits on, so it must be pushed outward along their shared face normal
+    /// by exactly [`OVERLAY_EPSILON`] to avoid z-fighting.
+    #[test]
+    fn side_overlay_quad_is_offset_outward_along_the_face_normal() {
+        let mut registry = BlockRegistry::new();
+        let grass_block = registry.intern("minecraft:grass_block");
+        let column = column_with(0, 0, vec![section_with(0, &[((5, 5, 5), grass_block)])]);
+        let neighbors = Neighbors::default();
+
+        let uv_table = uv_table_for(&registry);
+        let mut block_tint = no_tint_table_for(&registry);
+        block_tint[grass_block.0 as usize] = BlockTint {
+            top: TintSource::None,
+            bottom: TintSource::None,
+            side: TintSource::None,
+            side_overlay: Some((overlay_uv(), TintSource::Fixed(overlay_green()))),
+        };
+
+        let mesh = mesh_chunk_column(
+            &column,
+            &registry,
+            &neighbors,
+            &uv_table,
+            &block_tint,
+            &white_biome_colors(),
+        )
+        .unwrap();
+        let bevy::render::mesh::VertexAttributeValues::Float32x3(positions) =
+            mesh.attribute(Mesh::ATTRIBUTE_POSITION).unwrap()
+        else {
+            panic!("expected position attribute to be Float32x3");
+        };
+        let bevy::render::mesh::VertexAttributeValues::Float32x3(normals) =
+            mesh.attribute(Mesh::ATTRIBUTE_NORMAL).unwrap()
+        else {
+            panic!("expected normal attribute to be Float32x3");
+        };
+
+        // Emission order (see the `face` closure): East(base), East(overlay),
+        // West(base), West(overlay), South(base), South(overlay),
+        // North(base), North(overlay), Up(base), Down(base) — 4 vertices
+        // each. Each side's overlay quad (vertices 4..8, 12..16, ...)
+        // matches its base quad (0..4, 8..12, ...) corner-for-corner, offset
+        // by the normal.
+        for side in 0..4 {
+            let base_start = side * 8;
+            let overlay_start = base_start + 4;
+            for corner in 0..4 {
+                let base_pos = Vec3::from(positions[base_start + corner]);
+                let overlay_pos = Vec3::from(positions[overlay_start + corner]);
+                let normal = Vec3::from(normals[base_start + corner]);
+                let expected = base_pos + normal * OVERLAY_EPSILON;
+                assert!(
+                    (overlay_pos - expected).length() < 1e-6,
+                    "side {side} corner {corner}: expected {expected:?}, got {overlay_pos:?}"
+                );
+            }
+        }
+    }
+
+    /// Ticket 014: a side face culled by a loaded neighbour never gets its
+    /// overlay either — the overlay inherits face culling from the base
+    /// quad it sits on, rather than being emitted independently.
+    #[test]
+    fn side_overlay_is_not_emitted_for_a_face_culled_by_a_neighbour() {
+        let mut registry = BlockRegistry::new();
+        let grass_block = registry.intern("minecraft:grass_block");
+        // Two adjacent grass blocks: the shared east/west face (and its
+        // overlay) is culled on both sides.
+        let column = column_with(
+            0,
+            0,
+            vec![section_with(0, &[((5, 5, 5), grass_block), ((6, 5, 5), grass_block)])],
+        );
+        let neighbors = Neighbors::default();
+
+        let uv_table = uv_table_for(&registry);
+        let mut block_tint = no_tint_table_for(&registry);
+        block_tint[grass_block.0 as usize] = BlockTint {
+            top: TintSource::None,
+            bottom: TintSource::None,
+            side: TintSource::None,
+            side_overlay: Some((overlay_uv(), TintSource::Fixed(overlay_green()))),
+        };
+
+        let mesh = mesh_chunk_column(
+            &column,
+            &registry,
+            &neighbors,
+            &uv_table,
+            &block_tint,
+            &white_biome_colors(),
+        )
+        .unwrap();
+        let Indices::U32(indices) = mesh.indices().unwrap() else {
+            panic!("expected U32 indices");
+        };
+        // Two isolated grass blocks would be 10 quads each (20 total). The
+        // shared east/west face pair is culled from both blocks: 2 base
+        // quads gone, and their 2 matching overlay quads gone with them.
+        assert_eq!(indices.len(), (10 * 6 * 2) - (4 * 6));
     }
 }
