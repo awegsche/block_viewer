@@ -23,24 +23,33 @@
 //! [`shadows`] (017) owns everything about the sun casting shadows: the
 //! bias constants and cascade config [`spawn_sun`] gives the light at
 //! startup, keeping the cascade config in step with render distance from
-//! then on, and the status panel's on/off toggle. 018 will animate the
-//! palette over a day/night cycle, building on top of this rather than
-//! re-deriving its own lighting or sky-drawing state.
+//! then on, and the status panel's on/off toggle.
+//!
+//! [`time_of_day`] (018) owns the clock: [`TimeOfDay`] is what the status
+//! panel's slider/play-pause/speed controls actually mutate, and
+//! [`time_of_day::sync_palette_from_time_of_day`] is the only thing that
+//! writes [`SkyPalette`] wholesale from then on — every other system in
+//! this module still only ever *reads* the palette, unchanged since 016/017.
 
 mod bodies;
 mod dome;
 mod shadows;
+mod time_of_day;
 
 use bevy::pbr::{DirectionalLightShadowMap, NotShadowCaster, NotShadowReceiver};
 use bevy::prelude::*;
 use bevy::render::view::RenderLayers;
 
 pub use shadows::ShadowSettings;
+pub use time_of_day::{ticks_to_clock_string, TimeOfDay, REAL_TIME_TICKS_PER_SECOND, TICKS_PER_DAY};
 
 /// Everything visual about the atmosphere, in one place. `Default` is a
-/// fixed noon — there is no day/night animation yet (that's ticket 018);
-/// changing this resource at runtime (by mutating it directly, or replacing
-/// it wholesale) is what 018 will eventually drive from a clock.
+/// fixed, hand-picked noon, used as-is by anything that spins up
+/// [`SkyPlugin`] without also caring about the clock (mainly tests) — any
+/// real app gets [`TimeOfDay`] (018) too, whose
+/// [`time_of_day::sync_palette_from_time_of_day`] overwrites this resource
+/// wholesale from [`time_of_day::palette_for_ticks`] on the very first
+/// frame and every frame the clock moves after that.
 #[derive(Resource, Debug, Clone)]
 pub struct SkyPalette {
     /// Direction the sunlight travels (from the sun toward the ground) —
@@ -117,6 +126,7 @@ impl Plugin for SkyPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<SkyPalette>()
             .init_resource::<ShadowSettings>()
+            .init_resource::<TimeOfDay>()
             // Explicit rather than relying on `PbrPlugin`'s own default
             // (also 2048) — this is the knob the ticket calls out as the
             // quality/VRAM trade to reach for first (4096) if shadow
@@ -126,13 +136,22 @@ impl Plugin for SkyPlugin {
             .add_systems(
                 Update,
                 (
+                    // 018: advancing/scrubbing the clock has to land in
+                    // `SkyPalette` before anything below reads it, or a
+                    // slider drag/the play toggle would lag a frame behind
+                    // — `.chain()` on the whole tuple makes that ordering
+                    // explicit rather than relying on Bevy's default
+                    // (unordered/parallel) system scheduling.
+                    time_of_day::advance_time_of_day,
+                    time_of_day::sync_palette_from_time_of_day,
                     sync_sky_palette,
                     dome::rebuild_dome_on_palette_change,
                     bodies::sync_celestial_positions,
                     sync_sky_camera_rotation,
                     shadows::sync_shadow_cascades,
                     shadows::sync_shadow_settings,
-                ),
+                )
+                    .chain(),
             );
     }
 }
@@ -248,9 +267,16 @@ fn sync_sky_camera_rotation(
 
 /// Pushes [`SkyPalette`] out to every dependent piece of scene state
 /// whenever it changes (`Res::is_changed()` — true both the frame it's
-/// first inserted and any frame something mutates it, e.g. a future 018
-/// day/night system): the sun's colour/illuminance/rotation, [`AmbientLight`],
-/// [`ClearColor`], and every [`DistanceFog`]'s colour.
+/// first inserted and any frame something mutates it, e.g. 018's
+/// [`time_of_day::sync_palette_from_time_of_day`]): the sun's colour/
+/// illuminance/rotation, [`AmbientLight`], [`ClearColor`], and every
+/// [`DistanceFog`]'s colour.
+///
+/// The `DirectionalLight`'s `Transform` is [`time_of_day::moon_handover_direction`]
+/// applied to `palette.sun_direction`, not that field directly — see that
+/// function's docs for why the light's actual pointing direction and
+/// [`SkyPalette::sun_direction`] (what [`bodies`] reads to place the sun/
+/// moon billboards) have to diverge near the horizon.
 ///
 /// Does not touch `DistanceFog::falloff` — that tracks
 /// [`crate::streaming::RenderDistance`] instead (see
@@ -267,10 +293,11 @@ fn sync_sky_palette(
         return;
     }
 
+    let light_direction = time_of_day::moon_handover_direction(palette.sun_direction);
     for (mut light, mut transform) in &mut sun_query {
         light.color = palette.sun_color;
         light.illuminance = palette.sun_illuminance;
-        *transform = Transform::default().looking_to(palette.sun_direction, Vec3::Y);
+        *transform = Transform::default().looking_to(light_direction, Vec3::Y);
     }
 
     ambient.color = palette.ambient_color;
@@ -312,7 +339,12 @@ mod tests {
             .spawn((DirectionalLight::default(), Transform::default()))
             .id();
 
-        // First tick applies the just-inserted default palette.
+        // First tick: `TimeOfDay` defaults to paused noon, and
+        // `time_of_day::sync_palette_from_time_of_day` overwrites the
+        // just-inserted default `SkyPalette` with `palette_for_ticks(6000.0)`
+        // on this very frame — this test doesn't care what that intermediate
+        // value is, only that the manual override below sticks afterward
+        // (see the next comment for why it does).
         app.update();
 
         {
@@ -322,6 +354,11 @@ mod tests {
             palette.ambient_color = Color::srgb(0.1, 0.2, 0.3);
             palette.horizon_color = Color::srgb(0.4, 0.5, 0.6);
         }
+        // `TimeOfDay` itself was never touched between the two updates
+        // (still paused, still ticks 6000), so `advance_time_of_day` never
+        // wrote it and `sync_palette_from_time_of_day` sees `is_changed() ==
+        // false` this frame — otherwise it would clobber the manual
+        // override above right back to `palette_for_ticks(6000.0)`.
         app.update();
 
         let light = app.world().get::<DirectionalLight>(sun).unwrap();
@@ -335,6 +372,11 @@ mod tests {
         assert_eq!(clear.0, Color::srgb(0.4, 0.5, 0.6));
     }
 
+    /// With `TimeOfDay` wired into `SkyPlugin` (018), the very first frame
+    /// overwrites the hand-picked `SkyPalette::default()` with
+    /// `palette_for_ticks(6000.0)` (`TimeOfDay`'s own default: paused,
+    /// noon) — so the light's forward axis is expected to match *that*,
+    /// straight down, not the old hardcoded default's arbitrary vector.
     #[test]
     fn sun_direction_matches_the_directional_lights_forward_axis() {
         let mut app = test_app();
@@ -347,10 +389,9 @@ mod tests {
 
         let transform = app.world().get::<Transform>(sun).unwrap();
         let forward = transform.rotation * Vec3::NEG_Z;
-        let expected = SkyPalette::default().sun_direction;
         assert!(
-            forward.dot(expected) > 0.999,
-            "expected forward {forward:?} to match sun_direction {expected:?}"
+            forward.dot(Vec3::NEG_Y) > 0.999,
+            "expected forward {forward:?} to point straight down at noon"
         );
     }
 
@@ -372,7 +413,23 @@ mod tests {
         app.update();
 
         let fog = app.world().get::<DistanceFog>(camera).unwrap();
-        assert_eq!(fog.color, SkyPalette::default().horizon_color);
+        // Not `assert_eq!`: `TimeOfDay`'s default (noon) drives this via
+        // `time_of_day::palette_for_ticks`, which lerps through `Color`'s
+        // `LinearRgba` variant (see `time_of_day::lerp_color`) even at an
+        // exact keyframe tick, while `SkyPalette::default()`'s literal is
+        // the `Srgba` variant — the two numerically agree (the noon
+        // keyframe's horizon colour is deliberately the same hex as the
+        // hardcoded default) but `Color`'s derived `PartialEq` compares the
+        // variant tag first, so a bitwise `assert_eq!` would fail on two
+        // representations of the identical colour.
+        let got = fog.color.to_srgba();
+        let expected = SkyPalette::default().horizon_color.to_srgba();
+        assert!(
+            (got.red - expected.red).abs() < 1e-4
+                && (got.green - expected.green).abs() < 1e-4
+                && (got.blue - expected.blue).abs() < 1e-4,
+            "expected {expected:?}, got {got:?}"
+        );
         // Falloff is untouched — that's `camera.rs`'s job.
         match &fog.falloff {
             FogFalloff::Linear { start, end } => {

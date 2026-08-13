@@ -1,7 +1,7 @@
 # 018 - Day/night cycle
 
 ## Status
-Open
+Done (see Resolution)
 
 ## Depends on
 015 (`SkyPalette`). Much better with 016 (a sky to change) and 017 (shadows
@@ -151,3 +151,56 @@ resolution which way it went.
   colour discontinuities, especially across the wrap and at the sun/moon
   handover; confirm morning shadows fall west; confirm the slider doesn't
   fly the camera.
+
+## Resolution
+
+Implemented as designed, with two deviations worth recording:
+
+- **Sun direction formula.** The ticket's own placeholder
+  (`Quat::from_rotation_z(angle) * Vec3::NEG_Y`) doesn't survive contact
+  with its own convention (`ticks: 0 = dawn, 6000 = noon`): at `ticks = 0`
+  that formula points straight down, i.e. noon, not dawn. Used
+  `Vec3::NEG_X` instead (`src/sky/time_of_day.rs::raw_sun_direction`) —
+  verified against both cases the ticket calls out
+  (`tests::sun_points_straight_down_at_noon`,
+  `tests::morning_shadows_fall_west`), per its own instruction to check the
+  sign rather than trust the formula.
+- **Sun/moon handover.** A literal `Vec3::lerp` between "the sun's
+  direction" and "the moon's" is a lerp between two vectors that are
+  *always* exactly antipodal (not just near the horizon — `sky::bodies`
+  already places the sun billboard at `-sun_direction` and the moon at
+  `+sun_direction` at every tick), so it passes through the zero vector at
+  the crossover and produces a degenerate transform right when it matters
+  most. `time_of_day::moon_handover_direction` blends in *rotation angle*
+  space instead — rotates the given direction the extra half turn smoothly
+  within a narrow window of the horizon, never vector-lerps. It's a pure
+  function of the direction vector (not of `ticks`), applied only inside
+  `sync_sky_palette`'s `DirectionalLight` transform — `SkyPalette::sun_direction`
+  itself stays the true, continuous, unblended direction throughout, since
+  `sky::bodies` needs that to place the sun/moon billboards at their real
+  physical positions regardless of which one is doing the lighting.
+
+**`level.dat` seeding**: not done, per the ticket's own "optional" framing
+— left as a genuine follow-up ticket if wanted. `TimeOfDay` defaults to
+paused noon (`ticks: 6000.0, rate: 0.0`) instead.
+
+**Keyframe colours/illuminance** (`src/sky/time_of_day.rs::keyframes`) are
+starting points, not tuned by eye — nothing in this repo drives the camera
+to actually look at a render (see CLAUDE.md's manual-verification note).
+Illuminance values are real `light_consts::lux` presets rather than
+invented numbers (`AMBIENT_DAYLIGHT` at noon — matching
+`SkyPalette::default`'s own value exactly — `CLEAR_SUNRISE` at dawn/dusk,
+`HALLWAY` (~80 lux) at night, inside the ticket's suggested 50-100 lux
+range).
+
+**Side effect noticed and fixed in the same session**: while implementing
+this, a separate pre-existing bug was found and fixed — side-face texture
+UVs were wound inconsistently across faces (mirrored on East/South,
+transposed on West/North), which reads as textures rotated 90° between
+adjacent faces. Tracked and resolved as
+`finished_tickets/025-side-face-uv-winding-fix.md`, not part of this
+ticket's scope but adjacent enough to note here.
+
+`cargo test` passes (104/104). Manual verification (the slider, the
+sun/moon handover, morning shadows, egui not fighting the camera) is
+recorded in `todo.md` — not run here, per CLAUDE.md.

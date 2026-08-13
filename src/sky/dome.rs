@@ -2,8 +2,8 @@
 //! gradient baked straight into `Mesh::ATTRIBUTE_COLOR` per vertex, instead
 //! of a cubemap or a shader — see the parent ticket's "why not the obvious
 //! options". At ~500 vertices, rebuilding the whole mesh every time
-//! [`super::SkyPalette`] changes (018 will do this every frame once the day
-//! clock lands) is free.
+//! [`super::SkyPalette`] changes (018's day/night clock does this every
+//! frame it's running) is free.
 
 use bevy::color::Mix;
 use bevy::prelude::*;
@@ -109,10 +109,10 @@ pub(crate) fn build_dome_mesh(zenith: Color, horizon: Color) -> Mesh {
 
 /// Rebuilds the dome's vertex colours in place whenever [`super::SkyPalette`]
 /// changes (`Res::is_changed()` — true the frame it's first inserted too, so
-/// the dome is coloured correctly from frame one). 018 will tick this every
-/// frame once it animates the palette on a clock; at ~500 vertices that's
-/// free, which is the entire reason this bakes colour into geometry instead
-/// of a shader or a cubemap (see the parent ticket).
+/// the dome is coloured correctly from frame one). 018's day/night clock
+/// ticks this every frame it's running; at ~500 vertices that's free, which
+/// is the entire reason this bakes colour into geometry instead of a shader
+/// or a cubemap (see the parent ticket).
 ///
 /// `dome_mesh` is `Option` because this system is wired up by [`SkyPlugin`]
 /// (`crate::sky::SkyPlugin`) itself, before [`super::spawn_sky_scene`] has
