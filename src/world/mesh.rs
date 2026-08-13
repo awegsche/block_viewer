@@ -30,6 +30,30 @@
 //! with no special-casing per direction — the placeholder mesher this
 //! replaced mixed two different winding conventions across faces.
 //!
+//! ## Per-face UV winding
+//!
+//! Because each face lists its four corners starting from a different
+//! physical corner (whichever keeps the CCW-from-outside/`(0,1,2,0,2,3)`
+//! rule above true without special-casing), a single fixed
+//! `(u0,v1)-(u0,v0)-(u1,v0)-(u1,v1)` UV order does **not** land on the same
+//! four corners for every face. Worked out by hand (viewer standing on the
+//! normal's side, looking at the face, `up` = Bevy `+Y`): East/South's
+//! corner list comes out as bottom-right→top-right→top-left→bottom-left,
+//! which that fixed order maps correctly (it's a pure horizontal mirror of
+//! the naive expectation); West/North's comes out as
+//! bottom-left→bottom-right→top-right→top-left, which the *same* fixed
+//! order instead maps as a diagonal transpose — right on two corners, wrong
+//! on the other two. A mirror on one pair of faces and a transpose on the
+//! other differ by a 90° rotation, which is exactly the "side textures look
+//! rotated" symptom this produces on any side texture with directional
+//! detail (grain, an asymmetric bevel, ...). [`Face::corner_uvs`] gives each
+//! face the UV order that actually matches its own corner list instead of
+//! sharing one. `Up`/`Down` are left on the original order — nothing
+//! reported a problem there, and top/bottom UV orientation has no single
+//! "correct" answer the way the four side faces (which must at least agree
+//! with each other) do without also matching Minecraft's real north-aligned
+//! convention, which is out of scope here.
+//!
 //! ## Vertex colour channel (ticket 011)
 //!
 //! Every mesh carries `Mesh::ATTRIBUTE_COLOR`, a **multiplicative
@@ -201,6 +225,19 @@ impl Face {
     fn is_side(self) -> bool {
         matches!(self, Face::East | Face::West | Face::South | Face::North)
     }
+
+    /// The four UV corners to zip against [`face_geometry`]'s corners, in
+    /// the same order — see the module docs' "Per-face UV winding" section
+    /// for how East/South and West/North ended up needing different
+    /// mappings out of the same `UvRect`.
+    fn corner_uvs(self, rect: UvRect) -> [[f32; 2]; 4] {
+        let UvRect { u0, v0, u1, v1 } = rect;
+        match self {
+            Face::East | Face::South => [[u1, v1], [u1, v0], [u0, v0], [u0, v1]],
+            Face::West | Face::North => [[u0, v1], [u1, v1], [u1, v0], [u0, v0]],
+            Face::Up | Face::Down => [[u0, v1], [u0, v0], [u1, v0], [u1, v1]],
+        }
+    }
 }
 
 /// The four corners (CCW from outside) and outward normal, in Bevy space,
@@ -318,15 +355,9 @@ fn push_quad_offset(
         normals.push(normal.into());
         colors.push(color);
     }
-    // Same corner-to-corner pattern the placeholder single-texture UVs used
-    // (full 0..1 per face) — just scaled/offset into this face's atlas tile
-    // (ticket 004) instead of the whole image.
-    uvs.extend_from_slice(&[
-        [uv_rect.u0, uv_rect.v1],
-        [uv_rect.u0, uv_rect.v0],
-        [uv_rect.u1, uv_rect.v0],
-        [uv_rect.u1, uv_rect.v1],
-    ]);
+    // Per-face corner order — see the module docs' "Per-face UV winding"
+    // section for why this can't be one fixed pattern shared by every face.
+    uvs.extend_from_slice(&face.corner_uvs(uv_rect));
     indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
 }
 
@@ -528,12 +559,78 @@ pub fn mesh_chunk_column(
     )
 }
 
+/// A distinguishable, non-square `UvRect` for the "Per-face UV winding"
+/// regression tests below — asymmetric on purpose (`u0 != v0`, `u1 != v1`,
+/// and neither pair is a multiple of the other) so a swapped U/V or a
+/// mixed-up corner shows up as a wrong *value*, not just a coincidentally
+/// equal one.
+#[cfg(test)]
+const TEST_UV_RECT: UvRect = UvRect {
+    u0: 0.1,
+    v0: 0.2,
+    u1: 0.7,
+    v1: 0.9,
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::world::biome::BiomeRegistry;
     use crate::world::decode::ChunkSection;
     use crate::world::decode::{BIOME_GRID_VOLUME, SECTION_VOLUME};
+
+    /// Regression test for the "Per-face UV winding" bug (see the module
+    /// docs): every one of the four side faces must sample the texture's
+    /// top (`v0`) at its geometrically-highest corners and the texture's
+    /// bottom (`v1`) at its lowest, full stop — the bug this catches (found
+    /// on West/North specifically) was a diagonal transpose that swapped
+    /// `v0`/`v1` on two of a face's four corners, which this would have
+    /// failed on before the fix.
+    #[test]
+    fn every_side_faces_top_corners_sample_v0_and_bottom_corners_sample_v1() {
+        for face in [Face::East, Face::West, Face::South, Face::North] {
+            let (corners, _) = face_geometry(face, 3, 10, 5);
+            let uvs = face.corner_uvs(TEST_UV_RECT);
+            let max_y = corners.iter().map(|c| c.y).fold(f32::MIN, f32::max);
+            let min_y = corners.iter().map(|c| c.y).fold(f32::MAX, f32::min);
+            for (corner, uv) in corners.iter().zip(uvs.iter()) {
+                if corner.y == max_y {
+                    assert_eq!(
+                        uv[1], TEST_UV_RECT.v0,
+                        "{face:?}: top corner {corner:?} should sample v0, got uv {uv:?}"
+                    );
+                } else {
+                    assert_eq!(
+                        corner.y, min_y,
+                        "{face:?}: corner {corner:?} is neither the top nor bottom of the face"
+                    );
+                    assert_eq!(
+                        uv[1], TEST_UV_RECT.v1,
+                        "{face:?}: bottom corner {corner:?} should sample v1, got uv {uv:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Regression test for the same bug from the other side: East/South
+    /// share one UV corner order (a horizontal mirror of the naive
+    /// expectation) and West/North share a different one (see the module
+    /// docs) — pin both down explicitly rather than only checking the V
+    /// invariant above, which alone wouldn't catch a horizontal-only bug.
+    #[test]
+    fn east_and_south_share_a_uv_order_distinct_from_west_and_norths() {
+        let east_south = Face::East.corner_uvs(TEST_UV_RECT);
+        assert_eq!(Face::South.corner_uvs(TEST_UV_RECT), east_south);
+
+        let west_north = Face::West.corner_uvs(TEST_UV_RECT);
+        assert_eq!(Face::North.corner_uvs(TEST_UV_RECT), west_north);
+
+        assert_ne!(
+            east_south, west_north,
+            "East/South's corner order and West/North's should differ — see the module docs"
+        );
+    }
 
     fn section_with(y: i8, set: &[((usize, usize, usize), BlockId)]) -> ChunkSection {
         let mut blocks = Box::new([BlockRegistry::AIR; SECTION_VOLUME]);
