@@ -54,3 +54,10 @@ these itself (see CLAUDE.md's "Manual/visual verification").
   the window still opens and the reason shows up in the UI/console each
   time rather than a crash. Full steps and what to look for:
   `finished_tickets/008-graceful-startup-errors.manual-verification.md`.
+- [ ] **011 vertex colour channel: purely a no-op visually.** `cargo run`
+  (debug build) against the real save. Confirm the world looks **exactly**
+  as it did before this ticket — same colours everywhere. This ticket only
+  adds a white (`[1,1,1,1]`) multiplicative vertex colour attribute to
+  every chunk mesh; if anything looks tinted, darker, or washed out, the
+  colour is landing in the wrong colour space (see `src/world/mesh.rs`'s
+  module docs on sRGB vs. linear) rather than being a genuine no-op.
