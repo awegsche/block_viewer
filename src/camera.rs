@@ -468,8 +468,9 @@ fn next_boundary_t(origin: f32, voxel: i32, step: i32, dir: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::world::biome::BiomeRegistry;
     use crate::world::block::BlockRegistry;
-    use crate::world::decode::{ChunkColumn, ChunkSection, SECTION_VOLUME};
+    use crate::world::decode::{ChunkColumn, ChunkSection, BIOME_GRID_VOLUME, SECTION_VOLUME};
     use std::collections::HashMap;
 
     /// A [`DecodedWorld`] containing exactly one solid block at Minecraft
@@ -487,6 +488,7 @@ mod tests {
 
         let mut blocks = Box::new([BlockRegistry::AIR; SECTION_VOLUME]);
         blocks[ChunkSection::index(local_x, local_y, local_z)] = stone;
+        let biomes = Box::new([BiomeRegistry::PLAINS; BIOME_GRID_VOLUME]);
 
         let mut columns = HashMap::new();
         columns.insert(
@@ -494,11 +496,12 @@ mod tests {
             ChunkColumn {
                 x: cx,
                 z: cz,
-                sections: vec![ChunkSection { y: section_y, blocks }],
+                sections: vec![ChunkSection { y: section_y, blocks, biomes }],
             },
         );
         DecodedWorld {
             registry: std::sync::Arc::new(std::sync::Mutex::new(registry)),
+            biomes: std::sync::Arc::new(std::sync::Mutex::new(BiomeRegistry::new())),
             columns,
         }
     }

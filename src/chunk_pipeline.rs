@@ -303,9 +303,11 @@ pub(crate) fn start_chunk_loads(
 
         let region_cache = region_cache.0.clone();
         let registry = decoded_world.registry.clone();
+        let biome_registry = decoded_world.biomes.clone();
         let atlas = atlas.0.clone();
-        let task = pool
-            .spawn(async move { load_and_mesh_chunk(coord, region_cache, registry, atlas, neighbors) });
+        let task = pool.spawn(async move {
+            load_and_mesh_chunk(coord, region_cache, registry, biome_registry, atlas, neighbors)
+        });
         in_flight.0.insert(coord, task);
     }
 }
@@ -533,6 +535,7 @@ fn load_and_mesh_chunk(
     coord: (i32, i32),
     region_cache: Arc<Mutex<RegionCache>>,
     registry: Arc<Mutex<BlockRegistry>>,
+    biome_registry: Arc<Mutex<world::BiomeRegistry>>,
     atlas: Arc<AtlasUvIndex>,
     neighbors: OwnedNeighbors,
 ) -> Option<ChunkLoadResult> {
@@ -545,8 +548,13 @@ fn load_and_mesh_chunk(
         region.get_chunk(local_x, local_z)?.clone()
     };
 
+    // Both locks taken here, in this order, for the whole decode+mesh —
+    // same rule the module docs already state for `registry` alone, now
+    // extended to `biome_registry` so there's only ever one lock ordering
+    // to reason about.
     let mut registry = registry.lock().expect("block registry mutex poisoned");
-    let column = match world::decode_chunk(&nbt, &mut registry) {
+    let mut biome_registry = biome_registry.lock().expect("biome registry mutex poisoned");
+    let column = match world::decode_chunk(&nbt, &mut registry, &mut biome_registry) {
         Ok(column) => column,
         // Not fully generated is routine at the edge of explored terrain —
         // every real save has plenty of these, so logging it would just be
@@ -695,10 +703,11 @@ mod tests {
 
         let mut blocks = Box::new([BlockRegistry::AIR; world::SECTION_VOLUME]);
         blocks[world::ChunkSection::index(15, 5, 0)] = stone;
+        let biomes = Box::new([world::BiomeRegistry::PLAINS; world::BIOME_GRID_VOLUME]);
         let column = world::ChunkColumn {
             x: 0,
             z: 0,
-            sections: vec![world::ChunkSection { y: 0, blocks }],
+            sections: vec![world::ChunkSection { y: 0, blocks, biomes }],
         };
 
         let registry = Arc::new(Mutex::new(registry));
@@ -723,10 +732,11 @@ mod tests {
         // re-meshing with it present should cull that one face.
         let mut east_blocks = Box::new([BlockRegistry::AIR; world::SECTION_VOLUME]);
         east_blocks[world::ChunkSection::index(0, 5, 0)] = stone;
+        let east_biomes = Box::new([world::BiomeRegistry::PLAINS; world::BIOME_GRID_VOLUME]);
         let east_neighbor = world::ChunkColumn {
             x: 1,
             z: 0,
-            sections: vec![world::ChunkSection { y: 0, blocks: east_blocks }],
+            sections: vec![world::ChunkSection { y: 0, blocks: east_blocks, biomes: east_biomes }],
         };
         let neighbors = OwnedNeighbors {
             east: Some(east_neighbor),
@@ -757,6 +767,7 @@ mod tests {
 
         let region_cache = Arc::new(Mutex::new(RegionCache::new(meta, 4)));
         let registry = Arc::new(Mutex::new(BlockRegistry::new()));
+        let biome_registry = Arc::new(Mutex::new(world::BiomeRegistry::new()));
         let atlas = Arc::new(AtlasUvIndex::default());
 
         // The centre of a region a player has actually visited is the best
@@ -769,6 +780,7 @@ mod tests {
             coord,
             region_cache,
             registry,
+            biome_registry,
             atlas,
             OwnedNeighbors::default(),
         )
@@ -790,12 +802,14 @@ mod tests {
         };
         let region_cache = Arc::new(Mutex::new(RegionCache::new(meta, 1)));
         let registry = Arc::new(Mutex::new(BlockRegistry::new()));
+        let biome_registry = Arc::new(Mutex::new(world::BiomeRegistry::new()));
         let atlas = Arc::new(AtlasUvIndex::default());
 
         let result = load_and_mesh_chunk(
             (0, 0),
             region_cache,
             registry,
+            biome_registry,
             atlas,
             OwnedNeighbors::default(),
         );

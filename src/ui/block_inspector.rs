@@ -70,6 +70,14 @@ pub(crate) fn block_inspector_panel(
 
         ui.label(format!("Block: {}, {}, {}", voxel.x, voxel.y, voxel.z));
 
+        // Straight out of `DecodedWorld`'s decoded biome grid (ticket 012),
+        // unlike the block name/properties below — the fastest way to
+        // sanity-check that the biome decode is correct against a save you
+        // know is checking it live against the block under the cursor.
+        if let Some(biome) = biome_under(voxel, &decoded_world) {
+            ui.label(format!("Biome: {biome}"));
+        }
+
         if last_lookup.0.as_ref().map(|(v, _)| *v) != Some(voxel) {
             let found = region_cache
                 .as_deref()
@@ -94,6 +102,29 @@ pub(crate) fn block_inspector_panel(
             }
         }
     });
+}
+
+/// The biome name at `voxel` (Minecraft block coordinates), read straight
+/// out of [`DecodedWorld`]'s decoded biome grid (ticket 012) — unlike
+/// [`lookup_block`], there's no raw NBT path to cross-check against here,
+/// so this is the decoder's own answer. `None` covers the voxel's column or
+/// section not being loaded, same as `camera`'s own world-coordinate block
+/// lookups.
+fn biome_under(voxel: IVec3, decoded_world: &DecodedWorld) -> Option<String> {
+    let size = world::SECTION_SIZE as i32;
+    let column = decoded_world
+        .columns
+        .get(&(voxel.x.div_euclid(size), voxel.z.div_euclid(size)))?;
+    let section_y = voxel.y.div_euclid(size) as i8;
+    let section = column.sections.iter().find(|s| s.y == section_y)?;
+
+    let local_x = voxel.x.rem_euclid(size) as usize;
+    let local_y = voxel.y.rem_euclid(size) as usize;
+    let local_z = voxel.z.rem_euclid(size) as usize;
+    let id = section.biome_at(local_x, local_y, local_z);
+
+    let registry = decoded_world.biomes.lock().expect("biome registry mutex poisoned");
+    Some(registry.name(id).to_string())
 }
 
 /// Resolves `voxel` (Minecraft block coordinates) through the shared

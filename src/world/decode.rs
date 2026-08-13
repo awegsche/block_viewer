@@ -5,15 +5,28 @@
 //! `block_states` once instead of re-walking the NBT tree per block (see
 //! ticket 002). `ChunkRegion::get_block` (in `ranvil`) stays useful for
 //! one-off lookups; this is for meshing a whole chunk.
+//!
+//! Ticket 012 adds each section's `biomes` grid alongside `block_states` —
+//! same palette + packed-data shape, but a string palette, no 4-bit
+//! minimum on the bit width, and a 4x4x4 (not 16x16x16) grid. See
+//! [`decode_biomes`] for the differences in full.
+
+use std::collections::HashSet;
 
 use rnbt::NbtField;
 
+use super::biome::{BiomeId, BiomeRegistry};
 use super::block::{BlockId, BlockRegistry};
 
 /// Width/height/depth of a chunk section, in blocks.
 pub const SECTION_SIZE: usize = 16;
 /// Number of blocks in a chunk section (16x16x16).
 pub const SECTION_VOLUME: usize = SECTION_SIZE * SECTION_SIZE * SECTION_SIZE;
+/// Width/height/depth of a section's biome grid, in 4-block cells.
+pub const BIOME_GRID_SIZE: usize = 4;
+/// Number of biome cells in a chunk section (4x4x4, one per 4x4x4 block
+/// cube — ticket 012).
+pub const BIOME_GRID_VOLUME: usize = BIOME_GRID_SIZE * BIOME_GRID_SIZE * BIOME_GRID_SIZE;
 
 /// One 16x16x16 layer of a chunk column, decoded to a flat array of
 /// [`BlockId`]s. Indexed `x + z*16 + y*256` (locals 0..16 each), matching
@@ -24,6 +37,11 @@ pub struct ChunkSection {
     /// the bottommost section of a 1.18+ world.
     pub y: i8,
     pub blocks: Box<[BlockId; SECTION_VOLUME]>,
+    /// One [`BiomeId`] per 4x4x4 sub-cube (ticket 012), indexed
+    /// `x + z*4 + y*16` at *cell* resolution — go through [`Self::biome_at`]
+    /// rather than indexing this directly, since callers work in block
+    /// locals.
+    pub biomes: Box<[BiomeId; BIOME_GRID_VOLUME]>,
 }
 
 impl ChunkSection {
@@ -35,6 +53,19 @@ impl ChunkSection {
     /// Block at section-local coordinates (each 0..16).
     pub fn get(&self, x: usize, y: usize, z: usize) -> BlockId {
         self.blocks[Self::index(x, y, z)]
+    }
+
+    #[inline]
+    fn biome_index(x: usize, y: usize, z: usize) -> usize {
+        (x / 4) + (z / 4) * BIOME_GRID_SIZE + (y / 4) * BIOME_GRID_SIZE * BIOME_GRID_SIZE
+    }
+
+    /// Biome at the 4x4x4 cell containing section-local **block**
+    /// coordinates (each 0..16) — the division from block locals down to
+    /// biome-cell locals happens here, once, rather than at every call
+    /// site.
+    pub fn biome_at(&self, x: usize, y: usize, z: usize) -> BiomeId {
+        self.biomes[Self::biome_index(x, y, z)]
     }
 }
 
@@ -118,8 +149,10 @@ impl std::error::Error for DecodeError {}
 /// `mc_anvil::ChunkRegion::get_chunk`/`get_chunk_or_load`) into a dense
 /// [`ChunkColumn`].
 ///
-/// Interns every encountered block name into `registry`; pass the same
-/// registry across a whole save so [`BlockId`]s stay stable.
+/// Interns every encountered block name into `registry`, and every
+/// encountered biome name into `biomes` (ticket 012); pass the same
+/// registries across a whole save so [`BlockId`]s and [`BiomeId`]s stay
+/// stable.
 ///
 /// Returns [`DecodeError::NotFullyGenerated`] for chunks whose `Status`
 /// isn't `"minecraft:full"` — callers should skip these rather than treat
@@ -127,6 +160,7 @@ impl std::error::Error for DecodeError {}
 pub fn decode_chunk(
     nbt: &NbtField,
     registry: &mut BlockRegistry,
+    biomes: &mut BiomeRegistry,
 ) -> Result<ChunkColumn, DecodeError> {
     let status = nbt
         .get_string("Status")
@@ -144,6 +178,12 @@ pub fn decode_chunk(
         .as_compound_list()
         .ok_or(DecodeError::UnexpectedType("sections"))?;
 
+    // Dedupes the "no biome data" log line to once per chunk (mirrors
+    // `atlas::build_block_uv_table`'s per-call warned set) rather than once
+    // per missing section — a chunk missing biomes on one section is
+    // usually missing it on all of them.
+    let mut warned_missing_biomes: HashSet<&'static str> = HashSet::new();
+
     let mut sections = Vec::new();
     for section in section_entries {
         // Select sections by their own `Y` tag, not list position — the
@@ -155,7 +195,8 @@ pub fn decode_chunk(
         let y = y as i8;
 
         // Sections without `block_states` (e.g. those lighting-only
-        // sentinels) carry no blocks.
+        // sentinels) carry no blocks — and since they render nothing, their
+        // `biomes` is never sampled either, so skip before touching it.
         let Some(block_states) = section.get("block_states") else {
             continue;
         };
@@ -189,9 +230,12 @@ pub fn decode_chunk(
             if id == BlockRegistry::AIR {
                 continue;
             }
+            let section_biomes =
+                decode_biomes(section, biomes, &mut warned_missing_biomes)?;
             sections.push(ChunkSection {
                 y,
                 blocks: Box::new([id; SECTION_VOLUME]),
+                biomes: section_biomes,
             });
             continue;
         }
@@ -220,10 +264,87 @@ pub fn decode_chunk(
                 .ok_or(DecodeError::PaletteIndexOutOfRange(palette_index))?;
         }
 
-        sections.push(ChunkSection { y, blocks });
+        let section_biomes = decode_biomes(section, biomes, &mut warned_missing_biomes)?;
+        sections.push(ChunkSection { y, blocks, biomes: section_biomes });
     }
 
     Ok(ChunkColumn { x, z, sections })
+}
+
+/// Decodes one section's `biomes` compound (a sibling of `block_states`)
+/// into [`BIOME_GRID_VOLUME`] [`BiomeId`]s. Same palette + packed-data shape
+/// as `block_states`, with three differences (ticket 012):
+///
+/// 1. The palette is a list of *strings* (`TAG_List<TAG_String>`), not
+///    compounds — the biome name is the entry itself, no `Name` field to
+///    dig out.
+/// 2. No 4-bit minimum on the bit width: `((len - 1).ilog2() + 1).max(1)`,
+///    so a 2-entry palette packs at 1 bit.
+/// 3. The grid is 4x4x4 (64 entries, one per 4x4x4 block cube), not
+///    16x16x16 — same X-fastest, Y-slowest index order as `block_states`,
+///    just at a quarter resolution per axis.
+///
+/// A section with no `biomes` compound, or an empty palette, fills with
+/// [`BiomeRegistry::PLAINS`] and logs once per chunk via `warned` (the
+/// caller's `HashSet`, not a fresh one per section) rather than once per
+/// section.
+fn decode_biomes(
+    section: &NbtField,
+    registry: &mut BiomeRegistry,
+    warned: &mut HashSet<&'static str>,
+) -> Result<Box<[BiomeId; BIOME_GRID_VOLUME]>, DecodeError> {
+    let missing = |warned: &mut HashSet<&'static str>| {
+        if warned.insert("biomes") {
+            println!(
+                "block_viewer: section has no usable biome data — defaulting to minecraft:plains"
+            );
+        }
+        Box::new([BiomeRegistry::PLAINS; BIOME_GRID_VOLUME])
+    };
+
+    let Some(biomes) = section.get("biomes") else {
+        return Ok(missing(warned));
+    };
+    let Some(palette) = biomes.get_list("palette").and_then(|list| list.as_string_list()) else {
+        return Ok(missing(warned));
+    };
+    if palette.is_empty() {
+        return Ok(missing(warned));
+    }
+
+    let palette_ids: Vec<BiomeId> = palette.iter().map(|name| registry.intern(name)).collect();
+
+    if palette_ids.len() == 1 {
+        // Same fast path as `block_states`: a uniform palette omits `data`
+        // entirely.
+        return Ok(Box::new([palette_ids[0]; BIOME_GRID_VOLUME]));
+    }
+
+    let data = biomes
+        .get_long_array("data")
+        .ok_or(DecodeError::MissingField("biomes.data"))?;
+
+    // Unlike `block_states`, biome indices have no 4-bit minimum.
+    let bit_size = ((palette_ids.len() as u32 - 1).ilog2() + 1).max(1);
+    let indices_per_long = 64 / bit_size as usize;
+    let mask = (1u64 << bit_size) - 1;
+
+    let mut ids = Box::new([BiomeRegistry::PLAINS; BIOME_GRID_VOLUME]);
+    for (idx, biome) in ids.iter_mut().enumerate() {
+        // Same padding rule as `block_states`: indices don't span longs, so
+        // leftover high bits of a long are never read.
+        let long_index = idx / indices_per_long;
+        let slot = idx % indices_per_long;
+        let long_value = *data
+            .get(long_index)
+            .ok_or(DecodeError::UnexpectedType("biomes.data"))? as u64;
+        let palette_index = ((long_value >> (slot * bit_size as usize)) & mask) as usize;
+        *biome = *palette_ids
+            .get(palette_index)
+            .ok_or(DecodeError::PaletteIndexOutOfRange(palette_index))?;
+    }
+
+    Ok(ids)
 }
 
 #[cfg(test)]
@@ -247,6 +368,27 @@ mod tests {
         )
     }
 
+    fn biome_palette(names: &[&str]) -> NbtList {
+        NbtList::String(names.iter().map(|n| n.to_string()).collect())
+    }
+
+    /// A `biomes` compound with a palette but no `data` — matches how
+    /// Minecraft omits `data` for a single-entry palette.
+    fn biomes_uniform(names: &[&str]) -> NbtField {
+        NbtField::new_compound("biomes", vec![NbtField::new_list("palette", biome_palette(names))])
+    }
+
+    /// A `biomes` compound with a packed multi-entry palette.
+    fn biomes_packed(names: &[&str], data: Vec<i64>) -> NbtField {
+        NbtField::new_compound(
+            "biomes",
+            vec![
+                NbtField::new_list("palette", biome_palette(names)),
+                NbtField::new_long_array("data", data),
+            ],
+        )
+    }
+
     fn section_uniform(y: i8, name: &str) -> NbtField {
         let block_states = NbtField::new_compound(
             "block_states",
@@ -264,6 +406,17 @@ mod tests {
             ],
         );
         NbtField::new_compound("", vec![byte_field("Y", y), block_states])
+    }
+
+    /// [`section_uniform`] plus an explicit `biomes` compound, for tests
+    /// that care what the biome grid decodes to rather than letting it fall
+    /// back to plains.
+    fn section_uniform_with_biomes(y: i8, block_name: &str, biomes: NbtField) -> NbtField {
+        let block_states = NbtField::new_compound(
+            "block_states",
+            vec![NbtField::new_list("palette", palette(&[block_name]))],
+        );
+        NbtField::new_compound("", vec![byte_field("Y", y), block_states, biomes])
     }
 
     fn chunk_root(x: i32, z: i32, status: &str, sections: Vec<NbtField>) -> NbtField {
@@ -287,7 +440,8 @@ mod tests {
             vec![section_uniform(-4, "minecraft:air")],
         );
         let mut registry = BlockRegistry::new();
-        let column = decode_chunk(&root, &mut registry).unwrap();
+        let mut biomes = BiomeRegistry::new();
+        let column = decode_chunk(&root, &mut registry, &mut biomes).unwrap();
         assert!(
             column.sections.is_empty(),
             "uniform air section should be omitted, not stored"
@@ -303,7 +457,8 @@ mod tests {
             vec![section_uniform(-4, "minecraft:stone")],
         );
         let mut registry = BlockRegistry::new();
-        let column = decode_chunk(&root, &mut registry).unwrap();
+        let mut biomes = BiomeRegistry::new();
+        let column = decode_chunk(&root, &mut registry, &mut biomes).unwrap();
         assert_eq!(column.sections.len(), 1);
         let stone = registry.intern("minecraft:stone");
         assert!(column.sections[0].blocks.iter().all(|&b| b == stone));
@@ -328,7 +483,8 @@ mod tests {
             )],
         );
         let mut registry = BlockRegistry::new();
-        let column = decode_chunk(&root, &mut registry).unwrap();
+        let mut biomes = BiomeRegistry::new();
+        let column = decode_chunk(&root, &mut registry, &mut biomes).unwrap();
         let dirt = registry.intern("minecraft:dirt");
         assert_eq!(column.sections[0].get(0, 0, 0), dirt);
         assert_eq!(column.sections[0].get(1, 0, 0), BlockRegistry::AIR);
@@ -351,7 +507,8 @@ mod tests {
             vec![section_packed(-4, &name_refs, data)],
         );
         let mut registry = BlockRegistry::new();
-        let column = decode_chunk(&root, &mut registry).unwrap();
+        let mut biomes = BiomeRegistry::new();
+        let column = decode_chunk(&root, &mut registry, &mut biomes).unwrap();
         let expected = registry.intern("minecraft:block_16");
         assert_eq!(column.sections[0].get(1, 0, 0), expected);
     }
@@ -370,7 +527,8 @@ mod tests {
             ],
         );
         let mut registry = BlockRegistry::new();
-        let column = decode_chunk(&root, &mut registry).unwrap();
+        let mut biomes = BiomeRegistry::new();
+        let column = decode_chunk(&root, &mut registry, &mut biomes).unwrap();
         assert_eq!(column.sections.len(), 2);
 
         let stone = registry.intern("minecraft:stone");
@@ -385,7 +543,8 @@ mod tests {
     fn skips_chunks_that_are_not_fully_generated() {
         let root = chunk_root(0, 0, "minecraft:carvers", vec![]);
         let mut registry = BlockRegistry::new();
-        let err = decode_chunk(&root, &mut registry).unwrap_err();
+        let mut biomes = BiomeRegistry::new();
+        let err = decode_chunk(&root, &mut registry, &mut biomes).unwrap_err();
         assert!(
             matches!(err, DecodeError::NotFullyGenerated(ref status) if status == "minecraft:carvers")
         );
@@ -404,10 +563,165 @@ mod tests {
             ],
         );
         let mut registry = BlockRegistry::new();
-        let column = decode_chunk(&root, &mut registry).unwrap();
+        let mut biomes = BiomeRegistry::new();
+        let column = decode_chunk(&root, &mut registry, &mut biomes).unwrap();
 
         let (world_y, id) = column.topmost_non_air(0, 0).unwrap();
         assert_eq!(world_y, SECTION_SIZE as i32 + 15);
         assert_eq!(registry.name(id), "minecraft:grass_block");
+    }
+
+    #[test]
+    fn uniform_biome_palette_fills_every_cell() {
+        let root = chunk_root(
+            0,
+            0,
+            "minecraft:full",
+            vec![section_uniform_with_biomes(
+                -4,
+                "minecraft:stone",
+                biomes_uniform(&["minecraft:forest"]),
+            )],
+        );
+        let mut registry = BlockRegistry::new();
+        let mut biomes = BiomeRegistry::new();
+        let column = decode_chunk(&root, &mut registry, &mut biomes).unwrap();
+
+        let forest = biomes.intern("minecraft:forest");
+        assert!(column.sections[0].biomes.iter().all(|&b| b == forest));
+    }
+
+    #[test]
+    fn two_entry_biome_palette_packs_at_one_bit() {
+        // 2-entry palette -> naive `.max(4)` (the block_states minimum)
+        // would misread this; the real minimum here is 1 bit. 64 cells at
+        // 1 bit each fit in a single long, so index 1 (cell x=1,y=0,z=0)
+        // lands at bit offset 1.
+        let data = vec![0b10i64];
+        let root = chunk_root(
+            0,
+            0,
+            "minecraft:full",
+            vec![section_uniform_with_biomes(
+                -4,
+                "minecraft:stone",
+                biomes_packed(&["minecraft:plains", "minecraft:desert"], data),
+            )],
+        );
+        let mut registry = BlockRegistry::new();
+        let mut biomes = BiomeRegistry::new();
+        let column = decode_chunk(&root, &mut registry, &mut biomes).unwrap();
+
+        let desert = biomes.intern("minecraft:desert");
+        assert_eq!(column.sections[0].biomes[1], desert);
+        assert_eq!(column.sections[0].biomes[0], BiomeRegistry::PLAINS);
+    }
+
+    #[test]
+    fn five_entry_biome_palette_reads_the_right_cell_at_three_bits() {
+        // 5-entry palette -> bit_size = ilog2(4)+1 = 3, 21 cells per long.
+        // Cell index 1 -> long 0, bit offset 3.
+        let mut data = vec![0i64; 4];
+        data[0] = 4i64 << 3; // palette index 4
+        let names = [
+            "minecraft:plains",
+            "minecraft:forest",
+            "minecraft:desert",
+            "minecraft:taiga",
+            "minecraft:swamp",
+        ];
+        let root = chunk_root(
+            0,
+            0,
+            "minecraft:full",
+            vec![section_uniform_with_biomes(
+                -4,
+                "minecraft:stone",
+                biomes_packed(&names, data),
+            )],
+        );
+        let mut registry = BlockRegistry::new();
+        let mut biomes = BiomeRegistry::new();
+        let column = decode_chunk(&root, &mut registry, &mut biomes).unwrap();
+
+        let swamp = biomes.intern("minecraft:swamp");
+        assert_eq!(column.sections[0].biomes[1], swamp);
+    }
+
+    #[test]
+    fn section_with_no_biomes_compound_defaults_to_plains_without_panicking() {
+        let root = chunk_root(
+            0,
+            0,
+            "minecraft:full",
+            vec![section_uniform(-4, "minecraft:stone")],
+        );
+        let mut registry = BlockRegistry::new();
+        let mut biomes = BiomeRegistry::new();
+        let column = decode_chunk(&root, &mut registry, &mut biomes).unwrap();
+
+        assert!(column.sections[0]
+            .biomes
+            .iter()
+            .all(|&b| b == BiomeRegistry::PLAINS));
+    }
+
+    #[test]
+    fn biome_at_maps_block_locals_to_the_right_4x4x4_cell() {
+        let mut cells = Box::new([BiomeRegistry::PLAINS; BIOME_GRID_VOLUME]);
+        let desert = BiomeId(1);
+        cells[1] = desert; // cell (x=1, y=0, z=0)
+        let section = ChunkSection {
+            y: 0,
+            blocks: Box::new([BlockRegistry::AIR; SECTION_VOLUME]),
+            biomes: cells,
+        };
+
+        // (0,0,0) and (3,3,3) both fall in cell (0,0,0) — still plains.
+        assert_eq!(section.biome_at(0, 0, 0), BiomeRegistry::PLAINS);
+        assert_eq!(section.biome_at(3, 3, 3), BiomeRegistry::PLAINS);
+        // (4,0,0) crosses into the next cell on X — cell index 1.
+        assert_eq!(section.biome_at(4, 0, 0), desert);
+    }
+
+    /// Mirrors `chunk_pipeline`'s
+    /// `load_and_mesh_chunk_decodes_and_meshes_a_real_chunk` convention for
+    /// resolving a real region, but decodes a spread of chunks across it
+    /// (its diagonal) rather than just the centre one — a single chunk can
+    /// easily land entirely inside one biome, which would make "the biome
+    /// registry is non-trivial" flaky depending on exactly which chunk the
+    /// centre happens to be.
+    #[test]
+    fn decodes_a_plausible_biome_set_from_a_real_chunk() {
+        use mc_anvil::region::REGION_WIDTH_IN_CHUNKS;
+
+        let saves = mc_anvil::get_saves().expect("could not read the Minecraft saves directory");
+        let meta = saves
+            .into_iter()
+            .find(|s| !s.regions.is_empty())
+            .expect("need a save with at least one region");
+        let (rx, rz) = meta.regions[0];
+
+        let mut cache = crate::region_cache::RegionCache::new(meta, 4);
+        let region = cache.get_or_load((rx, rz)).expect("region should load");
+
+        let mut registry = BlockRegistry::new();
+        let mut biomes = BiomeRegistry::new();
+        let mut decoded_any = false;
+        for step in 0..REGION_WIDTH_IN_CHUNKS {
+            let Some(nbt) = region.get_chunk(step, step) else { continue };
+            let nbt = nbt.clone();
+            match decode_chunk(&nbt, &mut registry, &mut biomes) {
+                Ok(_) => decoded_any = true,
+                Err(DecodeError::NotFullyGenerated(_)) => continue,
+                Err(err) => panic!("failed to decode chunk ({step}, {step}): {err}"),
+            }
+        }
+
+        assert!(decoded_any, "expected at least one fully-generated chunk along the region's diagonal");
+        assert!(
+            biomes.len() > 1,
+            "expected at least one real biome name interned beyond the default minecraft:plains"
+        );
     }
 }

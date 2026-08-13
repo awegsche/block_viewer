@@ -412,15 +412,19 @@ pub fn mesh_chunk_column(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::world::biome::BiomeRegistry;
     use crate::world::decode::ChunkSection;
-    use crate::world::decode::SECTION_VOLUME;
+    use crate::world::decode::{BIOME_GRID_VOLUME, SECTION_VOLUME};
 
     fn section_with(y: i8, set: &[((usize, usize, usize), BlockId)]) -> ChunkSection {
         let mut blocks = Box::new([BlockRegistry::AIR; SECTION_VOLUME]);
         for &((x, ly, z), id) in set {
             blocks[ChunkSection::index(x, ly, z)] = id;
         }
-        ChunkSection { y, blocks }
+        // Face culling is what these tests check; the biome grid is
+        // irrelevant here (ticket 013 is what reads it), so every section
+        // just gets the plains default.
+        ChunkSection { y, blocks, biomes: Box::new([BiomeRegistry::PLAINS; BIOME_GRID_VOLUME]) }
     }
 
     fn column_with(x: i32, z: i32, sections: Vec<ChunkSection>) -> ChunkColumn {

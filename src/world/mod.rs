@@ -8,6 +8,7 @@
 //! and maps block names to per-face UV rects for it (ticket 004).
 
 pub mod atlas;
+pub mod biome;
 pub mod block;
 pub mod decode;
 pub mod mesh;
@@ -19,10 +20,13 @@ pub mod mesh;
 #[allow(unused_imports)]
 pub use atlas::{build_block_uv_table, AtlasUvIndex, BlockFaces, TextureAtlas, UvRect};
 #[allow(unused_imports)]
+pub use biome::{BiomeId, BiomeRegistry};
+#[allow(unused_imports)]
 pub use block::{BlockId, BlockRegistry};
 #[allow(unused_imports)]
 pub use decode::{
-    decode_chunk, ChunkColumn, ChunkSection, DecodeError, SECTION_SIZE, SECTION_VOLUME,
+    decode_chunk, ChunkColumn, ChunkSection, DecodeError, BIOME_GRID_VOLUME, SECTION_SIZE,
+    SECTION_VOLUME,
 };
 #[allow(unused_imports)]
 pub use mesh::{is_solid, mesh_chunk_column, Neighbors};

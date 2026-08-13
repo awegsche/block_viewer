@@ -48,12 +48,18 @@ pub(crate) fn status_panel(
 
         // Cheap on purpose: total section count times a section's fixed
         // in-memory size, not a real allocator walk — good enough for a
-        // ballpark, recomputed every frame the panel is open.
+        // ballpark, recomputed every frame the panel is open. Includes each
+        // section's biome grid (ticket 012) alongside its block grid — 128 B
+        // against 8 KB, about 1.5% on top, but small enough to just fold in
+        // rather than leave the estimate quietly wrong by more than it
+        // already was.
         let bytes: usize = decoded_world
             .columns
             .values()
             .map(|column| {
-                column.sections.len() * world::SECTION_VOLUME * std::mem::size_of::<world::BlockId>()
+                column.sections.len()
+                    * (world::SECTION_VOLUME * std::mem::size_of::<world::BlockId>()
+                        + world::BIOME_GRID_VOLUME * std::mem::size_of::<world::BiomeId>())
             })
             .sum();
         ui.label(format!(

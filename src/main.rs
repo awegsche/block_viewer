@@ -64,9 +64,14 @@ fn empty_save() -> Save {
 /// decoded chunks' block names directly into it, off the main thread, and
 /// [`world::BlockId`]s need to stay globally stable regardless of whether a
 /// chunk was decoded eagerly at startup or streamed in later.
+///
+/// `biomes` (ticket 012) is the same story, one registry over: background
+/// tasks intern each section's biome names into it during decode, and
+/// [`world::BiomeId`]s need the same global stability as [`world::BlockId`]s.
 #[derive(Resource)]
 pub(crate) struct DecodedWorld {
     pub(crate) registry: Arc<Mutex<world::BlockRegistry>>,
+    pub(crate) biomes: Arc<Mutex<world::BiomeRegistry>>,
     pub(crate) columns: HashMap<(i32, i32), world::ChunkColumn>,
 }
 
@@ -142,6 +147,7 @@ fn main() {
     let (save, startup_issue) = load_real_save();
     let decoded_world = DecodedWorld {
         registry: Arc::new(Mutex::new(world::BlockRegistry::new())),
+        biomes: Arc::new(Mutex::new(world::BiomeRegistry::new())),
         columns: HashMap::new(),
     };
 
