@@ -61,3 +61,12 @@ these itself (see CLAUDE.md's "Manual/visual verification").
   every chunk mesh; if anything looks tinted, darker, or washed out, the
   colour is landing in the wrong colour space (see `src/world/mesh.rs`'s
   module docs on sRGB vs. linear) rather than being a genuine no-op.
+- [ ] **012 biome decode: block inspector shows a plausible biome, world
+  renders unchanged.** `cargo run` (debug build) against the real save.
+  Point the cursor at terrain in a few different spots (ideally spots you
+  know the biome of — e.g. a beach vs. a forest) and confirm the "Block
+  Inspector" panel's new "Biome: minecraft:..." line names something
+  plausible for what's rendered there, and changes as you look at
+  different areas rather than sitting stuck on `minecraft:plains`
+  everywhere. Also confirm the world looks exactly as before — this ticket
+  is decode-only, no rendering changed.
