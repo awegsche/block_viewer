@@ -70,3 +70,15 @@ these itself (see CLAUDE.md's "Manual/visual verification").
   different areas rather than sitting stuck on `minecraft:plains`
   everywhere. Also confirm the world looks exactly as before — this ticket
   is decode-only, no rendering changed.
+- [ ] **013 biome tint: grass/leaves/water are coloured and vary by biome,
+  nothing looks washed out.** `cargo run` (debug build) against the real
+  save. Fly across a biome border (e.g. plains into a forest or desert,
+  or toward any ocean) and confirm the tint visibly changes rather than
+  staying flat green everywhere. Look at a grass block from above (should
+  read green) and then from the side (should still read brown dirt —
+  014's problem, not a bug here). If you know a spot with swamp or
+  badlands terrain in this save, check those read as a duller
+  green/khaki rather than the plains green (the hardcoded overrides in
+  `src/world/tint.rs`). Also confirm nothing looks unnaturally bright or
+  pastel/washed-out — that would mean the sRGB→linear conversion regressed
+  (see `src/world/tint.rs`'s module docs).

@@ -9,9 +9,11 @@
 
 pub mod atlas;
 pub mod biome;
+pub mod biome_data;
 pub mod block;
 pub mod decode;
 pub mod mesh;
+pub mod tint;
 
 // Not every re-export has a caller in this repo yet (`BlockId`, the raw
 // section/error types, and `is_solid` are part of the public API for
@@ -30,3 +32,8 @@ pub use decode::{
 };
 #[allow(unused_imports)]
 pub use mesh::{is_solid, mesh_chunk_column, Neighbors};
+#[allow(unused_imports)]
+pub use tint::{
+    build_biome_tint_table, build_block_tint_table, load_color_maps, BiomeColors, BlockTint,
+    ColorMaps, TintSource,
+};

@@ -47,7 +47,7 @@ use bevy::tasks::{block_on, poll_once, AsyncComputeTaskPool, Task};
 
 use crate::region_cache::{chunk_to_region_coord, RegionCache};
 use crate::streaming::PendingChunkWork;
-use crate::world::{self, AtlasUvIndex, BlockRegistry, ChunkColumn};
+use crate::world::{self, AtlasUvIndex, BiomeRegistry, BlockRegistry, ChunkColumn, ColorMaps};
 use crate::{BlockMesh, DecodedWorld};
 
 /// Shared, lockable handle onto the region LRU cache (005-b) so every
@@ -63,6 +63,12 @@ pub struct SharedRegionCache(pub Arc<Mutex<RegionCache>>);
 /// boundary into a background task.
 #[derive(Resource, Clone)]
 pub struct SharedAtlasIndex(pub Arc<AtlasUvIndex>);
+
+/// Shared, read-only colormap pair (ticket 013) — plain `[u8; 3]` texel
+/// data, so like [`SharedAtlasIndex`] it can cross the `Send` boundary into
+/// a background task without dragging any render-side type along.
+#[derive(Resource, Clone)]
+pub struct SharedColorMaps(pub Arc<ColorMaps>);
 
 /// The one material every streamed-in chunk mesh uses, built once at
 /// startup (`main.rs::setup`) from the packed atlas.
@@ -286,10 +292,13 @@ pub(crate) fn start_chunk_loads(
     decoded_world: Res<DecodedWorld>,
     region_cache: Option<Res<SharedRegionCache>>,
     atlas: Option<Res<SharedAtlasIndex>>,
+    color_maps: Option<Res<SharedColorMaps>>,
 ) {
-    // Both are inserted by `main.rs::setup` once the real save/atlas exist;
-    // before that (Startup hasn't finished) there's nothing to load with.
-    let (Some(region_cache), Some(atlas)) = (region_cache, atlas) else {
+    // All three are inserted by `main.rs::setup` once the real save/atlas/
+    // colormaps exist; before that (Startup hasn't finished) there's nothing
+    // to load with.
+    let (Some(region_cache), Some(atlas), Some(color_maps)) = (region_cache, atlas, color_maps)
+    else {
         return;
     };
 
@@ -305,8 +314,17 @@ pub(crate) fn start_chunk_loads(
         let registry = decoded_world.registry.clone();
         let biome_registry = decoded_world.biomes.clone();
         let atlas = atlas.0.clone();
+        let color_maps = color_maps.0.clone();
         let task = pool.spawn(async move {
-            load_and_mesh_chunk(coord, region_cache, registry, biome_registry, atlas, neighbors)
+            load_and_mesh_chunk(
+                coord,
+                region_cache,
+                registry,
+                biome_registry,
+                atlas,
+                color_maps,
+                neighbors,
+            )
         });
         in_flight.0.insert(coord, task);
     }
@@ -325,9 +343,10 @@ pub(crate) fn start_chunk_remeshes(
     mut in_flight: ResMut<InFlightChunkRemeshes>,
     decoded_world: Res<DecodedWorld>,
     atlas: Option<Res<SharedAtlasIndex>>,
+    color_maps: Option<Res<SharedColorMaps>>,
 ) {
     // Mirrors `start_chunk_loads`: nothing to mesh with before `setup()`.
-    let Some(atlas) = atlas else {
+    let (Some(atlas), Some(color_maps)) = (atlas, color_maps) else {
         return;
     };
 
@@ -342,9 +361,11 @@ pub(crate) fn start_chunk_remeshes(
 
         let neighbors = owned_neighbors_of(coord, &decoded_world.columns);
         let registry = decoded_world.registry.clone();
+        let biome_registry = decoded_world.biomes.clone();
         let atlas = atlas.0.clone();
+        let color_maps = color_maps.0.clone();
         let task = pool.spawn(async move {
-            remesh_chunk_column(coord, column, registry, atlas, neighbors)
+            remesh_chunk_column(coord, column, registry, biome_registry, atlas, color_maps, neighbors)
         });
         in_flight.0.insert(coord, task);
     }
@@ -511,17 +532,28 @@ pub(crate) fn poll_completed_chunk_remeshes(
 fn mesh_column_with_neighbors(
     column: &ChunkColumn,
     registry: &BlockRegistry,
+    biome_registry: &BiomeRegistry,
     atlas: &AtlasUvIndex,
+    color_maps: &ColorMaps,
     neighbors: &OwnedNeighbors,
 ) -> Option<Mesh> {
     let uv_table = world::build_block_uv_table(registry, atlas);
+    let block_tint = world::build_block_tint_table(registry);
+    let biome_colors = world::build_biome_tint_table(biome_registry, color_maps);
     let borrowed_neighbors = world::Neighbors {
         north: neighbors.north.as_ref(),
         south: neighbors.south.as_ref(),
         east: neighbors.east.as_ref(),
         west: neighbors.west.as_ref(),
     };
-    world::mesh_chunk_column(column, registry, &borrowed_neighbors, &uv_table)
+    world::mesh_chunk_column(
+        column,
+        registry,
+        &borrowed_neighbors,
+        &uv_table,
+        &block_tint,
+        &biome_colors,
+    )
 }
 
 /// Runs entirely inside a background task: resolves `coord`'s region via
@@ -535,8 +567,9 @@ fn load_and_mesh_chunk(
     coord: (i32, i32),
     region_cache: Arc<Mutex<RegionCache>>,
     registry: Arc<Mutex<BlockRegistry>>,
-    biome_registry: Arc<Mutex<world::BiomeRegistry>>,
+    biome_registry: Arc<Mutex<BiomeRegistry>>,
     atlas: Arc<AtlasUvIndex>,
+    color_maps: Arc<ColorMaps>,
     neighbors: OwnedNeighbors,
 ) -> Option<ChunkLoadResult> {
     let region_coord = chunk_to_region_coord(coord);
@@ -566,7 +599,14 @@ fn load_and_mesh_chunk(
             return None;
         }
     };
-    let mesh = mesh_column_with_neighbors(&column, &registry, &atlas, &neighbors);
+    let mesh = mesh_column_with_neighbors(
+        &column,
+        &registry,
+        &biome_registry,
+        &atlas,
+        &color_maps,
+        &neighbors,
+    );
 
     Some(ChunkLoadResult { coord, column, mesh })
 }
@@ -581,11 +621,21 @@ fn remesh_chunk_column(
     coord: (i32, i32),
     column: ChunkColumn,
     registry: Arc<Mutex<BlockRegistry>>,
+    biome_registry: Arc<Mutex<BiomeRegistry>>,
     atlas: Arc<AtlasUvIndex>,
+    color_maps: Arc<ColorMaps>,
     neighbors: OwnedNeighbors,
 ) -> ChunkRemeshResult {
     let registry = registry.lock().expect("block registry mutex poisoned");
-    let mesh = mesh_column_with_neighbors(&column, &registry, &atlas, &neighbors);
+    let biome_registry = biome_registry.lock().expect("biome registry mutex poisoned");
+    let mesh = mesh_column_with_neighbors(
+        &column,
+        &registry,
+        &biome_registry,
+        &atlas,
+        &color_maps,
+        &neighbors,
+    );
     ChunkRemeshResult { coord, mesh }
 }
 
@@ -601,6 +651,16 @@ fn local_chunk_index((cx, cz): (i32, i32), (rx, rz): (i32, i32)) -> (usize, usiz
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A colormap pair with no real pixels — fine for these tests, which
+    /// exercise face-culling/lock-passing behaviour, not what colour a
+    /// block actually ends up (that's `world::tint`'s own tests).
+    fn stub_color_maps() -> Arc<ColorMaps> {
+        Arc::new(ColorMaps {
+            grass: vec![[0u8, 0, 0]; 256 * 256],
+            foliage: vec![[0u8, 0, 0]; 256 * 256],
+        })
+    }
 
     #[test]
     fn local_chunk_index_matches_region_relative_position() {
@@ -711,7 +771,9 @@ mod tests {
         };
 
         let registry = Arc::new(Mutex::new(registry));
+        let biome_registry = Arc::new(Mutex::new(world::BiomeRegistry::new()));
         let atlas = Arc::new(AtlasUvIndex::default());
+        let color_maps = stub_color_maps();
 
         // No neighbours loaded yet: all 6 faces of the lone block render,
         // including the east face facing the not-yet-loaded neighbour.
@@ -719,7 +781,9 @@ mod tests {
             (0, 0),
             column.clone(),
             registry.clone(),
+            biome_registry.clone(),
             atlas.clone(),
+            color_maps.clone(),
             OwnedNeighbors::default(),
         );
         let mesh = without_neighbor.mesh.unwrap();
@@ -743,7 +807,8 @@ mod tests {
             ..Default::default()
         };
 
-        let with_neighbor = remesh_chunk_column((0, 0), column, registry, atlas, neighbors);
+        let with_neighbor =
+            remesh_chunk_column((0, 0), column, registry, biome_registry, atlas, color_maps, neighbors);
         let mesh = with_neighbor.mesh.unwrap();
         let Indices::U32(indices) = mesh.indices().unwrap() else {
             panic!("expected U32 indices");
@@ -769,6 +834,7 @@ mod tests {
         let registry = Arc::new(Mutex::new(BlockRegistry::new()));
         let biome_registry = Arc::new(Mutex::new(world::BiomeRegistry::new()));
         let atlas = Arc::new(AtlasUvIndex::default());
+        let color_maps = stub_color_maps();
 
         // The centre of a region a player has actually visited is the best
         // bet for a fully-generated chunk (edges of the explored area are
@@ -782,6 +848,7 @@ mod tests {
             registry,
             biome_registry,
             atlas,
+            color_maps,
             OwnedNeighbors::default(),
         )
         .expect("a real save's region centre should have a fully-generated chunk");
@@ -804,6 +871,7 @@ mod tests {
         let registry = Arc::new(Mutex::new(BlockRegistry::new()));
         let biome_registry = Arc::new(Mutex::new(world::BiomeRegistry::new()));
         let atlas = Arc::new(AtlasUvIndex::default());
+        let color_maps = stub_color_maps();
 
         let result = load_and_mesh_chunk(
             (0, 0),
@@ -811,6 +879,7 @@ mod tests {
             registry,
             biome_registry,
             atlas,
+            color_maps,
             OwnedNeighbors::default(),
         );
         assert!(result.is_none());

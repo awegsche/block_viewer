@@ -59,6 +59,7 @@ use bevy::{asset::RenderAssetUsages, prelude::*, render::mesh::Indices};
 use super::atlas::{BlockFaces, UvRect};
 use super::block::{BlockId, BlockRegistry};
 use super::decode::{ChunkColumn, SECTION_SIZE};
+use super::tint::{BiomeColors, BlockTint, TintSource};
 
 /// World Y of the bottom of the world (1.18+ worlds start at Y=-64). Below
 /// this, there is no column to compare against — it's the underside of the
@@ -184,6 +185,16 @@ impl Face {
             Face::East | Face::West | Face::South | Face::North => faces.side,
         }
     }
+
+    /// Which of a block's three per-face tint sources (ticket 013) this
+    /// face uses — same top/bottom/side split as [`Face::uv_rect`].
+    fn tint_source(self, tint: &BlockTint) -> TintSource {
+        match self {
+            Face::Up => tint.top,
+            Face::Down => tint.bottom,
+            Face::East | Face::West | Face::South | Face::North => tint.side,
+        }
+    }
 }
 
 /// The four corners (CCW from outside) and outward normal, in Bevy space,
@@ -290,9 +301,37 @@ fn push_quad(
 }
 
 /// Opaque white — the identity value for the multiplicative vertex colour
-/// channel (see the module docs). Every call site passes this until 013
-/// (biome tint) and 010 (baked light / AO) start computing real factors.
+/// channel (see the module docs), and what [`TintSource::None`] resolves to.
+/// 010 (baked light / AO) is the one remaining contributor still owed a real
+/// factor.
 const WHITE: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
+
+/// The [`BlockTint`] every id resolves to if `block_tint` (ticket 013) is
+/// shorter than the registry it was built from — should never trigger in
+/// practice, mirrors [`FALLBACK_FACES`].
+const FALLBACK_TINT: BlockTint = BlockTint::NONE;
+
+/// The [`BiomeColors`] every biome id resolves to if `biome_colors` (ticket
+/// 013) is shorter than the registry it was built from — opaque white on
+/// every source, same reasoning as [`FALLBACK_TINT`].
+const FALLBACK_BIOME_COLORS: BiomeColors = BiomeColors {
+    grass: bevy::color::LinearRgba::WHITE,
+    foliage: bevy::color::LinearRgba::WHITE,
+    water: bevy::color::LinearRgba::WHITE,
+};
+
+/// Resolves `source` against `biome` to the vertex colour a face tinted by
+/// it should carry.
+fn resolve_tint_color(source: TintSource, biome: BiomeColors) -> [f32; 4] {
+    let c = match source {
+        TintSource::None => return WHITE,
+        TintSource::Grass => biome.grass,
+        TintSource::Foliage => biome.foliage,
+        TintSource::Water => biome.water,
+        TintSource::Fixed(c) => c,
+    };
+    [c.red, c.green, c.blue, c.alpha]
+}
 
 /// Meshes one chunk column into a single Bevy [`Mesh`], with a quad per
 /// block face whose neighbour is non-solid (see [`is_solid`]).
@@ -309,11 +348,20 @@ const WHITE: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
 /// `uv_table` gives each block's per-face atlas rect (ticket 004),
 /// indexed directly by [`BlockId`] — build it once per save with
 /// [`super::atlas::build_block_uv_table`] and reuse it across every column.
+///
+/// `block_tint`/`biome_colors` (ticket 013) resolve each emitted face's
+/// vertex colour: `block_tint[id]` says what a face is tinted *by*
+/// ([`TintSource`]), and for the biome-dependent sources,
+/// `biome_colors[biome_id]` says what that resolves to. Build both with
+/// [`super::tint::build_block_tint_table`]/[`super::tint::build_biome_tint_table`]
+/// and reuse across every column, same as `uv_table`.
 pub fn mesh_chunk_column(
     column: &ChunkColumn,
     registry: &BlockRegistry,
     neighbors: &Neighbors,
     uv_table: &[BlockFaces],
+    block_tint: &[BlockTint],
+    biome_colors: &[BiomeColors],
 ) -> Option<Mesh> {
     let mut vertices = Vec::new();
     let mut normals = Vec::new();
@@ -333,11 +381,19 @@ pub fn mesh_chunk_column(
                     }
                     let dx = lx as i32;
                     let dz = lz as i32;
-                    // `uv_table` is built from the same registry these ids
-                    // came from, so this is always in range in practice;
-                    // fall back to the whole-atlas rect rather than panic
-                    // if a caller ever passes a mismatched table.
+                    // `uv_table`/`block_tint` are built from the same
+                    // registry these ids came from, so both lookups are
+                    // always in range in practice; fall back rather than
+                    // panic if a caller ever passes a mismatched table.
                     let faces = uv_table.get(id.0 as usize).copied().unwrap_or(FALLBACK_FACES);
+                    let tint = block_tint.get(id.0 as usize).copied().unwrap_or(FALLBACK_TINT);
+                    // Section-local `ly`, not `world_y` — `biome_at` expects
+                    // coordinates within this section's own 16x16x16 grid.
+                    let biome_id = section.biome_at(lx, ly, lz);
+                    let biome = biome_colors
+                        .get(biome_id.0 as usize)
+                        .copied()
+                        .unwrap_or(FALLBACK_BIOME_COLORS);
 
                     let mut face = |f: Face, exposed: bool| {
                         if exposed {
@@ -352,7 +408,7 @@ pub fn mesh_chunk_column(
                                 world_y,
                                 dz,
                                 f.uv_rect(&faces),
-                                WHITE,
+                                resolve_tint_color(f.tint_source(&tint), biome),
                             );
                         }
                     };
@@ -444,6 +500,25 @@ mod tests {
         vec![FALLBACK_FACES; registry.len()]
     }
 
+    /// No tint on any block — most of these tests check face-culling
+    /// geometry, not colour, so an all-`None` table keeps the vertex colour
+    /// channel at opaque white without pulling `tint::build_block_tint_table`
+    /// (and a real block name) into every one of them.
+    fn no_tint_table_for(registry: &BlockRegistry) -> Vec<BlockTint> {
+        vec![BlockTint::NONE; registry.len()]
+    }
+
+    /// A single biome (`BiomeRegistry::PLAINS`, id 0) resolving every source
+    /// to opaque white — pairs with [`no_tint_table_for`] so a plains lookup
+    /// never changes what these tests assert on.
+    fn white_biome_colors() -> Vec<BiomeColors> {
+        vec![BiomeColors {
+            grass: bevy::color::LinearRgba::WHITE,
+            foliage: bevy::color::LinearRgba::WHITE,
+            water: bevy::color::LinearRgba::WHITE,
+        }]
+    }
+
     #[test]
     fn isolated_block_emits_all_six_faces() {
         let (registry, stone) = stone_registry();
@@ -452,7 +527,7 @@ mod tests {
         let column = column_with(0, 0, vec![section_with(0, &[((5, 5, 5), stone)])]);
         let neighbors = Neighbors::default();
 
-        let mesh = mesh_chunk_column(&column, &registry, &neighbors, &uv_table_for(&registry)).unwrap();
+        let mesh = mesh_chunk_column(&column, &registry, &neighbors, &uv_table_for(&registry), &no_tint_table_for(&registry), &white_biome_colors()).unwrap();
         let Indices::U32(indices) = mesh.indices().unwrap() else {
             panic!("expected U32 indices");
         };
@@ -472,7 +547,7 @@ mod tests {
         );
         let neighbors = Neighbors::default();
 
-        let mesh = mesh_chunk_column(&column, &registry, &neighbors, &uv_table_for(&registry)).unwrap();
+        let mesh = mesh_chunk_column(&column, &registry, &neighbors, &uv_table_for(&registry), &no_tint_table_for(&registry), &white_biome_colors()).unwrap();
         let Indices::U32(indices) = mesh.indices().unwrap() else {
             panic!("expected U32 indices");
         };
@@ -488,7 +563,7 @@ mod tests {
         let column = column_with(0, 0, vec![section_with(-4, &[((5, 0, 5), stone)])]);
         let neighbors = Neighbors::default();
 
-        let mesh = mesh_chunk_column(&column, &registry, &neighbors, &uv_table_for(&registry)).unwrap();
+        let mesh = mesh_chunk_column(&column, &registry, &neighbors, &uv_table_for(&registry), &no_tint_table_for(&registry), &white_biome_colors()).unwrap();
         let Indices::U32(indices) = mesh.indices().unwrap() else {
             panic!("expected U32 indices");
         };
@@ -503,7 +578,7 @@ mod tests {
         let column = column_with(0, 0, vec![section_with(0, &[((15, 5, 0), stone)])]);
         let neighbors = Neighbors::default();
 
-        let mesh = mesh_chunk_column(&column, &registry, &neighbors, &uv_table_for(&registry)).unwrap();
+        let mesh = mesh_chunk_column(&column, &registry, &neighbors, &uv_table_for(&registry), &no_tint_table_for(&registry), &white_biome_colors()).unwrap();
         let Indices::U32(indices) = mesh.indices().unwrap() else {
             panic!("expected U32 indices");
         };
@@ -522,7 +597,7 @@ mod tests {
             ..Default::default()
         };
 
-        let mesh = mesh_chunk_column(&column, &registry, &neighbors, &uv_table_for(&registry)).unwrap();
+        let mesh = mesh_chunk_column(&column, &registry, &neighbors, &uv_table_for(&registry), &no_tint_table_for(&registry), &white_biome_colors()).unwrap();
         let Indices::U32(indices) = mesh.indices().unwrap() else {
             panic!("expected U32 indices");
         };
@@ -535,7 +610,7 @@ mod tests {
         let (registry, _) = stone_registry();
         let column = column_with(0, 0, vec![]);
         let neighbors = Neighbors::default();
-        assert!(mesh_chunk_column(&column, &registry, &neighbors, &uv_table_for(&registry)).is_none());
+        assert!(mesh_chunk_column(&column, &registry, &neighbors, &uv_table_for(&registry), &no_tint_table_for(&registry), &white_biome_colors()).is_none());
     }
 
     #[test]
@@ -544,7 +619,7 @@ mod tests {
         let column = column_with(0, 0, vec![section_with(0, &[((5, 5, 5), stone)])]);
         let neighbors = Neighbors::default();
 
-        let mesh = mesh_chunk_column(&column, &registry, &neighbors, &uv_table_for(&registry)).unwrap();
+        let mesh = mesh_chunk_column(&column, &registry, &neighbors, &uv_table_for(&registry), &no_tint_table_for(&registry), &white_biome_colors()).unwrap();
 
         let position_count = mesh.attribute(Mesh::ATTRIBUTE_POSITION).unwrap().len();
         let color_attr = mesh
@@ -556,5 +631,56 @@ mod tests {
 
         assert_eq!(colors.len(), position_count);
         assert!(colors.iter().all(|&c| c == [1.0, 1.0, 1.0, 1.0]));
+    }
+
+    /// Ticket 013: a grass block's top-face vertices carry the biome's
+    /// grass colour, and its bottom/side vertices stay white — the same
+    /// per-face split [`super::tint::resolve_block_tint`] establishes,
+    /// exercised all the way through mesh emission this time.
+    #[test]
+    fn grass_blocks_top_face_carries_the_biome_colour_and_its_other_faces_stay_white() {
+        let mut registry = BlockRegistry::new();
+        let grass_block = registry.intern("minecraft:grass_block");
+        // Isolated in open air so every one of its six faces is emitted.
+        let column = column_with(0, 0, vec![section_with(0, &[((5, 5, 5), grass_block)])]);
+        let neighbors = Neighbors::default();
+
+        let uv_table = uv_table_for(&registry);
+        let mut block_tint = no_tint_table_for(&registry);
+        block_tint[grass_block.0 as usize] = BlockTint {
+            top: TintSource::Grass,
+            bottom: TintSource::None,
+            side: TintSource::None,
+        };
+        let green = bevy::color::LinearRgba {
+            red: 0.2,
+            green: 0.8,
+            blue: 0.1,
+            alpha: 1.0,
+        };
+        let biome_colors = vec![BiomeColors {
+            grass: green,
+            foliage: bevy::color::LinearRgba::WHITE,
+            water: bevy::color::LinearRgba::WHITE,
+        }];
+
+        let mesh =
+            mesh_chunk_column(&column, &registry, &neighbors, &uv_table, &block_tint, &biome_colors)
+                .unwrap();
+        let bevy::render::mesh::VertexAttributeValues::Float32x4(colors) =
+            mesh.attribute(Mesh::ATTRIBUTE_COLOR).unwrap()
+        else {
+            panic!("expected vertex colour attribute to be Float32x4");
+        };
+
+        let green_arr = [green.red, green.green, green.blue, green.alpha];
+        assert!(
+            colors.iter().any(|&c| c == green_arr),
+            "expected at least one vertex (the top face) tinted with the biome's grass colour"
+        );
+        assert!(
+            colors.iter().any(|&c| c == WHITE),
+            "expected at least one vertex (bottom/side faces) left untinted"
+        );
     }
 }

@@ -207,8 +207,15 @@ fn setup(
         ..default()
     });
 
+    // Biome-tint colormaps (ticket 013) — same "plain data, resolved per
+    // chunk-load task" story as the atlas's `AtlasUvIndex` above: no fixed
+    // set of biomes to resolve up front, so `SharedColorMaps` just hands the
+    // raw texels to `chunk_pipeline`'s background tasks.
+    let color_maps = world::tint::load_color_maps(Path::new("assets/minecraft/textures/colormap"))
+        .expect("failed to load the biome colormaps");
+
     // Nothing is decoded yet — chunks stream in via the async pipeline
-    // (ticket 005-c) as the camera moves, driven by these three resources
+    // (ticket 005-c) as the camera moves, driven by these four resources
     // plus `DecodedWorld` (already inserted in `main()`). Ticket 005-e
     // deleted the old eager single-region load and per-column spawn loop
     // that used to populate the world here.
@@ -220,6 +227,7 @@ fn setup(
         region_cache,
     ))));
     commands.insert_resource(chunk_pipeline::SharedAtlasIndex(Arc::new(uv_index)));
+    commands.insert_resource(chunk_pipeline::SharedColorMaps(Arc::new(color_maps)));
     commands.insert_resource(chunk_pipeline::TerrainMaterial(material_handle));
 
     // Place the camera near the middle of the save's region footprint
