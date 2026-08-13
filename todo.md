@@ -107,8 +107,29 @@ these itself (see CLAUDE.md's "Manual/visual verification").
   the fog's falloff distance should react — a regression here would look
   like "the horizon goes blue-grey when I move the slider"). Finally,
   check the world doesn't read as washed out/bleached under the
-  ~10,000-lux noon sun — if it does, `src/sky.rs`'s `SkyPalette::default`
+  ~10,000-lux noon sun — if it does, `src/sky/mod.rs`'s `SkyPalette::default`
   needs a lower `sun_illuminance`, or `main.rs`'s camera needs a
   `Tonemapping` other than the default `TonyMcMapface` (try
   `ReinhardLuminance` before reaching for `Exposure` changes — see the
   ticket's "Tone mapping" section for the full order to try).
+- [ ] **016 skybox: gradient dome, sun and moon.** `cargo run` (debug
+  build) against the real save. Look straight up: should read as a smooth
+  zenith→horizon gradient with a large sun disc positioned consistently
+  with the lighting/shadows on terrain (opposite the direction it's
+  shining from). Look straight down from height: the dome should still be
+  visible past the render-distance edge, flat `horizon_color`, no
+  visible seam against the fog. Look at the horizon at eye level: confirm
+  there's no seam between terrain fading into fog and the dome behind it
+  — they should read as one continuous colour. Fly several thousand
+  blocks in any direction and confirm the sky/sun/moon don't move,
+  shrink, clip, or otherwise change (the sky camera's translation never
+  moves from the origin — only rotation follows the main camera).
+  Separately, check the moon is visible (opposite the sun, so likely
+  below the horizon at noon — worth a quick look with the render distance
+  or camera angle tweaked to catch it, or wait for 018's day/night cycle)
+  and reads as a plausible full-moon disc, not stretched/cropped from the
+  wrong cell of `moon_phases.png`. Finally, confirm the egui panels (save
+  picker, block inspector, status bar, ...) still draw on top of
+  everything with the second camera and the main camera's `ClearColorConfig::None`
+  in place — nothing should look like it's rendering underneath the UI or
+  vanishing behind the sky pass.

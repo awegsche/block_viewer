@@ -180,6 +180,7 @@ pub(crate) struct BlockMesh;
 
 fn setup(
     mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
     loaded_save: Res<LoadedSave>,
@@ -252,6 +253,13 @@ fn setup(
     commands.spawn((
         Name::new("Camera"),
         Camera3d::default(),
+        // Ticket 016: the sky camera (spawned below, `order: -1`) draws the
+        // dome/sun/moon first; this camera must not clear that away, so it
+        // draws terrain on top of the sky pass instead of erasing it.
+        Camera {
+            clear_color: ClearColorConfig::None,
+            ..default()
+        },
         Projection::Perspective(PerspectiveProjection {
             far: camera::far_plane_distance(render_distance.0),
             ..default()
@@ -275,6 +283,17 @@ fn setup(
         },
         Transform::default(),
     ));
+
+    // Ticket 016: the sky camera, gradient dome, and sun/moon billboards —
+    // see `sky::SkyPlugin`'s docs for why this is called from here rather
+    // than being a `Startup` system the plugin adds itself.
+    sky::spawn_sky_scene(
+        &mut commands,
+        &mut meshes,
+        &mut materials,
+        &mut images,
+        &sky_palette,
+    );
 }
 
 /// Bevy-space height every camera placement in this module uses. Real saves
