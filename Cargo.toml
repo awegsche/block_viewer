@@ -7,6 +7,10 @@ edition = "2024"
 bevy = "0.15.0"
 bevy_egui = "0.31.1"
 dirs = "5.0.1"
+# Gzip for the structure files ticket 023 writes. Already in `Cargo.lock` —
+# `ranvil` pulls it in for region decompression — so naming it here costs no
+# new download or compile.
+flate2 = "1.0.35"
 # Only for decoding the vanilla resource pack's PNGs into the startup atlas
 # (ticket 004) — bevy_image/arboard already pull in `image` with `png`
 # support, so this adds no new download.

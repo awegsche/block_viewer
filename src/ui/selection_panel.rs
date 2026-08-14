@@ -19,19 +19,18 @@
 use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts};
 
-use crate::blueprint::{BlueprintExtraction, ExtractOutcome, MAX_BLOCKS};
+use crate::blueprint::{BlueprintExtraction, ExtractOutcome, MAX_BLOCKS, STRUCTURE_BLOCK_MAX_SIZE};
 use crate::selection::{Face, Selection, SelectionBounds, CHUNK_STEP};
 
 /// Above this many blocks the volume line is coloured and the panel says an
 /// export will be slow: 1,000,000 = 100x100x100.
 ///
-/// Conservative against ticket 022's measured extraction cost — 2,097,152
-/// blocks over 64 chunk columns take ~175 ms including the region load
-/// (`cargo test measure_large_extraction -- --nocapture`), so a million
-/// blocks is under a tenth of a second, not "slow". Left where it is until
-/// ticket 023 measures the *write* half, which is the other thing this
-/// warning is about; the panel now reports each extraction's elapsed time,
-/// so the number to re-tune against is on screen.
+/// Both halves are measured now, and together they justify the number:
+/// 2,097,152 blocks extract in ~175 ms (ticket 022,
+/// `cargo test measure_large_extraction -- --nocapture`) and write in ~1.25 s
+/// (ticket 023, `cargo test measure_large_write -- --nocapture`). The write
+/// dominates by a factor of seven, so a million blocks is most of a second —
+/// worth warning about after all, where extraction alone would not have been.
 const VOLUME_WARN: u64 = 1_000_000;
 
 /// Above this many blocks the export button is disabled outright.
@@ -42,10 +41,13 @@ const VOLUME_WARN: u64 = 1_000_000;
 const VOLUME_CAP: u64 = MAX_BLOCKS;
 
 /// 48x48x48 = 110,592 blocks: the largest structure a *vanilla* structure
-/// block can load. Well below [`VOLUME_WARN`] on purpose — this app's writer
-/// (ticket 023) will happily emit a bigger `.nbt` than Minecraft will load
-/// back, so it's worth saying out loud in the panel rather than warning on.
-const STRUCTURE_BLOCK_LIMIT: u64 = 48 * 48 * 48;
+/// block can load. Well below [`VOLUME_WARN`] on purpose — ticket 023's
+/// writer happily emits a bigger `.nbt` than Minecraft will load back, so
+/// it's worth saying out loud in the panel rather than warning on.
+///
+/// Cubed from the writer's own per-side constant rather than restated, for
+/// the reason [`VOLUME_CAP`] is: two numbers for one limit can disagree.
+const STRUCTURE_BLOCK_LIMIT: u64 = (STRUCTURE_BLOCK_MAX_SIZE as u64).pow(3);
 
 /// Wide enough for `-30000000` at egui's default body font.
 const FIELD_WIDTH: f32 = 72.0;
@@ -255,9 +257,11 @@ fn readout(ui: &mut egui::Ui, bounds: &SelectionBounds, extraction: &mut Bluepri
         VolumeClass::OverCap => ui.colored_label(egui::Color32::RED, volume_text),
     };
     volume_label.on_hover_text(format!(
-        "A vanilla structure block loads at most 48 x 48 x 48 = {} blocks. \
-         Bigger blueprints still write, but Minecraft won't load them back.",
-        format_blocks(STRUCTURE_BLOCK_LIMIT)
+        "A vanilla structure block loads at most {max} x {max} x {max} = {} \
+         blocks. Bigger blueprints still write, but Minecraft won't load them \
+         back.",
+        format_blocks(STRUCTURE_BLOCK_LIMIT),
+        max = STRUCTURE_BLOCK_MAX_SIZE,
     ));
 
     match class {

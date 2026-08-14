@@ -20,14 +20,16 @@
 //!
 //! ## What happens to the result
 //!
-//! Ticket 022 stops at "in memory": the finished blueprint is logged (its
-//! size, its `DataVersion` and its palette — which is what the ticket's
+//! Still nothing, as of ticket 023: the finished blueprint is logged (its
+//! size, its `DataVersion` and its palette — which is what ticket 022's
 //! manual check reads to confirm properties survived) and summarised for the
-//! panel, then dropped. Ticket 023 adds the writer and 024 the save dialog,
-//! at which point [`poll_extraction`] hands the blueprint over instead of
+//! panel, then dropped. Ticket 023 landed [`structure`], which can write it
+//! out; ticket 024 adds the save dialog that supplies a filename, at which
+//! point [`poll_extraction`] hands the blueprint to the writer instead of
 //! dropping it.
 
 mod extract;
+mod structure;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -46,6 +48,12 @@ use crate::selection::SelectionBounds;
 pub use extract::{
     extract_blueprint, BlockState, Blueprint, ExtractError, ExtractProgress, MAX_BLOCKS,
 };
+
+// The writer has no caller until ticket 024's save dialog picks a filename
+// for it. Re-exported for the same reason as the types above: 024 asks
+// `blueprint` for it rather than reaching into a submodule.
+#[allow(unused_imports)]
+pub use structure::{write_structure_file, STRUCTURE_BLOCK_MAX_SIZE};
 
 /// How many palette entries the finished-extraction log prints before
 /// summarising the rest. Long enough to see a structure's whole palette,

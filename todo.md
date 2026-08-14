@@ -336,3 +336,25 @@ these itself (see CLAUDE.md's "Manual/visual verification").
   `extraction_agrees_with_the_block_inspectors_path_on_a_real_save` already
   does it for one 8x8x8 box, so this is only worth a minute.
   Resolution notes: `finished_tickets/022-blueprint-extraction.md`.
+- [ ] **023 structure writer: an exported `.nbt` loads in Minecraft.** The
+  one check for this ticket that can only happen in the game. Ticket 024
+  hasn't wired the export button to a save dialog yet, so produce a file
+  with the test that does it end to end against the real save:
+  `cargo test writes_a_real_box_from_the_save -- --nocapture`. It prints
+  the path it wrote to (in `%TEMP%`) and the palette it extracted — a
+  16x16x16 box at the middle of the save's first region, Y 60-75, so
+  expect terrain rather than a build. Then: copy the file into a world's
+  `generated/minecraft/structures/` folder (create it if missing), load it
+  with a structure block (place one, set it to Load mode, type the
+  filename without `.nbt`, hit Load, then Place). Confirm (1) the detected
+  size is 16 x 16 x 16, (2) the terrain matches what's actually at those
+  coordinates in the source world — **not mirrored**, which is the thing
+  most likely to be wrong: 019's `bevy.z = -mc.z` flip shows up as a
+  Z-mirrored build and nowhere else, and (3) blocks with an orientation
+  kept it. For (3) the printed palette is the guide — a terrain box will
+  usually only have `grass_block[snowy=false]`, so for a real orientation
+  check re-run the test with `origin` pointed at a staircase, a log wall
+  or a door you know the coordinates of, and confirm those blocks come out
+  facing the same way in the placed structure as in the source world.
+  Once 024 lands, this is the same check done through the export button
+  instead. Resolution notes: `finished_tickets/023-structure-nbt-writer.md`.
