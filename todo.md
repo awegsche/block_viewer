@@ -396,3 +396,48 @@ these itself (see CLAUDE.md's "Manual/visual verification").
   stuck (`camera::EguiInputCapture` defaults to "nothing captured", which is
   what should carry it). Ticket:
   `finished_tickets/027-lib-and-two-binary-shims.md`.
+- [ ] **ranvil 014 (+ 013): does Minecraft actually relight a chunk whose
+  `isLightOn` we cleared?** The single largest unverified assumption in the
+  citybuilder roadmap — the whole write path avoids writing a lighting engine
+  on the strength of this one byte, so the roadmap says to answer it in week
+  one rather than mid-project. The code half is done and tested
+  (`../ranvil/finished_tickets/014-relight-on-load-flag.md`); the flag is
+  confirmed to be a root `TAG_Byte` on the real save (`DataVersion` 4438) and
+  `set_blocks` now clears it. What's left can only be answered with the game
+  open. **Back the world up first** — this writes to a real save.
+
+  Produce an edited chunk. There's no UI for writing yet (that's W8), so the
+  quickest route is a throwaway test in `../ranvil` that opens a region of a
+  scratch world, `set_blocks` a solid roof — say a 16x16 slab of
+  `minecraft:stone` a few blocks above a patch of open ground you can find
+  again — and `save`s. A roof is the right shape because it makes all four
+  questions visible at once: what's under it must go dark.
+
+  Then load the world and check:
+  (1) **Is the flag alone enough?** Under the new roof should be *dark*, and
+  the roof should cast a shadow on the ground beside it. If the interior is
+  still fully lit, clearing `isLightOn` is not sufficient on its own and the
+  next thing to try is also deleting the affected sections' `BlockLight` /
+  `SkyLight` arrays — note that vanilla only writes those for sections whose
+  light isn't uniform (one chunk in `nbt_test` had `BlockLight` in exactly
+  one of its 24 sections), so "delete them" means "delete the ones that are
+  there", not "there is one per section". If *that* doesn't work either,
+  a real lighting engine has appeared in the plan and the roadmap needs
+  rewriting — which is exactly why this check is worth doing before W4.
+  (2) **Does it stick?** Quit, and re-read the same chunk's `isLightOn`
+  (a two-line test, or `mark_for_relight`'s inverse). It should read 1 again
+  — the game relit and re-claimed it. If it's still 0, every load of that
+  chunk pays to relight forever, and the write path needs to set the flag
+  itself after some notion of "we know the light is right", which it can't.
+  (3) **What does it cost?** Edit a few hundred chunks (a long thin run works)
+  and note whether loading the world is visibly slower or hitches. The
+  citybuilder will edit chunks by the hundred; if relighting is expensive
+  that's a scheduling constraint downstream needs to know about now.
+  (4) **Same trip, ranvil 013:** delete a chunk's whole `Heightmaps` compound
+  (instead of recomputing it), load the world, and see whether the game
+  rebuilds it — check that grass/snow/rain land correctly and mobs don't
+  spawn on lit ground. If it does rebuild, ticket
+  `../ranvil/tickets/013-heightmap-pack-unpack.md` evaporates entirely and a
+  day of 9-bit packing code with it; the roadmap explicitly says to check
+  this in the same sitting as 014. Record both answers in the two tickets'
+  Resolution sections.

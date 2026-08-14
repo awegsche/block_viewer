@@ -618,7 +618,10 @@ defaulting: a tint on the building's mesh reusing the vertex colour channel
   reason. The whole plan avoids writing a lighting engine on the strength of
   one byte. If it turns out Minecraft doesn't relight, that's a large ticket
   appearing mid-project, and better discovered in week one — it's an hour of
-  looking.
+  looking. **Half done:** the flag is confirmed present as a root `TAG_Byte`
+  on the real save (`DataVersion` 4438) and `set_blocks` now clears it; the
+  "does the game honour it" half is the one that needs the game open, and is
+  written up as a manual check in `../todo.md` alongside 013's question below.
 - **ranvil 011's round-trip test before its encoder.** Ticket 001 was this
   exact arithmetic, in the other direction, and it shipped broken upstream.
 - **ranvil 013 may not be needed at all** — if deleting `Heightmaps` makes
