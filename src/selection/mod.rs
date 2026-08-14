@@ -33,14 +33,6 @@
 //! box goes through [`SelectionBounds::bevy_aabb`] rather than doing this
 //! arithmetic again.
 
-// Some of this module's API still has no caller: what's left is for tickets
-// 021 (shows and edits the bounds) and 022 (walks them in `iter_blocks`
-// order). Same call as `world/mod.rs`'s `allow(unused_imports)` — the point
-// of doing 019 first is that those tickets find the coordinate rules already
-// settled and tested, so trimming this down to what today's callers happen
-// to use would defeat the ticket. Drop this once 022 lands.
-#![allow(dead_code)]
-
 mod gizmo;
 mod input;
 
@@ -158,6 +150,14 @@ impl SelectionBounds {
     ///
     /// Takes `self` by value (it's `Copy`) so the returned iterator borrows
     /// nothing.
+    ///
+    /// The last of 019's API with no caller outside tests: ticket 022 walks
+    /// a selection by *chunk column* rather than block by block (resolving
+    /// the region and chunk once per column instead of per block) and writes
+    /// its results through [`Self::index_of`], so this stays as the readable
+    /// statement of the order `index_of` computes — and as what that order is
+    /// tested against.
+    #[allow(dead_code)]
     pub fn iter_blocks(self) -> impl Iterator<Item = IVec3> {
         let (min, max) = (self.min, self.max);
         (min.y..=max.y).flat_map(move |y| {

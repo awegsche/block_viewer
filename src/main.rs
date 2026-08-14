@@ -6,6 +6,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+mod blueprint;
 mod camera;
 mod chunk_pipeline;
 mod region_cache;
@@ -162,6 +163,7 @@ fn main() {
         .add_plugins(chunk_pipeline::ChunkLoadPipelinePlugin)
         .add_plugins(unload::ChunkUnloadPlugin)
         .add_plugins(selection::SelectionPlugin)
+        .add_plugins(blueprint::BlueprintPlugin)
         .add_plugins(ui::UiPlugin)
         // The UI plugin's panels (ticket 007) need to have drawn this
         // frame before `drive_camera` — and, ticket 020, the selection's

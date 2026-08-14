@@ -642,7 +642,11 @@ fn remesh_chunk_column(
 /// `coord`'s position within `region_coord`'s 32x32 chunk grid, as
 /// [`ChunkRegion::get_chunk`](mc_anvil::chunkregion::ChunkRegion::get_chunk)
 /// expects it (each axis `0..32`).
-fn local_chunk_index((cx, cz): (i32, i32), (rx, rz): (i32, i32)) -> (usize, usize) {
+///
+/// `pub(crate)` so ticket 022's blueprint extraction resolves a column
+/// through the same arithmetic this pipeline does, rather than writing a
+/// second copy of it.
+pub(crate) fn local_chunk_index((cx, cz): (i32, i32), (rx, rz): (i32, i32)) -> (usize, usize) {
     use mc_anvil::region::REGION_WIDTH_IN_CHUNKS;
     let w = REGION_WIDTH_IN_CHUNKS as i32;
     ((cx - rx * w) as usize, (cz - rz * w) as usize)

@@ -178,3 +178,96 @@ no real save needed.
   match what the block inspector reports for those same blocks. Also
   extract a box straddling the loaded/unloaded boundary and confirm the
   unloaded part comes back as real blocks (loaded from disk), not air.
+
+---
+
+## Resolution
+
+Landed as `src/blueprint/` — `extract.rs` (the walk, no Bevy beyond `IVec3`)
+and `mod.rs` (the task, the resource, the systems).
+
+### What was built
+
+- `Blueprint` / `BlockState` / `ExtractError` / `ExtractProgress` as
+  specified, plus two additions:
+  - **`Blueprint::failed_columns`** — the ticket asks for the count to be
+    reported to the UI but doesn't say where it lives; the blueprint is the
+    only thing that crosses back from the task, so it carries it.
+  - **`BlockState: Display`**, emitting the vanilla block-state string
+    (`minecraft:oak_stairs[facing=north,half=bottom]`). That's what the
+    palette log line prints, which is what the manual check reads.
+- `extract_blueprint(bounds, &Arc<Mutex<RegionCache>>, &ExtractProgress)`,
+  called from an `AsyncComputeTaskPool` task held in `BlueprintExtraction`
+  (one at a time) and polled by `poll_extraction` with
+  `block_on(poll_once(..))`, exactly like `poll_completed_chunk_loads`.
+- Ticket 021's "Export…" button now starts an extraction instead of doing
+  nothing, and the panel shows a live `done / total chunk columns` line and
+  progress bar while one runs, then the result (blocks, distinct states,
+  elapsed, unreadable-column count). 024 replaces the log with a real file;
+  the button, the cap and the disable-while-busy rule are already in place.
+
+### Decisions worth knowing about
+
+- **Air is palette index 0, always**, seeded before anything is read — a
+  departure from "first-seen order". The dense array is pre-filled with air
+  and every missing chunk, out-of-range Y and unreadable column resolves to
+  it, so the fill value has to be in the palette. Costs one unused slot on a
+  selection that happens to contain no air.
+- **Sections are resolved by their `Y` tag, not by list position.** The
+  ticket flags `ChunkRegion::get_block`'s positional indexing as a quirk to
+  cross-check; rather than inherit it, the walk reads each section's own `Y`
+  the way `world::decode` does. The two are cross-checked against each other
+  anyway by `extraction_agrees_with_the_block_inspectors_path_on_a_real_save`,
+  which extracts an 8x8x8 box from the real save and asserts every block
+  matches `ChunkRegion::get_block` at the same coordinates. It passes, so
+  this save's section lists are contiguous and nothing in `../ranvil` needed
+  fixing.
+- **No `Status == "minecraft:full"` check**, unlike `world::decode_chunk`. A
+  partially generated chunk still has real blocks, and `get_block` — the
+  path an extraction gets cross-read against — doesn't check it either.
+- **Columns are visited region-major**, not in a Z/X sweep: the region cache
+  is only sized for a render distance, so a wide selection swept row by row
+  would evict and re-parse the same `.mca` files on every row.
+- **The lock is taken per column** and released between, per the ticket. The
+  alternative (cloning each chunk's NBT out of the cache to work on it
+  unlocked) allocates hundreds of KB per column to save a lock hold that is
+  one column's worth of decode.
+- **A region that fails to load counts as one failed column, not as all of
+  the columns it covers**: `RegionCache` remembers the failure and answers
+  every later request for it with `PathNotFoundError`, which is
+  indistinguishable from "the save doesn't have this region" — i.e. normal
+  air. Documented at the call site; it undercounts rather than crying wolf.
+
+### Measured
+
+`cargo test measure_large_extraction -- --nocapture`, against the real save:
+
+```
+extracted 2097152 blocks (64 columns) in 174.8854ms — 80 distinct states, 0 unreadable columns
+```
+
+2.1M blocks in ~175 ms *including* the region load from disk, i.e. ~1.3 s
+extrapolated to the 16,000,000-block `MAX_BLOCKS` cap. So ticket 021's
+`VOLUME_WARN` of 1,000,000 ("exporting this will be slow") is conservative by
+an order of magnitude on the extraction half. **Left where it is** — the
+warning is about the whole export, and 023's write cost is still unmeasured.
+`VOLUME_CAP` is now literally `blueprint::MAX_BLOCKS` rather than a second
+copy of the number, so the panel can't offer a button for a selection the
+extractor would refuse.
+
+### Also touched
+
+- `chunk_pipeline::local_chunk_index` is now `pub(crate)` — extraction
+  resolves a column through the same arithmetic rather than a second copy.
+- `selection/mod.rs`'s module-level `#![allow(dead_code)]` (added by 019 with
+  "drop this once 022 lands") is gone; only `iter_blocks` still has no
+  non-test caller, and it now carries its own `allow` explaining why 022
+  walks by column instead.
+
+### Out of scope, as stated
+
+Block entities, entities and biomes are all absent from `Blueprint`. Chest
+contents in particular are a second NBT path (`block_entities` in the chunk
+root) and want their own ticket.
+
+19 new tests; `cargo test` is 163 passing.

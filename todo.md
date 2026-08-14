@@ -295,3 +295,44 @@ these itself (see CLAUDE.md's "Manual/visual verification").
   glyphs render (`→ (Right)` etc.) rather than showing tofu boxes in egui's
   default font — if any do, the fix is dropping the arrow from
   `Face::key_label` in `src/selection/input.rs` and keeping the word.
+- [ ] **022 blueprint extraction: orientation survives, and the box isn't
+  limited to loaded chunks.** `cargo run` (debug build) against the real
+  save. The "Export…" button in the Selection panel now runs an extraction
+  and logs the result; nothing is written to disk yet (that's 023/024).
+  (1) **Properties survive.** Select a small box containing
+  orientation-sensitive blocks — a staircase, a log wall, a door, a
+  repeater or a piece of rail. Hit "Export…" and read the palette lines the
+  console prints (`block_viewer:   [7] minecraft:oak_stairs[facing=north,
+  half=bottom,shape=straight]`). Point the block inspector at those same
+  blocks and confirm the properties match what it reports. This is the
+  whole reason 022 doesn't read `DecodedWorld` — if a stair comes back with
+  no properties, or every stair in the box comes back identical, that's the
+  failure the ticket exists to prevent.
+  (2) **Past the render distance.** Grow a selection (Ctrl + a direction
+  steps a chunk at a time) until part of it is well outside the loaded
+  terrain — far enough that there's visibly no mesh there. Extract, and
+  confirm the far part comes back as real blocks, not air: the palette
+  should contain terrain block names, and the "distinct states" count
+  should be similar to a same-sized box inside the loaded area. The region
+  cache loads from disk on demand, so this is meant to work; if that half
+  comes back as pure air, the column loop is silently swallowing a region
+  error.
+  (3) **Progress and responsiveness.** Grow a box past a million blocks
+  (the panel turns the volume line yellow) and extract. The panel should
+  show `Extracting… n / m chunk columns` and a moving progress bar, the
+  window should keep rendering at a normal frame rate throughout, and
+  terrain should keep streaming in if you fly while it runs — the
+  extraction shares the region-cache lock with chunk loading and takes it
+  one column at a time specifically so it can't stall streaming. Note the
+  elapsed time the panel reports afterward: the measured figure is ~175 ms
+  for 2.1M blocks off a warm disk, so anything wildly slower than that
+  (especially if the frame rate drops with it) means the lock is being held
+  longer than intended.
+  (4) **Cross-check a couple of heights.** Pick two blocks at known
+  coordinates at clearly different Y values (say a surface block and one
+  deep underground), read them in the block inspector, then extract a box
+  containing both and confirm the palette contains both names. This is the
+  `sections`-indexing cross-check the ticket asks for — the automated test
+  `extraction_agrees_with_the_block_inspectors_path_on_a_real_save` already
+  does it for one 8x8x8 box, so this is only worth a minute.
+  Resolution notes: `finished_tickets/022-blueprint-extraction.md`.

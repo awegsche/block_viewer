@@ -19,19 +19,27 @@
 use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts};
 
+use crate::blueprint::{BlueprintExtraction, ExtractOutcome, MAX_BLOCKS};
 use crate::selection::{Face, Selection, SelectionBounds, CHUNK_STEP};
 
 /// Above this many blocks the volume line is coloured and the panel says an
 /// export will be slow: 1,000,000 = 100x100x100.
 ///
-/// Both this and [`VOLUME_CAP`] are guesses with no measurement behind them —
-/// ticket 022 is the one that will produce real extraction timings, and these
-/// are meant to be re-tuned against them then.
+/// Conservative against ticket 022's measured extraction cost — 2,097,152
+/// blocks over 64 chunk columns take ~175 ms including the region load
+/// (`cargo test measure_large_extraction -- --nocapture`), so a million
+/// blocks is under a tenth of a second, not "slow". Left where it is until
+/// ticket 023 measures the *write* half, which is the other thing this
+/// warning is about; the panel now reports each extraction's elapsed time,
+/// so the number to re-tune against is on screen.
 const VOLUME_WARN: u64 = 1_000_000;
 
-/// Above this many blocks the export button is disabled outright. See
-/// [`VOLUME_WARN`] — same caveat, 16x the threshold.
-const VOLUME_CAP: u64 = 16_000_000;
+/// Above this many blocks the export button is disabled outright.
+///
+/// The extraction's own hard limit, not a second copy of it: ticket 022
+/// refuses anything larger, and a panel that offered a button for a
+/// selection the extractor would reject outright would be lying about it.
+const VOLUME_CAP: u64 = MAX_BLOCKS;
 
 /// 48x48x48 = 110,592 blocks: the largest structure a *vanilla* structure
 /// block can load. Well below [`VOLUME_WARN`] on purpose — this app's writer
@@ -154,6 +162,7 @@ fn format_blocks(n: u64) -> String {
 pub(crate) fn selection_panel(
     mut contexts: EguiContexts,
     mut selection: ResMut<Selection>,
+    mut extraction: ResMut<BlueprintExtraction>,
     mut draft: Local<BoundsDraft>,
 ) {
     egui::Window::new("Selection").show(contexts.ctx_mut(), |ui| {
@@ -204,10 +213,15 @@ pub(crate) fn selection_panel(
                 // panel opened the frame with.
                 if let Some(bounds) = selection.0 {
                     ui.separator();
-                    readout(ui, &bounds);
+                    readout(ui, &bounds, &mut extraction);
                 }
             }
         }
+
+        // Outside the `match`: an extraction keeps running (and keeps
+        // reporting) even if the selection it was started from is cleared or
+        // moved while it's in flight — it works from a snapshot of the bounds.
+        extraction_status(ui, &extraction);
 
         ui.separator();
         key_legend(ui);
@@ -228,7 +242,7 @@ fn coord_fields(ui: &mut egui::Ui, fields: &mut [String; 3]) -> bool {
 }
 
 /// Size, volume, anchor, and the export button — the read-only half.
-fn readout(ui: &mut egui::Ui, bounds: &SelectionBounds) {
+fn readout(ui: &mut egui::Ui, bounds: &SelectionBounds, extraction: &mut BlueprintExtraction) {
     let size = bounds.size();
     ui.label(format!("Size: {} x {} x {}", size.x, size.y, size.z));
 
@@ -271,16 +285,73 @@ fn readout(ui: &mut egui::Ui, bounds: &SelectionBounds) {
     let anchor = bounds.anchor;
     ui.label(format!("Anchor: {}, {}, {}", anchor.x, anchor.y, anchor.z));
 
-    // Inert until ticket 024 hangs the save-file dialog off it (022 gives it
-    // a block count to report, 023 a file to write). It lands here rather
-    // than in 024 so that ticket is pure plumbing — and so the cap above has
-    // something to actually disable.
-    ui.add_enabled(
-        class != VolumeClass::OverCap,
+    // Ticket 022 makes this run the extraction and log what it found; 023
+    // gives it a file format and 024 a save dialog to pick a filename with.
+    let busy = extraction.busy();
+    let response = ui.add_enabled(
+        class != VolumeClass::OverCap && !busy,
         egui::Button::new("Export…"),
-    )
-    .on_hover_text("Not wired up yet — ticket 024.")
-    .on_disabled_hover_text("Selection is over the export cap.");
+    );
+    if response.clicked() {
+        extraction.request(*bounds);
+    }
+    response
+        .on_hover_text("Extract these blocks and log the palette (no file yet — ticket 024).")
+        .on_disabled_hover_text(if busy {
+            "An extraction is already running."
+        } else {
+            "Selection is over the export cap."
+        });
+}
+
+/// The running extraction's progress, or the last one's result. Nothing at
+/// all before the first export — an idle line here would just be noise in a
+/// panel that already has plenty.
+fn extraction_status(ui: &mut egui::Ui, extraction: &BlueprintExtraction) {
+    if let Some((done, total)) = extraction.progress() {
+        ui.separator();
+        ui.label(format!("Extracting… {done} / {total} chunk columns"));
+        // The whole reason the task publishes a column count: a
+        // multi-second extraction with no feedback reads as a hung window.
+        ui.add(egui::ProgressBar::new(extraction.fraction().unwrap_or(0.0)).show_percentage());
+        return;
+    }
+
+    let Some(outcome) = extraction.last() else {
+        return;
+    };
+    ui.separator();
+    match outcome {
+        ExtractOutcome::Done(summary) => {
+            ui.label(format!(
+                "Extracted {} blocks, {} distinct states in {:.2?}",
+                format_blocks(summary.blocks as u64),
+                summary.palette,
+                summary.elapsed
+            ));
+            ui.label(format!(
+                "  {} x {} x {} at {}, {}, {} — palette logged to the console",
+                summary.size.x,
+                summary.size.y,
+                summary.size.z,
+                summary.origin.x,
+                summary.origin.y,
+                summary.origin.z,
+            ));
+            if summary.failed_columns > 0 {
+                ui.colored_label(
+                    egui::Color32::YELLOW,
+                    format!(
+                        "{} chunk column(s) could not be read — those blocks are air.",
+                        summary.failed_columns
+                    ),
+                );
+            }
+        }
+        ExtractOutcome::Failed(err) => {
+            ui.colored_label(egui::Color32::RED, format!("Export failed: {err}"));
+        }
+    }
 }
 
 /// Ticket 020's bindings, generated from [`Face`] itself. A legend retyped as
