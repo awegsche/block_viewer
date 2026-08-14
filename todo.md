@@ -203,14 +203,13 @@ these itself (see CLAUDE.md's "Manual/visual verification").
   north and then from the south looks identically placed, which is the
   check for the `bevy.z = -mc.z` sign (a flipped Z puts the box one block
   off in Z and only in Z, which is near-invisible from one viewpoint);
-  (3) the depth-bias look — `src/selection/gizmo.rs`'s `DEPTH_BIAS` is
-  currently `-1.0`, i.e. the box always draws in front of terrain. Decide
-  whether that's right or whether terrain should occlude it (a small
-  negative bias instead, e.g. `-0.01`, which still avoids z-fighting where
-  the box is coplanar with block faces). Also judge `LINE_WIDTH`,
-  `BOX_COLOR` and `ANCHOR_COLOR` against real terrain — the yellow/orange
-  pair was picked without ever being looked at. Record whatever they end up
-  at, and why, in `finished_tickets/019-selection-volume.md`'s resolution.
+  (3) the depth-bias look — **answered, see ticket 026**: `-1.0` for the
+  whole box turned out to be unreadable underground, and the box is now
+  drawn twice (depth-tested solid, always-in-front dotted). What's left of
+  this item is judging `LINE_WIDTH`, `BOX_COLOR` and `ANCHOR_COLOR` against
+  real terrain — the yellow/orange pair was picked without ever being
+  looked at. Record whatever they end up at, and why, in
+  `finished_tickets/019-selection-volume.md`'s resolution.
 - [ ] **020 selection input: click anchors a box, the six keys push the face
   you pressed, and nothing fights the camera or egui.** `cargo run` (debug
   build) against the real save. Do 019's three checks above in the same pass
@@ -358,3 +357,26 @@ these itself (see CLAUDE.md's "Manual/visual verification").
   facing the same way in the placed structure as in the source world.
   Once 024 lands, this is the same check done through the export button
   instead. Resolution notes: `finished_tickets/023-structure-nbt-writer.md`.
+- [ ] **026 selection box legibility: the buried half is distinguishable.**
+  The whole ticket is a look call, so this is the check that decides
+  whether it worked. `cargo run`, click a block on open ground, then
+  extend the box downward into a hillside (arrow keys, or Ctrl + a
+  direction for a chunk at a time) until part of it is underground.
+  Confirm: (1) the part in open air is a **solid** line and the buried part
+  is **dotted and dimmer** — if the whole box looks solid the depth test
+  isn't happening, if the whole box looks dotted the solid pass is being
+  occluded when it shouldn't be; (2) the boundary between the two styles
+  tracks the terrain surface as you orbit, which is the cue the ticket
+  exists for; (3) the horizontal slice plates (every 16 blocks on world
+  chunk boundaries, coarsening to 32 for a very tall box) read as depth
+  rather than as clutter — if they're noise, `MAX_SLICES`/`SLICE_ALPHA` in
+  `src/selection/gizmo.rs` are the knobs, and dropping them entirely is a
+  legitimate outcome; (4) `SOLID_DEPTH_BIAS` (`-0.02`) against a box whose
+  bottom face sits flat on a flat surface — flickering along that edge
+  means it's too small; the box floating visibly in front of terrain it
+  should be behind means it's too large; (5) the dotted pass from a
+  distance — if the buried box vanishes at range, `BURIED_ALPHA` (0.55) is
+  too low or `BURIED_LINE_WIDTH` too thin. Record whatever the constants
+  end up at in `finished_tickets/026-selection-box-legibility.md`. If the
+  two-pass wireframe still isn't enough, the translucent fill that ticket
+  lists under "considered and not done" is the next thing to try.
