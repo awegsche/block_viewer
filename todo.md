@@ -396,6 +396,17 @@ these itself (see CLAUDE.md's "Manual/visual verification").
   stuck (`camera::EguiInputCapture` defaults to "nothing captured", which is
   what should carry it). Ticket:
   `finished_tickets/027-lib-and-two-binary-shims.md`.
+- [ ] **028 new save layout: the current-version save actually loads in the
+  app.** `ranvil` now resolves the overworld's regions to
+  `<save>/dimensions/minecraft/overworld/region` when a save has one
+  (ticket `../ranvil/finished_tickets/026-dimension-folder-save-layout.md`),
+  falling back to the old `<save>/region`. Verified headlessly via
+  `cargo run --example region_info` in `../ranvil` (lists `nbt_test` with 29
+  regions and reads a block), but not in the window: run
+  `cargo run --bin block_viewer` and check that the save picker lists
+  `nbt_test`, that selecting it streams real terrain in rather than leaving
+  an empty world, and that the startup-issue message is gone. If you still
+  have an older save around, load it too — both layouts are supposed to work.
 - [ ] **ranvil 014 (+ 013): does Minecraft actually relight a chunk whose
   `isLightOn` we cleared?** The single largest unverified assumption in the
   citybuilder roadmap — the whole write path avoids writing a lighting engine

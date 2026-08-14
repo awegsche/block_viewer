@@ -869,6 +869,7 @@ mod tests {
         let meta = mc_anvil::SaveMeta {
             name: "empty".to_string(),
             path: std::path::PathBuf::from("does-not-exist"),
+            region_dir: std::path::PathBuf::from("does-not-exist/region"),
             regions: vec![],
         };
         let region_cache = Arc::new(Mutex::new(RegionCache::new(meta, 1)));

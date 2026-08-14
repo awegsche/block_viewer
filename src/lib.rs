@@ -89,6 +89,7 @@ fn empty_save() -> Save {
         meta: SaveMeta {
             name: "(no save loaded)".to_string(),
             path: PathBuf::new(),
+            region_dir: PathBuf::new(),
             regions: Vec::new(),
         },
         regions: Vec::new(),

@@ -236,6 +236,7 @@ mod tests {
         let meta = SaveMeta {
             name: "broken".to_string(),
             path: std::path::PathBuf::from("does-not-exist-on-disk"),
+            region_dir: std::path::PathBuf::from("does-not-exist-on-disk/region"),
             regions: vec![(0, 0)],
         };
         let mut cache = RegionCache::new(meta, 4);

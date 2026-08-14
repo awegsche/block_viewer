@@ -3713,6 +3713,7 @@ dependencies = [
  "byteorder",
  "dirs",
  "flate2",
+ "libc",
  "once_cell",
  "regex",
  "rnbt",
