@@ -51,7 +51,7 @@ pub(crate) struct UiState {
     coord_z: String,
 }
 
-/// [`SystemSet`] every panel-drawing system runs in. `main.rs` orders
+/// [`SystemSet`] every panel-drawing system runs in. `viewer::run` orders
 /// [`camera::CameraSet`] `.after()` this, and [`sync_egui_input_capture`]
 /// also runs `.after()` this (see its own docs) — both need every panel to
 /// have already drawn this frame before they read what egui claimed.
@@ -87,7 +87,7 @@ impl Plugin for UiPlugin {
 /// can change while the viewer is running.
 ///
 /// Scans [`crate::saves_directory`] — the same CLI-arg-or-default directory
-/// `main.rs`'s startup pick uses (ticket 008) — so this list always matches
+/// `lib.rs`'s startup pick uses (ticket 008) — so this list always matches
 /// where the app actually looked, rather than silently falling back to the
 /// default `.minecraft/saves` if a custom instance directory was given.
 fn scan_saves(mut available: ResMut<AvailableSaves>) {
@@ -97,7 +97,7 @@ fn scan_saves(mut available: ResMut<AvailableSaves>) {
 
 /// Reads whether egui claimed this frame's pointer/keyboard input, once
 /// after every panel above has drawn, and publishes it as
-/// [`camera::EguiInputCapture`] for [`camera::drive_camera`] to gate its
+/// [`camera::EguiInputCapture`] for `camera::drive_camera` to gate its
 /// own input reads on (see that resource's docs for why). Running this
 /// after every panel — rather than interleaved with them — means it always
 /// reflects the union of every widget drawn this frame, not just whichever

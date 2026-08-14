@@ -114,7 +114,7 @@ pub(crate) fn build_dome_mesh(zenith: Color, horizon: Color) -> Mesh {
 /// is the entire reason this bakes colour into geometry instead of a shader
 /// or a cubemap (see the parent ticket).
 ///
-/// `dome_mesh` is `Option` because this system is wired up by [`SkyPlugin`]
+/// `dome_mesh` is `Option` because this system is wired up by [`crate::sky::SkyPlugin`]
 /// (`crate::sky::SkyPlugin`) itself, before [`super::spawn_sky_scene`] has
 /// necessarily run — a test app that adds the plugin without ever spawning
 /// the scene should just have nothing to rebuild, not panic on a missing

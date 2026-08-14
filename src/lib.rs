@@ -1,3 +1,43 @@
+//! Shared core for the two games in this package (ticket 027): the
+//! `block_viewer` explorer and the `citybuilder` built on top of it. Both
+//! live *inside* this lib rather than in separate crates, so `pub(crate)`
+//! keeps working across every shared module and no visibility churn was
+//! needed to grow the second entry point. The workspace split
+//! (`mc_core` / `block_viewer` / `citybuilder`) stays available as a later
+//! move, once the shared core stops changing shape.
+//!
+//! ## The module tree
+//!
+//! Everything above [`viewer`] and [`city`] is shared: [`world`] (decode,
+//! mesh, atlas, tint, biome, block), [`blueprint`], [`selection`]'s
+//! coordinate rules, [`region_cache`], [`streaming`], [`chunk_pipeline`],
+//! [`unload`], [`sky`] and [`camera`]. The two games are the leaves.
+//!
+//! [`selection`] is shared rather than viewer-only — the roadmap's sketch
+//! put it under `viewer`, but `blueprint::extract` already takes a
+//! [`selection::SelectionBounds`], and a shared module can't depend on a
+//! viewer-only one. It's also where ticket 019 fixed the coordinate rules
+//! (`bevy.z = -mc.z`, inclusive bounds) that the write path is meant to
+//! inherit rather than reinvent. Its *interaction* half (`gizmo`, `input`)
+//! is viewer-flavoured; splitting the module along that line is a later
+//! refactor if it earns itself.
+//!
+//! ## The shared startup
+//!
+//! [`world_app`] is the half of the old `main()` both games need — save
+//! loading, the streaming/meshing plugins, and the `Startup` system that
+//! builds the atlas, the region cache, the camera and the sky. Each game's
+//! `run()` adds its own layer on top of it: see [`viewer::run`] and
+//! [`city::run`].
+
+// This is an application, not a published library: the module tree is `pub`
+// only so the two binary shims can reach `viewer::run`/`city::run`, and the
+// docs are written for `cargo doc --document-private-items`. Doc comments
+// linking to a private system or resource are the norm here rather than a
+// leak, so ticket 027 silences the lint that started firing the moment the
+// tree stopped being a binary's private modules.
+#![allow(rustdoc::private_intra_doc_links)]
+
 use bevy::prelude::*;
 use mc_anvil::{get_saves_from_instance, region::REGION_WIDTH_IN_CHUNKS, Save, SaveMeta};
 use std::{
@@ -6,16 +46,17 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-mod blueprint;
-mod camera;
-mod chunk_pipeline;
-mod region_cache;
-mod selection;
-mod sky;
-mod streaming;
-mod ui;
-mod unload;
-mod world;
+pub mod blueprint;
+pub mod camera;
+pub mod chunk_pipeline;
+pub mod city;
+pub mod region_cache;
+pub mod selection;
+pub mod sky;
+pub mod streaming;
+pub mod unload;
+pub mod viewer;
+pub mod world;
 
 /// The currently loaded Minecraft save, populated at startup from a real
 /// save directory (`%AppData%\.minecraft\saves` on Windows). `pub(crate)`
@@ -23,8 +64,8 @@ mod world;
 /// runtime without restarting.
 ///
 /// Always holds a real (if possibly empty-of-regions) [`Save`] — never
-/// `Option`/`Result` — so every reader (`setup`, the save picker) can read
-/// `.0.meta` unconditionally. When nothing could actually be loaded at
+/// `Option`/`Result` — so every reader ([`setup_world`], the save picker) can
+/// read `.0.meta` unconditionally. When nothing could actually be loaded at
 /// startup (ticket 008: no `.minecraft` directory, an empty `saves/`
 /// folder, ...) this holds [`empty_save`] instead of panicking, and
 /// [`StartupIssue`] carries the reason for the UI to show.
@@ -78,13 +119,19 @@ pub(crate) struct DecodedWorld {
     pub(crate) columns: HashMap<(i32, i32), world::ChunkColumn>,
 }
 
+/// Marker on every spawned chunk mesh entity — `pub(crate)` so
+/// [`chunk_pipeline`]'s polling system can tag entities it spawns, and the
+/// save picker's world reset can find and despawn them.
+#[derive(Component)]
+pub(crate) struct BlockMesh;
+
 /// Directory to scan for Minecraft saves: the first CLI argument if one was
 /// given (ticket 008 — pointing at a CurseForge/MultiMC instance elsewhere
 /// on disk, since those don't live under the default directory), else
 /// `dirs::config_dir()/.minecraft/saves`
 /// (`C:\Users\<user>\AppData\Roaming\.minecraft\saves` on Windows). Shared by
 /// startup ([`try_load_real_save`]) and the UI's save picker
-/// ([`ui::scan_saves`]) so both agree on where "the saves directory" is.
+/// (`viewer::ui::scan_saves`) so both agree on where "the saves directory" is.
 pub(crate) fn saves_directory() -> PathBuf {
     saves_directory_from(std::env::args().nth(1))
 }
@@ -117,9 +164,10 @@ fn saves_directory_from(cli_arg: Option<String>) -> PathBuf {
 fn try_load_save_from(dir: &Path) -> Result<Save, String> {
     let saves = get_saves_from_instance(dir)
         .map_err(|e| format!("could not read saves directory {}: {e}", dir.display()))?;
-    let meta = saves.into_iter().next().ok_or_else(|| {
-        format!("no Minecraft saves found under {}", dir.display())
-    })?;
+    let meta = saves
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("no Minecraft saves found under {}", dir.display()))?;
 
     println!("Loading save {}", meta.get_grid_view());
 
@@ -146,7 +194,16 @@ fn load_real_save() -> (Save, Option<String>) {
     }
 }
 
-fn main() {
+/// The `App` both games start from (ticket 027): a real save loaded, the
+/// streaming/meshing pipeline wired up, and a camera under a sky. Running
+/// this as-is gives the citybuilder's M1 window; the viewer adds its
+/// selection, blueprint and UI layers on top before calling `run()`.
+///
+/// Deliberately *not* a `Plugin`: it loads the save synchronously before the
+/// `App` exists, because [`LoadedSave`] must be inserted as a resource
+/// rather than discovered, and because a save that can't be found is a
+/// message for the UI (ticket 008) rather than a startup failure.
+pub fn world_app() -> App {
     let (save, startup_issue) = load_real_save();
     let decoded_world = DecodedWorld {
         registry: Arc::new(Mutex::new(world::BlockRegistry::new())),
@@ -154,39 +211,25 @@ fn main() {
         columns: HashMap::new(),
     };
 
-    App::new()
-        .add_plugins(DefaultPlugins)
+    let mut app = App::new();
+    app.add_plugins(DefaultPlugins)
         .add_plugins(bevy::diagnostic::FrameTimeDiagnosticsPlugin)
         .add_plugins(camera::CameraControllerPlugin)
         .add_plugins(sky::SkyPlugin)
         .add_plugins(streaming::ChunkStreamingPlugin)
         .add_plugins(chunk_pipeline::ChunkLoadPipelinePlugin)
         .add_plugins(unload::ChunkUnloadPlugin)
-        .add_plugins(selection::SelectionPlugin)
-        .add_plugins(blueprint::BlueprintPlugin)
-        .add_plugins(ui::UiPlugin)
-        // The UI plugin's panels (ticket 007) need to have drawn this
-        // frame before `drive_camera` — and, ticket 020, the selection's
-        // click/key handling — read whether egui claimed pointer/keyboard
-        // input. See `camera::CameraSet`'s docs.
-        .configure_sets(
-            Update,
-            (camera::CameraSet, selection::SelectionInputSet).after(ui::UiPanelSet),
-        )
         .insert_resource(LoadedSave(save))
         .insert_resource(StartupIssue(startup_issue))
         .insert_resource(decoded_world)
-        .add_systems(Startup, setup)
-        .run();
+        .add_systems(Startup, setup_world);
+    app
 }
 
-/// Marker on every spawned chunk mesh entity — `pub(crate)` so
-/// [`chunk_pipeline`]'s polling system can tag entities it spawns the same
-/// way [`setup`]'s eager spawn does.
-#[derive(Component)]
-pub(crate) struct BlockMesh;
-
-fn setup(
+/// The `Startup` half of [`world_app`]: the texture atlas and biome
+/// colormaps, the region cache and terrain material the streaming pipeline
+/// runs on, and the camera, sun and sky scene.
+fn setup_world(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
@@ -235,7 +278,7 @@ fn setup(
 
     // Nothing is decoded yet — chunks stream in via the async pipeline
     // (ticket 005-c) as the camera moves, driven by these four resources
-    // plus `DecodedWorld` (already inserted in `main()`). Ticket 005-e
+    // plus `DecodedWorld` (already inserted in `world_app()`). Ticket 005-e
     // deleted the old eager single-region load and per-column spawn loop
     // that used to populate the world here.
     let region_cache = region_cache::RegionCache::new(

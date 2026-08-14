@@ -1,5 +1,5 @@
 //! Async load/decode/mesh pipeline (ticket 005-c): turns a `to_load` chunk
-//! coordinate from [`PendingChunkWork`](crate::streaming::PendingChunkWork)
+//! coordinate from [`crate::streaming::PendingChunkWork`]
 //! into a spawned mesh entity via [`AsyncComputeTaskPool`], off the main
 //! thread except for the final mesh upload / entity spawn.
 //!
@@ -52,7 +52,7 @@ use crate::{BlockMesh, DecodedWorld};
 
 /// Shared, lockable handle onto the region LRU cache (005-b) so every
 /// chunk-load task can resolve a chunk's region without owning a copy of
-/// the cache itself. `main.rs`'s `setup()` builds the one instance of this,
+/// the cache itself. `lib.rs`'s `setup_world()` builds the one instance of this,
 /// sized to the save and render distance.
 #[derive(Resource, Clone)]
 pub struct SharedRegionCache(pub Arc<Mutex<RegionCache>>);
@@ -71,7 +71,7 @@ pub struct SharedAtlasIndex(pub Arc<AtlasUvIndex>);
 pub struct SharedColorMaps(pub Arc<ColorMaps>);
 
 /// The one material every streamed-in chunk mesh uses, built once at
-/// startup (`main.rs::setup`) from the packed atlas.
+/// startup (`lib.rs::setup_world`) from the packed atlas.
 #[derive(Resource, Clone)]
 pub struct TerrainMaterial(pub Handle<StandardMaterial>);
 
@@ -119,7 +119,7 @@ impl InFlightChunkLoads {
 /// Chunk coordinate -> spawned chunk-mesh entity, so
 /// [`crate::unload`] (005-d) knows which entity to despawn for a
 /// coordinate leaving render distance. Populated here in
-/// [`poll_completed_chunk_loads`] and by `main.rs::setup`'s eager startup
+/// [`poll_completed_chunk_loads`] and by `lib.rs::setup_world`'s eager startup
 /// spawn — until 005-e deletes that eager path, both need to register into
 /// this the same way for unload to work regardless of which one spawned a
 /// given chunk. A coordinate with no entry either hasn't spawned yet or was
@@ -226,7 +226,7 @@ pub struct ChunkRemeshResult {
 /// (005-c) and their re-mesh counterparts
 /// [`start_chunk_remeshes`]/[`poll_completed_chunk_remeshes`] (005-f).
 /// [`SharedRegionCache`], [`SharedAtlasIndex`], and [`TerrainMaterial`] all
-/// need real save/asset data that only exists once `main.rs::setup` has
+/// need real save/asset data that only exists once `lib.rs::setup_world` has
 /// run, so this plugin doesn't insert those — it just owns what's
 /// meaningful without them.
 pub struct ChunkLoadPipelinePlugin;
@@ -294,7 +294,7 @@ pub(crate) fn start_chunk_loads(
     atlas: Option<Res<SharedAtlasIndex>>,
     color_maps: Option<Res<SharedColorMaps>>,
 ) {
-    // All three are inserted by `main.rs::setup` once the real save/atlas/
+    // All three are inserted by `lib.rs::setup_world` once the real save/atlas/
     // colormaps exist; before that (Startup hasn't finished) there's nothing
     // to load with.
     let (Some(region_cache), Some(atlas), Some(color_maps)) = (region_cache, atlas, color_maps)
@@ -375,7 +375,7 @@ pub(crate) fn start_chunk_remeshes(
 /// single non-blocking poll, Bevy's standard pattern for checking an
 /// `AsyncComputeTaskPool` task from a normal system without an executor of
 /// its own. For up to [`ChunkUploadBudget`] completed tasks this frame,
-/// uploads the mesh and spawns the entity (mirroring `main.rs::setup`'s
+/// uploads the mesh and spawns the entity (mirroring `lib.rs::setup_world`'s
 /// eager spawn: `Mesh3d`/`MeshMaterial3d`/`Transform`/[`BlockMesh`]) and
 /// records the decoded column into [`DecodedWorld`] either way. Also queues
 /// a re-mesh (ticket 005-f) for any of the four neighbour coordinates that
@@ -422,7 +422,7 @@ pub(crate) fn poll_completed_chunk_loads(
                     MeshMaterial3d(material.0.clone()),
                     // Chunk mesh vertices are chunk-local; place the entity at
                     // the chunk's world origin (bevy.x = mc.x, bevy.z = -mc.z —
-                    // see `world::mesh` docs), same as `main.rs::setup`.
+                    // see `world::mesh` docs), same as `lib.rs::setup_world`.
                     Transform::from_xyz(
                         cx as f32 * world::SECTION_SIZE as f32,
                         0.0,

@@ -18,7 +18,7 @@ pub mod tint;
 // Not every re-export has a caller in this repo yet (`BlockId`, the raw
 // section/error types, and `is_solid` are part of the public API for
 // callers like ticket 007, not dead weight) — allow the unused ones rather
-// than trim the API down to today's only caller (`main.rs`).
+// than trim the API down to today's only caller (`lib.rs`).
 #[allow(unused_imports)]
 pub use atlas::{build_block_uv_table, AtlasUvIndex, BlockFaces, TextureAtlas, UvRect};
 #[allow(unused_imports)]

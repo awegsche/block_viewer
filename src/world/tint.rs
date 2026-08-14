@@ -220,7 +220,7 @@ const WATER_TINTED: &[&str] = &["water", "water_cauldron", "bubble_column"];
 
 /// Source file stem of grass's green side fringe (014) — a separate texture
 /// vanilla composites over `grass_block_side`, not part of the top/bottom/
-/// side split [`super::atlas::resolve_faces`] resolves.
+/// side split `super::atlas::resolve_faces` resolves.
 const GRASS_SIDE_OVERLAY: &str = "grass_block_side_overlay";
 
 fn resolve_block_tint(name: &str, atlas: &AtlasUvIndex, warned: &mut HashSet<String>) -> BlockTint {
@@ -482,7 +482,7 @@ mod tests {
     /// Loads the real vendored colormaps (mirrors `atlas`'s
     /// `builds_atlas_from_the_real_asset_pack`) — a spot-check that
     /// `assets/minecraft/textures/colormap/{grass,foliage}.png` are still
-    /// 256x256 and readable, since [`load_color_maps`] is what `main.rs`
+    /// 256x256 and readable, since [`load_color_maps`] is what `lib.rs`
     /// calls at startup.
     #[test]
     fn loads_the_real_vendored_colormaps() {

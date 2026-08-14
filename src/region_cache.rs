@@ -169,7 +169,7 @@ mod tests {
     use std::time::Instant;
 
     /// This repo assumes a real Minecraft saves directory is reachable on
-    /// the dev machine (see `main.rs::load_real_save`); these tests follow
+    /// the dev machine (see `lib.rs::load_real_save`); these tests follow
     /// the same convention rather than faking one.
     fn real_save_meta() -> SaveMeta {
         let saves = mc_anvil::get_saves().expect("could not read the Minecraft saves directory");

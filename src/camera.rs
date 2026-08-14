@@ -1,7 +1,7 @@
 //! Free-flying + orbit/inspect camera (ticket 006).
 //!
 //! This is the one camera implementation in the repo: it replaces both the
-//! fixed-target `orbit` system that used to live in `main.rs` and the
+//! fixed-target `orbit` system that used to live in the old `main.rs` and the
 //! never-compiled `pan_orbit_camera_bundle.rs` (deleted — two half-camera
 //! implementations was the actual bug ticket 006 called out).
 //!
@@ -54,7 +54,7 @@ impl Plugin for CameraControllerPlugin {
     }
 }
 
-/// Marker [`SystemSet`] for [`drive_camera`] — `main.rs` orders this
+/// Marker [`SystemSet`] for [`drive_camera`] — `viewer::run` orders this
 /// `.after()` the UI plugin's own panel-drawing set (ticket 007) so
 /// [`EguiInputCapture`], which the UI updates once per frame right after it
 /// finishes drawing, reflects *this* frame's panels by the time
@@ -175,8 +175,8 @@ fn fog_falloff(render_distance_chunks: u32) -> FogFalloff {
 
 /// A soft distance fog fading terrain out before the far plane, so chunks
 /// don't visibly pop out of existence at the render-distance edge. `color`
-/// is a caller-supplied starting value (`main.rs::setup` passes
-/// [`crate::sky::SkyPalette::horizon_color`]) — [`crate::sky::sync_sky_palette`]
+/// is a caller-supplied starting value (`lib.rs::setup_world` passes
+/// [`crate::sky::SkyPalette::horizon_color`]) — `sky::sync_sky_palette`
 /// keeps it in sync with the palette from then on, and
 /// [`sync_render_distance_effects`] never touches it, only the falloff.
 pub fn atmosphere_fog(render_distance_chunks: u32, color: Color) -> DistanceFog {

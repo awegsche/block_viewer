@@ -56,7 +56,7 @@ impl WorldReset<'_, '_> {
     /// camera to its region centroid — everything the ticket's "switching
     /// tears down spawned chunks and re-streams" needs, so the next
     /// `Update` starts streaming `meta` in from scratch exactly the way
-    /// startup does (`main.rs::setup`). Every pipeline resource here
+    /// startup does (`lib.rs::setup_world`). Every pipeline resource here
     /// derives `Default`, so resetting is just replacing each with a fresh
     /// one rather than draining it field by field.
     fn switch_save(&mut self, meta: SaveMeta, render_distance: u32) {

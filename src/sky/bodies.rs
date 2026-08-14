@@ -131,7 +131,7 @@ fn celestial_transform(direction: Vec3) -> Transform {
 }
 
 /// Spawns the sun and moon billboards on [`super::SKY_LAYER`], loading their
-/// textures the same eager, panic-on-failure way `main.rs::setup` loads the
+/// textures the same eager, panic-on-failure way `lib.rs::setup_world` loads the
 /// block atlas and biome colormaps — both textures are checked into the
 /// repo, so a missing one means a broken checkout, not a recoverable
 /// runtime condition.

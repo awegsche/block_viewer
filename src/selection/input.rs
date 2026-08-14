@@ -4,7 +4,7 @@
 //!
 //! ## Why these keys
 //!
-//! [`crate::camera::drive_camera`] already owns `W`/`A`/`S`/`D`, `Q`/`E`,
+//! `camera::drive_camera` already owns `W`/`A`/`S`/`D`, `Q`/`E`,
 //! `ShiftLeft`, `Tab` and both mouse buttons, so nothing here may reuse any
 //! of them. What's left, and what this module claims:
 //!
@@ -263,7 +263,7 @@ struct FaceRepeats([RepeatTimer; 6]);
 #[derive(Default)]
 struct ClickTracker(Option<f32>);
 
-/// [`SystemSet`] for this module's systems. `main.rs` orders it
+/// [`SystemSet`] for this module's systems. `viewer::run` orders it
 /// `.after(ui::UiPanelSet)`, exactly as it does [`camera::CameraSet`], so
 /// [`EguiInputCapture`] holds *this* frame's value when these systems read it
 /// rather than lagging a frame behind — otherwise the first click on a new

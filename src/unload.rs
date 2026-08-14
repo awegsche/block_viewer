@@ -3,7 +3,7 @@
 //!
 //! - **Despawn + free**: for every coordinate 005-a's diff put in
 //!   [`PendingChunkWork::to_unload`], despawn its chunk entity, free its
-//!   mesh, and drop its [`world::ChunkColumn`] from [`DecodedWorld`].
+//!   mesh, and drop its [`crate::world::ChunkColumn`] from [`DecodedWorld`].
 //! - **Cancel stale in-flight loads**: `to_unload` is computed against
 //!   `DecodedWorld.columns` (005-a's notion of "loaded"), so a coordinate
 //!   that's mid-load (005-c) but not yet inserted into `columns` never
@@ -17,7 +17,7 @@
 //!
 //! Region cache eviction (005-b) needs no code here: `RegionCache`'s
 //! capacity is already sized to one render distance's worth of regions
-//! (`region_cache::recommended_capacity`, wired in `main.rs::setup`), so
+//! (`region_cache::recommended_capacity`, wired in `lib.rs::setup_world`), so
 //! plain LRU eviction drops regions no loaded chunk still needs — the
 //! simpler of the two options the ticket allows, chosen over a per-region
 //! refcount because the sizing already holds up.

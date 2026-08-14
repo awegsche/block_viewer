@@ -117,7 +117,7 @@ pub(crate) fn status_panel(
         // from there. All egui widgets, all inside this same panel/window,
         // so the slider drag doesn't fly the camera for the same reason
         // the render-distance one above never has: `ui::sync_egui_input_capture`
-        // and `camera::CameraSet`'s ordering (see `main.rs`) already cover
+        // and `camera::CameraSet`'s ordering (see `viewer::run`) already cover
         // every panel this module draws, this one included.
         ui.separator();
         ui.horizontal(|ui| {

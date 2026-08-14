@@ -3,6 +3,23 @@ name = "block_viewer"
 version = "0.1.0"
 edition = "2024"
 
+# Ticket 027: one package, one lib, two binary shims — the viewer and the
+# citybuilder both live *inside* the lib (`src/viewer`, `src/city`) over a
+# shared core, so `pub(crate)` keeps working across every shared module.
+# The `mc_core`/`block_viewer`/`citybuilder` workspace split stays available
+# as a later move, once that core stops changing shape.
+[lib]
+name = "block_viewer"
+path = "src/lib.rs"
+
+[[bin]]
+name = "block_viewer"
+path = "src/bin/block_viewer.rs"
+
+[[bin]]
+name = "citybuilder"
+path = "src/bin/citybuilder.rs"
+
 [dependencies]
 bevy = "0.15.0"
 bevy_egui = "0.31.1"

@@ -207,7 +207,7 @@ fn blit_padded(atlas: &mut RgbaImage, col: u32, row: u32, src: &RgbaImage) {
 
 /// Builds the packed atlas from every block texture under `dir` (pass
 /// `assets/minecraft/textures/block` — see ticket 004). Nearest filtering
-/// is set on the returned [`Image`] to match `main.rs`'s existing sampler
+/// is set on the returned [`Image`] to match `lib.rs`'s existing sampler
 /// choice.
 pub fn build(dir: &Path) -> std::io::Result<TextureAtlas> {
     let mut named_tiles = load_tiles(dir)?;

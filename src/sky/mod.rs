@@ -3,7 +3,7 @@
 //! distance fog all read from one [`SkyPalette`] resource instead of each
 //! picking its own hardcoded colour.
 //!
-//! Before this, `main.rs::setup` spawned a bare `PointLight` a fixed offset
+//! Before this, `lib.rs::setup_world` spawned a bare `PointLight` a fixed offset
 //! above the camera's startup position — it lit a small sphere near spawn
 //! and left everything else to flat ambient light, and the sky-ish fog
 //! colour in `camera::atmosphere_fog` had no relationship to anything else
@@ -113,12 +113,12 @@ pub(crate) struct SkyCamera;
 ///
 /// Does **not** spawn the sky camera/dome/sun/moon itself — those need
 /// [`Assets<Image>`] loaded from disk the same eager, panic-on-failure way
-/// `main.rs::setup` loads the block atlas, and nothing in this repo runs
+/// `lib.rs::setup_world` loads the block atlas, and nothing in this repo runs
 /// that kind of I/O from inside a `Startup` system that `cargo test` would
 /// also execute (see `world::atlas`'s own tests for why: relative asset
 /// paths only resolve from the crate root, which is true for `cargo run`
 /// but not guaranteed for every test harness). Call [`spawn_sky_scene`] and
-/// [`spawn_sun`] from `main.rs::setup` instead, right alongside the atlas/
+/// [`spawn_sun`] from `lib.rs::setup_world` instead, right alongside the atlas/
 /// colormap loads it already does.
 pub struct SkyPlugin;
 
@@ -157,10 +157,10 @@ impl Plugin for SkyPlugin {
 }
 
 /// Spawns the sun's `DirectionalLight` with shadows configured for
-/// `render_distance_chunks` (ticket 017) — a plain function `main.rs::setup`
+/// `render_distance_chunks` (ticket 017) — a plain function `lib.rs::setup_world`
 /// calls, for the same reason [`spawn_sky_scene`] is (see [`SkyPlugin`]'s
 /// docs). Kept separate from [`spawn_sky_scene`] because it needs no image/
-/// mesh assets, and because `main.rs::setup` spawns the sun before the sky
+/// mesh assets, and because `lib.rs::setup_world` spawns the sun before the sky
 /// scene.
 ///
 /// Only sets the fields [`sync_sky_palette`] doesn't already own on the very
@@ -193,7 +193,7 @@ pub(crate) fn shadow_cascade_distance(render_distance_chunks: u32) -> f32 {
 }
 
 /// Spawns the sky camera, the gradient dome, and the sun/moon billboards —
-/// see [`SkyPlugin`]'s docs for why this is a plain function `main.rs::setup`
+/// see [`SkyPlugin`]'s docs for why this is a plain function `lib.rs::setup_world`
 /// calls rather than a `Startup` system this plugin adds itself.
 ///
 /// The sky camera renders first (`order: -1`) with its own
@@ -317,7 +317,7 @@ mod tests {
     /// A minimal app with [`SkyPlugin`] plus the vanilla-Bevy resources it
     /// writes into — `MinimalPlugins` doesn't insert [`AmbientLight`] or
     /// [`ClearColor`] itself (those come from `DefaultPlugins` in the real
-    /// app), so tests provide stand-ins the same way `main.rs` would end up
+    /// app), so tests provide stand-ins the same way `lib.rs` would end up
     /// with real ones.
     fn test_app() -> App {
         let mut app = App::new();

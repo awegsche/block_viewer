@@ -380,3 +380,19 @@ these itself (see CLAUDE.md's "Manual/visual verification").
   end up at in `finished_tickets/026-selection-box-legibility.md`. If the
   two-pass wireframe still isn't enough, the translucent fill that ticket
   lists under "considered and not done" is the next thing to try.
+- [ ] **027 lib + two binary shims: both binaries still behave.** The
+  package now builds a lib plus `block_viewer` and `citybuilder` bins, so
+  the check is that nothing moved semantically. (1)
+  `cargo run --bin block_viewer` — the viewer must behave exactly as it did
+  before: terrain streams in, every egui panel draws, the save picker
+  switches saves, the selection box responds to clicks and arrow keys, and
+  dragging a slider or typing in a coordinate field still doesn't fly the
+  camera or move the selection (that last one is the `configure_sets`
+  ordering that moved from `main.rs` into `viewer::run`, and it fails
+  silently if it got dropped). (2) `cargo run --bin citybuilder` — a window
+  on the same save, same terrain streaming, same free-flight camera, and
+  **no UI panels at all**; that's milestone M1 and it's the whole of it. It
+  has no egui, so confirm the camera still flies normally rather than being
+  stuck (`camera::EguiInputCapture` defaults to "nothing captured", which is
+  what should carry it). Ticket:
+  `finished_tickets/027-lib-and-two-binary-shims.md`.

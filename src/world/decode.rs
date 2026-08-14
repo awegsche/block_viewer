@@ -95,7 +95,7 @@ impl ChunkColumn {
     /// 0..16), scanning sections top-down. Returns `(world_y, block_id)`.
     ///
     /// Used to place the camera above the terrain surface at startup by
-    /// ticket 006's original eager-decode version of `main.rs::spawn_point`;
+    /// ticket 006's original eager-decode version of `lib.rs::spawn_point`;
     /// ticket 005-e's streaming startup can no longer do that (nothing is
     /// decoded yet at startup), but this stays for the block-under-cursor
     /// readout planned in ticket 007.

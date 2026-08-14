@@ -158,7 +158,7 @@ impl Plugin for BlueprintPlugin {
 
 /// Dispatches a requested extraction onto [`AsyncComputeTaskPool`].
 ///
-/// [`SharedRegionCache`] only exists once `main.rs::setup` has run against a
+/// [`SharedRegionCache`] only exists once `lib.rs::setup_world` has run against a
 /// real save; without it there's nothing to read, which is a reportable
 /// failure rather than a silently dropped click (ticket 008's empty-save
 /// startup can leave the app in exactly that state).

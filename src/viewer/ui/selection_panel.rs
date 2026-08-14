@@ -3,7 +3,7 @@
 //! it is a good idea — and the legend for ticket 020's keys, which are
 //! undiscoverable otherwise.
 //!
-//! This is the one place [`crate::ui`] and [`crate::selection`] meet: panels
+//! This is the one place [`crate::viewer::ui`] and [`crate::selection`] meet: panels
 //! live here, selection state lives there, and this module reads and writes
 //! [`Selection`] without either side growing a dependency on the other's
 //! internals.
