@@ -99,6 +99,14 @@ const NON_SOLID: [&str; 3] = [
     "minecraft:void_air",
 ];
 
+/// The name half of [`is_solid`], with no [`BlockRegistry`] in the way —
+/// what [`super::super::blueprint::mesh`] (ticket 037, roadmap B2) checks a
+/// palette entry's `BlockState::name` against directly, since a blueprint's
+/// palette has no registry to resolve a [`BlockId`] through.
+pub(crate) fn is_solid_name(name: &str) -> bool {
+    !NON_SOLID.contains(&name)
+}
+
 /// Whole-atlas UV rect used only as a last-resort fallback if `uv_table`
 /// passed to [`mesh_chunk_column`] is shorter than the registry it was
 /// built from — should never trigger in practice (see the call site).
@@ -116,7 +124,7 @@ const FALLBACK_FACES: BlockFaces = BlockFaces {
 
 /// Whether `id` should count as "there" for face-culling purposes.
 pub fn is_solid(id: BlockId, registry: &BlockRegistry) -> bool {
-    id != BlockRegistry::AIR && !NON_SOLID.contains(&registry.name(id))
+    id != BlockRegistry::AIR && is_solid_name(registry.name(id))
 }
 
 /// The four chunk columns horizontally adjacent to the one being meshed,
@@ -188,8 +196,14 @@ fn block_at(column: &ChunkColumn, neighbors: &Neighbors, dx: i32, world_y: i32, 
 
 /// The six directions a face can be exposed in, named in Minecraft terms
 /// (see the module docs for how these map onto Bevy's axes).
+///
+/// `pub(crate)`, along with the quad-emission functions below it
+/// ([`face_geometry`], [`push_quad`], [`push_quad_offset`]) — shared with
+/// [`super::super::blueprint::mesh`] (ticket 037, roadmap B2), which meshes
+/// a `Blueprint`'s palette-and-indices grid through the same geometry
+/// instead of duplicating it.
 #[derive(Debug, Clone, Copy)]
-enum Face {
+pub(crate) enum Face {
     East,
     West,
     Up,
@@ -202,7 +216,7 @@ impl Face {
     /// Which of a block's three distinct textures (ticket 004) this face
     /// samples: `Up`/`Down` get the top/bottom texture, every horizontal
     /// face shares the side texture.
-    fn uv_rect(self, faces: &BlockFaces) -> UvRect {
+    pub(crate) fn uv_rect(self, faces: &BlockFaces) -> UvRect {
         match self {
             Face::Up => faces.top,
             Face::Down => faces.bottom,
@@ -212,7 +226,7 @@ impl Face {
 
     /// Which of a block's three per-face tint sources (ticket 013) this
     /// face uses — same top/bottom/side split as [`Face::uv_rect`].
-    fn tint_source(self, tint: &BlockTint) -> TintSource {
+    pub(crate) fn tint_source(self, tint: &BlockTint) -> TintSource {
         match self {
             Face::Up => tint.top,
             Face::Down => tint.bottom,
@@ -222,7 +236,7 @@ impl Face {
 
     /// Whether this is one of the four horizontal faces — the only ones a
     /// [`BlockTint::side_overlay`] (014) can apply to.
-    fn is_side(self) -> bool {
+    pub(crate) fn is_side(self) -> bool {
         matches!(self, Face::East | Face::West | Face::South | Face::North)
     }
 
@@ -230,7 +244,7 @@ impl Face {
     /// the same order — see the module docs' "Per-face UV winding" section
     /// for how East/South and West/North ended up needing different
     /// mappings out of the same `UvRect`.
-    fn corner_uvs(self, rect: UvRect) -> [[f32; 2]; 4] {
+    pub(crate) fn corner_uvs(self, rect: UvRect) -> [[f32; 2]; 4] {
         let UvRect { u0, v0, u1, v1 } = rect;
         match self {
             Face::East | Face::South => [[u1, v1], [u1, v0], [u0, v0], [u0, v1]],
@@ -242,7 +256,7 @@ impl Face {
 
 /// The four corners (CCW from outside) and outward normal, in Bevy space,
 /// of `face` for the unit block at chunk-local `(dx, world_y, dz)`.
-fn face_geometry(face: Face, dx: i32, world_y: i32, dz: i32) -> ([Vec3; 4], Vec3) {
+pub(crate) fn face_geometry(face: Face, dx: i32, world_y: i32, dz: i32) -> ([Vec3; 4], Vec3) {
     let x0 = dx as f32;
     let x1 = x0 + 1.0;
     let y0 = world_y as f32;
@@ -311,7 +325,7 @@ fn face_geometry(face: Face, dx: i32, world_y: i32, dz: i32) -> ([Vec3; 4], Vec3
     }
 }
 
-fn push_quad(
+pub(crate) fn push_quad(
     vertices: &mut Vec<[f32; 3]>,
     normals: &mut Vec<[f32; 3]>,
     uvs: &mut Vec<[f32; 2]>,
@@ -334,7 +348,7 @@ fn push_quad(
 /// overlay quad, which is coplanar with the base side quad it sits on and
 /// needs a small nudge to avoid z-fighting (see [`OVERLAY_EPSILON`]).
 #[allow(clippy::too_many_arguments)]
-fn push_quad_offset(
+pub(crate) fn push_quad_offset(
     vertices: &mut Vec<[f32; 3]>,
     normals: &mut Vec<[f32; 3]>,
     uvs: &mut Vec<[f32; 2]>,
@@ -368,13 +382,13 @@ fn push_quad_offset(
 /// the far plane at this project's render distances — see ticket 014's
 /// "epsilon offset" section for the number to revisit if shimmering shows up
 /// at the render-distance edge (the manual check in `todo.md`).
-const OVERLAY_EPSILON: f32 = 0.001;
+pub(crate) const OVERLAY_EPSILON: f32 = 0.001;
 
 /// Opaque white — the identity value for the multiplicative vertex colour
 /// channel (see the module docs), and what [`TintSource::None`] resolves to.
 /// 010 (baked light / AO) is the one remaining contributor still owed a real
 /// factor.
-const WHITE: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
+pub(crate) const WHITE: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
 
 /// The [`BlockTint`] every id resolves to if `block_tint` (ticket 013) is
 /// shorter than the registry it was built from — should never trigger in
@@ -392,7 +406,7 @@ const FALLBACK_BIOME_COLORS: BiomeColors = BiomeColors {
 
 /// Resolves `source` against `biome` to the vertex colour a face tinted by
 /// it should carry.
-fn resolve_tint_color(source: TintSource, biome: BiomeColors) -> [f32; 4] {
+pub(crate) fn resolve_tint_color(source: TintSource, biome: BiomeColors) -> [f32; 4] {
     let c = match source {
         TintSource::None => return WHITE,
         TintSource::Grass => biome.grass,

@@ -288,7 +288,11 @@ const OVERRIDES: &[(&str, &str, &str, &str)] = &[
     ("lava", "lava_still", "lava_still", "lava_still"),
 ];
 
-fn resolve_faces(name: &str, atlas: &AtlasUvIndex, warned: &mut HashSet<String>) -> BlockFaces {
+/// `pub(crate)`: [`super::super::blueprint::mesh`] (ticket 037, roadmap B2)
+/// resolves a blueprint palette entry's faces the same way, straight off its
+/// `BlockState::name` — a blueprint has no [`BlockRegistry`] to route
+/// through [`build_block_uv_table`].
+pub(crate) fn resolve_faces(name: &str, atlas: &AtlasUvIndex, warned: &mut HashSet<String>) -> BlockFaces {
     if let Some(&(_, top, bottom, side)) = OVERRIDES.iter().find(|&&(n, ..)| n == name) {
         return BlockFaces {
             top: atlas.tile(top).unwrap_or(atlas.fallback),

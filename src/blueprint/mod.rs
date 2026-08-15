@@ -30,6 +30,7 @@
 
 mod export;
 mod extract;
+mod mesh;
 mod structure;
 
 use std::sync::Arc;
@@ -64,6 +65,12 @@ pub use structure::{write_structure_file, STRUCTURE_BLOCK_MAX_SIZE};
 // `blueprint::structure` directly.
 #[allow(unused_imports)]
 pub use structure::{read_structure, read_structure_file, StructureReadError};
+
+// Ticket 037 (roadmap B2): meshing has no caller yet either — B3/B4
+// (rotation, the asset catalogue) are what will spawn a meshed blueprint
+// into the world — re-exported for the same reason as everything above.
+#[allow(unused_imports)]
+pub use mesh::mesh_blueprint;
 
 /// How many palette entries the finished-extraction log prints before
 /// summarising the rest. Long enough to see a structure's whole palette,

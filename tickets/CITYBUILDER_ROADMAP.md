@@ -2,7 +2,7 @@
 
 Not a work item; the plan for the citybuilder game and the shared world-edit
 infrastructure it needs. High-level tasks here get split into numbered
-tickets in this directory when they're picked up (next free number: 036).
+tickets in this directory when they're picked up (next free number: 038).
 Companion to `ROADMAP.md`, which covers the viewer 001–029.
 
 ## The goal
@@ -114,7 +114,7 @@ L1  lib.rs + two bin shims                       <- DONE (ticket 027)
      |
      +-- B  blueprints as building models
      |    B1  structure .nbt reader (inverse of 023)  <- DONE (ticket 036)
-     |    B2  Blueprint -> Bevy mesh
+     |    B2  Blueprint -> Bevy mesh                  <- DONE (ticket 037)
      |    B3  rotation, incl. block-state properties
      |    B4  the building asset catalogue
      |
@@ -366,13 +366,25 @@ reads as a malformed file rather than something to guess "air" for.
 one parse, all-or-nothing). No caller yet; B2-B4 are what will load a `.nbt`
 file into the catalogue.
 
-**B2. `Blueprint` → Bevy `Mesh`.** Not the same entry point as
-`mesh_chunk_column`: a blueprint has a `BlockState` palette with properties
-and no `BlockRegistry`, so UV and tint resolution differs. Share the quad
-emission; add a palette-based front end. Two decisions: faces at the
-blueprint's outer boundary are always emitted (it's a free-standing object,
-not a chunk with neighbours), and air in the palette stays air — blueprints
-are not solid boxes.
+**B2. `Blueprint` → Bevy `Mesh`. — done, ticket 037.** Not the same entry
+point as `mesh_chunk_column`: a blueprint has a `BlockState` palette with
+properties and no `BlockRegistry`, so UV and tint resolution differs. Share
+the quad emission; add a palette-based front end. Two decisions: faces at
+the blueprint's outer boundary are always emitted (it's a free-standing
+object, not a chunk with neighbours), and air in the palette stays air —
+blueprints are not solid boxes.
+
+How it came out: `resolve_faces` (`world::atlas`) and `resolve_block_tint`
+(`world::tint`) were already name-keyed rather than `BlockId`-keyed, so
+`blueprint::mesh_blueprint` reuses both directly — only their visibility
+(and `world::mesh`'s `Face` enum and quad-push functions) had to widen to
+`pub(crate)`, no logic duplicated. No per-block biome exists on a
+`Blueprint`, so every biome-dependent tint on the mesh resolves against one
+`BiomeColors` the caller passes in — a reasonable default for a preview, not
+a claim about where the building will stand. Mesh coordinates run
+`0..size` on all three axes including Y, since a blueprint has no absolute
+world height until something places it. No caller yet, same as 036 — B3/B4
+are what will call this.
 
 **B3. Rotation.** 90/180/270 about Y. The mesh part is a transform; the
 *blocks* part is not — a stair's `facing`, a log's `axis`, a door's `hinge`

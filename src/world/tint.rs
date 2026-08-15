@@ -223,7 +223,11 @@ const WATER_TINTED: &[&str] = &["water", "water_cauldron", "bubble_column"];
 /// side split `super::atlas::resolve_faces` resolves.
 const GRASS_SIDE_OVERLAY: &str = "grass_block_side_overlay";
 
-fn resolve_block_tint(name: &str, atlas: &AtlasUvIndex, warned: &mut HashSet<String>) -> BlockTint {
+/// `pub(crate)`: [`super::super::blueprint::mesh`] (ticket 037, roadmap B2)
+/// resolves a blueprint palette entry's tint the same way, straight off its
+/// `BlockState::name` — a blueprint has no [`BlockRegistry`] to route
+/// through [`build_block_tint_table`].
+pub(crate) fn resolve_block_tint(name: &str, atlas: &AtlasUvIndex, warned: &mut HashSet<String>) -> BlockTint {
     if name == "grass_block" {
         // Bottom is dirt, side is dirt + 014's green fringe overlay — only
         // the top face is grass texture at all.
