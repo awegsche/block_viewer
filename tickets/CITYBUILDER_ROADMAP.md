@@ -197,8 +197,8 @@ it's that crate's subject matter, not ours:
 | 010 | mutable chunk access + dirty tracking on `ChunkRegion` |
 | 011 | `set_block`: palette insertion and `block_states` re-packing |
 | 012 | creating sections that don't exist yet (building above terrain) |
-| 013 | `Heightmaps` pack/unpack and recomputation |
-| 014 | relight-on-load (`isLightOn`) — **investigation first** |
+| 013 | `Heightmaps` pack/unpack — only if deleting them doesn't work |
+| 014 | relight-on-load (`isLightOn`) — **done**; the game does the lighting |
 | 015 | removing orphaned `block_entities` on overwrite |
 | 016 | `session.lock` detection: is the world open right now |
 | 017 | oversized chunks (`.mcc`) — **read done**; writing them is ranvil 027 |
@@ -229,12 +229,15 @@ what order the pieces happen. The split is deliberate — ranvil owns the
 Anvil format, `edit` owns what we're allowed to do to a world.
 
 - **Sequencing.** Block changes (011/012) → block-entity cleanup (015) →
-  heightmap recompute (013) → relight flag (014) → write (009). Getting the
-  order wrong means recomputing heightmaps from pre-edit blocks.
-- **Block classification.** 013's `recompute_heightmaps` takes the "does
-  this block motion-block / count as a leaf" taxonomy from the caller. That
-  caller is here, because that's game data and this is where the block
-  registry lives.
+  heightmap invalidation (013) → relight flag (014) → write (009). Getting
+  the order wrong means recomputing heightmaps from pre-edit blocks — or,
+  under the "let the game rebuild them" default below, deleting a compound
+  that a later step in the same edit would have wanted to read.
+- **Block classification.** *Only if* heightmaps end up being recomputed
+  here rather than deleted: 013's `recompute_heightmaps` takes the "does
+  this block motion-block / count as a leaf" taxonomy from the caller, and
+  that caller is here, because that's game data and this is where the block
+  registry lives. The default is not to need it.
 - **`Status`.** Only edit chunks that are fully generated
   (`minecraft:full`); writing into a partially-generated chunk invites the
   generator to overwrite it later.
@@ -614,20 +617,32 @@ defaulting: a tint on the building's mesh reusing the vertex colour channel
   building until blocks provably land in a world Minecraft opens without
   complaint. W8 puts that proof one ticket after the infrastructure instead
   of at the end of the project.
-- **Verify the `isLightOn` relight assumption first, before any of it.**
-  ranvil 014 is written as investigation-then-implementation for this
-  reason. The whole plan avoids writing a lighting engine on the strength of
-  one byte. If it turns out Minecraft doesn't relight, that's a large ticket
-  appearing mid-project, and better discovered in week one — it's an hour of
-  looking. **Half done:** the flag is confirmed present as a root `TAG_Byte`
-  on the real save (`DataVersion` 4438) and `set_blocks` now clears it; the
-  "does the game honour it" half is the one that needs the game open, and is
-  written up as a manual check in `../todo.md` alongside 013's question below.
+- **Lighting is Minecraft's job — decided, not deferred.** This project
+  never computes light. `set_blocks` clears the chunk's `isLightOn` byte
+  (ranvil 014) and the game relights when it gets round to it; lazily is
+  fine, and a building that is wrongly lit until something touches its chunk
+  is an accepted cost, not a bug to be fixed here.
+
+  This used to be written up as the assumption to verify before anything
+  else. It isn't a gate any more, because the decision no longer depends on
+  the answer. The flag is confirmed present as a root `TAG_Byte` on the real
+  save (`DataVersion` 4438) and is cleared on every edit; whether the game
+  honours it is still worth ten minutes with the world open (the manual check
+  in `../todo.md`), and if it doesn't, the fallback is deleting the affected
+  sections' `BlockLight`/`SkyLight` arrays. If *that* doesn't work either,
+  the answer is still not a lighting engine — it's living with stale light.
+  Nothing in W waits on this.
 - **ranvil 011's round-trip test before its encoder.** Ticket 001 was this
   exact arithmetic, in the other direction, and it shipped broken upstream.
-- **ranvil 013 may not be needed at all** — if deleting `Heightmaps` makes
-  the game rebuild them the way clearing `isLightOn` does, the whole ticket
-  evaporates. Check it in the same sitting as 014.
+- **`Heightmaps` follow lighting: let the game rebuild them.** Same
+  reasoning, one field over — W4 deletes the compound on an edited chunk
+  rather than recomputing it, and ranvil 013's 9-bit packing code only gets
+  written if the game turns out not to prime missing heightmaps on load.
+  That's the cheap half of 013's own "check this before implementing" note,
+  and it's the default now rather than a thing to decide later. Worth
+  confirming in the same sitting as the relight check above (grass, snow and
+  rain landing correctly, mobs not spawning on lit ground), but W4 doesn't
+  wait for it either.
 - **B and C can run in parallel with W** — different files, no shared types
   beyond `Blueprint`. If two things are being worked at once, that's the
   split.
@@ -650,7 +665,11 @@ defaulting: a tint on the building's mesh reusing the vertex colour channel
 
 - **Terrain generation.** Placements reaching ungenerated chunks are refused
   (W5), not generated. Generating vanilla-compatible terrain is a project.
-- **Real lighting computation.** See W4.
+- **Lighting computation of any kind** — and not just in this iteration.
+  We clear `isLightOn`, we never compute a light level, and stale light in
+  the meantime is accepted. See the ordering advice for the fallbacks if the
+  game turns out to be lazier about relighting than hoped; none of them is
+  "write a lighting engine".
 - **Writing block entities.** Blueprints with chests and signs place their
   blocks; the entities are dropped, with a warning. Removing *existing* ones
   we overwrite is in scope — that's corruption avoidance, not a feature.
