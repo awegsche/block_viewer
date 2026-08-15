@@ -65,6 +65,14 @@ pub trait RegionSource {
     /// access starts again from what's on disk. The rollback path; see the
     /// module docs.
     fn discard(&mut self, coord: (i32, i32));
+
+    /// Which regions currently hold unsaved changes, in no particular order.
+    ///
+    /// On the trait rather than only on [`RegionCache`] so that ticket 033's
+    /// [`WriteSession::flush`](super::session::WriteSession::flush) — "save
+    /// everything that's dirty" — shares one save path with `commit` instead
+    /// of growing a second one for the concrete cache.
+    fn dirty_regions(&self) -> Vec<(i32, i32)>;
 }
 
 impl RegionSource for RegionCache {
@@ -83,6 +91,12 @@ impl RegionSource for RegionCache {
         // Fully qualified: the inherent method and this one share a name, and
         // spelling out which is being called keeps that from being a puzzle.
         RegionCache::discard(self, coord);
+    }
+
+    fn dirty_regions(&self) -> Vec<(i32, i32)> {
+        // Same name-sharing as `discard` above; the inherent one returns an
+        // iterator over the cache's own map.
+        RegionCache::dirty_regions(self).collect()
     }
 }
 
@@ -213,12 +227,20 @@ fn fetch(
 ) -> Result<&mut ChunkRegion, EditRefusal> {
     source
         .region_mut(coord)
-        .map_err(|unavailable| match unavailable {
-            RegionUnavailable::NotGenerated => EditRefusal::RegionNotGenerated { region: coord },
-            RegionUnavailable::Unreadable(reason) => {
-                EditRefusal::RegionUnreadable { region: coord, reason }
-            }
-        })
+        .map_err(|unavailable| refusal_for(coord, unavailable))
+}
+
+/// The refusal a [`RegionUnavailable`] means for a given region — shared with
+/// ticket 033's write session, which hits the same two cases when it goes back
+/// for a region to save.
+pub(crate) fn refusal_for(coord: (i32, i32), unavailable: RegionUnavailable) -> EditRefusal {
+    match unavailable {
+        RegionUnavailable::NotGenerated => EditRefusal::RegionNotGenerated { region: coord },
+        RegionUnavailable::Unreadable(reason) => EditRefusal::RegionUnreadable {
+            region: coord,
+            reason,
+        },
+    }
 }
 
 /// Folds the per-region reports into one.

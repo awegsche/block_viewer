@@ -516,3 +516,14 @@ these itself (see CLAUDE.md's "Manual/visual verification").
   **not** rebuild them, W4 swaps one call for
   `recompute_heightmaps(x, z, classify)` and moves on. Record the answer in
   both tickets' Resolution sections.
+
+- [ ] **033 write safety: does our `session.lock` actually conflict with
+  Minecraft's?** Needs the game installed, ten minutes, and nothing built —
+  `../ranvil/tickets/025-verify-session-lock-against-a-running-minecraft.md`
+  has the five steps and is where the answers get recorded. It's listed here
+  too because ticket 033 now *refuses to write* on the strength of that lock,
+  and step 5 in particular ("hold the lock via `SessionLock::acquire`, then try
+  to open that world in Minecraft — the game should refuse") is the half
+  `WriteSession` depends on: if the game opens the world anyway, holding the
+  lock buys nothing and W6's guarantee shrinks to a probe. Do this before W8
+  writes to a world you care about.

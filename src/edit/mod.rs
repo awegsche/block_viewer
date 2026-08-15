@@ -31,9 +31,16 @@
 //! it. [`route::apply_routed`] (ticket 032) is the entry point for an edit
 //! that spans several region files — a building near a region corner touches
 //! up to four — and it is built out of [`plan`] and [`apply`] rather than
-//! around them. Backups, `session.lock` and the save itself are W6: `apply`
-//! deliberately does **not** call `ChunkRegion::save`, because a function that
-//! both edits and writes to disk can't be tested without a disk.
+//! around them. Neither of them saves: `apply` deliberately does **not** call
+//! `ChunkRegion::save`, because a function that both edits and writes to disk
+//! can't be tested without a disk, and because 032's rollback is "throw the
+//! in-memory region away", which only works while nothing has been written.
+//!
+//! [`session::WriteSession`] (ticket 033) is the step past that — the only
+//! thing here that touches the user's save. It holds the world's
+//! `session.lock` so Minecraft can't have it, copies each region file aside
+//! before this session's first write to it, and saves. Its
+//! [`plan`](session::WriteSession::plan) is the dry run.
 //!
 //! # Coordinates
 //!
@@ -59,7 +66,11 @@ use crate::selection::{WORLD_MAX_Y, WORLD_MIN_Y};
 use crate::world::SECTION_SIZE;
 
 pub mod route;
+pub mod session;
 pub use route::{apply_routed, plan_routed, route, RegionSource, RegionUnavailable};
+pub use session::{
+    RegionWrite, WriteError, WritePlan, WriteSafety, WriteSession, WriteSummary, BACKUP_DIR,
+};
 
 /// Blocks across a region file, both horizontal axes: 32 chunks of 16.
 const REGION_WIDTH_IN_BLOCKS: i32 = REGION_WIDTH_IN_CHUNKS as i32 * SECTION_SIZE as i32;

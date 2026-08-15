@@ -783,10 +783,11 @@ impl SaveFixture {
     }
 
     fn load(&self, coord: (i32, i32)) -> ChunkRegion {
-        let mut region: ChunkRegion =
-            Region::new(coord.0, coord.1, self.meta.get_region_path(coord.0, coord.1)).into();
-        region.load_chunks().expect("load the fixture region");
-        region
+        load_region_file(&self.meta.get_region_path(coord.0, coord.1), coord)
+    }
+
+    fn region_bytes(&self, coord: (i32, i32)) -> Vec<u8> {
+        std::fs::read(self.meta.get_region_path(coord.0, coord.1)).expect("read the region file")
     }
 
     /// Every region loaded up front, as a [`RegionSource`] with no cache and
@@ -807,6 +808,14 @@ impl Drop for SaveFixture {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.dir);
     }
+}
+
+/// Any `.mca` file, loaded as the region at `coord` — the fixture's own files
+/// and, in the write-safety tests below, the backup copies of them.
+fn load_region_file(path: &std::path::Path, coord: (i32, i32)) -> ChunkRegion {
+    let mut region: ChunkRegion = Region::new(coord.0, coord.1, path).into();
+    region.load_chunks().expect("load the region file");
+    region
 }
 
 /// A chunk that passes every preflight check and still can't be written to:
@@ -854,6 +863,14 @@ impl RegionSource for FixtureRegions {
     fn discard(&mut self, coord: (i32, i32)) {
         self.regions.remove(&coord);
         self.discarded.push(coord);
+    }
+
+    fn dirty_regions(&self) -> Vec<(i32, i32)> {
+        self.regions
+            .iter()
+            .filter(|(_, region)| region.is_dirty())
+            .map(|(coord, _)| *coord)
+            .collect()
     }
 }
 
@@ -1187,4 +1204,322 @@ fn a_region_outside_the_save_is_refused_through_the_cache_too() {
         .unwrap_err(),
         EditRefusal::RegionNotGenerated { region: (9, 0) }
     );
+}
+
+// -------------------------------------------------------------------------------------------------
+// ---- write safety (ticket 033) -------------------------------------------------------------------
+// -------------------------------------------------------------------------------------------------
+
+use crate::edit::session::{session_stamp, WriteError, WriteSafety, WriteSession};
+
+/// A write session on a fixture save. The fixture's temp directory has no
+/// `session.lock` until this creates one, which is itself part of what's under
+/// test — a world nobody has opened is a world nobody has locked.
+fn write_session(save: &SaveFixture) -> WriteSession {
+    WriteSession::open(&save.meta).expect("nobody has the fixture world open")
+}
+
+#[test]
+fn a_committed_edit_reaches_the_files_and_leaves_nothing_dirty() {
+    let save = SaveFixture::corner("commit");
+    let mut cache = save.cache(4);
+    let mut session = write_session(&save);
+
+    let summary = session
+        .commit(
+            &corner_building(dirt()),
+            &mut cache,
+            &EditPolicy::default(),
+        )
+        .expect("a valid edit on an unlocked world");
+
+    assert_eq!(summary.report.blocks_written, 16);
+    assert_eq!(
+        summary.regions_written,
+        vec![(-1, -1), (-1, 0), (0, -1), (0, 0)]
+    );
+    assert_eq!(
+        cache.dirty_regions().count(),
+        0,
+        "committing is what 031 and 032 stopped short of: the regions are saved"
+    );
+
+    // Read back from disk rather than from the cache — the cache would show
+    // the in-memory edit whether or not it was written.
+    for (region, at) in [
+        ((-1, -1), IVec3::new(-1, 5, -1)),
+        ((-1, 0), IVec3::new(-1, 5, 0)),
+        ((0, -1), IVec3::new(0, 5, -1)),
+        ((0, 0), IVec3::new(0, 5, 0)),
+    ] {
+        assert_eq!(
+            block_name_at(&save.load(region), at),
+            "minecraft:dirt",
+            "region {region:?} should have been written"
+        );
+    }
+}
+
+#[test]
+fn the_first_write_of_a_session_backs_the_region_file_up_and_the_second_does_not() {
+    let save = SaveFixture::corner("backup");
+    let mut cache = save.cache(4);
+    let mut session = write_session(&save);
+
+    let first = session
+        .commit(
+            &one_block(IVec3::new(0, 5, 0), dirt()),
+            &mut cache,
+            &EditPolicy::default(),
+        )
+        .expect("a valid edit");
+
+    assert_eq!(first.backups.len(), 1);
+    let backup = first.backups[0].clone();
+    assert!(backup.starts_with(session.backup_dir()));
+    assert_eq!(
+        block_name_at(&load_region_file(&backup, (0, 0)), IVec3::new(0, 5, 0)),
+        "minecraft:stone",
+        "the backup is the world as it was before we touched it"
+    );
+
+    let second = session
+        .commit(
+            &one_block(IVec3::new(1, 5, 1), stairs()),
+            &mut cache,
+            &EditPolicy::default(),
+        )
+        .expect("the region was saved, so a second transaction is allowed");
+
+    assert!(
+        second.backups.is_empty(),
+        "backing up again would overwrite the only copy of the pre-edit state with our own output"
+    );
+    assert_eq!(
+        block_name_at(&load_region_file(&backup, (0, 0)), IVec3::new(0, 5, 0)),
+        "minecraft:stone",
+        "...which is what this asserts: the backup still holds the original"
+    );
+    // ...and the second edit did land, on top of the first.
+    let on_disk = save.load((0, 0));
+    assert_eq!(block_name_at(&on_disk, IVec3::new(0, 5, 0)), "minecraft:dirt");
+    assert_eq!(
+        block_name_at(&on_disk, IVec3::new(1, 5, 1)),
+        "minecraft:oak_stairs"
+    );
+}
+
+#[test]
+fn a_refused_edit_writes_nothing_and_backs_nothing_up() {
+    let save = SaveFixture::corner("commit-refused");
+    let mut cache = save.cache(4);
+    let mut session = write_session(&save);
+    let before = save.region_bytes((0, 0));
+
+    let mut edit = corner_building(dirt());
+    edit.set(IVec3::new(1000, 5, 0), dirt());
+
+    assert!(matches!(
+        session
+            .commit(&edit, &mut cache, &EditPolicy::default())
+            .unwrap_err(),
+        WriteError::Refused(EditRefusal::RegionNotGenerated { region: (1, 0) })
+    ));
+
+    assert!(
+        !session.backup_dir().exists(),
+        "a session that never wrote anything leaves nothing on disk, not even a directory"
+    );
+    assert_eq!(save.region_bytes((0, 0)), before);
+    assert_eq!(cache.dirty_regions().count(), 0);
+}
+
+#[test]
+fn a_backup_that_cannot_be_taken_rolls_the_transaction_back_instead_of_writing_unprotected() {
+    let save = SaveFixture::corner("backup-fails");
+    let mut cache = save.cache(4);
+    // A plain file where the backup directory needs to go: `create_dir_all`
+    // can't have it, and no backup means no write.
+    std::fs::write(save.meta.path.join(crate::edit::BACKUP_DIR), b"not a directory")
+        .expect("stage the obstruction");
+    let mut session = write_session(&save);
+    let before = save.region_bytes((0, 0));
+
+    let err = session
+        .commit(
+            &corner_building(dirt()),
+            &mut cache,
+            &EditPolicy::default(),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, WriteError::Backup { .. }),
+        "expected a backup failure, got {err:?}"
+    );
+
+    // The backup pass runs to completion before the first save, so this fails
+    // with the save untouched — and 032's discard makes that a full rollback.
+    assert_eq!(save.region_bytes((0, 0)), before);
+    assert_eq!(
+        cache.dirty_regions().count(),
+        0,
+        "the in-memory mutations were discarded too, or the next transaction would be refused"
+    );
+    assert_eq!(
+        block_name_at(
+            cache.get_or_load((0, 0)).expect("re-read from disk"),
+            IVec3::new(0, 5, 0)
+        ),
+        "minecraft:stone"
+    );
+}
+
+#[test]
+fn flushing_saves_what_a_batch_left_dirty_and_is_a_no_op_afterwards() {
+    let save = SaveFixture::corner("flush");
+    let mut cache = save.cache(4);
+    let batching = EditPolicy {
+        allow_dirty_regions: true,
+        ..EditPolicy::default()
+    };
+
+    // Two transactions applied without saving in between — the case
+    // `allow_dirty_regions` exists for, and the one `flush` finishes.
+    apply_routed(
+        &one_block(IVec3::new(0, 5, 0), dirt()),
+        &mut cache,
+        &batching,
+    )
+    .expect("a valid edit");
+    apply_routed(
+        &one_block(IVec3::new(-1, 5, -1), dirt()),
+        &mut cache,
+        &batching,
+    )
+    .expect("a valid edit");
+    assert_eq!(cache.dirty_regions().count(), 2);
+
+    let mut session = write_session(&save);
+    let summary = session.flush(&mut cache).expect("both regions save");
+
+    assert_eq!(summary.regions_written, vec![(-1, -1), (0, 0)]);
+    assert_eq!(summary.backups.len(), 2);
+    assert_eq!(cache.dirty_regions().count(), 0);
+    assert_eq!(
+        block_name_at(&save.load((0, 0)), IVec3::new(0, 5, 0)),
+        "minecraft:dirt"
+    );
+    assert_eq!(
+        block_name_at(&save.load((-1, -1)), IVec3::new(-1, 5, -1)),
+        "minecraft:dirt"
+    );
+
+    let again = session.flush(&mut cache).expect("nothing to do");
+    assert!(again.regions_written.is_empty());
+    assert!(again.backups.is_empty());
+}
+
+#[test]
+fn the_dry_run_names_the_files_it_would_write_and_touches_none_of_them() {
+    let save = SaveFixture::corner("dry-run");
+    let mut cache = save.cache(4);
+    let session = write_session(&save);
+    let before = save.region_bytes((0, 0));
+
+    let plan = session
+        .plan(
+            &corner_building(dirt()),
+            &mut cache,
+            &EditPolicy::default(),
+        )
+        .expect("a valid edit");
+
+    assert_eq!(plan.report.blocks_written, 16);
+    assert_eq!(plan.regions.len(), 4);
+    assert_eq!(plan.regions[0].coord, (-1, -1));
+    assert_eq!(plan.regions[0].path, save.meta.get_region_path(-1, -1));
+    assert!(
+        plan.regions.iter().all(|region| !region.backed_up
+            && region
+                .backup
+                .as_ref()
+                .is_some_and(|backup| backup.starts_with(session.backup_dir()))),
+        "nothing is backed up yet, and every backup would go in this session's directory"
+    );
+    // The text a UI shows before committing.
+    let rendered = plan.to_string();
+    assert!(rendered.contains("16 block(s)"), "{rendered}");
+    assert!(rendered.contains("r.0.0.mca"), "{rendered}");
+
+    // A dry run is dry: no edit, no save, no directory.
+    assert_eq!(cache.dirty_regions().count(), 0);
+    assert!(!session.backup_dir().exists());
+    assert_eq!(save.region_bytes((0, 0)), before);
+}
+
+#[test]
+fn the_backups_can_be_turned_off_for_a_caller_that_has_its_own() {
+    let save = SaveFixture::corner("no-backup");
+    let mut cache = save.cache(4);
+    let mut session = WriteSession::open_with(
+        &save.meta,
+        WriteSafety {
+            back_up: false,
+            ..WriteSafety::default()
+        },
+    )
+    .expect("nobody has the fixture world open");
+
+    let summary = session
+        .commit(
+            &one_block(IVec3::new(0, 5, 0), dirt()),
+            &mut cache,
+            &EditPolicy::default(),
+        )
+        .expect("a valid edit");
+
+    assert!(summary.backups.is_empty());
+    assert!(!session.backup_dir().exists());
+    assert_eq!(
+        block_name_at(&save.load((0, 0)), IVec3::new(0, 5, 0)),
+        "minecraft:dirt"
+    );
+}
+
+/// Windows only, and deliberately: a POSIX record lock never conflicts with
+/// its own owner, so the Unix version of this would pass without proving
+/// anything unless the lock were staged from a child process. `mc_anvil`'s
+/// ticket 016 test suite does exactly that for the lock itself; what's under
+/// test *here* is only that this layer refuses when the lock is refused.
+#[test]
+#[cfg(windows)]
+fn a_world_that_is_open_in_minecraft_is_refused() {
+    let save = SaveFixture::corner("locked");
+    let held = mc_anvil::SessionLock::acquire(&save.meta)
+        .expect("the lock file is reachable")
+        .expect("nobody else holds it");
+
+    let err = WriteSession::open(&save.meta).unwrap_err();
+    assert!(
+        matches!(err, WriteError::WorldIsOpen { .. }),
+        "expected the world to read as open, got {err:?}"
+    );
+
+    // ...and closing the world gives it back.
+    drop(held);
+    assert!(WriteSession::open(&save.meta).is_ok());
+}
+
+#[test]
+fn the_backup_directory_is_named_after_the_moment_the_session_opened() {
+    let at = |seconds: u64| {
+        session_stamp(std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds))
+    };
+
+    assert_eq!(at(0), "1970-01-01T00-00-00Z");
+    assert_eq!(at(1_755_264_000), "2025-08-15T13-20-00Z");
+    // The two leap-year cases a hand-rolled civil date gets wrong: an ordinary
+    // leap year, and the century that is one anyway.
+    assert_eq!(at(1_709_209_845), "2024-02-29T12-30-45Z");
+    assert_eq!(at(951_825_600), "2000-02-29T12-00-00Z");
 }

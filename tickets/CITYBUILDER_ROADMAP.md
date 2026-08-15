@@ -2,7 +2,7 @@
 
 Not a work item; the plan for the citybuilder game and the shared world-edit
 infrastructure it needs. High-level tasks here get split into numbered
-tickets in this directory when they're picked up (next free number: 033).
+tickets in this directory when they're picked up (next free number: 034).
 Companion to `ROADMAP.md`, which covers the viewer 001–029.
 
 ## The goal
@@ -108,7 +108,7 @@ L1  lib.rs + two bin shims                       <- DONE (ticket 027)
      |    W4  the chunk edit model            <- DONE (ticket 031)
      |         |
      |    W5  boundary routing + region batching  <- DONE (ticket 032)
-     |    W6  write safety: lock, backup, atomic, dry run
+     |    W6  write safety: lock, backup, atomic  <- DONE (ticket 033)
      |    W7  live re-mesh: edits mark chunks dirty
      |    W8  viewer: a paint/fill command proving W1-W7
      |
@@ -286,8 +286,8 @@ The invalidation turned out to be the small half: the cache *holds* the mutated
 region, so reads already see post-edit blocks. What goes stale is `DecodedWorld`
 and its meshes, and that's W7, off `EditReport::chunks`.
 
-**W6. Write safety.** The "sound way to save a modified world" this plan
-rests on:
+**W6. Write safety. — done, ticket 033.** The "sound way to save a modified
+world" this plan rests on:
 
 - **Refuse to write to a world Minecraft has open.** ranvil 016 reports it
   (via `session.lock`'s OS lock — note the file's *existence* proves
@@ -299,6 +299,22 @@ rests on:
   leave the old region file intact.
 - **Dry run**: report which regions and chunks would change, and how many
   blocks, without touching disk. This is also the test harness.
+
+How it came out: `edit::session::WriteSession` **holds** the lock rather than
+probing it (`SessionLock::acquire`, released on drop), because a probe cannot
+close the gap between the check and the write — and holding also keeps the game
+out *mid-edit*, which a probe never could. It is a write session, not the app's
+lifetime: a viewer that never edits never locks the world.
+
+Atomicity was already upstream (009's temp/fsync/rename), so what this ticket
+actually decided is where the guarantee *stops*: per region file. `commit`
+applies in memory (all-or-nothing, 032), then backs up **every** touched file
+before saving **any** of them, so a backup failure always happens with the save
+untouched and can be rolled back by 032's discard. A failure during the saves
+can't be, and says so — `WriteError::WriteFailed` names what was written, what
+wasn't, and the backup directory. Leaving those regions dirty rather than
+discarding them is deliberate: a disk error is retryable, and discarding would
+turn it into lost work.
 
 **W7. Live re-mesh.** An edit marks its chunks dirty; the pipeline re-meshes
 them, including the neighbours whose faces the edit exposed — 005-f already
