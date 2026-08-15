@@ -108,6 +108,37 @@ impl RegionCache {
     /// region only gets logged, and its file re-read, once rather than on
     /// every chunk that lands inside it.
     pub fn get_or_load(&mut self, region_coord: (i32, i32)) -> Result<&ChunkRegion, MCLoadError> {
+        self.load_if_absent(region_coord)?;
+        Ok(self
+            .entries
+            .get(&region_coord)
+            .expect("just inserted or touched above"))
+    }
+
+    /// [`get_or_load`](Self::get_or_load), mutably: the write path's way in
+    /// (ticket 032), since [`crate::edit`] needs `&mut ChunkRegion` to apply
+    /// an edit and the cache is the only thing that knows where a region file
+    /// lives.
+    ///
+    /// The returned region stays resident until it is saved: `evict_lru`
+    /// refuses to drop a dirty one, so an edit can't be lost to ordinary
+    /// streaming traffic between being applied and being written.
+    pub fn get_or_load_mut(
+        &mut self,
+        region_coord: (i32, i32),
+    ) -> Result<&mut ChunkRegion, MCLoadError> {
+        self.load_if_absent(region_coord)?;
+        Ok(self
+            .entries
+            .get_mut(&region_coord)
+            .expect("just inserted or touched above"))
+    }
+
+    /// Loads `region_coord` if it isn't resident and marks it most-recently-
+    /// used. Shared by [`get_or_load`](Self::get_or_load) and
+    /// [`get_or_load_mut`](Self::get_or_load_mut) so there's one copy of the
+    /// load path rather than two that can drift.
+    fn load_if_absent(&mut self, region_coord: (i32, i32)) -> Result<(), MCLoadError> {
         if self.failed.contains(&region_coord) {
             return Err(MCLoadError::PathNotFoundError);
         }
@@ -136,10 +167,51 @@ impl RegionCache {
         }
 
         self.touch(region_coord);
-        Ok(self
-            .entries
-            .get(&region_coord)
-            .expect("just inserted or touched above"))
+        Ok(())
+    }
+
+    /// Whether the save this cache reads has a region file at `region_coord`
+    /// at all — ungenerated terrain rather than a load failure. The write path
+    /// (ticket 032) reports the two differently: one is "you can't build
+    /// there", the other is "something is wrong with this save".
+    pub fn has_region(&self, (rx, rz): (i32, i32)) -> bool {
+        self.save_meta.has_region(rx, rz)
+    }
+
+    /// Whether a region is currently loaded, without touching its LRU
+    /// position — the read `discard` and the eviction guard are observed
+    /// through, and what W6 asks before deciding whether saving a region needs
+    /// it loaded first.
+    pub fn is_resident(&self, region_coord: (i32, i32)) -> bool {
+        self.entries.contains_key(&region_coord)
+    }
+
+    /// Every resident region with unsaved changes, in no particular order.
+    ///
+    /// W6 saves these; ticket 032's routing refuses to start a new transaction
+    /// while one of its target regions is in here, and the city panel (roadmap
+    /// G2) shows them so the user can tell whether what they see has reached
+    /// the world.
+    pub fn dirty_regions(&self) -> impl Iterator<Item = (i32, i32)> + '_ {
+        self.entries
+            .iter()
+            .filter(|(_, region)| region.is_dirty())
+            .map(|(coord, _)| *coord)
+    }
+
+    /// Drops a resident region **including any unsaved changes in it**, so the
+    /// next access re-reads it from disk.
+    ///
+    /// This is the write path's rollback (ticket 032): `edit::apply` never
+    /// saves, so throwing the in-memory region away is a complete and exact
+    /// undo of everything applied to it since it was loaded — which is also
+    /// why it must only be called on a region whose *only* unsaved changes are
+    /// the ones being rolled back.
+    ///
+    /// Returns whether a region was actually resident.
+    pub fn discard(&mut self, region_coord: (i32, i32)) -> bool {
+        self.order.retain(|&k| k != region_coord);
+        self.entries.remove(&region_coord).is_some()
     }
 
     fn region_path(&self, (rx, rz): (i32, i32)) -> PathBuf {
@@ -154,12 +226,26 @@ impl RegionCache {
 
     /// Drops the least-recently-used region, freeing its decoded chunk
     /// data (`ChunkRegion::chunks`) along with the rest of the struct.
+    ///
+    /// **Skips regions with unsaved changes** (ticket 032): `ChunkRegion`'s
+    /// own `is_dirty` doc comment names this cache as the reason it exists,
+    /// and evicting an edited region drops the edit silently — a building near
+    /// a region corner spans four files, and ordinary streaming traffic in the
+    /// same frame is enough to push one of them out. If every resident region
+    /// is dirty nothing is evicted and `capacity` is exceeded; the overshoot
+    /// is bounded by how much was edited before the next save, which is a far
+    /// better failure than losing the edit.
     fn evict_lru(&mut self) {
-        if self.order.is_empty() {
+        let lru = self.order.iter().position(|coord| {
+            self.entries
+                .get(coord)
+                .is_none_or(|region| !region.is_dirty())
+        });
+        let Some(index) = lru else {
             return;
-        }
-        let lru = self.order.remove(0);
-        self.entries.remove(&lru);
+        };
+        let coord = self.order.remove(index);
+        self.entries.remove(&coord);
     }
 }
 

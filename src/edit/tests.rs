@@ -16,8 +16,11 @@
 
 use super::*;
 
-use mc_anvil::region::{ChunkPayload, Region, CHUNKS_PER_REGION};
+use mc_anvil::region::{ChunkPayload, Region, CHUNKS_PER_REGION, REGION_WIDTH_IN_CHUNKS};
+use mc_anvil::SaveMeta;
 use rnbt::{NbtField, NbtList, NbtValue};
+
+use crate::region_cache::RegionCache;
 
 /// The `DataVersion` the fixtures claim: a 1.21 release, the same one the real
 /// save carries.
@@ -201,17 +204,17 @@ impl RegionFixture {
             .as_nanos();
         let dir = std::env::temp_dir().join(format!("block_viewer-edit-{label}-{nanos}"));
         std::fs::create_dir_all(&dir).expect("create temp dir");
-        let path = dir.join("r.0.0.mca");
 
-        let mut payloads: Vec<Option<ChunkPayload>> = vec![None; CHUNKS_PER_REGION];
-        payloads[0] = Some(ChunkPayload::Nbt(full_chunk(0, 0, FIXTURE_DATA_VERSION)));
-        payloads[1] = Some(ChunkPayload::Nbt(full_chunk(1, 0, FIXTURE_DATA_VERSION)));
-        payloads[2] = Some(ChunkPayload::Nbt(full_chunk(2, 0, 3953)));
-        payloads[3] = Some(ChunkPayload::Nbt(unfinished_chunk(3, 0)));
-
-        Region::new(0, 0, &path)
-            .write(&payloads)
-            .expect("write the fixture region");
+        let path = write_region(
+            &dir,
+            (0, 0),
+            &[
+                ((0, 0), full_chunk(0, 0, FIXTURE_DATA_VERSION)),
+                ((1, 0), full_chunk(1, 0, FIXTURE_DATA_VERSION)),
+                ((2, 0), full_chunk(2, 0, 3953)),
+                ((3, 0), unfinished_chunk(3, 0)),
+            ],
+        );
 
         Self {
             dir,
@@ -235,6 +238,30 @@ impl Drop for RegionFixture {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.dir);
     }
+}
+
+/// Writes one `r.<x>.<z>.mca` into `dir`, with `chunks` given by **world**
+/// chunk coordinate — the region-local slot each one lands in comes from the
+/// same `local_chunk_index` the read path uses, so a fixture for a negative
+/// region doesn't need the arithmetic done by hand. Returns its path.
+fn write_region(
+    dir: &std::path::Path,
+    region_coord: (i32, i32),
+    chunks: &[((i32, i32), NbtField)],
+) -> std::path::PathBuf {
+    let mut payloads: Vec<Option<ChunkPayload>> = vec![None; CHUNKS_PER_REGION];
+    for (chunk, nbt) in chunks {
+        let (local_x, local_z) = local_chunk_index(*chunk, region_coord);
+        payloads[local_z * REGION_WIDTH_IN_CHUNKS + local_x] =
+            Some(ChunkPayload::Nbt(nbt.clone()));
+    }
+
+    let (rx, rz) = region_coord;
+    let path = dir.join(format!("r.{rx}.{rz}.mca"));
+    Region::new(rx, rz, &path)
+        .write(&payloads)
+        .expect("write the fixture region");
+    path
 }
 
 /// A finished chunk: one all-stone section at `Y = 0`, plus the chunk-root
@@ -693,4 +720,471 @@ fn the_baseline_is_off_by_default_because_it_costs_a_read_per_block() {
     .expect("a valid edit");
 
     assert_eq!(report.replaced, None);
+}
+
+// -------------------------------------------------------------------------------------------------
+// ---- routing across region files (ticket 032) ----------------------------------------------------
+// -------------------------------------------------------------------------------------------------
+
+/// A synthetic *save*: a `region/` directory of `.mca` files and the
+/// [`SaveMeta`] that lists them, so the routed edit can be driven both against
+/// bare regions and against a real [`RegionCache`].
+struct SaveFixture {
+    dir: std::path::PathBuf,
+    meta: SaveMeta,
+}
+
+impl SaveFixture {
+    /// The four regions that meet at the world origin — `(-1,-1)`, `(-1,0)`,
+    /// `(0,-1)` and `(0,0)` — each with exactly the one chunk that touches the
+    /// corner generated, and nothing else.
+    ///
+    /// The origin corner is the four-way junction, so a small building placed
+    /// across it exercises the maximum fan-out *and* negative coordinates in
+    /// the same edit — which is the pair of things that go wrong together.
+    fn corner(label: &str) -> Self {
+        Self::build(label, full_chunk(0, 0, FIXTURE_DATA_VERSION))
+    }
+
+    /// [`SaveFixture::corner`] with the origin chunk's section malformed, so
+    /// the preflight accepts it and `set_blocks` refuses it — the phase-2
+    /// failure the rollback exists for. Chunk `(0,0)` is the *last* region the
+    /// routed apply visits, so three regions are already applied when it
+    /// happens.
+    fn corner_with_a_malformed_origin(label: &str) -> Self {
+        Self::build(label, malformed_chunk(0, 0))
+    }
+
+    fn build(label: &str, origin_chunk: NbtField) -> Self {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("block_viewer-route-{label}-{nanos}"));
+        let region_dir = dir.join("region");
+        std::fs::create_dir_all(&region_dir).expect("create temp dir");
+
+        for chunk in [(-1, -1), (-1, 0), (0, -1)] {
+            write_region(
+                &region_dir,
+                chunk_to_region_coord(chunk),
+                &[(chunk, full_chunk(chunk.0, chunk.1, FIXTURE_DATA_VERSION))],
+            );
+        }
+        write_region(&region_dir, (0, 0), &[((0, 0), origin_chunk)]);
+
+        let meta = SaveMeta {
+            name: "route-fixture".to_string(),
+            path: dir.clone(),
+            region_dir,
+            regions: vec![(-1, -1), (-1, 0), (0, -1), (0, 0)],
+        };
+        Self { dir, meta }
+    }
+
+    fn load(&self, coord: (i32, i32)) -> ChunkRegion {
+        let mut region: ChunkRegion =
+            Region::new(coord.0, coord.1, self.meta.get_region_path(coord.0, coord.1)).into();
+        region.load_chunks().expect("load the fixture region");
+        region
+    }
+
+    /// Every region loaded up front, as a [`RegionSource`] with no cache and
+    /// no eviction in it.
+    fn regions(&self) -> FixtureRegions {
+        FixtureRegions {
+            regions: self.meta.regions.iter().map(|c| (*c, self.load(*c))).collect(),
+            discarded: Vec::new(),
+        }
+    }
+
+    fn cache(&self, capacity: usize) -> RegionCache {
+        RegionCache::new(self.meta.clone(), capacity)
+    }
+}
+
+impl Drop for SaveFixture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// A chunk that passes every preflight check and still can't be written to:
+/// finished, current, with a section at `Y = 0` that has no `block_states` at
+/// all. `check_set_block` finds the section and says yes; `set_blocks` needs
+/// the palette and says no.
+fn malformed_chunk(x: i32, z: i32) -> NbtField {
+    let section = NbtField::new_compound(
+        "",
+        vec![NbtField {
+            name: "Y".to_string(),
+            value: NbtValue::Byte(FIXTURE_SECTION_Y as u8),
+        }],
+    );
+    NbtField::new_compound(
+        "",
+        vec![
+            NbtField::new_list("sections", NbtList::Compound(vec![section])),
+            NbtField::new_i32("xPos", x),
+            NbtField::new_i32("zPos", z),
+            NbtField::new_i32("yPos", -4),
+            NbtField::new_i32("DataVersion", FIXTURE_DATA_VERSION),
+            NbtField::new_string("Status", "minecraft:full"),
+        ],
+    )
+}
+
+/// A [`RegionSource`] over regions already in memory: no save, no cache, no
+/// eviction — only the routing rules under test. Records what was discarded,
+/// which is how the rollback is observed at this level; that discarding
+/// actually restores the pre-edit blocks is the *cache's* behaviour and is
+/// tested through one.
+struct FixtureRegions {
+    regions: BTreeMap<(i32, i32), ChunkRegion>,
+    discarded: Vec<(i32, i32)>,
+}
+
+impl RegionSource for FixtureRegions {
+    fn region_mut(&mut self, coord: (i32, i32)) -> Result<&mut ChunkRegion, RegionUnavailable> {
+        self.regions
+            .get_mut(&coord)
+            .ok_or(RegionUnavailable::NotGenerated)
+    }
+
+    fn discard(&mut self, coord: (i32, i32)) {
+        self.regions.remove(&coord);
+        self.discarded.push(coord);
+    }
+}
+
+/// The 4x4 footprint centred on the world origin: 16 blocks, four blocks in
+/// each of the four regions that meet there.
+fn corner_building(state: BlockState) -> WorldEdit {
+    let mut edit = WorldEdit::new();
+    for x in -2..2 {
+        for z in -2..2 {
+            edit.set(IVec3::new(x, 5, z), state.clone());
+        }
+    }
+    edit
+}
+
+// ---- the split -----------------------------------------------------------------------------------
+
+#[test]
+fn routing_splits_an_edit_by_region_file() {
+    let mut edit = WorldEdit::new().with_data_version(FIXTURE_DATA_VERSION);
+    edit.set(IVec3::new(-1, 5, -1), stone());
+    edit.set(IVec3::new(0, 5, 0), dirt());
+    // The last block of region (0,0), and the first of region (1,0).
+    edit.set(IVec3::new(511, 5, 0), stone());
+    edit.set(IVec3::new(512, 5, 0), dirt());
+
+    let routed = route(&edit);
+
+    assert_eq!(
+        routed.keys().copied().collect::<Vec<_>>(),
+        vec![(-1, -1), (0, 0), (1, 0)]
+    );
+    assert_eq!(routed[&(0, 0)].len(), 2);
+    assert_eq!(routed[&(-1, -1)].len(), 1);
+    // Every sub-edit inherits the parent's version claim, or nothing would be
+    // refused on a mismatch once it had been split.
+    assert_eq!(
+        routed[&(1, 0)].data_version(),
+        Some(FIXTURE_DATA_VERSION),
+        "the split has to carry the DataVersion claim onto every piece"
+    );
+}
+
+#[test]
+fn routing_keeps_last_write_wins_within_a_region() {
+    let mut edit = WorldEdit::new();
+    edit.set(IVec3::new(0, 5, 0), dirt());
+    // A write to another region in between, which must not disturb the order
+    // of the two that share one.
+    edit.set(IVec3::new(600, 5, 0), stone());
+    edit.set(IVec3::new(0, 5, 0), stairs());
+
+    let routed = route(&edit);
+    let origin = &routed[&(0, 0)];
+
+    assert_eq!(origin.edits().len(), 2);
+    assert_eq!(origin.edits()[1].state, stairs());
+}
+
+// ---- applying across regions ---------------------------------------------------------------------
+
+#[test]
+fn a_building_on_a_region_corner_lands_in_all_four_files() {
+    let save = SaveFixture::corner("corner");
+    let mut source = save.regions();
+
+    let report = apply_routed(
+        &corner_building(dirt()),
+        &mut source,
+        &EditPolicy::default(),
+    )
+    .expect("all four regions are generated");
+
+    assert_eq!(report.blocks_written, 16);
+    assert_eq!(report.regions, vec![(-1, -1), (-1, 0), (0, -1), (0, 0)]);
+    // One chunk per region here, and the chunk coordinates happen to be the
+    // same four numbers — the corner is where both grids meet.
+    assert_eq!(report.chunks, vec![(-1, -1), (-1, 0), (0, -1), (0, 0)]);
+
+    for x in -2..2 {
+        for z in -2..2 {
+            let at = IVec3::new(x, 5, z);
+            let region = &source.regions[&address_of(at).region];
+            assert_eq!(
+                block_name_at(region, at),
+                "minecraft:dirt",
+                "the block at ({x}, 5, {z}) should have been written"
+            );
+        }
+    }
+    assert!(
+        source.regions.values().all(|region| region.is_dirty()),
+        "all four region files need saving now"
+    );
+}
+
+#[test]
+fn one_refused_region_leaves_every_other_region_untouched() {
+    let save = SaveFixture::corner("refused");
+    let mut source = save.regions();
+
+    let mut edit = corner_building(dirt());
+    // Chunk (-1, 2) is in region (-1, 0), which exists — but that chunk was
+    // never generated, and iteration 1 doesn't generate terrain.
+    edit.set(IVec3::new(-2, 5, 40), dirt());
+
+    assert_eq!(
+        apply_routed(&edit, &mut source, &EditPolicy::default()).unwrap_err(),
+        EditRefusal::ChunkNotGenerated { chunk: (-1, 2) }
+    );
+
+    // Three quarters of a building is worse than none: the preflight covers
+    // every region before any of them is written.
+    assert!(
+        source.regions.values().all(|region| !region.is_dirty()),
+        "a refused transaction must not dirty a single region"
+    );
+    assert_eq!(
+        block_name_at(&source.regions[&(-1, -1)], IVec3::new(-2, 5, -2)),
+        "minecraft:stone"
+    );
+}
+
+#[test]
+fn a_failure_after_the_preflight_rolls_the_applied_regions_back() {
+    let save = SaveFixture::corner_with_a_malformed_origin("rollback");
+    let mut source = save.regions();
+
+    let refusal = apply_routed(
+        &corner_building(dirt()),
+        &mut source,
+        &EditPolicy::default(),
+    )
+    .unwrap_err();
+
+    assert!(
+        matches!(refusal, EditRefusal::Rejected { .. }),
+        "the preflight can't model a malformed section; set_blocks refuses it: {refusal:?}"
+    );
+    // The three regions that did apply were thrown away rather than left
+    // holding a quarter of a building each.
+    assert_eq!(source.discarded, vec![(-1, -1), (-1, 0), (0, -1)]);
+    assert!(
+        source.regions.values().all(|region| !region.is_dirty()),
+        "nothing dirty survives a rolled-back transaction"
+    );
+}
+
+#[test]
+fn a_region_the_save_never_generated_is_refused_rather_than_generated() {
+    let save = SaveFixture::corner("no-region");
+    let mut source = save.regions();
+
+    assert_eq!(
+        apply_routed(
+            &one_block(IVec3::new(1000, 5, 0), dirt()),
+            &mut source,
+            &EditPolicy::default()
+        )
+        .unwrap_err(),
+        EditRefusal::RegionNotGenerated { region: (1, 0) }
+    );
+}
+
+#[test]
+fn a_region_with_unsaved_changes_is_refused_unless_the_policy_allows_it() {
+    let save = SaveFixture::corner("dirty");
+    let mut source = save.regions();
+
+    apply_routed(
+        &one_block(IVec3::new(0, 5, 0), dirt()),
+        &mut source,
+        &EditPolicy::default(),
+    )
+    .expect("the first transaction");
+
+    // The rollback discards a whole region, so a second transaction over the
+    // same one would put the first at risk. One transaction at a time, saved
+    // in between — which is the contract W6 implements.
+    let second = one_block(IVec3::new(1, 5, 1), stairs());
+    assert_eq!(
+        apply_routed(&second, &mut source, &EditPolicy::default()).unwrap_err(),
+        EditRefusal::RegionHasUnsavedChanges { region: (0, 0) }
+    );
+
+    let batching = EditPolicy {
+        allow_dirty_regions: true,
+        ..EditPolicy::default()
+    };
+    apply_routed(&second, &mut source, &batching).expect("the caller took the risk knowingly");
+    assert_eq!(
+        block_name_at(&source.regions[&(0, 0)], IVec3::new(1, 5, 1)),
+        "minecraft:oak_stairs"
+    );
+}
+
+#[test]
+fn the_merged_baseline_is_sorted_across_regions() {
+    let save = SaveFixture::corner("baseline");
+    let mut source = save.regions();
+
+    let mut edit = WorldEdit::new();
+    edit.set(IVec3::new(0, 5, 0), dirt());
+    edit.set(IVec3::new(-1, 5, -1), dirt());
+
+    let report = apply_routed(
+        &edit,
+        &mut source,
+        &EditPolicy {
+            capture_replaced: true,
+            ..EditPolicy::default()
+        },
+    )
+    .expect("a valid edit");
+
+    // Region-major order isn't position order, so the merge sorts: the undo
+    // record has to look the same however the edit was split.
+    assert_eq!(
+        report.replaced.expect("asked for it"),
+        vec![
+            (IVec3::new(-1, 5, -1), stone()),
+            (IVec3::new(0, 5, 0), stone()),
+        ]
+    );
+}
+
+// ---- the cache as a region source ------------------------------------------------------------------
+
+/// An edit spanning the two diagonally opposite regions of the corner
+/// fixture — two files, four regions' worth of cache pressure between them.
+fn two_region_edit() -> WorldEdit {
+    let mut edit = WorldEdit::new();
+    edit.set(IVec3::new(-1, 5, -1), dirt());
+    edit.set(IVec3::new(0, 5, 0), dirt());
+    edit
+}
+
+#[test]
+fn the_cache_will_not_evict_a_region_with_unsaved_changes() {
+    let save = SaveFixture::corner("cache-guard");
+    // Capacity 1: without the guard, applying the second region would evict
+    // the first and the edit in it would vanish silently.
+    let mut cache = save.cache(1);
+
+    apply_routed(&two_region_edit(), &mut cache, &EditPolicy::default()).expect("a valid edit");
+
+    assert_eq!(cache.len(), 2, "capacity is exceeded rather than an edit lost");
+    assert_eq!(
+        cache.dirty_regions().collect::<BTreeSet<_>>(),
+        BTreeSet::from([(-1, -1), (0, 0)])
+    );
+    // And the cache serves post-edit blocks: the streaming pipeline reads
+    // through this same entry, so it can't go on handing out the old ones.
+    assert_eq!(
+        block_name_at(cache.get_or_load((0, 0)).expect("resident"), IVec3::new(0, 5, 0)),
+        "minecraft:dirt"
+    );
+}
+
+#[test]
+fn saving_lets_ordinary_eviction_resume() {
+    let save = SaveFixture::corner("cache-save");
+    let mut cache = save.cache(1);
+
+    apply_routed(&two_region_edit(), &mut cache, &EditPolicy::default()).expect("a valid edit");
+    for coord in cache.dirty_regions().collect::<Vec<_>>() {
+        cache
+            .get_or_load_mut(coord)
+            .expect("resident")
+            .save()
+            .expect("save the region");
+    }
+    assert_eq!(cache.dirty_regions().count(), 0);
+
+    // `dirty_regions` comes back in no particular order, and saving touches
+    // what it returns — so say which region is most-recently-used rather than
+    // depending on which order the two got saved in.
+    cache.get_or_load((0, 0)).expect("resident");
+
+    // (-1,-1) is now the least-recently-used clean region, so a third region
+    // takes its place instead of pushing the cache further over capacity.
+    cache.get_or_load((-1, 0)).expect("a generated region");
+    assert!(!cache.is_resident((-1, -1)));
+    assert_eq!(cache.len(), 2);
+
+    // ...and what was saved is on disk, not just in memory.
+    assert_eq!(
+        block_name_at(&save.load((-1, -1)), IVec3::new(-1, 5, -1)),
+        "minecraft:dirt"
+    );
+}
+
+#[test]
+fn discarding_a_region_throws_the_unsaved_edit_away() {
+    let save = SaveFixture::corner("cache-discard");
+    let mut cache = save.cache(4);
+
+    apply_routed(
+        &one_block(IVec3::new(0, 5, 0), dirt()),
+        &mut cache,
+        &EditPolicy::default(),
+    )
+    .expect("a valid edit");
+    assert_eq!(cache.dirty_regions().count(), 1);
+
+    assert!(cache.discard((0, 0)));
+    assert!(!cache.is_resident((0, 0)));
+
+    // Which is the rollback: nothing was saved, so re-reading the file is an
+    // exact undo of everything that had been applied to it.
+    assert_eq!(
+        block_name_at(cache.get_or_load((0, 0)).expect("reloaded"), IVec3::new(0, 5, 0)),
+        "minecraft:stone"
+    );
+    assert_eq!(cache.dirty_regions().count(), 0);
+}
+
+#[test]
+fn a_region_outside_the_save_is_refused_through_the_cache_too() {
+    let save = SaveFixture::corner("cache-missing");
+    let mut cache = save.cache(4);
+
+    // The cache answers "not found" for a region the save never had and for
+    // one that won't load; only it knows which, so only it can tell them apart.
+    assert_eq!(
+        apply_routed(
+            &one_block(IVec3::new(5000, 5, 0), dirt()),
+            &mut cache,
+            &EditPolicy::default()
+        )
+        .unwrap_err(),
+        EditRefusal::RegionNotGenerated { region: (9, 0) }
+    );
 }

@@ -2,7 +2,7 @@
 
 Not a work item; the plan for the citybuilder game and the shared world-edit
 infrastructure it needs. High-level tasks here get split into numbered
-tickets in this directory when they're picked up (next free number: 032).
+tickets in this directory when they're picked up (next free number: 033).
 Companion to `ROADMAP.md`, which covers the viewer 001–029.
 
 ## The goal
@@ -93,7 +93,7 @@ Gaps found while planning, each of which is real work:
 | ~~Nothing recomputes `Heightmaps`, clears `isLightOn`, or cleans up `block_entities` after an edit~~ — all three now exist upstream (013, 014, 015); sequencing them is W4's job | upstream, `ranvil` 013–015 |
 | `blueprint::structure` only **writes** `.nbt`. No reader | `blueprint/structure.rs` |
 | `mesh_chunk_column` meshes a `ChunkColumn` via `BlockId`; a `Blueprint` is a `BlockState` palette + `Vec<u16>` with no registry | `world/mesh.rs` |
-| `RegionCache::get_or_load` hands out `&ChunkRegion`. No mutation, no invalidation | `region_cache.rs` |
+| ~~`RegionCache::get_or_load` hands out `&ChunkRegion`. No mutation, no invalidation~~ — done: `get_or_load_mut`, an eviction guard for dirty regions, `discard` and `dirty_regions` (032) | `region_cache.rs` |
 
 ## The shape of the work
 
@@ -107,7 +107,7 @@ L1  lib.rs + two bin shims                       <- DONE (ticket 027)
      |         |
      |    W4  the chunk edit model            <- DONE (ticket 031)
      |         |
-     |    W5  boundary routing + region batching
+     |    W5  boundary routing + region batching  <- DONE (ticket 032)
      |    W6  write safety: lock, backup, atomic, dry run
      |    W7  live re-mesh: edits mark chunks dirty
      |    W8  viewer: a paint/fill command proving W1-W7
@@ -260,10 +260,10 @@ the Anvil format, `edit` owns what we're allowed to do to a world.
   off-by-one buildings happen. This codebase already carries `bevy.z = -mc.z`
   and inclusive bounds from 019 — inherit them, don't reinvent them.
 
-**W5. Boundary routing and region batching.** Block coordinate →
-`(region, chunk, section, local index)`, and the batching that makes it
-sane. A 20×20 building straddles up to 4 chunks; placed near a region corner
-it straddles up to 4 region files. Requirements:
+**W5. Boundary routing and region batching. — done, ticket 032.** Block
+coordinate → `(region, chunk, section, local index)`, and the batching that
+makes it sane. A 20×20 building straddles up to 4 chunks; placed near a region
+corner it straddles up to 4 region files. Requirements:
 
 - group all changes by region file, apply every one of them, write each file
   **once**
@@ -271,6 +271,20 @@ it straddles up to 4 region files. Requirements:
   ungenerated chunk — iteration 1 does not generate terrain
 - `RegionCache` needs a mutable path and invalidation; the streaming
   pipeline must not go on serving pre-edit bytes
+
+How it came out: `edit::route` splits the edit by region and then **plans every
+region before applying any of them**, because neither `set_blocks` nor 031's
+`apply` gives all-or-nothing across four files, and three quarters of a building
+is worse than none. If the write phase fails anyway — the preflight can't model
+every way the Anvil format can be malformed — the regions already applied are
+*discarded* from the cache, which is a complete rollback exactly because nothing
+here saves. That's also why a region carrying an earlier transaction's unsaved
+changes is refused: the rollback would take those with it. One transaction at a
+time, saved before the next, which is the contract W6 implements.
+
+The invalidation turned out to be the small half: the cache *holds* the mutated
+region, so reads already see post-edit blocks. What goes stale is `DecodedWorld`
+and its meshes, and that's W7, off `EditReport::chunks`.
 
 **W6. Write safety.** The "sound way to save a modified world" this plan
 rests on:

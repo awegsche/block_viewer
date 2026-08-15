@@ -25,14 +25,15 @@
 //! `set_blocks` call. A recompute over half-applied blocks would bake a
 //! surface that never existed.
 //!
-//! # Scope: one region
+//! # Scope: one region, or several
 //!
 //! [`apply`] takes a single `&mut ChunkRegion` and refuses anything outside
-//! it. Routing an edit across the up-to-four region files a building near a
-//! corner touches — and the `RegionCache` mutation that needs — is W5;
-//! backups, `session.lock` and the save itself are W6. `apply` deliberately
-//! does **not** call `ChunkRegion::save`: a function that both edits and
-//! writes to disk can't be tested without a disk.
+//! it. [`route::apply_routed`] (ticket 032) is the entry point for an edit
+//! that spans several region files — a building near a region corner touches
+//! up to four — and it is built out of [`plan`] and [`apply`] rather than
+//! around them. Backups, `session.lock` and the save itself are W6: `apply`
+//! deliberately does **not** call `ChunkRegion::save`, because a function that
+//! both edits and writes to disk can't be tested without a disk.
 //!
 //! # Coordinates
 //!
@@ -56,6 +57,9 @@ use crate::chunk_pipeline::local_chunk_index;
 use crate::region_cache::chunk_to_region_coord;
 use crate::selection::{WORLD_MAX_Y, WORLD_MIN_Y};
 use crate::world::SECTION_SIZE;
+
+pub mod route;
+pub use route::{apply_routed, plan_routed, route, RegionSource, RegionUnavailable};
 
 /// Blocks across a region file, both horizontal axes: 32 chunks of 16.
 const REGION_WIDTH_IN_BLOCKS: i32 = REGION_WIDTH_IN_CHUNKS as i32 * SECTION_SIZE as i32;
@@ -125,6 +129,12 @@ impl WorldEdit {
     /// Every block this edit would write, in the order they were added.
     pub fn edits(&self) -> &[BlockEdit] {
         &self.edits
+    }
+
+    /// Which Minecraft version these block states are spelled for, if the
+    /// source knew. [`route`] carries it onto every sub-edit it produces.
+    pub fn data_version(&self) -> Option<i32> {
+        self.data_version
     }
 
     pub fn is_empty(&self) -> bool {
@@ -200,6 +210,15 @@ pub struct EditPolicy {
     /// per position; a caller that might ever want to undo should turn it on,
     /// because afterwards the data is gone from the save for good.
     pub capture_replaced: bool,
+    /// Allow a transaction whose target regions already hold unsaved changes.
+    ///
+    /// Read by the routed entry points ([`route::apply_routed`]) only — a
+    /// single-region [`apply`] has no rollback to protect. Off by default
+    /// because that rollback discards the whole region: an earlier
+    /// transaction's unsaved edit would go with it. Turning it on says the
+    /// caller is batching deliberately and accepts that a failure rolls back
+    /// further than it caused.
+    pub allow_dirty_regions: bool,
 }
 
 impl Default for EditPolicy {
@@ -209,6 +228,7 @@ impl Default for EditPolicy {
             require_full_status: true,
             enforce_data_version: true,
             capture_replaced: false,
+            allow_dirty_regions: false,
         }
     }
 }
@@ -231,9 +251,24 @@ pub enum EditRefusal {
     /// Y is outside the world's build range.
     OutsideBuildLimits { at: IVec3 },
     /// The position belongs to a different region file than the one being
-    /// edited. W5's job; refused here rather than wrapped into the wrong
-    /// place, which is what region-local coordinates would silently do.
+    /// edited — from the single-region [`apply`], which refuses it rather than
+    /// wrapping it into the wrong place the way region-local coordinates
+    /// silently would. [`route::apply_routed`] is what makes such an edit
+    /// legal, so this is not reachable through it.
     OutsideRegion { at: IVec3, region: (i32, i32) },
+    /// The save has no region file there at all: ungenerated terrain, one
+    /// scale up from [`EditRefusal::ChunkNotGenerated`]. A building placed past
+    /// the edge of explored terrain hits this one first.
+    RegionNotGenerated { region: (i32, i32) },
+    /// The region file exists and won't load — truncated, corrupt, an
+    /// unsupported compression. Not the same news as ungenerated terrain, and
+    /// reported separately so the user can tell which they have.
+    RegionUnreadable { region: (i32, i32), reason: String },
+    /// A target region already holds unsaved changes from an earlier
+    /// transaction (ticket 032). Refused because this transaction's rollback
+    /// discards the whole region and would take those with it; save first, or
+    /// set [`EditPolicy::allow_dirty_regions`].
+    RegionHasUnsavedChanges { region: (i32, i32) },
     /// The chunk isn't in the region file: ungenerated terrain. Iteration 1
     /// does not generate terrain, so this is a refusal and not a prompt.
     ChunkNotGenerated { chunk: (i32, i32) },
@@ -271,6 +306,21 @@ impl std::fmt::Display for EditRefusal {
                 f,
                 "({}, {}, {}) is not in region ({}, {})",
                 at.x, at.y, at.z, region.0, region.1
+            ),
+            EditRefusal::RegionNotGenerated { region } => write!(
+                f,
+                "region ({}, {}) has not been generated yet",
+                region.0, region.1
+            ),
+            EditRefusal::RegionUnreadable { region, reason } => write!(
+                f,
+                "region ({}, {}) could not be read: {reason}",
+                region.0, region.1
+            ),
+            EditRefusal::RegionHasUnsavedChanges { region } => write!(
+                f,
+                "region ({}, {}) has unsaved changes; save them before editing it again",
+                region.0, region.1
             ),
             EditRefusal::ChunkNotGenerated { chunk } => write!(
                 f,
@@ -311,6 +361,10 @@ pub struct EditReport {
     pub blocks_written: usize,
     /// The chunks the edit lands in, ascending.
     pub chunks: Vec<(i32, i32)>,
+    /// The region files the edit lands in, ascending — one from [`plan`], up
+    /// to four from [`route::plan_routed`], which is the number a building
+    /// placed on a region corner can reach.
+    pub regions: Vec<(i32, i32)>,
     /// What each written position held before, if
     /// [`EditPolicy::capture_replaced`] asked for it. Ascending by position,
     /// so two runs of the same edit produce the same record.
@@ -430,6 +484,7 @@ pub fn plan(
     Ok(EditReport {
         blocks_written: positions.len(),
         chunks: sections.keys().copied().collect(),
+        regions: vec![region_coord],
         replaced: None,
     })
 }
