@@ -360,6 +360,51 @@ fn one_block(at: IVec3, state: BlockState) -> WorldEdit {
 // ---- planning -----------------------------------------------------------------------------------
 // -------------------------------------------------------------------------------------------------
 
+// -------------------------------------------------------------------------------------------------
+// ---- filling a selection (ticket 035) -------------------------------------------------------------
+// -------------------------------------------------------------------------------------------------
+
+#[test]
+fn fill_builds_one_edit_per_block_in_the_bounds() {
+    let bounds = crate::selection::SelectionBounds::from_corners(
+        IVec3::new(0, 5, 0),
+        IVec3::new(0, 5, 0),
+        IVec3::new(1, 6, 2),
+    );
+    let edit = WorldEdit::fill(bounds, dirt());
+
+    assert_eq!(edit.len(), bounds.volume() as usize);
+    assert!(edit.edits().iter().all(|e| e.state == dirt()));
+    let positions: std::collections::HashSet<IVec3> =
+        edit.edits().iter().map(|e| e.at).collect();
+    assert_eq!(positions, bounds.iter_blocks().collect());
+}
+
+#[test]
+fn filling_a_selection_lands_every_block_in_the_world() {
+    let fixture = RegionFixture::new("fill");
+    let mut region = fixture.load();
+
+    let bounds = crate::selection::SelectionBounds::from_corners(
+        IVec3::new(1, 5, 1),
+        IVec3::new(1, 5, 1),
+        IVec3::new(3, 5, 3),
+    );
+    let edit = WorldEdit::fill(bounds, dirt());
+
+    let report = apply(&edit, &mut region, &EditPolicy::default()).expect("a valid fill");
+    assert_eq!(report.blocks_written, 9);
+
+    for at in bounds.iter_blocks() {
+        assert_eq!(block_name_at(&region, at), "minecraft:dirt");
+    }
+    // Just outside the box, untouched.
+    assert_eq!(
+        block_name_at(&region, IVec3::new(4, 5, 4)),
+        "minecraft:stone"
+    );
+}
+
 #[test]
 fn an_empty_edit_is_refused_rather_than_reported_as_success() {
     let fixture = RegionFixture::new("empty");

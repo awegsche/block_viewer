@@ -2,7 +2,7 @@
 
 Not a work item; the plan for the citybuilder game and the shared world-edit
 infrastructure it needs. High-level tasks here get split into numbered
-tickets in this directory when they're picked up (next free number: 034).
+tickets in this directory when they're picked up (next free number: 036).
 Companion to `ROADMAP.md`, which covers the viewer 001–029.
 
 ## The goal
@@ -109,8 +109,8 @@ L1  lib.rs + two bin shims                       <- DONE (ticket 027)
      |         |
      |    W5  boundary routing + region batching  <- DONE (ticket 032)
      |    W6  write safety: lock, backup, atomic  <- DONE (ticket 033)
-     |    W7  live re-mesh: edits mark chunks dirty
-     |    W8  viewer: a paint/fill command proving W1-W7
+     |    W7  live re-mesh: edits mark chunks dirty  <- DONE (ticket 034)
+     |    W8  viewer: a paint/fill command proving W1-W7  <- DONE (ticket 035)
      |
      +-- B  blueprints as building models
      |    B1  structure .nbt reader (inverse of 023)
@@ -321,13 +321,28 @@ them, including the neighbours whose faces the edit exposed — 005-f already
 solved exactly this problem for the loading frontier, so follow it rather
 than inventing a second dirty-chunk mechanism.
 
-**W8. A paint/fill command in the viewer.** Fill the current 019 selection
-with a block, or stamp a loaded blueprint at it, driven from the existing
-selection panel. This exists to *prove W1–W7 end to end before any game code
-is written*, and it's directly the first feature of the general
-explore-and-modify app. Its manual verification — write, open the world in
-Minecraft, confirm the blocks are there, the lighting is right, and nothing
-is corrupt — is the gate the rest of the roadmap waits on.
+**W8. A paint/fill command in the viewer. — done, ticket 035.** Fill the
+current 019 selection with a block, or stamp a loaded blueprint at it,
+driven from the existing selection panel. This exists to *prove W1–W7 end to
+end before any game code is written*, and it's directly the first feature of
+the general explore-and-modify app. Its manual verification — write, open
+the world in Minecraft, confirm the blocks are there, the lighting is right,
+and nothing is corrupt — is the gate the rest of the roadmap waits on.
+
+How it came out: fill only, not blueprint stamping — there's no blueprint
+*reader* yet (B1), and the only in-memory blueprint today is whatever the
+last extraction produced, which isn't what "a loaded blueprint" means. Fill
+alone already exercises W1–W7 end to end: `WorldEdit::fill(bounds, state)`
+(shared with H1 later), a `BlockState: FromStr` parser as the inverse of
+022's `Display`, and a `viewer::paint` module built to the same
+state-machine-plus-task shape as `blueprint::export`, holding the shared
+region-cache lock for the whole commit (a routed transaction can't release
+it partway through without breaking 032's all-or-nothing guarantee, unlike
+extraction's per-column locking). A successful commit fires
+`chunk_pipeline::ChunksEdited`, so 034's live re-mesh is what makes the
+result visible without a restart — this ticket is the first thing that
+actually calls it. The manual open-in-Minecraft check is recorded in
+`../todo.md`, not done here.
 
 ---
 

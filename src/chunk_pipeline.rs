@@ -38,6 +38,31 @@
 //! avoids frame stutter. A per-worker registry (sharded, merged back on
 //! poll) would restore inter-task parallelism if this ever shows up in a
 //! profile; not worth the complexity yet at one save's worth of block names.
+//!
+//! ## Live re-mesh on edit (ticket 034, roadmap W7)
+//!
+//! [`crate::edit`] mutates the very `ChunkRegion` this pipeline reads
+//! through (both go through the same shared [`RegionCache`]), so a fresh
+//! decode already sees post-edit blocks — but the *already-decoded*
+//! [`world::ChunkColumn`]s sitting in [`DecodedWorld`] and their meshes are
+//! now stale, and nothing re-derives them on its own. [`ChunksEdited`]
+//! is how an edit says so: any system that commits an edit fires it with
+//! [`crate::edit::EditReport::chunks`], and [`queue_edited_chunk_reloads`]
+//! turns that into two kinds of work, using 005-f's re-mesh queue for the
+//! second rather than a second dirty-chunk mechanism:
+//!
+//! - the edited chunks themselves go through [`PendingChunkReloads`] /
+//!   [`start_chunk_reloads`] / [`poll_completed_chunk_reloads`] — a full
+//!   re-decode *and* re-mesh, because unlike a 005-f neighbour, these
+//!   chunks' own blocks changed;
+//! - their loaded neighbours (that weren't themselves edited) go straight
+//!   into [`PendingChunkRemeshes`] — same as 005-f, since only the mesh
+//!   at the shared boundary can have changed.
+//!
+//! A coordinate that isn't currently in [`DecodedWorld`] is dropped rather
+//! than queued: it isn't on screen, and whenever it does stream in,
+//! [`load_and_mesh_chunk`] decodes it from the (already-edited) region for
+//! free.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -185,6 +210,61 @@ impl InFlightChunkRemeshes {
     }
 }
 
+/// Fired when an edit ([`crate::edit`], roadmap W4/W5) commits: the chunks
+/// whose blocks actually changed, straight from
+/// [`crate::edit::EditReport::chunks`]. Nothing in this crate sends it yet
+/// — that's W8 and the city's building placement — but the pipeline that
+/// reacts to it ([`queue_edited_chunk_reloads`]) is W7's, ticket 034, so it
+/// exists ahead of any caller.
+#[derive(Event, Debug, Clone)]
+pub struct ChunksEdited(pub Vec<(i32, i32)>);
+
+/// How many completed chunk-reload tasks (ticket 034) get uploaded per
+/// frame — the reload equivalent of [`ChunkUploadBudget`]/[`ChunkRemeshBudget`].
+/// A single edit (a placed building, a fill command) can touch many chunks
+/// at once, and each needs a full re-decode, not just a re-mesh, so this
+/// stays a separate counter for the same "different kind of pressure"
+/// reason [`ChunkRemeshBudget`] does.
+#[derive(Resource, Debug, Clone, Copy)]
+pub struct ChunkReloadBudget(pub usize);
+
+impl Default for ChunkReloadBudget {
+    fn default() -> Self {
+        Self(4)
+    }
+}
+
+/// Chunk coordinates queued for a full reload (ticket 034) because an edit
+/// changed their blocks — as opposed to [`PendingChunkRemeshes`], whose
+/// coordinates only need their mesh rebuilt against unchanged blocks.
+/// Populated by [`queue_edited_chunk_reloads`], drained by
+/// [`start_chunk_reloads`].
+#[derive(Resource, Default)]
+pub struct PendingChunkReloads(HashSet<(i32, i32)>);
+
+impl PendingChunkReloads {
+    /// Mirrors [`PendingChunkRemeshes::cancel_out_of_range`]: a coordinate
+    /// the camera has since left render distance shouldn't reload.
+    pub(crate) fn cancel_out_of_range(&mut self, desired: &HashSet<(i32, i32)>) {
+        self.0.retain(|coord| desired.contains(coord));
+    }
+}
+
+/// In-flight reload tasks (ticket 034), keyed by chunk coordinate — the
+/// reload equivalent of [`InFlightChunkRemeshes`]. Reuses [`ChunkLoadResult`]
+/// as its task output rather than a distinct type: a reload *is* a load in
+/// everything but which queue triggered it, decoding and meshing the same
+/// way [`load_and_mesh_chunk`] already does.
+#[derive(Resource, Default)]
+pub struct InFlightChunkReloads(HashMap<(i32, i32), Task<Option<ChunkLoadResult>>>);
+
+impl InFlightChunkReloads {
+    /// Mirrors [`InFlightChunkRemeshes::cancel_out_of_range`].
+    pub(crate) fn cancel_out_of_range(&mut self, desired: &HashSet<(i32, i32)>) {
+        self.0.retain(|coord, _| desired.contains(coord));
+    }
+}
+
 /// The four already-loaded neighbour columns available at the moment a
 /// chunk's load task was kicked off — an owned snapshot (cloned out of
 /// [`DecodedWorld`] on the main thread before spawning the task), since a
@@ -239,13 +319,20 @@ impl Plugin for ChunkLoadPipelinePlugin {
             .init_resource::<PendingChunkRemeshes>()
             .init_resource::<InFlightChunkRemeshes>()
             .init_resource::<ChunkRemeshBudget>()
+            .init_resource::<PendingChunkReloads>()
+            .init_resource::<InFlightChunkReloads>()
+            .init_resource::<ChunkReloadBudget>()
+            .add_event::<ChunksEdited>()
             .add_systems(
                 Update,
                 (
                     poll_completed_chunk_loads,
                     poll_completed_chunk_remeshes,
+                    poll_completed_chunk_reloads,
+                    queue_edited_chunk_reloads,
                     start_chunk_loads,
                     start_chunk_remeshes,
+                    start_chunk_reloads,
                 )
                     .chain(),
             );
@@ -480,46 +567,215 @@ pub(crate) fn poll_completed_chunk_remeshes(
 
     for result in completed {
         in_flight.0.remove(&result.coord);
-        let existing_entity = spawned.0.get(&result.coord).copied();
+        apply_mesh_update(
+            result.coord,
+            result.mesh,
+            &mut spawned,
+            &mut commands,
+            &mut meshes,
+            &mut mesh_of,
+            &material.0,
+        );
+    }
+}
 
-        match (result.mesh, existing_entity) {
-            (Some(mesh), Some(entity)) => {
-                // The common case: swap the handle in place, free the old one.
-                if let Ok(mut mesh3d) = mesh_of.get_mut(entity) {
-                    let old_handle = mesh3d.0.clone();
-                    mesh3d.0 = meshes.add(mesh);
-                    meshes.remove(&old_handle);
+/// Reads every [`ChunksEdited`] event fired this frame (ticket 034) and
+/// turns each edit's chunk list into queued work: every edited chunk goes
+/// into [`PendingChunkReloads`] (its own blocks changed, so it needs a full
+/// re-decode); every one of *those* chunks' loaded neighbours that wasn't
+/// itself edited goes into [`PendingChunkRemeshes`] instead (005-f's
+/// existing queue — only its mesh at the shared boundary can have changed).
+/// A neighbour that isn't loaded is left alone here the same way
+/// [`poll_completed_chunk_loads`] leaves one alone: [`start_chunk_remeshes`]
+/// drops anything not actually in [`DecodedWorld`] when it drains the queue.
+pub(crate) fn queue_edited_chunk_reloads(
+    mut events: EventReader<ChunksEdited>,
+    mut pending_reloads: ResMut<PendingChunkReloads>,
+    mut pending_remeshes: ResMut<PendingChunkRemeshes>,
+) {
+    for ChunksEdited(chunks) in events.read() {
+        let edited: HashSet<(i32, i32)> = chunks.iter().copied().collect();
+        for &coord in chunks {
+            pending_reloads.0.insert(coord);
+            for neighbor in neighbor_coords(coord) {
+                if !edited.contains(&neighbor) {
+                    pending_remeshes.0.insert(neighbor);
                 }
             }
-            (Some(mesh), None) => {
-                // Rare: the chunk had no exposed faces at its last mesh build
-                // (no entity yet) but now does — spawn one, same as a load.
-                let (cx, cz) = result.coord;
-                let entity = commands
-                    .spawn((
-                        Mesh3d(meshes.add(mesh)),
-                        MeshMaterial3d(material.0.clone()),
-                        Transform::from_xyz(
-                            cx as f32 * world::SECTION_SIZE as f32,
-                            0.0,
-                            -(cz as f32 * world::SECTION_SIZE as f32),
-                        ),
-                        BlockMesh,
-                    ))
-                    .id();
-                spawned.0.insert(result.coord, entity);
-            }
-            (None, Some(entity)) => {
-                // Rare: the chunk's last exposed face is now interior — free
-                // the mesh and despawn, mirroring `unload::unload_chunks`.
-                if let Ok(mesh3d) = mesh_of.get(entity) {
-                    meshes.remove(&mesh3d.0);
-                }
-                commands.entity(entity).despawn();
-                spawned.0.remove(&result.coord);
-            }
-            (None, None) => {} // Still nothing to render; nothing to do.
         }
+    }
+}
+
+/// Spawns an [`AsyncComputeTaskPool`] task for every coordinate in
+/// [`PendingChunkReloads`] that isn't already reloading and is currently in
+/// [`DecodedWorld`] (ticket 034) — a coordinate not loaded isn't on screen,
+/// and the next real load will decode it from the already-edited region for
+/// free, so it's dropped rather than queued for later.
+///
+/// Unlike [`start_chunk_remeshes`], a coordinate already in flight is left
+/// in the pending set instead of being dropped: see the ticket's "Watch
+/// out" — a second edit to a chunk mid-reload must still get its own
+/// reload once the first one clears, because nothing else will re-trigger
+/// it the way a later neighbour arrival does for 005-f's frontier case.
+pub(crate) fn start_chunk_reloads(
+    mut pending: ResMut<PendingChunkReloads>,
+    mut in_flight: ResMut<InFlightChunkReloads>,
+    decoded_world: Res<DecodedWorld>,
+    region_cache: Option<Res<SharedRegionCache>>,
+    atlas: Option<Res<SharedAtlasIndex>>,
+    color_maps: Option<Res<SharedColorMaps>>,
+) {
+    // Mirrors `start_chunk_loads`/`start_chunk_remeshes`: nothing to
+    // decode/mesh with before `setup()`.
+    let (Some(region_cache), Some(atlas), Some(color_maps)) = (region_cache, atlas, color_maps)
+    else {
+        return;
+    };
+
+    let ready: Vec<(i32, i32)> = pending
+        .0
+        .iter()
+        .copied()
+        .filter(|coord| !in_flight.0.contains_key(coord))
+        .collect();
+
+    let pool = AsyncComputeTaskPool::get();
+    for coord in ready {
+        pending.0.remove(&coord);
+        if !decoded_world.columns.contains_key(&coord) {
+            continue; // Not on screen; the next real load reads the edit for free.
+        }
+
+        let neighbors = owned_neighbors_of(coord, &decoded_world.columns);
+        let region_cache = region_cache.0.clone();
+        let registry = decoded_world.registry.clone();
+        let biome_registry = decoded_world.biomes.clone();
+        let atlas = atlas.0.clone();
+        let color_maps = color_maps.0.clone();
+        let task = pool.spawn(async move {
+            load_and_mesh_chunk(
+                coord,
+                region_cache,
+                registry,
+                biome_registry,
+                atlas,
+                color_maps,
+                neighbors,
+            )
+        });
+        in_flight.0.insert(coord, task);
+    }
+}
+
+/// Polls every in-flight reload task (ticket 034) the same
+/// `block_on(poll_once(&mut task))` way the other two polling systems do.
+/// For up to [`ChunkReloadBudget`] completed tasks this frame, records the
+/// freshly-decoded column into [`DecodedWorld`] (replacing the stale one —
+/// the whole reason this queue exists rather than reusing
+/// [`poll_completed_chunk_remeshes`]) and applies the mesh update the same
+/// spawn/swap/despawn way a re-mesh does.
+///
+/// A `None` result (the edit somehow left the chunk undecodable) is
+/// dropped with nothing rendered — [`load_and_mesh_chunk`] already logs a
+/// real decode failure; the routine "not fully generated" case can't
+/// happen here since the edit itself refuses ungenerated chunks (`edit`
+/// module, `require_full_status`).
+pub(crate) fn poll_completed_chunk_reloads(
+    mut in_flight: ResMut<InFlightChunkReloads>,
+    mut decoded_world: ResMut<DecodedWorld>,
+    mut spawned: ResMut<SpawnedChunkEntities>,
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut mesh_of: Query<&mut Mesh3d>,
+    material: Option<Res<TerrainMaterial>>,
+    budget: Res<ChunkReloadBudget>,
+) {
+    let Some(material) = material else {
+        return; // Set by `setup()`; nothing to spawn with before that.
+    };
+
+    let mut completed = Vec::new();
+    for (&coord, task) in in_flight.0.iter_mut() {
+        if let Some(result) = block_on(poll_once(task)) {
+            completed.push((coord, result));
+            if completed.len() >= budget.0 {
+                break;
+            }
+        }
+    }
+
+    for (coord, result) in completed {
+        in_flight.0.remove(&coord);
+        let Some(result) = result else { continue };
+
+        decoded_world.columns.insert(coord, result.column);
+        apply_mesh_update(
+            coord,
+            result.mesh,
+            &mut spawned,
+            &mut commands,
+            &mut meshes,
+            &mut mesh_of,
+            &material.0,
+        );
+    }
+}
+
+/// Shared by [`poll_completed_chunk_remeshes`] and
+/// [`poll_completed_chunk_reloads`]: the three-way outcome a completed mesh
+/// build can have against whatever entity already exists for `coord`. Swaps
+/// the `Mesh3d` handle in place (freeing the old one) when both a mesh and
+/// an entity exist — the common case, since re-meshing/reloading a chunk
+/// never itself changes anything about the entity beyond the geometry —
+/// and falls back to spawning or despawning for the edge cases where the
+/// update flips whether the chunk has any exposed faces at all.
+fn apply_mesh_update(
+    coord: (i32, i32),
+    mesh: Option<Mesh>,
+    spawned: &mut SpawnedChunkEntities,
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    mesh_of: &mut Query<&mut Mesh3d>,
+    material: &Handle<StandardMaterial>,
+) {
+    let existing_entity = spawned.0.get(&coord).copied();
+
+    match (mesh, existing_entity) {
+        (Some(mesh), Some(entity)) => {
+            if let Ok(mut mesh3d) = mesh_of.get_mut(entity) {
+                let old_handle = mesh3d.0.clone();
+                mesh3d.0 = meshes.add(mesh);
+                meshes.remove(&old_handle);
+            }
+        }
+        (Some(mesh), None) => {
+            // Rare: the chunk had no exposed faces at its last mesh build
+            // (no entity yet) but now does — spawn one, same as a load.
+            let (cx, cz) = coord;
+            let entity = commands
+                .spawn((
+                    Mesh3d(meshes.add(mesh)),
+                    MeshMaterial3d(material.clone()),
+                    Transform::from_xyz(
+                        cx as f32 * world::SECTION_SIZE as f32,
+                        0.0,
+                        -(cz as f32 * world::SECTION_SIZE as f32),
+                    ),
+                    BlockMesh,
+                ))
+                .id();
+            spawned.0.insert(coord, entity);
+        }
+        (None, Some(entity)) => {
+            // Rare: the chunk's last exposed face is now interior — free
+            // the mesh and despawn, mirroring `unload::unload_chunks`.
+            if let Ok(mesh3d) = mesh_of.get(entity) {
+                meshes.remove(&mesh3d.0);
+            }
+            commands.entity(entity).despawn();
+            spawned.0.remove(&coord);
+        }
+        (None, None) => {} // Still nothing to render; nothing to do.
     }
 }
 
@@ -888,5 +1144,69 @@ mod tests {
             OwnedNeighbors::default(),
         );
         assert!(result.is_none());
+    }
+
+    /// Ticket 034: same cancellation behaviour as [`InFlightChunkRemeshes`],
+    /// for in-flight reloads.
+    #[test]
+    fn in_flight_reloads_cancel_out_of_range_drops_tasks_outside_the_desired_set() {
+        use bevy::tasks::{AsyncComputeTaskPool, TaskPool};
+
+        let pool = AsyncComputeTaskPool::get_or_init(TaskPool::new);
+        let mut in_flight = InFlightChunkReloads::default();
+        in_flight.0.insert((0, 0), pool.spawn(async { None }));
+        in_flight.0.insert((5, 5), pool.spawn(async { None }));
+
+        let desired: HashSet<(i32, i32)> = HashSet::from([(0, 0)]);
+        in_flight.cancel_out_of_range(&desired);
+
+        assert!(in_flight.0.contains_key(&(0, 0)), "still desired, should survive");
+        assert!(
+            !in_flight.0.contains_key(&(5, 5)),
+            "left the desired set, should have been canceled"
+        );
+    }
+
+    /// Ticket 034: same as [`PendingChunkRemeshes`]'s equivalent test — a
+    /// coordinate queued for reload that's left render distance before
+    /// `start_chunk_reloads` got to it should be dropped.
+    #[test]
+    fn pending_reloads_cancel_out_of_range_drops_coords_outside_the_desired_set() {
+        let mut pending = PendingChunkReloads::default();
+        pending.0.insert((0, 0));
+        pending.0.insert((5, 5));
+
+        let desired: HashSet<(i32, i32)> = HashSet::from([(0, 0)]);
+        pending.cancel_out_of_range(&desired);
+
+        assert_eq!(pending.0, HashSet::from([(0, 0)]));
+    }
+
+    /// Ticket 034: firing [`ChunksEdited`] for two adjacent chunks queues
+    /// both for a full reload, and queues only the *outer* loaded
+    /// neighbours for a plain re-mesh — the shared boundary between the two
+    /// edited chunks is covered by their own reloads, so it must not also
+    /// land in [`PendingChunkRemeshes`].
+    #[test]
+    fn queue_edited_chunk_reloads_splits_edited_chunks_from_their_outer_neighbours() {
+        let mut app = App::new();
+        app.add_event::<ChunksEdited>()
+            .init_resource::<PendingChunkReloads>()
+            .init_resource::<PendingChunkRemeshes>()
+            .add_systems(Update, queue_edited_chunk_reloads);
+
+        // (0, 0) and (0, 1) are edited and share a boundary; (0, -1) is the
+        // outer neighbour of (0, 0), on the opposite side from (0, 1).
+        app.world_mut()
+            .send_event(ChunksEdited(vec![(0, 0), (0, 1)]));
+        app.update();
+
+        let reloads = &app.world().resource::<PendingChunkReloads>().0;
+        assert_eq!(*reloads, HashSet::from([(0, 0), (0, 1)]));
+
+        let remeshes = &app.world().resource::<PendingChunkRemeshes>().0;
+        assert!(remeshes.contains(&(0, -1)), "the outer neighbour should be queued for a re-mesh");
+        assert!(!remeshes.contains(&(0, 0)), "an edited chunk gets a reload, not a plain re-mesh");
+        assert!(!remeshes.contains(&(0, 1)), "an edited chunk gets a reload, not a plain re-mesh");
     }
 }

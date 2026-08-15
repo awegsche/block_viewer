@@ -62,7 +62,7 @@ use mc_anvil::BlockState as AnvilBlockState;
 use crate::blueprint::BlockState;
 use crate::chunk_pipeline::local_chunk_index;
 use crate::region_cache::chunk_to_region_coord;
-use crate::selection::{WORLD_MAX_Y, WORLD_MIN_Y};
+use crate::selection::{SelectionBounds, WORLD_MAX_Y, WORLD_MIN_Y};
 use crate::world::SECTION_SIZE;
 
 pub mod route;
@@ -154,6 +154,19 @@ impl WorldEdit {
 
     pub fn len(&self) -> usize {
         self.edits.len()
+    }
+
+    /// Fills every block in `bounds` with `state` — the same block at every
+    /// position. Shared by the viewer's paint/fill command (roadmap W8,
+    /// ticket 035) and, eventually, terraforming (H1): both are the same
+    /// write path with a different source of block changes, so the
+    /// construction of a "one block everywhere" edit belongs here rather
+    /// than in either caller.
+    pub fn fill(bounds: SelectionBounds, state: BlockState) -> Self {
+        bounds
+            .iter_blocks()
+            .map(|at| BlockEdit { at, state: state.clone() })
+            .collect()
     }
 }
 

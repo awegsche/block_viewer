@@ -2,12 +2,14 @@
 //! save. Everything below the entry point is shared with [`crate::city`] —
 //! see [`crate::world_app`] — and what this module adds is the explorer's
 //! own layer: the selection volume's interaction and panel, blueprint
-//! extraction started from it, and the egui UI.
+//! extraction started from it, the paint/fill command (ticket 035, roadmap
+//! W8), and the egui UI.
 //!
 //! This was `main.rs` before ticket 027 split the package into a lib plus
 //! two binary shims. `run()` is that `main()`'s body, minus the half that
 //! moved to [`crate::world_app`].
 
+mod paint;
 pub mod ui;
 
 use bevy::prelude::*;
@@ -20,6 +22,7 @@ pub fn run() {
     world_app()
         .add_plugins(selection::SelectionPlugin)
         .add_plugins(blueprint::BlueprintPlugin)
+        .add_plugins(paint::PaintPlugin)
         .add_plugins(ui::UiPlugin)
         // The UI plugin's panels (ticket 007) need to have drawn this
         // frame before `drive_camera` — and, ticket 020, the selection's

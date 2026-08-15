@@ -139,6 +139,65 @@ impl std::fmt::Display for BlockState {
     }
 }
 
+/// Parses the same `name[key=value,...]` syntax [`Display`](std::fmt::Display)
+/// writes, for the viewer's paint/fill command (ticket 035, roadmap W8) — a
+/// text field is the only place a block name comes from that isn't already a
+/// palette entry, so it needs a way in as well as a way out.
+///
+/// A bare name with no `:` is prefixed with `minecraft:`, the same shorthand
+/// Minecraft's own commands accept, so typing `stone` works without reaching
+/// for the namespace every time.
+impl std::str::FromStr for BlockState {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let s = s.trim();
+        if s.is_empty() {
+            return Err("expected a block name".to_string());
+        }
+
+        let (name_part, props_part) = match s.split_once('[') {
+            Some((name, rest)) => {
+                let props = rest
+                    .strip_suffix(']')
+                    .ok_or_else(|| format!("{s}: missing closing ]"))?;
+                (name, Some(props))
+            }
+            None => (s, None),
+        };
+
+        let name_part = name_part.trim();
+        if name_part.is_empty() {
+            return Err(format!("{s}: expected a block name"));
+        }
+        let name = if name_part.contains(':') {
+            name_part.to_string()
+        } else {
+            format!("minecraft:{name_part}")
+        };
+
+        let mut properties = Vec::new();
+        if let Some(props) = props_part {
+            let props = props.trim();
+            if !props.is_empty() {
+                for pair in props.split(',') {
+                    let (key, value) = pair
+                        .split_once('=')
+                        .ok_or_else(|| format!("{pair}: expected key=value"))?;
+                    let (key, value) = (key.trim(), value.trim());
+                    if key.is_empty() || value.is_empty() {
+                        return Err(format!("{pair}: expected key=value"));
+                    }
+                    properties.push((key.to_string(), value.to_string()));
+                }
+            }
+        }
+        properties.sort();
+
+        Ok(BlockState { name, properties })
+    }
+}
+
 /// A selected volume, extracted: a palette of distinct block states and one
 /// index into it per block.
 ///
@@ -650,6 +709,91 @@ mod tests {
 
     fn bounds(min: IVec3, max: IVec3) -> SelectionBounds {
         SelectionBounds::from_corners(min, min, max)
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // ---- BlockState::from_str (ticket 035) -------------------------------------------------------
+    // ---------------------------------------------------------------------------------------------
+
+    #[test]
+    fn parses_a_bare_name_with_no_properties() {
+        let state: BlockState = "minecraft:stone".parse().unwrap();
+        assert_eq!(state, BlockState { name: "minecraft:stone".to_string(), properties: vec![] });
+    }
+
+    #[test]
+    fn a_name_with_no_namespace_is_prefixed_with_minecraft() {
+        let state: BlockState = "stone".parse().unwrap();
+        assert_eq!(state.name, "minecraft:stone");
+    }
+
+    #[test]
+    fn parses_properties_and_sorts_them_by_key() {
+        let state: BlockState = "minecraft:oak_stairs[half=top,facing=east]".parse().unwrap();
+        assert_eq!(
+            state,
+            BlockState {
+                name: "minecraft:oak_stairs".to_string(),
+                properties: vec![
+                    ("facing".to_string(), "east".to_string()),
+                    ("half".to_string(), "top".to_string()),
+                ],
+            }
+        );
+    }
+
+    /// Whitespace around the brackets, the commas and the `=` is a paste
+    /// artefact, not a typo — same forgiveness the selection panel's own
+    /// coordinate fields give.
+    #[test]
+    fn surrounding_whitespace_is_forgiven() {
+        let state: BlockState = "  minecraft:oak_log[ axis = y ] ".parse().unwrap();
+        assert_eq!(
+            state,
+            BlockState {
+                name: "minecraft:oak_log".to_string(),
+                properties: vec![("axis".to_string(), "y".to_string())],
+            }
+        );
+    }
+
+    #[test]
+    fn empty_brackets_are_a_name_with_no_properties() {
+        let state: BlockState = "minecraft:stone[]".parse().unwrap();
+        assert_eq!(state.properties, Vec::new());
+    }
+
+    #[test]
+    fn every_display_output_parses_back_to_the_same_state() {
+        for state in [
+            BlockState::air(),
+            BlockState { name: "minecraft:stone".to_string(), properties: vec![] },
+            BlockState {
+                name: "minecraft:oak_stairs".to_string(),
+                properties: vec![
+                    ("facing".to_string(), "east".to_string()),
+                    ("half".to_string(), "top".to_string()),
+                ],
+            },
+        ] {
+            let round_tripped: BlockState = state.to_string().parse().unwrap();
+            assert_eq!(round_tripped, state);
+        }
+    }
+
+    #[test]
+    fn malformed_input_is_refused_rather_than_guessed_at() {
+        for bad in [
+            "",
+            "   ",
+            "minecraft:stone[",
+            "minecraft:stone[facing]",
+            "minecraft:stone[=north]",
+            "minecraft:stone[facing=]",
+            "[facing=north]",
+        ] {
+            assert!(bad.parse::<BlockState>().is_err(), "{bad:?} should not parse");
+        }
     }
 
     fn byte_field(name: &str, value: i8) -> NbtField {

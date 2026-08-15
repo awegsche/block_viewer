@@ -527,3 +527,37 @@ these itself (see CLAUDE.md's "Manual/visual verification").
   `WriteSession` depends on: if the game opens the world anyway, holding the
   lock buys nothing and W6's guarantee shrinks to a probe. Do this before W8
   writes to a world you care about.
+
+- [ ] **035 paint/fill command: the blocks are actually there when
+  Minecraft opens the world.** This is the roadmap's W8 gate — the point of
+  the whole W1-W7 chain was to reach a button that does this, and only a
+  human opening the game can confirm it worked. **Back the world up first**
+  (or run this against a scratch copy) — this writes to a real save.
+
+  `cargo run` against the save, click a corner, extend the selection to a
+  small box (a handful of blocks — nothing near `VOLUME_WARN`), type a block
+  name into the new "Paint" section of the Selection panel (try one with
+  properties, e.g. `minecraft:oak_stairs[facing=east,half=top]`, to check
+  they aren't dropped) and click "Fill". Confirm:
+  (1) the status line reports blocks/chunks/regions written, and the
+  in-viewer mesh updates to show the new block(s) without a restart (034's
+  live re-mesh, W7) — this is the one half a human doesn't need Minecraft
+  open to check;
+  (2) close the viewer (a `WriteSession` holds `session.lock` for as long as
+  it's open — see the 033 item above) and open the same save in Minecraft:
+  the filled blocks are there, at the right position (no mirroring — 019's
+  Z flip is what the app's own selection gizmo already renders correctly,
+  but the write path has its own coordinate arithmetic and this is its
+  first real-world check), with the properties intact if you typed any;
+  (3) the surrounding area is otherwise undisturbed, and nothing reads as
+  corrupted (the world loads at all, chunks near the edit aren't missing or
+  glitched);
+  (4) try clicking "Fill" again with the world still open in Minecraft —
+  it should refuse (033's `WorldIsOpen`), not write underneath the running
+  game.
+
+  If any of this is wrong, it's almost certainly one of W4's coordinate
+  rules or W5's region routing, not this ticket's own code — `commit_fill`'s
+  own tests already prove the write lands where a synthetic fixture says it
+  should; what only this check can prove is that the fixture's assumptions
+  match a real save.

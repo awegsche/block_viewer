@@ -16,14 +16,17 @@
 //! face key, `Escape`), so the readout stays live without the fields fighting
 //! what's being typed into them.
 
+use std::str::FromStr;
+
 use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts};
 
 use crate::blueprint::{
-    BlueprintExport, BlueprintExtraction, ExportState, ExtractOutcome, MAX_BLOCKS,
+    BlockState, BlueprintExport, BlueprintExtraction, ExportState, ExtractOutcome, MAX_BLOCKS,
     STRUCTURE_BLOCK_MAX_SIZE,
 };
 use crate::selection::{Face, Selection, SelectionBounds, CHUNK_STEP};
+use crate::viewer::paint::{PaintCommand, PaintState};
 
 /// Above this many blocks the volume line is coloured and the panel says an
 /// export will be slow: 1,000,000 = 100x100x100.
@@ -118,6 +121,18 @@ fn axis_strings(v: IVec3) -> [String; 3] {
     [v.x.to_string(), v.y.to_string(), v.z.to_string()]
 }
 
+/// The "Paint" section's typed block name, ticket 035. Unlike
+/// [`BoundsDraft`] it never re-syncs from anything — the block to fill with
+/// is independent of the selection's own bounds, so what's typed stays put
+/// across clicks, face-key moves and even a cleared selection.
+pub(crate) struct PaintDraft(String);
+
+impl Default for PaintDraft {
+    fn default() -> Self {
+        Self("minecraft:stone".to_string())
+    }
+}
+
 /// Parses one corner's three fields. `None` if any of them isn't a whole
 /// number — including empty, which is what a field mid-edit looks like.
 fn parse_corner(fields: &[String; 3]) -> Option<IVec3> {
@@ -169,7 +184,9 @@ pub(crate) fn selection_panel(
     mut selection: ResMut<Selection>,
     extraction: Res<BlueprintExtraction>,
     mut export: ResMut<BlueprintExport>,
+    mut paint: ResMut<PaintCommand>,
     mut draft: Local<BoundsDraft>,
+    mut paint_draft: Local<PaintDraft>,
 ) {
     egui::Window::new("Selection").show(contexts.ctx_mut(), |ui| {
         draft.sync(&selection);
@@ -220,14 +237,18 @@ pub(crate) fn selection_panel(
                 if let Some(bounds) = selection.0 {
                     ui.separator();
                     readout(ui, &bounds, &mut export);
+                    ui.separator();
+                    paint_controls(ui, &bounds, &mut paint, &mut paint_draft.0);
                 }
             }
         }
 
         // Outside the `match`: an export keeps running (and keeps reporting)
         // even if the selection it was started from is cleared or moved while
-        // it's in flight — it works from a snapshot of the bounds.
+        // it's in flight — it works from a snapshot of the bounds. A paint
+        // does too, for the same reason.
         export_status(ui, &export, &extraction);
+        paint_status(ui, &paint);
 
         ui.separator();
         key_legend(ui);
@@ -313,6 +334,79 @@ fn readout(ui: &mut egui::Ui, bounds: &SelectionBounds, export: &mut BlueprintEx
         } else {
             "Selection is over the export cap."
         });
+}
+
+/// The "Paint" section (ticket 035, roadmap W8): a block name field and a
+/// "Fill" button that writes it into every position in `bounds` — a real
+/// edit to the save's region files, unlike everything else this panel does.
+///
+/// Shares [`classify_volume`]/[`VOLUME_CAP`] with the export button above:
+/// both operations scale with block count, and a fill of the same size as an
+/// over-cap export is exactly as unreasonable to click.
+fn paint_controls(ui: &mut egui::Ui, bounds: &SelectionBounds, paint: &mut PaintCommand, block_text: &mut String) {
+    ui.label("Paint");
+    ui.horizontal(|ui| {
+        ui.label("Block");
+        ui.add(egui::TextEdit::singleline(block_text).desired_width(220.0));
+    });
+
+    let parsed: Result<BlockState, String> = BlockState::from_str(block_text);
+    if let Err(err) = &parsed {
+        ui.colored_label(egui::Color32::RED, err);
+    }
+
+    let class = classify_volume(bounds.volume());
+    let busy = paint.busy();
+    let response = ui.add_enabled(
+        parsed.is_ok() && class != VolumeClass::OverCap && !busy,
+        egui::Button::new("Fill"),
+    );
+    if response.clicked() {
+        if let Ok(state) = parsed {
+            paint.request(*bounds, state);
+        }
+    }
+    response
+        .on_hover_text(
+            "Write this block into every position in the selection — a real edit to the \
+             save's region files, refused if Minecraft has the world open.",
+        )
+        .on_disabled_hover_text(if busy {
+            "A paint is already running."
+        } else if class == VolumeClass::OverCap {
+            "Selection is over the fill cap."
+        } else {
+            "Enter a valid block name, e.g. minecraft:stone or \
+             minecraft:oak_stairs[facing=north]."
+        });
+}
+
+/// The last paint's progress or result — [`export_status`]'s shape, one state
+/// machine down. Keeps reporting even after the selection it painted is
+/// cleared or moved, the same reason `export_status` does.
+fn paint_status(ui: &mut egui::Ui, paint: &PaintCommand) {
+    match paint.state() {
+        PaintState::Idle => {}
+        PaintState::Writing { blocks, .. } => {
+            ui.separator();
+            ui.label(format!("Writing {} blocks…", format_blocks(*blocks as u64)));
+            ui.spinner();
+        }
+        PaintState::Done { blocks, chunks, regions } => {
+            ui.separator();
+            ui.colored_label(
+                WROTE_COLOR,
+                format!(
+                    "Painted {} blocks across {chunks} chunk(s), {regions} region file(s).",
+                    format_blocks(*blocks as u64)
+                ),
+            );
+        }
+        PaintState::Failed { message } => {
+            ui.separator();
+            ui.colored_label(egui::Color32::RED, format!("Paint failed: {message}"));
+        }
+    }
 }
 
 /// A written file's status line is green rather than the default text

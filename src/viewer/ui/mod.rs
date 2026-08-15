@@ -1,9 +1,13 @@
 //! egui-based explorer UI (ticket 007): a save picker with a clickable
 //! region grid, a coordinate jump + readout, a block inspector, and a
-//! status panel. Every panel is read-only *as far as the world goes* — this
-//! is a viewer, not an editor (see the ticket's "out of scope"). Ticket 021's
-//! [`selection_panel`] does write, but only to [`crate::selection::Selection`],
-//! which is a view onto the world rather than part of it.
+//! status panel. Every panel but one is read-only *as far as the world
+//! goes*. Ticket 021's [`selection_panel`] moves
+//! [`crate::selection::Selection`], a view onto the world rather than part
+//! of it — and, since ticket 035 (roadmap W8), its "Fill" button is a real
+//! write to the save's region files, gated behind an explicit click and
+//! [`crate::edit::session::WriteSession`]'s safety rules (W6): refused if
+//! Minecraft has the world open, backed up before the first write, written
+//! atomically.
 //!
 //! Each panel is its own system in its own submodule; this module only
 //! wires them into the app and owns the two small pieces of state they
