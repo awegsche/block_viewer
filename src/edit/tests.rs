@@ -1,0 +1,696 @@
+//! Tests for the edit model (ticket 031).
+//!
+//! Two layers, deliberately. The rules — coordinates, build limits, `Status`,
+//! `DataVersion` — are pure functions over a chunk's NBT and are tested
+//! without a file anywhere. Everything that actually writes runs against a
+//! **synthetic region file** built in a temp directory by
+//! [`RegionFixture`], rather than against the developer's real save: the
+//! interesting cases (an ungenerated chunk, a half-generated one, a chunk from
+//! the wrong Minecraft version) are ones a real save mostly doesn't have where
+//! you need them, and a test that edits a copy of somebody's world is a test
+//! that behaves differently on every machine.
+//!
+//! `mc_anvil::region::Region::write` takes chunk NBT and produces a real
+//! `.mca`, so the fixture is byte-accurate without this module knowing
+//! anything about sector tables or zlib.
+
+use super::*;
+
+use mc_anvil::region::{ChunkPayload, Region, CHUNKS_PER_REGION};
+use rnbt::{NbtField, NbtList, NbtValue};
+
+/// The `DataVersion` the fixtures claim: a 1.21 release, the same one the real
+/// save carries.
+const FIXTURE_DATA_VERSION: i32 = 4438;
+
+/// The section the fixtures populate, and so the Y range the tests write in:
+/// `Y = 0`, world Y 0..15. Deliberately not the bottommost one — an edit model
+/// that only ever worked at the world bottom would hide a section-index bug.
+const FIXTURE_SECTION_Y: i8 = 0;
+
+fn stone() -> BlockState {
+    BlockState {
+        name: "minecraft:stone".to_string(),
+        properties: Vec::new(),
+    }
+}
+
+fn dirt() -> BlockState {
+    BlockState {
+        name: "minecraft:dirt".to_string(),
+        properties: Vec::new(),
+    }
+}
+
+/// A block with properties, to prove they survive the conversion into
+/// `mc_anvil`'s `BlockState` and back out of the palette.
+fn stairs() -> BlockState {
+    BlockState {
+        name: "minecraft:oak_stairs".to_string(),
+        properties: vec![
+            ("facing".to_string(), "east".to_string()),
+            ("half".to_string(), "top".to_string()),
+        ],
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// ---- coordinates --------------------------------------------------------------------------------
+// -------------------------------------------------------------------------------------------------
+
+#[test]
+fn addresses_are_region_relative_and_round_towards_the_world_bottom() {
+    let at = address_of(IVec3::new(0, 5, 0));
+    assert_eq!(at.chunk, (0, 0));
+    assert_eq!(at.region, (0, 0));
+    assert_eq!((at.local_x, at.local_z), (0, 0));
+
+    // The last block of region (0,0).
+    let at = address_of(IVec3::new(511, 5, 511));
+    assert_eq!(at.region, (0, 0));
+    assert_eq!(at.chunk, (31, 31));
+    assert_eq!((at.local_x, at.local_z), (511, 511));
+
+    // One further is the next region's first block.
+    let at = address_of(IVec3::new(512, 5, 512));
+    assert_eq!(at.region, (1, 1));
+    assert_eq!(at.chunk, (32, 32));
+    assert_eq!((at.local_x, at.local_z), (0, 0));
+}
+
+#[test]
+fn negative_coordinates_do_not_truncate_towards_zero() {
+    // The bug every world editor writes once: `/` and `%` put x = -1 in chunk
+    // 0 at local -1, when it belongs to chunk -1 at local 511.
+    let at = address_of(IVec3::new(-1, 5, -1));
+    assert_eq!(at.chunk, (-1, -1));
+    assert_eq!(at.region, (-1, -1));
+    assert_eq!((at.local_x, at.local_z), (511, 511));
+
+    let at = address_of(IVec3::new(-512, 5, -513));
+    assert_eq!(at.region, (-1, -2));
+    assert_eq!((at.local_x, at.local_z), (0, 511));
+
+    // ...and the same rounding for the section a Y falls in.
+    assert_eq!(section_y_of(0), 0);
+    assert_eq!(section_y_of(15), 0);
+    assert_eq!(section_y_of(-1), -1);
+    assert_eq!(section_y_of(-64), -4);
+    assert_eq!(section_y_of(319), 19);
+}
+
+// -------------------------------------------------------------------------------------------------
+// ---- the per-chunk rules, without a region file --------------------------------------------------
+// -------------------------------------------------------------------------------------------------
+
+/// A chunk root carrying only the tags the rules read.
+fn chunk_root(status: Option<&str>, data_version: Option<i32>) -> NbtField {
+    let mut fields = Vec::new();
+    if let Some(status) = status {
+        fields.push(NbtField::new_string("Status", status));
+    }
+    if let Some(version) = data_version {
+        fields.push(NbtField::new_i32("DataVersion", version));
+    }
+    NbtField::new_compound("", fields)
+}
+
+#[test]
+fn a_half_generated_chunk_is_refused() {
+    let nbt = chunk_root(Some("minecraft:features"), Some(FIXTURE_DATA_VERSION));
+    let refusal = check_chunk_nbt((3, 4), &nbt, &EditPolicy::default(), None).unwrap_err();
+
+    assert_eq!(
+        refusal,
+        EditRefusal::StatusNotFull {
+            chunk: (3, 4),
+            status: "minecraft:features".to_string()
+        }
+    );
+
+    // ...and a chunk with no `Status` at all is refused too, rather than
+    // assumed finished. We're about to write into it.
+    let nbt = chunk_root(None, Some(FIXTURE_DATA_VERSION));
+    assert!(matches!(
+        check_chunk_nbt((3, 4), &nbt, &EditPolicy::default(), None),
+        Err(EditRefusal::StatusNotFull { .. })
+    ));
+}
+
+#[test]
+fn a_data_version_mismatch_is_refused_and_can_be_overridden() {
+    let nbt = chunk_root(Some("minecraft:full"), Some(FIXTURE_DATA_VERSION));
+
+    assert_eq!(
+        check_chunk_nbt((0, 0), &nbt, &EditPolicy::default(), Some(3953)).unwrap_err(),
+        EditRefusal::DataVersionMismatch {
+            chunk: (0, 0),
+            save: FIXTURE_DATA_VERSION,
+            edit: 3953
+        }
+    );
+
+    // The same version passes...
+    assert!(
+        check_chunk_nbt(
+            (0, 0),
+            &nbt,
+            &EditPolicy::default(),
+            Some(FIXTURE_DATA_VERSION)
+        )
+        .is_ok()
+    );
+
+    // ...and so does an edit that makes no version claim at all, which is what
+    // an edit built from block names in code looks like.
+    assert!(check_chunk_nbt((0, 0), &nbt, &EditPolicy::default(), None).is_ok());
+
+    // The override is for a UI offering "do it anyway".
+    let lenient = EditPolicy {
+        enforce_data_version: false,
+        ..EditPolicy::default()
+    };
+    assert!(check_chunk_nbt((0, 0), &nbt, &lenient, Some(3953)).is_ok());
+}
+
+// -------------------------------------------------------------------------------------------------
+// ---- the region fixture -------------------------------------------------------------------------
+// -------------------------------------------------------------------------------------------------
+
+/// A synthetic region file in a temp directory, removed on drop.
+struct RegionFixture {
+    dir: std::path::PathBuf,
+    path: std::path::PathBuf,
+    coord: (i32, i32),
+}
+
+impl RegionFixture {
+    /// Region (0,0) with four chunks in it:
+    ///
+    /// - **(0,0)** and **(1,0)**: ordinary finished chunks, one section of
+    ///   stone at `Y = 0`, `Status = minecraft:full`, `isLightOn = 1`,
+    ///   `DataVersion` 4438, and `Heightmaps` claiming a flat surface.
+    /// - **(2,0)**: finished, but written by an older Minecraft
+    ///   (`DataVersion` 3953).
+    /// - **(3,0)**: still generating (`Status = minecraft:features`).
+    /// - every other slot is empty, i.e. ungenerated terrain.
+    fn new(label: &str) -> Self {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("block_viewer-edit-{label}-{nanos}"));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("r.0.0.mca");
+
+        let mut payloads: Vec<Option<ChunkPayload>> = vec![None; CHUNKS_PER_REGION];
+        payloads[0] = Some(ChunkPayload::Nbt(full_chunk(0, 0, FIXTURE_DATA_VERSION)));
+        payloads[1] = Some(ChunkPayload::Nbt(full_chunk(1, 0, FIXTURE_DATA_VERSION)));
+        payloads[2] = Some(ChunkPayload::Nbt(full_chunk(2, 0, 3953)));
+        payloads[3] = Some(ChunkPayload::Nbt(unfinished_chunk(3, 0)));
+
+        Region::new(0, 0, &path)
+            .write(&payloads)
+            .expect("write the fixture region");
+
+        Self {
+            dir,
+            path,
+            coord: (0, 0),
+        }
+    }
+
+    fn load(&self) -> ChunkRegion {
+        let mut region: ChunkRegion = Region::new(self.coord.0, self.coord.1, &self.path).into();
+        region.load_chunks().expect("load the fixture region");
+        region
+    }
+
+    fn bytes(&self) -> Vec<u8> {
+        std::fs::read(&self.path).expect("read the fixture region")
+    }
+}
+
+impl Drop for RegionFixture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// A finished chunk: one all-stone section at `Y = 0`, plus the chunk-root
+/// tags the edit model and `mc_anvil` read.
+fn full_chunk(x: i32, z: i32, data_version: i32) -> NbtField {
+    let mut fields = chunk_fields(x, z, data_version);
+    fields.push(NbtField::new_string("Status", "minecraft:full"));
+    NbtField::new_compound("", fields)
+}
+
+/// A chunk the generator hasn't finished with.
+fn unfinished_chunk(x: i32, z: i32) -> NbtField {
+    let mut fields = chunk_fields(x, z, FIXTURE_DATA_VERSION);
+    fields.push(NbtField::new_string("Status", "minecraft:features"));
+    NbtField::new_compound("", fields)
+}
+
+fn chunk_fields(x: i32, z: i32, data_version: i32) -> Vec<NbtField> {
+    // A one-entry palette and no packed `data`, which is how Minecraft stores
+    // a uniform section — `set_blocks` has to grow both.
+    let palette = NbtList::Compound(vec![NbtField::new_compound(
+        "",
+        vec![NbtField::new_string("Name", "minecraft:stone")],
+    )]);
+    let section = NbtField::new_compound(
+        "",
+        vec![
+            NbtField {
+                name: "Y".to_string(),
+                value: NbtValue::Byte(FIXTURE_SECTION_Y as u8),
+            },
+            NbtField::new_compound("block_states", vec![NbtField::new_list("palette", palette)]),
+        ],
+    );
+
+    // Stone to the top of the one section: world Y 15, so every column's
+    // heightmap value is `15 + 1 - (-64)` = 80.
+    let heights = [80u16; 256];
+    let mut longs = vec![0i64; 37];
+    for (column, value) in heights.iter().enumerate() {
+        longs[column / 7] |= (*value as i64) << ((column % 7) * 9);
+    }
+    let heightmaps = NbtField::new_compound(
+        "Heightmaps",
+        [
+            "MOTION_BLOCKING",
+            "MOTION_BLOCKING_NO_LEAVES",
+            "OCEAN_FLOOR",
+            "WORLD_SURFACE",
+        ]
+        .iter()
+        .map(|key| NbtField::new_long_array(*key, longs.clone()))
+        .collect::<Vec<_>>(),
+    );
+
+    vec![
+        NbtField::new_list("sections", NbtList::Compound(vec![section])),
+        NbtField::new_i32("xPos", x),
+        NbtField::new_i32("zPos", z),
+        NbtField::new_i32("yPos", -4),
+        NbtField::new_i32("DataVersion", data_version),
+        NbtField {
+            name: "isLightOn".to_string(),
+            value: NbtValue::Byte(1),
+        },
+        heightmaps,
+    ]
+}
+
+/// The block name at a world position, read back through the region.
+fn block_name_at(region: &ChunkRegion, at: IVec3) -> String {
+    let address = address_of(at);
+    region
+        .get_block(address.local_x, address.y, address.local_z)
+        .expect("a populated chunk")
+        .get_string("Name")
+        .expect("a palette entry")
+        .clone()
+}
+
+fn light_flag(region: &ChunkRegion, chunk: (i32, i32)) -> Option<u8> {
+    region
+        .get_chunk(chunk.0 as usize, chunk.1 as usize)
+        .expect("a populated chunk")
+        .get_byte("isLightOn")
+}
+
+/// A single-block edit at a position inside the fixture's stone.
+fn one_block(at: IVec3, state: BlockState) -> WorldEdit {
+    let mut edit = WorldEdit::new();
+    edit.set(at, state);
+    edit
+}
+
+// -------------------------------------------------------------------------------------------------
+// ---- planning -----------------------------------------------------------------------------------
+// -------------------------------------------------------------------------------------------------
+
+#[test]
+fn an_empty_edit_is_refused_rather_than_reported_as_success() {
+    let fixture = RegionFixture::new("empty");
+    let region = fixture.load();
+
+    assert_eq!(
+        plan(&WorldEdit::new(), &region, &EditPolicy::default()).unwrap_err(),
+        EditRefusal::Empty
+    );
+}
+
+#[test]
+fn the_build_limits_are_the_selections() {
+    let fixture = RegionFixture::new("limits");
+    let region = fixture.load();
+
+    for y in [WORLD_MAX_Y + 1, WORLD_MIN_Y - 1] {
+        let at = IVec3::new(4, y, 4);
+        assert_eq!(
+            plan(&one_block(at, stone()), &region, &EditPolicy::default()).unwrap_err(),
+            EditRefusal::OutsideBuildLimits { at }
+        );
+    }
+}
+
+#[test]
+fn a_position_in_another_region_is_refused_not_wrapped() {
+    // The trap this exists for: region-local coordinates are `rem_euclid(512)`,
+    // so x = 512 would silently land at local 0 of *this* region — a building
+    // placed 512 blocks from where the user asked for it, in a file they
+    // weren't editing.
+    let fixture = RegionFixture::new("region");
+    let region = fixture.load();
+    let at = IVec3::new(512, 5, 5);
+
+    assert_eq!(
+        plan(&one_block(at, stone()), &region, &EditPolicy::default()).unwrap_err(),
+        EditRefusal::OutsideRegion { at, region: (0, 0) }
+    );
+}
+
+#[test]
+fn an_ungenerated_chunk_is_refused() {
+    let fixture = RegionFixture::new("ungenerated");
+    let region = fixture.load();
+
+    // Chunk (5,0) is one of the 1020 empty slots.
+    assert_eq!(
+        plan(
+            &one_block(IVec3::new(5 * 16, 5, 0), stone()),
+            &region,
+            &EditPolicy::default()
+        )
+        .unwrap_err(),
+        EditRefusal::ChunkNotGenerated { chunk: (5, 0) }
+    );
+}
+
+#[test]
+fn a_missing_section_is_refused() {
+    let fixture = RegionFixture::new("section");
+    let region = fixture.load();
+
+    // The fixture chunks carry one section, `Y = 0`. Y = 100 is inside the
+    // build limits and inside a generated chunk, and still has nowhere to go —
+    // writes never create sections.
+    assert_eq!(
+        plan(
+            &one_block(IVec3::new(4, 100, 4), stone()),
+            &region,
+            &EditPolicy::default()
+        )
+        .unwrap_err(),
+        EditRefusal::SectionMissing {
+            chunk: (0, 0),
+            section_y: 6
+        }
+    );
+}
+
+#[test]
+fn planning_counts_blocks_and_chunks_and_writes_nothing() {
+    let fixture = RegionFixture::new("plan");
+    let before = fixture.bytes();
+    let mut region = fixture.load();
+
+    let mut edit = WorldEdit::new();
+    edit.set(IVec3::new(1, 5, 1), dirt());
+    edit.set(IVec3::new(2, 5, 1), dirt());
+    // Same position twice: one block in the world, so counted once.
+    edit.set(IVec3::new(2, 5, 1), stone());
+    // ...and one in the neighbouring chunk.
+    edit.set(IVec3::new(16, 5, 1), dirt());
+
+    let report = plan(&edit, &region, &EditPolicy::default()).expect("a valid edit");
+    assert_eq!(report.blocks_written, 3);
+    assert_eq!(report.chunks, vec![(0, 0), (1, 0)]);
+    assert_eq!(report.replaced, None);
+
+    // The dry run is a dry run: nothing dirtied, nothing on disk changed.
+    assert!(!region.is_dirty());
+    region.save().expect("a no-op save");
+    assert_eq!(fixture.bytes(), before);
+}
+
+// -------------------------------------------------------------------------------------------------
+// ---- applying -----------------------------------------------------------------------------------
+// -------------------------------------------------------------------------------------------------
+
+#[test]
+fn an_edit_lands_in_the_world_and_survives_a_save_and_reload() {
+    let fixture = RegionFixture::new("apply");
+    let mut region = fixture.load();
+
+    let mut edit = WorldEdit::new();
+    edit.set(IVec3::new(1, 5, 1), dirt());
+    edit.set(IVec3::new(2, 5, 1), stairs());
+
+    let report = apply(&edit, &mut region, &EditPolicy::default()).expect("a valid edit");
+    assert_eq!(report.blocks_written, 2);
+    assert!(region.is_dirty());
+
+    region.save().expect("save");
+    let reloaded = fixture.load();
+
+    assert_eq!(
+        block_name_at(&reloaded, IVec3::new(1, 5, 1)),
+        "minecraft:dirt"
+    );
+    assert_eq!(
+        block_name_at(&reloaded, IVec3::new(2, 5, 1)),
+        "minecraft:oak_stairs"
+    );
+    // Untouched blocks are still what they were.
+    assert_eq!(
+        block_name_at(&reloaded, IVec3::new(3, 5, 1)),
+        "minecraft:stone"
+    );
+
+    // The properties survived the round trip through the palette — a stair
+    // that comes back with none is the failure ticket 022 exists to prevent,
+    // one direction over.
+    let address = address_of(IVec3::new(2, 5, 1));
+    let entry = reloaded
+        .get_block(address.local_x, address.y, address.local_z)
+        .expect("the stairs");
+    assert_eq!(
+        entry
+            .get_compound("Properties")
+            .expect("stairs have properties")
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn a_refused_edit_changes_absolutely_nothing() {
+    // The single most important test here: one bad position in a batch must
+    // not leave the good ones written.
+    let fixture = RegionFixture::new("refused");
+    let before = fixture.bytes();
+    let mut region = fixture.load();
+
+    let mut edit = WorldEdit::new();
+    edit.set(IVec3::new(1, 5, 1), dirt());
+    edit.set(IVec3::new(2, 5, 1), dirt());
+    // Chunk (3,0) is still generating, so the whole edit is refused.
+    edit.set(IVec3::new(3 * 16 + 1, 5, 1), dirt());
+
+    assert!(matches!(
+        apply(&edit, &mut region, &EditPolicy::default()),
+        Err(EditRefusal::StatusNotFull { chunk: (3, 0), .. })
+    ));
+
+    assert_eq!(
+        block_name_at(&region, IVec3::new(1, 5, 1)),
+        "minecraft:stone"
+    );
+    assert!(
+        !region.is_dirty(),
+        "a refused edit must not dirty the region"
+    );
+
+    region.save().expect("a no-op save");
+    assert_eq!(fixture.bytes(), before, "the file must be byte-identical");
+}
+
+#[test]
+fn an_edit_hands_the_lighting_back_to_the_game_for_the_chunks_it_touched() {
+    // `mc_anvil` clears `isLightOn` inside `set_blocks` (its ticket 014). This
+    // is the cross-crate assertion that it's actually wired in — nothing in
+    // this repo checked it before.
+    let fixture = RegionFixture::new("light");
+    let mut region = fixture.load();
+
+    apply(
+        &one_block(IVec3::new(1, 5, 1), dirt()),
+        &mut region,
+        &EditPolicy::default(),
+    )
+    .expect("a valid edit");
+
+    assert_eq!(light_flag(&region, (0, 0)), Some(0));
+    assert_eq!(light_flag(&region, (1, 0)), Some(1), "an untouched chunk");
+}
+
+// -------------------------------------------------------------------------------------------------
+// ---- heightmap policy ----------------------------------------------------------------------------
+// -------------------------------------------------------------------------------------------------
+
+/// A stand-in for the block registry a real caller brings — enough for the
+/// fixture's three blocks. The real one is a table built against
+/// `world::BlockRegistry`, and isn't worth building until the in-game check
+/// says `Delete` isn't good enough.
+fn classify(state: &AnvilBlockState) -> HeightmapClass {
+    if state.is_air() {
+        HeightmapClass::AIR
+    } else {
+        HeightmapClass::SOLID
+    }
+}
+
+fn surface_at(region: &ChunkRegion, chunk: (i32, i32), dx: usize, dz: usize) -> i32 {
+    region
+        .heightmap(
+            chunk.0 as usize,
+            chunk.1 as usize,
+            mc_anvil::HeightmapKind::WorldSurface,
+        )
+        .expect("the chunk has heightmaps")[mc_anvil::heightmap::column_index(dx, dz)]
+}
+
+#[test]
+fn the_default_policy_deletes_the_heightmaps_of_the_touched_chunks_only() {
+    let fixture = RegionFixture::new("hm-delete");
+    let mut region = fixture.load();
+
+    apply(
+        &one_block(IVec3::new(1, 5, 1), dirt()),
+        &mut region,
+        &EditPolicy::default(),
+    )
+    .expect("a valid edit");
+
+    assert!(
+        region
+            .get_chunk(0, 0)
+            .expect("populated")
+            .get("Heightmaps")
+            .is_none()
+    );
+    assert!(
+        region
+            .get_chunk(1, 0)
+            .expect("populated")
+            .get("Heightmaps")
+            .is_some(),
+        "an untouched chunk keeps its heightmaps"
+    );
+}
+
+#[test]
+fn recomputing_follows_the_blocks_and_leaving_them_alone_goes_stale() {
+    let fixture = RegionFixture::new("hm-recompute");
+
+    // Digging the top two blocks out of one column lowers its surface from 16
+    // (one above the section's top block, Y = 15) to 14.
+    let air = BlockState::air();
+    let mut edit = WorldEdit::new();
+    edit.set(IVec3::new(1, 15, 1), air.clone());
+    edit.set(IVec3::new(1, 14, 1), air);
+
+    let mut region = fixture.load();
+    apply(
+        &edit,
+        &mut region,
+        &EditPolicy {
+            heightmaps: HeightmapPolicy::Recompute(classify),
+            ..EditPolicy::default()
+        },
+    )
+    .expect("a valid edit");
+
+    assert_eq!(surface_at(&region, (0, 0), 1, 1), 14);
+    assert_eq!(surface_at(&region, (0, 0), 2, 1), 16, "an untouched column");
+
+    // The same edit with `Leave` keeps the pre-edit claim — which is what
+    // "stale" looks like, and why the default isn't `Leave`.
+    let mut region = fixture.load();
+    apply(
+        &edit,
+        &mut region,
+        &EditPolicy {
+            heightmaps: HeightmapPolicy::Leave,
+            ..EditPolicy::default()
+        },
+    )
+    .expect("a valid edit");
+
+    assert_eq!(surface_at(&region, (0, 0), 1, 1), 16);
+}
+
+// -------------------------------------------------------------------------------------------------
+// ---- the as-built baseline -----------------------------------------------------------------------
+// -------------------------------------------------------------------------------------------------
+
+#[test]
+fn capturing_the_replaced_blocks_gives_an_undo() {
+    let fixture = RegionFixture::new("baseline");
+    let mut region = fixture.load();
+
+    let mut edit = WorldEdit::new();
+    edit.set(IVec3::new(1, 5, 1), dirt());
+    edit.set(IVec3::new(2, 5, 1), stairs());
+
+    let policy = EditPolicy {
+        capture_replaced: true,
+        ..EditPolicy::default()
+    };
+    let report = apply(&edit, &mut region, &policy).expect("a valid edit");
+
+    let replaced = report.replaced.expect("asked for it");
+    assert_eq!(
+        replaced,
+        vec![
+            (IVec3::new(1, 5, 1), stone()),
+            (IVec3::new(2, 5, 1), stone()),
+        ]
+    );
+
+    // Which is exactly an undo: play it back and the world is as it was.
+    let undo: WorldEdit = replaced
+        .into_iter()
+        .map(|(at, state)| BlockEdit { at, state })
+        .collect();
+    apply(&undo, &mut region, &EditPolicy::default()).expect("the undo applies");
+
+    assert_eq!(
+        block_name_at(&region, IVec3::new(1, 5, 1)),
+        "minecraft:stone"
+    );
+    assert_eq!(
+        block_name_at(&region, IVec3::new(2, 5, 1)),
+        "minecraft:stone"
+    );
+}
+
+#[test]
+fn the_baseline_is_off_by_default_because_it_costs_a_read_per_block() {
+    let fixture = RegionFixture::new("baseline-off");
+    let mut region = fixture.load();
+
+    let report = apply(
+        &one_block(IVec3::new(1, 5, 1), dirt()),
+        &mut region,
+        &EditPolicy::default(),
+    )
+    .expect("a valid edit");
+
+    assert_eq!(report.replaced, None);
+}

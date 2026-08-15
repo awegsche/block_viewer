@@ -95,7 +95,12 @@ impl BlockState {
 
     /// Reads one `block_states.palette` entry: its `Name`, plus its
     /// `Properties` compound if it has one.
-    fn from_palette_entry(entry: &NbtField) -> Result<Self, DecodeError> {
+    ///
+    /// `pub(crate)` for ticket 031's edit model, which records what a write
+    /// replaced (the as-built baseline) and must spell those states exactly
+    /// the way an extraction would — same sort, same non-string handling — or
+    /// a blueprint and a baseline of the same blocks wouldn't compare equal.
+    pub(crate) fn from_palette_entry(entry: &NbtField) -> Result<Self, DecodeError> {
         let name = entry
             .get_string("Name")
             .ok_or(DecodeError::MissingField("Name"))?

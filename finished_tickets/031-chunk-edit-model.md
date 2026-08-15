@@ -1,7 +1,7 @@
 # 031 - The chunk edit model (roadmap W4)
 
 ## Status
-Open
+Done — implemented and tested. See the Resolution for the four deviations.
 
 ## Depends on
 Nothing outstanding. This is the ticket the whole write path was waiting for,
@@ -251,3 +251,69 @@ copies out of the real save into `%TEMP%`):
 - The heightmap policy default is `Delete`, and swapping it is one line.
 
 ## Resolution
+
+`src/edit/mod.rs` (~570 lines with the docs) and `src/edit/tests.rs` (17
+tests). `cargo test`: 210 pass. No new clippy warnings.
+
+### Deviations from the design above
+
+**1. A refusal the ticket didn't list, and the most important one here:
+`OutsideRegion`.** Region-local coordinates are `rem_euclid(512)`, so a
+position in a *neighbouring* region silently wraps into the region being
+edited — x = 512 lands at local 0, i.e. a building placed 512 blocks from
+where the user asked for it, in a file they weren't editing. `plan` refuses
+any position whose region isn't this one. W5 is what makes such an edit
+legal by routing it to the right file; until then it must not be quietly
+mislocated. Test: `a_position_in_another_region_is_refused_not_wrapped`.
+
+**2. `EditRefusal::Rejected`.** `set_blocks` can still refuse after preflight
+accepted — a malformed section, an empty palette, cases this layer doesn't
+model. Carries the message rather than the `MCLoadError` because that type
+isn't `Clone`.
+
+**3. `EditReport::regions` dropped.** A single-region `apply` has exactly one,
+so the field was noise. It comes back in W5, where it means something.
+
+**4. The tests use a synthetic region file, not a copy of the real save.** The
+ticket proposed copying out of the developer's world, following ticket 023's
+precedent. Better available: `mc_anvil::region::Region::write` takes chunk NBT
+and produces a real `.mca`, so `RegionFixture` builds one in a temp dir with
+exactly the four chunks the tests need — two ordinary finished ones, one from
+an older `DataVersion`, one still generating, and 1020 ungenerated slots. Those
+are cases a real save mostly doesn't have where you need them, and a test that
+edits somebody's world behaves differently on every machine. Nothing in this
+module's tests touches the real save now.
+
+### Confirmed while building it
+
+- **The sequence really is preflight → `set_blocks` → heightmaps.** Nothing
+  else was needed; `set_blocks` did the block-entity cleanup and the relight
+  flag exactly as documented.
+  `an_edit_hands_the_lighting_back_to_the_game_for_the_chunks_it_touched` is
+  the first test in this repo to assert that across the crate boundary — flag
+  0 on the touched chunk, 1 on its neighbour.
+- **The all-or-nothing guarantee holds end to end.** A batch with two good
+  positions and one in a half-generated chunk leaves the region byte-identical
+  and *undirtied* — which matters as much as the blocks, because a dirty
+  region would be rewritten to disk by the next save for no reason.
+- **`capture_replaced` really is an undo.** The test plays the captured states
+  back through `apply` and the world returns to its original blocks. That's I1,
+  D3 and E5 exercised before any of them exists.
+- **The preflight is cheap.** Section existence is checked once per
+  (chunk, section) rather than once per block, so a 4000-block building costs
+  a handful of `check_set_block` calls, not 4000.
+
+### One thing left deliberately undone
+
+`HeightmapPolicy::Recompute` takes a `fn(&BlockState) -> HeightmapClass` from
+the caller and the tests pass a two-line stub. The real table — built once
+against `world::BlockRegistry`, following `world::tint::build_block_tint_table`
+— is **not** written, because the default is `Delete` and the in-game check in
+`../todo.md` is what decides whether it's ever needed. The variant exists so
+that answer costs one line.
+
+### Next
+
+W5: route an edit across the up-to-four region files a building near a corner
+touches, and give `RegionCache` a mutable path with the eviction guard
+(`ChunkRegion::is_dirty`) that a dirty region needs.

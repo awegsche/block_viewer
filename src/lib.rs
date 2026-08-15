@@ -50,6 +50,7 @@ pub mod blueprint;
 pub mod camera;
 pub mod chunk_pipeline;
 pub mod city;
+pub mod edit;
 pub mod region_cache;
 pub mod selection;
 pub mod sky;

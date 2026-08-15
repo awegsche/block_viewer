@@ -105,7 +105,7 @@ L1  lib.rs + two bin shims                       <- DONE (ticket 027)
      |    W2  ranvil: the whole Anvil write  upstream ../ranvil    DONE (009-017)
      |    W3  bulk encode / section batching  DONE (ranvil's set_blocks)
      |         |
-     |    W4  the chunk edit model            <- KEYSTONE, ticket 031
+     |    W4  the chunk edit model            <- DONE (ticket 031)
      |         |
      |    W5  boundary routing + region batching
      |    W6  write safety: lock, backup, atomic, dry run
@@ -227,7 +227,7 @@ spanning longs, single-entry palettes omitting `data`) are written out in
 011; ticket 001 was a bug in that same arithmetic in the read direction, so
 the round-trip property test comes before the encoder.
 
-**W4. The chunk edit model — the keystone. — ticket 031.** Given ranvil
+**W4. The chunk edit model — the keystone. — done, ticket 031.** Given ranvil
 provides the primitives, this is the *policy* layer: what a well-formed edit
 is, and in what order the pieces happen. The split is deliberate — ranvil owns
 the Anvil format, `edit` owns what we're allowed to do to a world.
