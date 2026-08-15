@@ -201,10 +201,11 @@ it's that crate's subject matter, not ours:
 | 014 | relight-on-load (`isLightOn`) — **investigation first** |
 | 015 | removing orphaned `block_entities` on overwrite |
 | 016 | `session.lock` detection: is the world open right now |
-| 017 | oversized chunks (`.mcc`), read and write |
+| 017 | oversized chunks (`.mcc`) — **read done**; writing them is ranvil 027 |
 | 018 | compression types beyond zlib (robustness, low priority) |
 | 019 | stale fixtures README (cleanup found while planning) |
 | 020 | expose per-chunk timestamps — the change-detection gate for I5 |
+| 027 | writing an oversized chunk back out (fallout of 017) |
 
 The decision worth repeating here because it shapes W5: 009 **rewrites the
 whole region file** rather than allocating freed sectors in place. A chunk
