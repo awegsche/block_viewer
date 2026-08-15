@@ -19,7 +19,10 @@
 use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts};
 
-use crate::blueprint::{BlueprintExtraction, ExtractOutcome, MAX_BLOCKS, STRUCTURE_BLOCK_MAX_SIZE};
+use crate::blueprint::{
+    BlueprintExport, BlueprintExtraction, ExportState, ExtractOutcome, MAX_BLOCKS,
+    STRUCTURE_BLOCK_MAX_SIZE,
+};
 use crate::selection::{Face, Selection, SelectionBounds, CHUNK_STEP};
 
 /// Above this many blocks the volume line is coloured and the panel says an
@@ -164,7 +167,8 @@ fn format_blocks(n: u64) -> String {
 pub(crate) fn selection_panel(
     mut contexts: EguiContexts,
     mut selection: ResMut<Selection>,
-    mut extraction: ResMut<BlueprintExtraction>,
+    extraction: Res<BlueprintExtraction>,
+    mut export: ResMut<BlueprintExport>,
     mut draft: Local<BoundsDraft>,
 ) {
     egui::Window::new("Selection").show(contexts.ctx_mut(), |ui| {
@@ -215,15 +219,15 @@ pub(crate) fn selection_panel(
                 // panel opened the frame with.
                 if let Some(bounds) = selection.0 {
                     ui.separator();
-                    readout(ui, &bounds, &mut extraction);
+                    readout(ui, &bounds, &mut export);
                 }
             }
         }
 
-        // Outside the `match`: an extraction keeps running (and keeps
-        // reporting) even if the selection it was started from is cleared or
-        // moved while it's in flight — it works from a snapshot of the bounds.
-        extraction_status(ui, &extraction);
+        // Outside the `match`: an export keeps running (and keeps reporting)
+        // even if the selection it was started from is cleared or moved while
+        // it's in flight — it works from a snapshot of the bounds.
+        export_status(ui, &export, &extraction);
 
         ui.separator();
         key_legend(ui);
@@ -244,7 +248,7 @@ fn coord_fields(ui: &mut egui::Ui, fields: &mut [String; 3]) -> bool {
 }
 
 /// Size, volume, anchor, and the export button — the read-only half.
-fn readout(ui: &mut egui::Ui, bounds: &SelectionBounds, extraction: &mut BlueprintExtraction) {
+fn readout(ui: &mut egui::Ui, bounds: &SelectionBounds, export: &mut BlueprintExport) {
     let size = bounds.size();
     ui.label(format!("Size: {} x {} x {}", size.x, size.y, size.z));
 
@@ -289,73 +293,150 @@ fn readout(ui: &mut egui::Ui, bounds: &SelectionBounds, extraction: &mut Bluepri
     let anchor = bounds.anchor;
     ui.label(format!("Anchor: {}, {}, {}", anchor.x, anchor.y, anchor.z));
 
-    // Ticket 022 makes this run the extraction and log what it found; 023
-    // gives it a file format and 024 a save dialog to pick a filename with.
-    let busy = extraction.busy();
+    // The whole 021/022/023/024 group in one button: pick a filename, read
+    // the blocks out of the save, write a vanilla structure file.
+    let busy = export.busy();
     let response = ui.add_enabled(
         class != VolumeClass::OverCap && !busy,
         egui::Button::new("Export…"),
     );
     if response.clicked() {
-        extraction.request(*bounds);
+        export.request(*bounds);
     }
     response
-        .on_hover_text("Extract these blocks and log the palette (no file yet — ticket 024).")
+        .on_hover_text(
+            "Save these blocks as a Minecraft structure (.nbt) — a structure block \
+             can then load it back in-game.",
+        )
         .on_disabled_hover_text(if busy {
-            "An extraction is already running."
+            "An export is already running."
         } else {
             "Selection is over the export cap."
         });
 }
 
-/// The running extraction's progress, or the last one's result. Nothing at
-/// all before the first export — an idle line here would just be noise in a
-/// panel that already has plenty.
-fn extraction_status(ui: &mut egui::Ui, extraction: &BlueprintExtraction) {
-    if let Some((done, total)) = extraction.progress() {
-        ui.separator();
-        ui.label(format!("Extracting… {done} / {total} chunk columns"));
-        // The whole reason the task publishes a column count: a
-        // multi-second extraction with no feedback reads as a hung window.
-        ui.add(egui::ProgressBar::new(extraction.fraction().unwrap_or(0.0)).show_percentage());
-        return;
-    }
+/// A written file's status line is green rather than the default text
+/// colour — this is the one line in the panel that reports something having
+/// happened outside the app, and it's the line the user came for.
+const WROTE_COLOR: egui::Color32 = egui::Color32::from_rgb(120, 220, 120);
 
-    let Some(outcome) = extraction.last() else {
-        return;
-    };
-    ui.separator();
-    match outcome {
-        ExtractOutcome::Done(summary) => {
+/// The export's current step, or the last one's result. Nothing at all before
+/// the first export and nothing after a cancelled dialog — an idle line here
+/// would just be noise in a panel that already has plenty.
+///
+/// One arm per [`ExportState`], which is the reason the export is one state
+/// machine rather than a handful of option fields: there is no combination of
+/// them this has to reconcile.
+fn export_status(
+    ui: &mut egui::Ui,
+    export: &BlueprintExport,
+    extraction: &BlueprintExtraction,
+) {
+    match export.state() {
+        ExportState::Idle => {}
+        ExportState::Choosing { .. } => {
+            ui.separator();
+            ui.label("Choosing a file…");
+        }
+        ExportState::Extracting { .. } => {
+            ui.separator();
+            extraction_progress(ui, extraction);
+        }
+        ExportState::Writing { path, blocks, .. } => {
+            ui.separator();
             ui.label(format!(
-                "Extracted {} blocks, {} distinct states in {:.2?}",
-                format_blocks(summary.blocks as u64),
-                summary.palette,
-                summary.elapsed
+                "Writing {} blocks to {}…",
+                format_blocks(*blocks as u64),
+                file_name(path)
             ));
-            ui.label(format!(
-                "  {} x {} x {} at {}, {}, {} — palette logged to the console",
-                summary.size.x,
-                summary.size.y,
-                summary.size.z,
-                summary.origin.x,
-                summary.origin.y,
-                summary.origin.z,
-            ));
-            if summary.failed_columns > 0 {
-                ui.colored_label(
-                    egui::Color32::YELLOW,
-                    format!(
-                        "{} chunk column(s) could not be read — those blocks are air.",
-                        summary.failed_columns
-                    ),
-                );
+            // No progress figure: the writer streams into a gzip encoder and
+            // has no counter to publish. A million blocks is ~1.25 s (ticket
+            // 023's `measure_large_write`), so a spinner is honest and a
+            // fake percentage would not be.
+            ui.spinner();
+        }
+        ExportState::Done { path, blocks } => {
+            ui.separator();
+            extraction_summary(ui, extraction);
+            ui.colored_label(
+                WROTE_COLOR,
+                format!("Wrote {} blocks to:", format_blocks(*blocks as u64)),
+            );
+            // The full path, wrapped rather than widening the window — "where
+            // did it go" is the entire question this line answers, so the
+            // file name alone won't do.
+            ui.add(
+                egui::Label::new(egui::RichText::new(path.display().to_string()).monospace())
+                    .wrap(),
+            );
+            if ui.button("Copy path").clicked() {
+                ui.output_mut(|out| out.copied_text = path.display().to_string());
             }
         }
-        ExtractOutcome::Failed(err) => {
-            ui.colored_label(egui::Color32::RED, format!("Export failed: {err}"));
+        ExportState::Failed { message } => {
+            ui.separator();
+            ui.colored_label(egui::Color32::RED, format!("Export failed: {message}"));
         }
     }
+}
+
+/// The extraction's column counter, while it's the step the export is on.
+///
+/// The whole reason the task publishes a column count: a multi-second
+/// extraction with no feedback reads as a hung window.
+fn extraction_progress(ui: &mut egui::Ui, extraction: &BlueprintExtraction) {
+    let Some((done, total)) = extraction.progress() else {
+        // The one frame between the filename being chosen and the task being
+        // dispatched, and the frame after it finishes.
+        ui.label("Extracting…");
+        return;
+    };
+    ui.label(format!("Extracting… {done} / {total} chunk columns"));
+    ui.add(egui::ProgressBar::new(extraction.fraction().unwrap_or(0.0)).show_percentage());
+}
+
+/// What the finished extraction found, above the written-file line. Kept from
+/// ticket 022: the palette count and the unreadable-column warning are how
+/// you tell a good export from one that quietly wrote a box of air.
+fn extraction_summary(ui: &mut egui::Ui, extraction: &BlueprintExtraction) {
+    // `Failed` is the export's to report — it's already in `ExportState`, and
+    // saying it twice in one panel would read as two separate problems.
+    let Some(ExtractOutcome::Done(summary)) = extraction.last() else {
+        return;
+    };
+    ui.label(format!(
+        "Extracted {} blocks, {} distinct states in {:.2?}",
+        format_blocks(summary.blocks as u64),
+        summary.palette,
+        summary.elapsed
+    ));
+    ui.label(format!(
+        "  {} x {} x {} at {}, {}, {} — palette logged to the console",
+        summary.size.x,
+        summary.size.y,
+        summary.size.z,
+        summary.origin.x,
+        summary.origin.y,
+        summary.origin.z,
+    ));
+    if summary.failed_columns > 0 {
+        ui.colored_label(
+            egui::Color32::YELLOW,
+            format!(
+                "{} chunk column(s) could not be read — those blocks are air.",
+                summary.failed_columns
+            ),
+        );
+    }
+}
+
+/// A path's last component, for the lines where the whole path would crowd
+/// out the sentence around it. Falls back to the full path rather than to
+/// nothing for the (unreachable through the dialog) path ending in `..`.
+fn file_name(path: &std::path::Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
 }
 
 /// Ticket 020's bindings, generated from [`Face`] itself. A legend retyped as

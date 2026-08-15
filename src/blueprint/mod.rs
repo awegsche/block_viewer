@@ -20,14 +20,15 @@
 //!
 //! ## What happens to the result
 //!
-//! Still nothing, as of ticket 023: the finished blueprint is logged (its
-//! size, its `DataVersion` and its palette — which is what ticket 022's
-//! manual check reads to confirm properties survived) and summarised for the
-//! panel, then dropped. Ticket 023 landed [`structure`], which can write it
-//! out; ticket 024 adds the save dialog that supplies a filename, at which
-//! point [`poll_extraction`] hands the blueprint to the writer instead of
-//! dropping it.
+//! It goes to a file. The finished blueprint is logged (its size, its
+//! `DataVersion` and its palette — which is what ticket 022's manual check
+//! reads to confirm properties survived), summarised for the panel, and then
+//! parked in [`BlueprintExtraction::take_blueprint`] for [`export`] to hand to
+//! [`structure`]'s writer. Ticket 024 is what joined those up; before it, the
+//! blueprint was logged and dropped, so the button printed a line that read
+//! like a successful export and wrote nothing.
 
+mod export;
 mod extract;
 mod structure;
 
@@ -49,10 +50,11 @@ pub use extract::{
     extract_blueprint, BlockState, Blueprint, ExtractError, ExtractProgress, MAX_BLOCKS,
 };
 
-// The writer has no caller until ticket 024's save dialog picks a filename
-// for it. Re-exported for the same reason as the types above: 024 asks
-// `blueprint` for it rather than reaching into a submodule.
-#[allow(unused_imports)]
+pub use export::{BlueprintExport, ExportState};
+
+// `write_structure_file`'s only caller is `export`, a sibling — re-exported
+// for the same reason as the types above: a submodule asks `blueprint` for
+// what it needs rather than reaching into another submodule.
 pub use structure::{write_structure_file, STRUCTURE_BLOCK_MAX_SIZE};
 
 /// How many palette entries the finished-extraction log prints before
@@ -73,6 +75,12 @@ pub struct BlueprintExtraction {
     requested: Option<SelectionBounds>,
     in_flight: Option<InFlight>,
     last: Option<ExtractOutcome>,
+    /// The last extraction's blueprint, waiting for [`export`] to collect it
+    /// (ticket 024). Separate from [`Self::last`] because the two have
+    /// different lifetimes: the summary stays on screen until the next export
+    /// starts, while the blueprint — up to sixteen million blocks of it — is
+    /// taken and dropped as soon as it has been written.
+    finished: Option<Blueprint>,
 }
 
 struct InFlight {
@@ -138,21 +146,34 @@ impl BlueprintExtraction {
     pub fn last(&self) -> Option<&ExtractOutcome> {
         self.last.as_ref()
     }
+
+    /// Takes the finished blueprint, if the last extraction produced one and
+    /// nobody has claimed it yet.
+    ///
+    /// Taken rather than borrowed because the writer needs to own it on
+    /// another thread, and because leaving a blueprint this size sitting in a
+    /// resource after it has been written is megabytes of nothing.
+    pub fn take_blueprint(&mut self) -> Option<Blueprint> {
+        self.finished.take()
+    }
 }
 
-/// Adds [`BlueprintExtraction`] and the two systems that drive it.
+/// Adds [`BlueprintExtraction`] and, through
+/// [`export::BlueprintExportPlugin`], everything that drives it.
 ///
-/// Ordered `poll` before `start` for the same reason
-/// [`crate::chunk_pipeline`] chains its four that way: a request made this
-/// frame shouldn't have to wait for the next one to be dispatched, and
-/// polling first means the slot a just-finished extraction frees is
-/// immediately available.
+/// The two systems here ([`poll_extraction`] and [`start_extraction`]) are
+/// registered by the export plugin rather than by this one, because they have
+/// to interleave with the export's four in a single chain — an extraction is
+/// the middle two steps of an export, not a parallel feature. Ordering
+/// rationale lives there; the short version is the one
+/// [`crate::chunk_pipeline`] chains its four systems by, `poll` before
+/// `start`, so a request made this frame is dispatched this frame.
 pub struct BlueprintPlugin;
 
 impl Plugin for BlueprintPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<BlueprintExtraction>()
-            .add_systems(Update, (poll_extraction, start_extraction).chain());
+            .add_plugins(export::BlueprintExportPlugin);
     }
 }
 
@@ -181,8 +202,11 @@ fn start_extraction(
         .spawn(async move { extract_blueprint(bounds, &cache, &task_progress) });
 
     // The previous run's summary would otherwise sit under a running
-    // extraction's progress line, reading as this one's result.
+    // extraction's progress line, reading as this one's result. The blueprint
+    // goes with it: if the last one was never collected (a write that failed
+    // before it started, say) it's dead weight, not this run's output.
     extraction.last = None;
+    extraction.finished = None;
     extraction.in_flight = Some(InFlight {
         task,
         progress,
@@ -206,16 +230,18 @@ fn poll_extraction(mut extraction: ResMut<BlueprintExtraction>) {
     extraction.last = Some(match result {
         Ok(blueprint) => {
             log_blueprint(&blueprint, elapsed);
-            ExtractOutcome::Done(ExtractSummary {
+            let summary = ExtractSummary {
                 origin: blueprint.origin,
                 size: blueprint.size,
                 blocks: blueprint.volume(),
                 palette: blueprint.palette.len(),
                 failed_columns: blueprint.failed_columns,
                 elapsed,
-            })
-            // `blueprint` is dropped here — ticket 023's writer is what will
-            // consume it.
+            };
+            // Parked for `export::drive_write` to collect and hand to the
+            // writer, rather than dropped here as it was before ticket 024.
+            extraction.finished = Some(blueprint);
+            ExtractOutcome::Done(summary)
         }
         Err(err) => {
             println!("block_viewer: extraction failed: {err}");

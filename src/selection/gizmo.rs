@@ -45,12 +45,21 @@ struct BuriedSelectionGizmos;
 /// coplanar with block faces — which is constantly, since every selection
 /// boundary *is* a block boundary.
 ///
-/// Bevy's gizmo shader applies a negative bias as
-/// `clip.z * (clip.w / clip.z)^-bias`, i.e. perspective-correct: the nudge
-/// grows with distance, so one value covers the whole view rather than
-/// needing to be tuned per range. Small enough that terrain still occludes
-/// the line properly, which is the entire point of this pass.
-const SOLID_DEPTH_BIAS: f32 = -0.02;
+/// **This number has to be tiny** (ticket 029). Bevy's gizmo shader applies a
+/// negative bias as `clip.z * (clip.w / clip.z)^-bias`, and under a reverse-Z
+/// infinite projection `clip.z` is the near plane and `clip.w` the view
+/// distance — so the line is pulled forward by a *fraction* of how far away it
+/// is, roughly `-bias * ln(distance / near)`. With `near` at 0.1 (this app
+/// leaves [`PerspectiveProjection`] at its default) that fraction is about
+/// `6 * -bias` across the whole useful range. 026's original `-0.02` was
+/// therefore a ~12% pull: nearly a block through terrain at 10 blocks out and
+/// almost six at 50, which meant terrain stopped occluding this pass entirely
+/// and the two passes drew identically. That's what made the box unreadable.
+///
+/// At `-0.0002` the pull is ~6 cm at 50 blocks — invisible, but still some
+/// four orders of magnitude more than float32 reverse-Z needs to win a
+/// coplanar depth test, so the z-fighting this exists for stays fixed.
+const SOLID_DEPTH_BIAS: f32 = -0.0002;
 
 /// The far end of [`GizmoConfig::depth_bias`]'s range: always in front of
 /// everything, however deep it's buried.
@@ -58,18 +67,26 @@ const BURIED_DEPTH_BIAS: f32 = -1.0;
 
 const LINE_WIDTH: f32 = 2.5;
 
-/// The buried pass is drawn slightly thinner as well as dotted — a dotted
-/// line of the same weight reads as a *heavier* line broken up, rather than
-/// as a fainter one.
-const BURIED_LINE_WIDTH: f32 = 2.0;
+/// The buried pass's width — which is also its *dash* length (ticket 029).
+///
+/// [`GizmoLineStyle::Dotted`] has no spacing of its own: the shader's
+/// `fragment_dotted` measures the pattern in units of `line_width` with a
+/// period of 2, so a dash is `line_width` pixels long and so is the gap after
+/// it. At 026's 2.0 that's a 2px-on/2px-off stipple, which reads as a solid
+/// line at half brightness rather than as a dashed one — no use at all as the
+/// thing that distinguishes this pass. 4px dashes are unambiguous.
+///
+/// The cost is that the buried pass is now *wider* than the solid one, which
+/// is backwards where they overlap in open air; [`BURIED_ALPHA`] pays for it.
+const BURIED_LINE_WIDTH: f32 = 4.0;
 
 /// How far the buried pass is dimmed.
 ///
-/// Not lower, because [`GizmoLineStyle::Dotted`] has already halved the ink
-/// on those lines; the dotting is what makes the two passes distinguishable,
-/// and the alpha only has to stop the buried half shouting over the visible
-/// one.
-const BURIED_ALPHA: f32 = 0.55;
+/// Lower than it would need to be on its own, because the two passes overlap
+/// wherever the box is in open air and this one is drawn on top at four
+/// pixels wide. At 0.4 that overlap reads as a faint broken halo around the
+/// crisp solid line, rather than as a fat dashed line smothering it.
+const BURIED_ALPHA: f32 = 0.4;
 
 /// Warm yellow: reads against grass, stone and water alike, and isn't a
 /// colour the vanilla texture set has much of.

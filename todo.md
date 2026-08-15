@@ -355,31 +355,70 @@ these itself (see CLAUDE.md's "Manual/visual verification").
   check re-run the test with `origin` pointed at a staircase, a log wall
   or a door you know the coordinates of, and confirm those blocks come out
   facing the same way in the placed structure as in the source world.
-  Once 024 lands, this is the same check done through the export button
-  instead. Resolution notes: `finished_tickets/023-structure-nbt-writer.md`.
-- [ ] **026 selection box legibility: the buried half is distinguishable.**
-  The whole ticket is a look call, so this is the check that decides
-  whether it worked. `cargo run`, click a block on open ground, then
-  extend the box downward into a hillside (arrow keys, or Ctrl + a
-  direction for a chunk at a time) until part of it is underground.
-  Confirm: (1) the part in open air is a **solid** line and the buried part
-  is **dotted and dimmer** — if the whole box looks solid the depth test
-  isn't happening, if the whole box looks dotted the solid pass is being
-  occluded when it shouldn't be; (2) the boundary between the two styles
-  tracks the terrain surface as you orbit, which is the cue the ticket
-  exists for; (3) the horizontal slice plates (every 16 blocks on world
-  chunk boundaries, coarsening to 32 for a very tall box) read as depth
-  rather than as clutter — if they're noise, `MAX_SLICES`/`SLICE_ALPHA` in
-  `src/selection/gizmo.rs` are the knobs, and dropping them entirely is a
-  legitimate outcome; (4) `SOLID_DEPTH_BIAS` (`-0.02`) against a box whose
-  bottom face sits flat on a flat surface — flickering along that edge
-  means it's too small; the box floating visibly in front of terrain it
-  should be behind means it's too large; (5) the dotted pass from a
-  distance — if the buried box vanishes at range, `BURIED_ALPHA` (0.55) is
-  too low or `BURIED_LINE_WIDTH` too thin. Record whatever the constants
-  end up at in `finished_tickets/026-selection-box-legibility.md`. If the
-  two-pass wireframe still isn't enough, the translucent fill that ticket
-  lists under "considered and not done" is the next thing to try.
+  024 has now landed, so this is the same check done through the export
+  button instead — the test is only the fallback if the dialog misbehaves.
+  Resolution notes: `finished_tickets/023-structure-nbt-writer.md`.
+- [ ] **024 save dialog: the export button writes a file where it says it
+  does.** The reported symptom was a button that logged a line reading like
+  success and wrote nothing at all; the point of this check is that it now
+  writes something, somewhere findable. `cargo run --bin block_viewer`,
+  select a small box (a dozen blocks is plenty), click **Export…**.
+  Confirm: (1) a **native Windows save dialog opens**, filtered to `.nbt`,
+  with the filename pre-filled as `blueprint_<x>_<y>_<z>.nbt` from the
+  selection's minimum corner, and starting in the save's
+  `generated/minecraft/structures/` if it has one, else in the save folder;
+  (2) **the window keeps repainting behind it** — orbit the camera with the
+  dialog open, and confirm terrain still streams. If the dialog gets *lost
+  behind* the app window when you click the game, that's the missing
+  `set_parent` call (deliberately skipped — it needs a direct
+  `raw-window-handle` dependency and an `unsafe` handle fetch, and the
+  panel's "Choosing a file…" line is the cheap mitigation); say so and it
+  becomes its own ticket; (3) **cancel** the dialog — nothing is written,
+  no error appears, and the button re-enables; (4) pick a name and confirm
+  the panel ends on a green "Wrote N blocks to:" with the **full path**
+  under it, that **Copy path** puts that path on the clipboard, and that
+  the file is actually there on disk with a plausible size; (5) export a
+  large selection (over a million blocks, so the panel's yellow warning is
+  showing) and watch the **extraction progress bar advance** and then a
+  spinner while it writes, rather than the UI freezing; (6) export to a
+  location you can't write to (`C:\Windows\System32\` or a read-only
+  folder) and confirm a **red "Export failed:" line naming the path**
+  rather than a crash. Then run 023's in-game check above through this
+  button. Resolution notes: `finished_tickets/024-save-file-dialog.md`.
+- [x] **026 selection box legibility: the buried half is distinguishable.**
+  Checked, and the answer was *no* — "I don't see which part is underneath
+  the surface, is the double pass rendering working at all?". Diagnosed in
+  ticket 029: both passes were running, but `SOLID_DEPTH_BIAS = -0.02` is a
+  *proportional* bias (~12% of the view distance), so terrain never occluded
+  the "depth tested" pass and the two drew identically. Superseded by the
+  029 check below.
+- [ ] **029 selection box, take two: the depth bias is now tiny.**
+  `cargo run --bin block_viewer`, click a block on open ground, then extend
+  the box downward into a hillside (arrow keys, or Ctrl + a direction for a
+  chunk at a time) until part of it is underground. Confirm: (1) the part in
+  open air is a **solid** line and the buried part is **dashed and dimmer**
+  — if the whole box still looks solid the depth test still isn't happening,
+  if the whole box looks dashed the solid pass is being occluded when it
+  shouldn't be; (2) the boundary between the two styles tracks the terrain
+  surface as you orbit, which is the cue the whole thing exists for; (3) the
+  horizontal slice plates (every 16 blocks on world chunk boundaries,
+  coarsening to 32 for a very tall box) read as depth rather than as clutter
+  — if they're noise, `MAX_SLICES`/`SLICE_ALPHA` in `src/selection/gizmo.rs`
+  are the knobs, and dropping them entirely is a legitimate outcome; (4)
+  `SOLID_DEPTH_BIAS` (now `-0.0002`) against a box whose bottom face sits
+  flat on a flat surface — flickering along that edge means it's too small
+  (try `-0.001`); the box still floating in front of terrain it should be
+  behind means it's still too large (try `-0.00005`). Note that this number
+  is *proportional to distance*, so judge it far from the camera as well as
+  near; (5) the dashed pass at range — if the buried box vanishes,
+  `BURIED_ALPHA` (now 0.4) is too low; if the dashes read as a fat noisy
+  halo around the solid line in open air, `BURIED_LINE_WIDTH` (now 4.0, and
+  it sets the dash length too — 4px on, 4px off) is too wide. Record
+  whatever the constants end up at in
+  `finished_tickets/029-selection-depth-bias-is-proportional.md`. If the
+  two-pass wireframe *still* isn't enough once the bias is right, the
+  translucent fill under 026's "considered and not done" is the next thing
+  to try.
 - [ ] **027 lib + two binary shims: both binaries still behave.** The
   package now builds a lib plus `block_viewer` and `citybuilder` bins, so
   the check is that nothing moved semantically. (1)
