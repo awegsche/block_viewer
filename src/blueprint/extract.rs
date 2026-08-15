@@ -206,7 +206,7 @@ impl std::str::FromStr for BlockState {
 /// slots for them, and they're each their own follow-up (chest contents in
 /// particular are a second NBT path entirely, `block_entities` in the chunk
 /// root).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Blueprint {
     /// Selection size in blocks (X, Y, Z), Minecraft axes.
     pub size: IVec3,

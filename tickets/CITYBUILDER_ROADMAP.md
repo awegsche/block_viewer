@@ -113,7 +113,7 @@ L1  lib.rs + two bin shims                       <- DONE (ticket 027)
      |    W8  viewer: a paint/fill command proving W1-W7  <- DONE (ticket 035)
      |
      +-- B  blueprints as building models
-     |    B1  structure .nbt reader (inverse of 023)
+     |    B1  structure .nbt reader (inverse of 023)  <- DONE (ticket 036)
      |    B2  Blueprint -> Bevy mesh
      |    B3  rotation, incl. block-state properties
      |    B4  the building asset catalogue
@@ -348,10 +348,23 @@ actually calls it. The manual open-in-Minecraft check is recorded in
 
 ## B — Blueprints as building models
 
-**B1. Structure `.nbt` reader.** The inverse of 023: vanilla structure file
-→ `Blueprint`. Round-trip test against 023's writer. This is what lets
-buildings be authored in Minecraft itself and pulled in with the existing
-extraction UI.
+**B1. Structure `.nbt` reader. — done, ticket 036.** The inverse of 023:
+vanilla structure file → `Blueprint`. Round-trip test against 023's writer.
+This is what lets buildings be authored in Minecraft itself and pulled in
+with the existing extraction UI.
+
+How it came out: `blueprint::structure::{read_structure, read_structure_file}`,
+the mirror of the writer's own split (a `Read`-taking function under a
+path-taking convenience wrapper), reusing `BlockState::from_palette_entry`
+for the palette rather than a third copy of the sort-and-dedupe logic. The
+reader is stricter than the format technically requires — `blocks` must be
+dense (one entry per position in `size`, no gaps, no duplicates) — because
+that's what `write_blocks` and an in-game Save both actually produce; a gap
+reads as a malformed file rather than something to guess "air" for.
+`Blueprint::origin` comes back `IVec3::ZERO` (never written, per 023) and
+`failed_columns` comes back `0` (no partial-column walk on this path — it's
+one parse, all-or-nothing). No caller yet; B2-B4 are what will load a `.nbt`
+file into the catalogue.
 
 **B2. `Blueprint` → Bevy `Mesh`.** Not the same entry point as
 `mesh_chunk_column`: a blueprint has a `BlockState` palette with properties

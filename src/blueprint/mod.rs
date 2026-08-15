@@ -57,6 +57,14 @@ pub use export::{BlueprintExport, ExportState};
 // what it needs rather than reaching into another submodule.
 pub use structure::{write_structure_file, STRUCTURE_BLOCK_MAX_SIZE};
 
+// Ticket 036 (roadmap B1): the reader has no caller yet — B2-B4 (blueprint
+// meshing, rotation, the asset catalogue) are what will load `.nbt` files
+// through it — but it's re-exported now for the same reason as everything
+// else above: `blueprint` is the module a caller reaches for, not
+// `blueprint::structure` directly.
+#[allow(unused_imports)]
+pub use structure::{read_structure, read_structure_file, StructureReadError};
+
 /// How many palette entries the finished-extraction log prints before
 /// summarising the rest. Long enough to see a structure's whole palette,
 /// short enough not to bury the console for a selection covering half a
