@@ -2,8 +2,8 @@
 
 Not a work item; the plan for the citybuilder game and the shared world-edit
 infrastructure it needs. High-level tasks here get split into numbered
-tickets in this directory when they're picked up (next free number: 028).
-Companion to `ROADMAP.md`, which covers the viewer 001–026.
+tickets in this directory when they're picked up (next free number: 030).
+Companion to `ROADMAP.md`, which covers the viewer 001–029.
 
 ## The goal
 
