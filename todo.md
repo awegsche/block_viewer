@@ -446,6 +446,25 @@ these itself (see CLAUDE.md's "Manual/visual verification").
   `nbt_test`, that selecting it streams real terrain in rather than leaving
   an empty world, and that the startup-issue message is gone. If you still
   have an older save around, load it too — both layouts are supposed to work.
+- [ ] **030 citybuilder render floor: the underground is gone and nothing
+  visible went with it.** (Only once 030 has landed — nothing to look at
+  before that.) `cargo run --bin citybuilder` against the real save. Fly the
+  camera over varied terrain — ideally past a **ravine, a cliff face and a cave
+  mouth**, which are the three shapes the per-chunk `min(OCEAN_FLOOR)` floor is
+  supposed to handle by dragging the whole chunk's floor down. Confirm: (1) no
+  visible hole, missing face or "see-through" patch anywhere the camera looks
+  from a normal city-building height; (2) no vertical seam or wall at chunk
+  boundaries, which is what a neighbour column with a different floor would
+  produce if the "below the floor reads as solid" rule in `block_at` isn't
+  working; (3) water still reads right at a shoreline and out over an ocean
+  (`OCEAN_FLOOR` is the sea *bed*, so an ocean chunk's floor should be well
+  under the water, not at it). Then `cargo run --bin block_viewer` on the same
+  save and confirm the world looks **exactly** as before — the viewer keeps
+  rendering everything, and the automated identical-mesh test only proves that
+  for the fixture column. If the margin (starting at one 16-block section)
+  looks too thin or too generous, record what it ends up at in
+  `finished_tickets/030-...md`'s Resolution, along with the measured
+  before/after the ticket asks for.
 - [ ] **ranvil 014 (+ 013): does Minecraft actually relight a chunk whose
   `isLightOn` we cleared?** **No longer a gate** — the decision is that this
   project never computes light, and a chunk that stays wrongly lit until the
@@ -487,12 +506,13 @@ these itself (see CLAUDE.md's "Manual/visual verification").
   and note whether loading the world is visibly slower or hitches. The
   citybuilder will edit chunks by the hundred; if relighting is expensive
   that's a scheduling constraint downstream needs to know about now.
-  (4) **Same trip, ranvil 013 — now the more useful half of this check:**
-  delete a chunk's whole `Heightmaps` compound (instead of recomputing it),
-  load the world, and see whether the game rebuilds it — check that
-  grass/snow/rain land correctly and mobs don't spawn on lit ground. Deleting
-  is what W4 does by default, on the same "let the game do it" reasoning as
-  the lighting; if the game does rebuild them, ticket
-  `../ranvil/tickets/013-heightmap-pack-unpack.md` evaporates entirely and a
-  day of 9-bit packing code with it. Record both answers in the two tickets'
-  Resolution sections.
+  (4) **Same trip, ranvil 013:** delete a chunk's whole `Heightmaps` compound
+  (`ChunkRegion::remove_heightmaps`) instead of recomputing it, load the world,
+  and see whether the game rebuilds it — check that grass/snow/rain land
+  correctly and mobs don't spawn on lit ground. Deleting is what W4 does by
+  default, on the same "let the game do it" reasoning as the lighting. This is
+  now a *cheaper decision than it was*: ranvil 013 is implemented (packing
+  verified against real game bytes; see its resolution), so if the game does
+  **not** rebuild them, W4 swaps one call for
+  `recompute_heightmaps(x, z, classify)` and moves on. Record the answer in
+  both tickets' Resolution sections.

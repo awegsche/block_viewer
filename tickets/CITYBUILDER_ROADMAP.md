@@ -2,7 +2,7 @@
 
 Not a work item; the plan for the citybuilder game and the shared world-edit
 infrastructure it needs. High-level tasks here get split into numbered
-tickets in this directory when they're picked up (next free number: 030).
+tickets in this directory when they're picked up (next free number: 031).
 Companion to `ROADMAP.md`, which covers the viewer 001–029.
 
 ## The goal
@@ -90,7 +90,7 @@ Gaps found while planning, each of which is real work:
 | `ranvil` cannot write. No sector allocation, no header write, no compression path — `Region::load` reads bytes and that's it | upstream, `ranvil` 009–010 |
 | `rnbt` has almost no mutation API — `NbtField::write` exists (023 uses it), but only `NbtValue::swap_remove` can change anything | upstream `../rnbt` (no ticket system there; W1) |
 | No `block_states` **encoder**. `decode.rs:246` unpacks palette + bit-width; nothing packs it back | upstream, `ranvil` 011 |
-| Nothing recomputes `Heightmaps`, clears `isLightOn`, or cleans up `block_entities` after an edit | upstream, `ranvil` 013–015 |
+| ~~Nothing recomputes `Heightmaps`, clears `isLightOn`, or cleans up `block_entities` after an edit~~ — all three now exist upstream (013, 014, 015); sequencing them is W4's job | upstream, `ranvil` 013–015 |
 | `blueprint::structure` only **writes** `.nbt`. No reader | `blueprint/structure.rs` |
 | `mesh_chunk_column` meshes a `ChunkColumn` via `BlockId`; a `Blueprint` is a `BlockState` palette + `Vec<u16>` with no registry | `world/mesh.rs` |
 | `RegionCache::get_or_load` hands out `&ChunkRegion`. No mutation, no invalidation | `region_cache.rs` |
@@ -138,6 +138,7 @@ L1  lib.rs + two bin shims                       <- DONE (ticket 027)
                |
                +-- G  UI: build menu, city panel
                +-- H  terraforming: dig and level
+               |    (H's digging is what makes R1's floor move — ticket 030)
                |
                +-- I  damage: the world diffing back
                     I1  the as-built baseline        <- ITERATION 1
@@ -147,6 +148,9 @@ L1  lib.rs + two bin shims                       <- DONE (ticket 027)
                     I5  scan scheduling + timestamp gate
                     I6  repair
                     I7  display: per-building and city-wide
+
+R  the city view's render depth   (independent of everything above)
+     R1  don't mesh below the terrain surface   <- ticket 030
 ```
 
 ---
@@ -197,7 +201,7 @@ it's that crate's subject matter, not ours:
 | 010 | mutable chunk access + dirty tracking on `ChunkRegion` |
 | 011 | `set_block`: palette insertion and `block_states` re-packing |
 | 012 | creating sections that don't exist yet (building above terrain) |
-| 013 | `Heightmaps` pack/unpack — only if deleting them doesn't work |
+| 013 | `Heightmaps` pack/unpack and recompute — **done**; reading them is what a render-depth cutoff would use |
 | 014 | relight-on-load (`isLightOn`) — **done**; the game does the lighting |
 | 015 | removing orphaned `block_entities` on overwrite |
 | 016 | `session.lock` detection: is the world open right now |
@@ -610,6 +614,27 @@ defaulting: a tint on the building's mesh reusing the vertex colour channel
 
 ---
 
+## R — The city view's render depth
+
+**R1. Don't mesh below the terrain surface. — ticket 030.** The citybuilder's
+camera looks at the surface from above and never goes under it, so the ~7
+sections per chunk column below the terrain are decoded, meshed and drawn for
+nothing — and the caves in them are where the invisible face count really is.
+A per-chunk floor from `min(OCEAN_FLOOR)` over the chunk's 256 heightmap
+columns (`ranvil` 013, done) cuts them, and taking the *minimum* is what makes
+it safe: a ravine or cave mouth anywhere in the chunk drags the floor down with
+it, so the cutoff never slices into a hole you can see.
+
+**`block_viewer` keeps rendering everything** — the explorer needs the
+underground, and the floor is switched on by `city::run()` rather than shared.
+
+Independent of W, B, C and D: it's a change to the decode/mesh path and nothing
+in the game logic touches it. H (digging) is what later makes the floor move,
+and that half is written up in the ticket as a re-*decode* rather than 005-f's
+re-mesh, because the blocks under the floor were never decoded to begin with.
+
+---
+
 ## Ordering advice
 
 - **L1 first, alone.** It's mechanical and it touches everything.
@@ -634,15 +659,20 @@ defaulting: a tint on the building's mesh reusing the vertex colour channel
   Nothing in W waits on this.
 - **ranvil 011's round-trip test before its encoder.** Ticket 001 was this
   exact arithmetic, in the other direction, and it shipped broken upstream.
-- **`Heightmaps` follow lighting: let the game rebuild them.** Same
-  reasoning, one field over — W4 deletes the compound on an edited chunk
-  rather than recomputing it, and ranvil 013's 9-bit packing code only gets
-  written if the game turns out not to prime missing heightmaps on load.
-  That's the cheap half of 013's own "check this before implementing" note,
-  and it's the default now rather than a thing to decide later. Worth
-  confirming in the same sitting as the relight check above (grass, snow and
-  rain landing correctly, mobs not spawning on lit ground), but W4 doesn't
-  wait for it either.
+- **`Heightmaps` follow lighting: let the game rebuild them** — still the
+  default, but no longer the only option. W4 deletes the compound on an edited
+  chunk (`ChunkRegion::remove_heightmaps`) rather than recomputing it, and the
+  in-game check (grass, snow and rain landing correctly, mobs not spawning on
+  lit ground) is still worth doing in the same sitting as the relight check
+  above. What changed is that ranvil 013 got written anyway, so a bad answer
+  costs one call swapped for `recompute_heightmaps(x, z, classify)` rather than
+  a day of 9-bit packing code — and the classifier it would need is the block
+  taxonomy W4 already has to own. W4 doesn't wait for the check either way.
+
+  013 got written because its **read** half is useful regardless of any of
+  that: the heightmaps sit at the chunk root and say how deep a chunk's terrain
+  goes before a single section is decoded, which is what a render-depth cutoff
+  would key off. See ranvil's `finished_tickets/013-...md`.
 - **B and C can run in parallel with W** — different files, no shared types
   beyond `Blueprint`. If two things are being worked at once, that's the
   split.
