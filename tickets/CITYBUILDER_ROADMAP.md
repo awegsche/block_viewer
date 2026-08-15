@@ -2,7 +2,7 @@
 
 Not a work item; the plan for the citybuilder game and the shared world-edit
 infrastructure it needs. High-level tasks here get split into numbered
-tickets in this directory when they're picked up (next free number: 031).
+tickets in this directory when they're picked up (next free number: 032).
 Companion to `ROADMAP.md`, which covers the viewer 001–029.
 
 ## The goal
@@ -87,9 +87,9 @@ Gaps found while planning, each of which is real work:
 
 | Gap | Where |
 |---|---|
-| `ranvil` cannot write. No sector allocation, no header write, no compression path — `Region::load` reads bytes and that's it | upstream, `ranvil` 009–010 |
-| `rnbt` has almost no mutation API — `NbtField::write` exists (023 uses it), but only `NbtValue::swap_remove` can change anything | upstream `../rnbt` (no ticket system there; W1) |
-| No `block_states` **encoder**. `decode.rs:246` unpacks palette + bit-width; nothing packs it back | upstream, `ranvil` 011 |
+| ~~`ranvil` cannot write~~ — done: sector allocation, header, zlib framing and an atomic replace (009), with dirty tracking (010) | upstream, `ranvil` 009–010 |
+| ~~`rnbt` has almost no mutation API~~ — done: `get_mut`, `insert`, `remove`, `as_*_mut` | upstream `../rnbt` (no ticket system there; W1) |
+| ~~No `block_states` **encoder**~~ — done: `set_blocks` packs, widens and re-packs a whole section per batch | upstream, `ranvil` 011 |
 | ~~Nothing recomputes `Heightmaps`, clears `isLightOn`, or cleans up `block_entities` after an edit~~ — all three now exist upstream (013, 014, 015); sequencing them is W4's job | upstream, `ranvil` 013–015 |
 | `blueprint::structure` only **writes** `.nbt`. No reader | `blueprint/structure.rs` |
 | `mesh_chunk_column` meshes a `ChunkColumn` via `BlockId`; a `Blueprint` is a `BlockState` palette + `Vec<u16>` with no registry | `world/mesh.rs` |
@@ -101,11 +101,11 @@ Gaps found while planning, each of which is real work:
 L1  lib.rs + two bin shims                       <- DONE (ticket 027)
      |
      +-- W  the write path (shared infrastructure)
-     |    W1  rnbt: mutation API             upstream ../rnbt
-     |    W2  ranvil: the whole Anvil write  upstream ../ranvil 009-019
-     |    W3  bulk encode / section batching
+     |    W1  rnbt: mutation API             upstream ../rnbt      DONE
+     |    W2  ranvil: the whole Anvil write  upstream ../ranvil    DONE (009-017)
+     |    W3  bulk encode / section batching  DONE (ranvil's set_blocks)
      |         |
-     |    W4  the chunk edit model            <- KEYSTONE
+     |    W4  the chunk edit model            <- KEYSTONE, ticket 031
      |         |
      |    W5  boundary routing + region batching
      |    W6  write safety: lock, backup, atomic, dry run
@@ -227,16 +227,22 @@ spanning longs, single-entry palettes omitting `data`) are written out in
 011; ticket 001 was a bug in that same arithmetic in the read direction, so
 the round-trip property test comes before the encoder.
 
-**W4. The chunk edit model — the keystone.** Given ranvil provides the
-primitives, this is the *policy* layer: what a well-formed edit is, and in
-what order the pieces happen. The split is deliberate — ranvil owns the
-Anvil format, `edit` owns what we're allowed to do to a world.
+**W4. The chunk edit model — the keystone. — ticket 031.** Given ranvil
+provides the primitives, this is the *policy* layer: what a well-formed edit
+is, and in what order the pieces happen. The split is deliberate — ranvil owns
+the Anvil format, `edit` owns what we're allowed to do to a world.
 
 - **Sequencing.** Block changes (011/012) → block-entity cleanup (015) →
   heightmap invalidation (013) → relight flag (014) → write (009). Getting
   the order wrong means recomputing heightmaps from pre-edit blocks — or,
   under the "let the game rebuild them" default below, deleting a compound
   that a later step in the same edit would have wanted to read.
+
+  **Three of those five moved upstream**: `ranvil`'s `set_blocks` does the
+  block-entity cleanup and clears `isLightOn` itself, in its own passes, only
+  on an accepted batch. So W4's own order is preflight → `set_blocks` →
+  heightmaps, with the heightmap step running once per chunk at the *end of
+  the transaction* rather than once per `set_blocks` call. See ticket 031.
 - **Block classification.** *Only if* heightmaps end up being recomputed
   here rather than deleted: 013's `recompute_heightmaps` takes the "does
   this block motion-block / count as a leaf" taxonomy from the caller, and
