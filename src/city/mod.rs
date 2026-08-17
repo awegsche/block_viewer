@@ -155,17 +155,33 @@
 //! path by the new [`undo::UndoPlugin`], the same `request`/`busy`/`state`
 //! shape `commit`/`demolish` already use.
 //!
-//! ## The road graph (ticket 053, roadmap F1)
+//! ## The road graph (ticket 053, roadmap F1) — and its cell-space revision
+//! (ticket 054)
 //!
 //! [`road`] is the first piece of group F: adjacency and reachability
-//! queries over [`state::City`]'s existing road tiles
-//! (`add_road`/`roads()`, landed with D1 but otherwise unread until now).
-//! No new stored state — a road graph is derived from `City::occupant_at`
-//! on every call, so it can never itself go stale. Not wired into `run` as
-//! a plugin; it's a pure query module, the primitive F2's drag-to-build,
+//! queries over [`state::City`]'s road cells (`add_road_cell`/
+//! `road_cells()`, landed with D1 but otherwise unread until now). No new
+//! stored state — a road graph is derived from `City::is_road_cell` on
+//! every call, so it can never itself go stale. Not wired into `run` as a
+//! plugin; it's a pure query module, the primitive F2's drag-to-build,
 //! F3's auto-tiling and F4's connectivity queries will each call once they
 //! exist — the same "proven, not yet used" state several earlier tickets
 //! (042, 039, 040) landed their own resources in.
+//!
+//! Ticket 054 redefined a road from a single-block tile to a
+//! [`state::ROAD_CELL_SIZE`]-block cell (a real cross-section, not a 1x1
+//! dot) and moved `road`'s whole coordinate space to match — a breaking
+//! change to 053's shipped API, not an addition next to it, since a road
+//! now has a *shape* that a block-tile model had no way to represent. It
+//! also lands `road::select_piece`, the pure classification F3's
+//! auto-tiling needs (which of six piece shapes a cell's connections call
+//! for, and the rotation that reproduces them), and [`road_catalogue`], a
+//! loader for the six `.nbt` blueprints — one per shape — that
+//! `select_piece` picks between. No real `.nbt` pieces ship yet (they need
+//! an actual Minecraft structure-block export); `road_catalogue` is proven
+//! against synthetic fixtures the same way ticket 039's building catalogue
+//! tests were, and isn't wired into `run` until there's something on disk
+//! for it to load.
 
 use std::path::{Path, PathBuf};
 
@@ -178,6 +194,7 @@ mod persistence;
 mod picking;
 mod placement;
 mod road;
+mod road_catalogue;
 mod save;
 mod state;
 mod ui;

@@ -60,7 +60,7 @@
 //! (ticket 049, roadmap E5) is `remove_building`'s second, deliberate
 //! caller, and adds two more: [`City::occupant_at`] finds what's under the
 //! cursor, [`City::building`] looks up its placement. Everything past those
-//! four (`remove_road`, `len`, `is_empty`) is still only proven by tests;
+//! four (`remove_road_cell`, `len`, `is_empty`) is still only proven by tests;
 //! their own `#[allow(dead_code)]` marks are that same "no caller yet"
 //! situation, not a note-worthy call each time it recurs.
 
@@ -169,6 +169,25 @@ pub fn footprint_tiles(origin: IVec3, footprint: IVec2, rotation: Rotation) -> i
     (0..extent.x).flat_map(move |dx| (0..extent.y).map(move |dz| base + IVec2::new(dx, dz)))
 }
 
+/// Width and depth, in blocks, of one road cell (ticket 054, roadmap F1/F3):
+/// 1 shoulder (grass, etc.) + 1 kerb + 2 road surface + 1 kerb + 1 shoulder
+/// on each cross-section, laid out symmetrically — `1+1+2+1+1 = 6`. A road
+/// is placed and connects to its neighbours one cell at a time, not one
+/// block at a time, the way a building's footprint is one unit regardless of
+/// how many blocks it covers.
+pub const ROAD_CELL_SIZE: i32 = 6;
+
+/// Every Minecraft `(x, z)` block tile one road cell covers — `cell` scaled
+/// up by [`ROAD_CELL_SIZE`], `cell`'s own `(x, z)` naming its *minimum*
+/// corner. The cell-space counterpart of [`footprint_tiles`]; a road cell
+/// has no rotation of its own to fold in here (unlike a footprint) —
+/// [`super::road::select_piece`] is what a cell's orientation feeds into,
+/// downstream of occupancy, not upstream of it.
+pub fn road_cell_tiles(cell: IVec2) -> impl Iterator<Item = IVec2> {
+    let base = cell * ROAD_CELL_SIZE;
+    (0..ROAD_CELL_SIZE).flat_map(move |dx| (0..ROAD_CELL_SIZE).map(move |dz| base + IVec2::new(dx, dz)))
+}
+
 /// The authoritative city state: placed buildings, roads, and the occupancy
 /// grid both are checked against. See the module docs for the rule this
 /// implements and what is deliberately not here yet (a journal, anything
@@ -182,7 +201,13 @@ pub fn footprint_tiles(origin: IVec3, footprint: IVec2, rotation: Rotation) -> i
 pub struct City {
     buildings: HashMap<BuildingId, PlacedBuilding>,
     next_id: u64,
-    roads: HashSet<IVec2>,
+    /// Cell coordinates (ticket 054) — not block tiles. `occupancy` still
+    /// holds a block-tile [`Occupant::Road`] for every one of a cell's 36
+    /// tiles, kept in lockstep by [`add_road_cell`](Self::add_road_cell)/
+    /// [`remove_road_cell`](Self::remove_road_cell); this set is the source
+    /// of truth for "is this cell a road," the way `buildings` is for
+    /// buildings.
+    road_cells: HashSet<IVec2>,
     occupancy: HashMap<IVec2, Occupant>,
 }
 
@@ -299,34 +324,55 @@ impl City {
         self.next_id = self.next_id.max(at_least);
     }
 
-    /// Marks `tile` as a road. Idempotent if `tile` is already a road;
-    /// refused if it's held by a building (or anything else).
-    pub fn add_road(&mut self, tile: IVec2) -> Result<(), PlacementError> {
-        match self.occupancy.get(&tile) {
-            Some(Occupant::Road) => Ok(()),
-            Some(&by) => Err(PlacementError::TileOccupied { tile, by }),
-            None => {
-                self.occupancy.insert(tile, Occupant::Road);
-                self.roads.insert(tile);
-                Ok(())
+    /// Marks `cell` (cell coordinates, ticket 054 — see [`ROAD_CELL_SIZE`])
+    /// as a road, occupying all 36 block tiles [`road_cell_tiles`] lists for
+    /// it. Idempotent if `cell` is already a road; all-or-nothing and
+    /// refused if *any* of those 36 tiles are held by a building or another
+    /// road cell — the same "plan every tile before marking any of them"
+    /// shape [`place_building`](Self::place_building) uses, so a refused
+    /// road cell never leaves a partial one behind.
+    pub fn add_road_cell(&mut self, cell: IVec2) -> Result<(), PlacementError> {
+        if self.road_cells.contains(&cell) {
+            return Ok(());
+        }
+
+        let tiles: Vec<IVec2> = road_cell_tiles(cell).collect();
+        for &tile in &tiles {
+            if let Some(&by) = self.occupancy.get(&tile) {
+                return Err(PlacementError::TileOccupied { tile, by });
             }
         }
+
+        for &tile in &tiles {
+            self.occupancy.insert(tile, Occupant::Road);
+        }
+        self.road_cells.insert(cell);
+        Ok(())
     }
 
-    /// Clears a road tile. Returns whether it was actually a road tile
-    /// beforehand.
+    /// Clears a road cell and frees all 36 of its block tiles. Returns
+    /// whether `cell` was actually a road cell beforehand.
     #[allow(dead_code)] // no caller yet — see the module docs
-    pub fn remove_road(&mut self, tile: IVec2) -> bool {
-        if self.roads.remove(&tile) {
-            self.occupancy.remove(&tile);
+    pub fn remove_road_cell(&mut self, cell: IVec2) -> bool {
+        if self.road_cells.remove(&cell) {
+            for tile in road_cell_tiles(cell) {
+                self.occupancy.remove(&tile);
+            }
             true
         } else {
             false
         }
     }
 
-    pub fn roads(&self) -> impl Iterator<Item = &IVec2> {
-        self.roads.iter()
+    pub fn road_cells(&self) -> impl Iterator<Item = &IVec2> {
+        self.road_cells.iter()
+    }
+
+    /// Whether `cell` is a road cell — [`city::road`](super::road)'s own
+    /// adjacency queries go through this rather than re-deriving it from
+    /// [`occupant_at`](Self::occupant_at) at one of the cell's 36 tiles.
+    pub fn is_road_cell(&self, cell: IVec2) -> bool {
+        self.road_cells.contains(&cell)
     }
 
     pub fn is_tile_free(&self, tile: IVec2) -> bool {
@@ -423,35 +469,55 @@ mod tests {
     }
 
     #[test]
-    fn a_road_cannot_be_placed_on_a_building_and_vice_versa() {
+    fn placing_a_road_cell_occupies_exactly_its_36_tiles() {
+        let mut city = City::default();
+        city.add_road_cell(IVec2::new(1, 2)).unwrap();
+
+        for x in 6..12 {
+            for z in 12..18 {
+                assert_eq!(city.occupant_at(IVec2::new(x, z)), Some(Occupant::Road));
+            }
+        }
+        // One tile outside the cell on every side stays free.
+        assert!(city.is_tile_free(IVec2::new(5, 12)));
+        assert!(city.is_tile_free(IVec2::new(12, 12)));
+        assert!(city.is_tile_free(IVec2::new(6, 11)));
+        assert!(city.is_tile_free(IVec2::new(6, 18)));
+    }
+
+    #[test]
+    fn a_road_cell_cannot_be_placed_on_a_building_and_vice_versa() {
         let mut city = City::default();
         let building_id = city
             .place_building("house01", IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::new(2, 2))
             .unwrap();
 
-        let err = city.add_road(IVec2::new(0, 0)).unwrap_err();
+        // Cell (0, 0) covers block tiles 0..6 x 0..6, which overlaps the
+        // building's 2x2 footprint at its very first checked tile.
+        let err = city.add_road_cell(IVec2::new(0, 0)).unwrap_err();
         assert!(matches!(
             err,
             PlacementError::TileOccupied { tile, by: Occupant::Building(id) }
                 if tile == IVec2::new(0, 0) && id == building_id
         ));
 
-        city.add_road(IVec2::new(5, 5)).expect("an empty tile should accept a road");
+        city.add_road_cell(IVec2::new(5, 5)).expect("an empty cell should accept a road");
+        // Cell (5, 5) covers block tiles 30..36 x 30..36.
         let err = city
-            .place_building("house01", IVec3::new(5, 64, 5), Rotation::Deg0, IVec2::new(1, 1))
+            .place_building("house01", IVec3::new(30, 64, 30), Rotation::Deg0, IVec2::new(1, 1))
             .unwrap_err();
         assert!(matches!(
             err,
-            PlacementError::TileOccupied { tile, by: Occupant::Road } if tile == IVec2::new(5, 5)
+            PlacementError::TileOccupied { tile, by: Occupant::Road } if tile == IVec2::new(30, 30)
         ));
     }
 
     #[test]
-    fn adding_the_same_road_tile_twice_is_a_no_op() {
+    fn adding_the_same_road_cell_twice_is_a_no_op() {
         let mut city = City::default();
-        city.add_road(IVec2::new(1, 1)).unwrap();
-        city.add_road(IVec2::new(1, 1)).expect("re-adding the same road tile should succeed");
-        assert_eq!(city.roads().count(), 1);
+        city.add_road_cell(IVec2::new(1, 1)).unwrap();
+        city.add_road_cell(IVec2::new(1, 1)).expect("re-adding the same road cell should succeed");
+        assert_eq!(city.road_cells().count(), 1);
     }
 
     #[test]
@@ -480,12 +546,23 @@ mod tests {
     }
 
     #[test]
-    fn remove_road_reports_whether_a_tile_was_actually_a_road() {
+    fn remove_road_cell_reports_whether_a_cell_was_actually_a_road() {
         let mut city = City::default();
-        assert!(!city.remove_road(IVec2::new(0, 0)), "never added");
-        city.add_road(IVec2::new(0, 0)).unwrap();
-        assert!(city.remove_road(IVec2::new(0, 0)));
+        assert!(!city.remove_road_cell(IVec2::new(0, 0)), "never added");
+        city.add_road_cell(IVec2::new(0, 0)).unwrap();
+        assert!(city.remove_road_cell(IVec2::new(0, 0)));
         assert!(city.is_tile_free(IVec2::new(0, 0)));
+        assert!(!city.is_road_cell(IVec2::new(0, 0)));
+
+        // Removing frees every one of the cell's 36 tiles, not just its
+        // corner.
+        city.add_road_cell(IVec2::new(0, 0)).unwrap();
+        city.remove_road_cell(IVec2::new(0, 0));
+        for x in 0..6 {
+            for z in 0..6 {
+                assert!(city.is_tile_free(IVec2::new(x, z)));
+            }
+        }
     }
 
     #[test]
@@ -502,12 +579,12 @@ mod tests {
         let mut city = City::default();
         let a = city.place_building("house01", IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::ONE).unwrap();
         let b = city.place_building("house01", IVec3::new(5, 64, 5), Rotation::Deg0, IVec2::ONE).unwrap();
-        city.add_road(IVec2::new(2, 2)).unwrap();
-        city.add_road(IVec2::new(2, 3)).unwrap();
+        city.add_road_cell(IVec2::new(2, 2)).unwrap();
+        city.add_road_cell(IVec2::new(2, 3)).unwrap();
 
         let ids: HashSet<BuildingId> = city.buildings().map(|(id, _)| id).collect();
         assert_eq!(ids, HashSet::from([a, b]));
-        assert_eq!(city.roads().count(), 2);
+        assert_eq!(city.road_cells().count(), 2);
         assert_eq!(city.len(), 2);
     }
 }

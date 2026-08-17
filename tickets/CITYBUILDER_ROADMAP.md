@@ -2,7 +2,7 @@
 
 Not a work item; the plan for the citybuilder game and the shared world-edit
 infrastructure it needs. High-level tasks here get split into numbered
-tickets in this directory when they're picked up (next free number: 050).
+tickets in this directory when they're picked up (next free number: 055).
 Companion to `ROADMAP.md`, which covers the viewer 001–029.
 
 ## The goal
@@ -132,14 +132,14 @@ L1  lib.rs + two bin shims                       <- DONE (ticket 027)
                +-- E  placement          +-- F  streets
                |    E1  RTS camera, picking    <- DONE (ticket 045)
                |                                F1  road graph on the grid
-               |    E2  grid + footprint fit        <- DONE (ticket 053)
-               |         <- DONE (ticket 046)   F2  drag-to-build routing
-               |    E3  ghost + validity       F3  auto-tiling the pieces
-               |         <- DONE (ticket 047)
-               |    E4  commit                 F4  connectivity queries
-               |         <- DONE (ticket 048)
-               |    E5  demolish
-               |         <- DONE (ticket 049)
+               |    E2  grid + footprint fit        <- DONE (053, revised 054)
+               |         <- DONE (ticket 046)   F1b road cells + piece
+               |    E3  ghost + validity           selection <- DONE (054)
+               |         <- DONE (ticket 047)   F2  drag-to-build routing
+               |    E4  commit                 F3  auto-tiling the pieces
+               |         <- DONE (ticket 048)       (selection done, ticket
+               |    E5  demolish                    054; rendering open)
+               |         <- DONE (ticket 049)   F4  connectivity queries
                |
                +-- G  UI: build menu, city panel
                +-- H  terraforming: dig and level
@@ -791,39 +791,71 @@ world never actually got. See `finished_tickets/051-defer-world-writes-to-a-save
 
 ## F — Streets
 
-**F1. The road graph. — done, ticket 053.** Tiles plus adjacency, on the same
+**F1. The road graph. — done, ticket 053; revised to cell space and given
+F3's piece selection by ticket 054.** Tiles plus adjacency, on the same
 grid as E2. Iteration 1 needs the graph even without logistics, because F3
 and F4 both read it.
 
-How it came out: `city::road`, no new resource — `connections_at`/
+How 053 came out: `city::road`, no new resource — `connections_at`/
 `reachable_from`/`is_connected` all take `&state::City` and recompute their
-answer off its existing occupancy grid (`add_road`/`roads()`, landed with D1
-but otherwise unread until now) on every call, the same "derived, never
-stored" choice `city::grid::fit_footprint` already made for terrain fit, so
-there's nothing here that can itself go stale. `Direction`'s four offsets
-follow Minecraft's own `x`/`z` convention (north `-z`, south `+z`, east
-`+x`, west `-x`), not a screen-relative one — this module never touches a
-Bevy `Transform`, so the `bevy.z = -mc.z` flip other modules carry doesn't
-apply. `connections_at` deliberately works from a tile that isn't itself a
-road yet (F2's drag-to-build preview will want "what would this connect to"
-before committing) and reads `Occupant::Road` specifically, not "is this
-tile occupied" — a building must not read as a road neighbour.
+answer off its existing occupancy grid on every call, the same "derived,
+never stored" choice `city::grid::fit_footprint` already made for terrain
+fit, so there's nothing here that can itself go stale. `Direction`'s four
+offsets follow Minecraft's own `x`/`z` convention (north `-z`, south `+z`,
+east `+x`, west `-x`), not a screen-relative one — this module never
+touches a Bevy `Transform`, so the `bevy.z = -mc.z` flip other modules
+carry doesn't apply. `connections_at` deliberately works from a tile that
+isn't itself a road yet (F2's drag-to-build preview will want "what would
+this connect to" before committing) and reads `Occupant::Road` specifically,
+not "is this tile occupied" — a building must not read as a road neighbour.
 `reachable_from`'s BFS returns the empty set for a non-road start rather
 than a one-element set, so "reaches only itself" (a real one-tile road
 island) and "isn't a road at all" stay distinguishable — the distinction
-F4's "is this building on the network" will need. No caller yet — same
-"proven, not yet used" state tickets 039/040/042 landed their own resources
-in; F2 is the first one due.
+F4's "is this building on the network" will need.
+
+How 054 revised it: a road became a real `ROAD_CELL_SIZE` (6-block) cell —
+2 road-surface blocks flanked by a kerb and a shoulder on each side — not a
+1x1-block tile, because a rotated straight piece can't stand in for a
+corner and 053's tile model had no piece concept to get that right or
+wrong. `state::City::add_road`/`remove_road`/`roads()` became
+`add_road_cell`/`remove_road_cell`/`road_cells()`/`is_road_cell` outright
+(not added alongside the old ones — two road grids that could disagree is
+worse than one migration), each cell marking all 36 underlying block tiles
+`Occupant::Road` with the same all-or-nothing shape `place_building` uses.
+`city::road`'s whole coordinate space moved with it — `Direction`'s offsets
+are unchanged in *value* but now mean "one cell." `persistence::CitySave`'s
+`roads` field (block tiles) became `road_cells` (cell coordinates) with a
+version bump (`1` → `2`), refusing rather than silently misplacing an old
+save's roads six blocks off.
+
+054 also lands F3's *selection* half early, since it has no dependency on
+F3's rendering or F2's input: `road::RoadPieceKind` (`Isolated | DeadEnd |
+Straight | Corner | T | Cross`) and `road::select_piece`, which rotates a
+canonical connection pattern per kind through `blueprint::rotate::Rotation`'s
+own clockwise convention until it matches a cell's actual connections —
+so the returned kind and rotation are exactly what
+`blueprint::rotate_blueprint` would need to reproduce the right shape.
+`city::road_catalogue` loads the fixed six `.nbt` files (`isolated.nbt`,
+`dead_end.nbt`, `straight.nbt`, `corner.nbt`, `t.nbt`, `cross.nbt`) that
+`select_piece`'s kinds pick between, validated to be exactly
+`ROAD_CELL_SIZE` on `x`/`z`. No real pieces ship with 054 — like 039's
+`house01.nbt`, they need an actual structure-block export, not something to
+fabricate — so the catalogue is proven against synthetic fixtures and isn't
+wired into `city::run()` yet. No caller for any of this beyond its own
+tests — same "proven, not yet used" state tickets 039/040/042 landed their
+own resources in; F2 is the first one due, and what will call `select_piece`
+and `road_catalogue::RoadCatalogue::get` to actually mesh and write a cell.
 
 **F2. Drag-to-build.** Click-drag from A to B, routed over the grid, with a
-live preview of the tiles it would claim and their cost.
+live preview of the cells it would claim and their cost.
 
-**F3. Auto-tiling.** Each tile picks its piece — straight, corner, T,
-cross, end — from its neighbours in the graph, and re-picks when a neighbour
-changes. Pieces can be tiny blueprints (consistent with everything else) or
-generated block patterns; blueprints are the better default since it makes
-roads authorable in Minecraft like buildings. Slopes are the hard part and
-are a legitimate iteration-2 deferral if they bite.
+**F3. Auto-tiling.** Selection is done (ticket 054, above): each cell's
+`select_piece` answer is the kind and rotation to render, re-picked when a
+neighbour changes. What's left is wiring that to a spawned/rotated mesh
+(the same `blueprint::rotate_blueprint` + `blueprint::mesh_blueprint` path
+E3's ghost preview already uses) and to the write path (W4/W5) once F2
+gives it something to place. Slopes are the hard part and are a legitimate
+iteration-2 deferral if they bite.
 
 **F4. Connectivity queries.** "Is this building on the road network", "what
 does this road segment reach". No consumer in iteration 1 — it's the

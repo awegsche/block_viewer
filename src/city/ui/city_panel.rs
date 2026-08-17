@@ -206,7 +206,7 @@ pub(super) fn city_panel(
 
         ui.separator();
         ui.heading("Roads");
-        ui.label(format!("{} tile(s)", city.roads().count()));
+        ui.label(format!("{} cell(s)", city.road_cells().count()));
 
         ui.separator();
         ui.heading("Last edit");

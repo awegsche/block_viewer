@@ -4,9 +4,9 @@
 //!
 //! ## Why `occupancy` is never on disk
 //!
-//! [`CitySave`] is not a serialized [`City`] — it's `buildings`, `roads` and
-//! `next_id`, the same three things [`State::insert_loaded`](state::City::insert_loaded)
-//! and [`state::City::add_road`] already derive `occupancy` from at runtime.
+//! [`CitySave`] is not a serialized [`City`] — it's `buildings`, `road_cells`
+//! and `next_id`, the same three things [`State::insert_loaded`](state::City::insert_loaded)
+//! and [`state::City::add_road_cell`] already derive `occupancy` from at runtime.
 //! Storing the occupancy grid too would let a hand-edited file disagree with
 //! itself (two buildings claiming the same tile, say); rebuilding it on load
 //! through the same all-or-nothing checks [`state::City::place_building`]
@@ -30,6 +30,13 @@
 //! [`PersistenceError::UnsupportedVersion`] — refused and logged by the
 //! caller, not guessed at. A migration function is later work, once a
 //! version actually needs one.
+//!
+//! Bumped to `2` by ticket 054: version 1's `roads` field held raw block
+//! tiles, one per road block; version 2's `road_cells` holds
+//! [`super::state::ROAD_CELL_SIZE`]-block cell coordinates instead — the
+//! same `(i32, i32)` shape on disk, so a version-1 file would parse cleanly
+//! and silently misplace every road cell 6x if this weren't caught by the
+//! version check rather than left to guess.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -42,7 +49,7 @@ use crate::blueprint::Rotation;
 
 /// The `CitySave` schema version this build writes and reads. Bumped only
 /// alongside a migration path — see the module docs.
-pub const CURRENT_VERSION: u32 = 1;
+pub const CURRENT_VERSION: u32 = 2;
 
 /// Where [`save_city`]/[`load_city`] look, relative to a save's root
 /// (`SaveMeta::path`) — the roadmap's own `<save>/citybuilder/city.ron`.
@@ -61,7 +68,9 @@ struct CitySave {
     version: u32,
     next_id: u64,
     buildings: Vec<SavedBuilding>,
-    roads: Vec<(i32, i32)>,
+    /// Cell coordinates (ticket 054), not block tiles — see the module
+    /// docs' version-bump note.
+    road_cells: Vec<(i32, i32)>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -131,10 +140,10 @@ pub fn save_city(city: &City, save_root: &Path) -> Result<(), PersistenceError> 
         .collect();
     buildings.sort_by_key(|b| b.id);
 
-    let mut roads: Vec<(i32, i32)> = city.roads().map(|tile| (tile.x, tile.y)).collect();
-    roads.sort();
+    let mut road_cells: Vec<(i32, i32)> = city.road_cells().map(|cell| (cell.x, cell.y)).collect();
+    road_cells.sort();
 
-    let save = CitySave { version: CURRENT_VERSION, next_id: city.next_id_raw(), buildings, roads };
+    let save = CitySave { version: CURRENT_VERSION, next_id: city.next_id_raw(), buildings, road_cells };
     // Pretty-printed: a person may want to read or hand-edit this file, the
     // same call city::definition's RON files are written for by hand.
     let text = ron::ser::to_string_pretty(&save, ron::ser::PrettyConfig::default())
@@ -175,10 +184,10 @@ pub fn load_city(save_root: &Path) -> Result<City, PersistenceError> {
             .map_err(PersistenceError::Corrupt)?;
     }
 
-    let mut roads = save.roads;
-    roads.sort();
-    for (x, z) in roads {
-        city.add_road(IVec2::new(x, z)).map_err(PersistenceError::Corrupt)?;
+    let mut road_cells = save.road_cells;
+    road_cells.sort();
+    for (x, z) in road_cells {
+        city.add_road_cell(IVec2::new(x, z)).map_err(PersistenceError::Corrupt)?;
     }
 
     // `insert_loaded` already raised `next_id` past every id it inserted;
@@ -213,7 +222,7 @@ mod tests {
         let dir = temp_dir("missing");
         let city = load_city(&dir).expect("a missing save file is not an error");
         assert!(city.is_empty());
-        assert_eq!(city.roads().count(), 0);
+        assert_eq!(city.road_cells().count(), 0);
     }
 
     #[test]
@@ -224,7 +233,7 @@ mod tests {
 
         let loaded = load_city(&dir).unwrap();
         assert!(loaded.is_empty());
-        assert_eq!(loaded.roads().count(), 0);
+        assert_eq!(loaded.road_cells().count(), 0);
     }
 
     #[test]
@@ -237,8 +246,8 @@ mod tests {
         let b = city
             .place_building("house01", IVec3::new(0, 70, 0), Rotation::Deg90, IVec2::new(3, 5))
             .unwrap();
-        city.add_road(IVec2::new(50, 50)).unwrap();
-        city.add_road(IVec2::new(50, 51)).unwrap();
+        city.add_road_cell(IVec2::new(50, 50)).unwrap();
+        city.add_road_cell(IVec2::new(50, 51)).unwrap();
 
         save_city(&city, &dir).unwrap();
         let loaded = load_city(&dir).unwrap();
@@ -255,8 +264,8 @@ mod tests {
         // The rotated occupancy rectangle should have round-tripped too.
         assert_eq!(loaded.occupant_at(IVec2::new(4, 2)), Some(crate::city::state::Occupant::Building(b)));
 
-        assert_eq!(loaded.roads().count(), 2);
-        assert!(!loaded.is_tile_free(IVec2::new(50, 50)));
+        assert_eq!(loaded.road_cells().count(), 2);
+        assert!(loaded.is_road_cell(IVec2::new(50, 50)));
     }
 
     /// The scenario the module docs call out: the *highest*-id building is
@@ -292,12 +301,32 @@ mod tests {
         fs::create_dir_all(dir.join("citybuilder")).unwrap();
         fs::write(
             dir.join("citybuilder/city.ron"),
-            "(version: 999, next_id: 0, buildings: [], roads: [])",
+            "(version: 999, next_id: 0, buildings: [], road_cells: [])",
         )
         .unwrap();
 
         let err = load_city(&dir).unwrap_err();
         assert!(matches!(err, PersistenceError::UnsupportedVersion(999)));
+    }
+
+    /// Ticket 054: a version-1 file's `roads` field held raw block tiles,
+    /// not cell coordinates — renamed to `road_cells` on the version-2
+    /// struct, so a version-1 file (still carrying the old field name) fails
+    /// to deserialize into the new shape at all. Refused as a parse error,
+    /// same as any other malformed file — never silently loaded with old
+    /// block-tile roads reinterpreted as cell coordinates 6x too large.
+    #[test]
+    fn an_old_block_tile_road_save_is_refused_not_silently_reinterpreted() {
+        let dir = temp_dir("old_road_format");
+        fs::create_dir_all(dir.join("citybuilder")).unwrap();
+        fs::write(
+            dir.join("citybuilder/city.ron"),
+            "(version: 1, next_id: 0, buildings: [], roads: [(5, 5)])",
+        )
+        .unwrap();
+
+        let err = load_city(&dir).unwrap_err();
+        assert!(matches!(err, PersistenceError::Parse(_)), "{err:?}");
     }
 
     #[test]
@@ -317,13 +346,13 @@ mod tests {
         fs::write(
             dir.join("citybuilder/city.ron"),
             r#"(
-                version: 1,
+                version: 2,
                 next_id: 2,
                 buildings: [
                     (id: 0, definition: "house01", origin: (0, 64, 0), rotation: Deg0, footprint: (4, 4)),
                     (id: 1, definition: "house01", origin: (3, 64, 3), rotation: Deg0, footprint: (4, 4)),
                 ],
-                roads: [],
+                road_cells: [],
             )"#,
         )
         .unwrap();
@@ -333,18 +362,18 @@ mod tests {
     }
 
     #[test]
-    fn a_saved_road_colliding_with_a_building_is_corrupt() {
+    fn a_saved_road_cell_colliding_with_a_building_is_corrupt() {
         let dir = temp_dir("road_overlap");
         fs::create_dir_all(dir.join("citybuilder")).unwrap();
         fs::write(
             dir.join("citybuilder/city.ron"),
             r#"(
-                version: 1,
+                version: 2,
                 next_id: 1,
                 buildings: [
                     (id: 0, definition: "house01", origin: (0, 64, 0), rotation: Deg0, footprint: (2, 2)),
                 ],
-                roads: [(0, 0)],
+                road_cells: [(0, 0)],
             )"#,
         )
         .unwrap();
