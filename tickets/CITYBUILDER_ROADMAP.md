@@ -132,8 +132,8 @@ L1  lib.rs + two bin shims                       <- DONE (ticket 027)
                +-- E  placement          +-- F  streets
                |    E1  RTS camera, picking    <- DONE (ticket 045)
                |                                F1  road graph on the grid
-               |    E2  grid + footprint fit   F2  drag-to-build routing
-               |         <- DONE (ticket 046)
+               |    E2  grid + footprint fit        <- DONE (ticket 053)
+               |         <- DONE (ticket 046)   F2  drag-to-build routing
                |    E3  ghost + validity       F3  auto-tiling the pieces
                |         <- DONE (ticket 047)
                |    E4  commit                 F4  connectivity queries
@@ -791,9 +791,29 @@ world never actually got. See `finished_tickets/051-defer-world-writes-to-a-save
 
 ## F — Streets
 
-**F1. The road graph.** Tiles plus adjacency, on the same grid as E2.
-Iteration 1 needs the graph even without logistics, because F3 and F4 both
-read it.
+**F1. The road graph. — done, ticket 053.** Tiles plus adjacency, on the same
+grid as E2. Iteration 1 needs the graph even without logistics, because F3
+and F4 both read it.
+
+How it came out: `city::road`, no new resource — `connections_at`/
+`reachable_from`/`is_connected` all take `&state::City` and recompute their
+answer off its existing occupancy grid (`add_road`/`roads()`, landed with D1
+but otherwise unread until now) on every call, the same "derived, never
+stored" choice `city::grid::fit_footprint` already made for terrain fit, so
+there's nothing here that can itself go stale. `Direction`'s four offsets
+follow Minecraft's own `x`/`z` convention (north `-z`, south `+z`, east
+`+x`, west `-x`), not a screen-relative one — this module never touches a
+Bevy `Transform`, so the `bevy.z = -mc.z` flip other modules carry doesn't
+apply. `connections_at` deliberately works from a tile that isn't itself a
+road yet (F2's drag-to-build preview will want "what would this connect to"
+before committing) and reads `Occupant::Road` specifically, not "is this
+tile occupied" — a building must not read as a road neighbour.
+`reachable_from`'s BFS returns the empty set for a non-road start rather
+than a one-element set, so "reaches only itself" (a real one-tile road
+island) and "isn't a road at all" stay distinguishable — the distinction
+F4's "is this building on the network" will need. No caller yet — same
+"proven, not yet used" state tickets 039/040/042 landed their own resources
+in; F2 is the first one due.
 
 **F2. Drag-to-build.** Click-drag from A to B, routed over the grid, with a
 live preview of the tiles it would claim and their cost.

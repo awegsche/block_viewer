@@ -154,6 +154,18 @@
 //! [`journal::Journal::undo_last`]'s promised caller, run through the write
 //! path by the new [`undo::UndoPlugin`], the same `request`/`busy`/`state`
 //! shape `commit`/`demolish` already use.
+//!
+//! ## The road graph (ticket 053, roadmap F1)
+//!
+//! [`road`] is the first piece of group F: adjacency and reachability
+//! queries over [`state::City`]'s existing road tiles
+//! (`add_road`/`roads()`, landed with D1 but otherwise unread until now).
+//! No new stored state — a road graph is derived from `City::occupant_at`
+//! on every call, so it can never itself go stale. Not wired into `run` as
+//! a plugin; it's a pure query module, the primitive F2's drag-to-build,
+//! F3's auto-tiling and F4's connectivity queries will each call once they
+//! exist — the same "proven, not yet used" state several earlier tickets
+//! (042, 039, 040) landed their own resources in.
 
 use std::path::{Path, PathBuf};
 
@@ -165,6 +177,7 @@ mod journal;
 mod persistence;
 mod picking;
 mod placement;
+mod road;
 mod save;
 mod state;
 mod ui;
