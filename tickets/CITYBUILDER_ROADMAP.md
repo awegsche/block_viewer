@@ -2,7 +2,7 @@
 
 Not a work item; the plan for the citybuilder game and the shared world-edit
 infrastructure it needs. High-level tasks here get split into numbered
-tickets in this directory when they're picked up (next free number: 045).
+tickets in this directory when they're picked up (next free number: 047).
 Companion to `ROADMAP.md`, which covers the viewer 001–029.
 
 ## The goal
@@ -133,6 +133,7 @@ L1  lib.rs + two bin shims                       <- DONE (ticket 027)
                |    E1  RTS camera, picking    <- DONE (ticket 045)
                |                                F1  road graph on the grid
                |    E2  grid + footprint fit   F2  drag-to-build routing
+               |         <- DONE (ticket 046)
                |    E3  ghost + validity       F3  auto-tiling the pieces
                |    E4  commit                 F4  connectivity queries
                |    E5  demolish
@@ -651,10 +652,30 @@ existing `camera::block_under_cursor` — no second raycast — with no
 consumer yet, the same "proven, not yet used" state ticket 042's `City`
 landed in; E2's grid fit and E3's ghost preview are the eventual readers.
 
-**E2. Grid and footprint fit.** Tile grid, footprint occupancy, and the
-terrain rules: sample heights under the footprint, define what slope is
-buildable, decide whether the game auto-levels or refuses. The answer here
-feeds H directly.
+**E2. Grid and footprint fit. — done, ticket 046.** Tile grid, footprint
+occupancy, and the terrain rules: sample heights under the footprint, define
+what slope is buildable, decide whether the game auto-levels or refuses. The
+answer here feeds H directly.
+
+How it came out: `city::grid::fit_footprint(origin, footprint, rotation,
+&DecodedWorld) -> FootprintFit`, sampling ground through
+`ChunkColumn::topmost_non_air` against `DecodedWorld.columns` directly —
+no `RegionCache`, no I/O, the same already-decoded data E1's picking reads
+— and walking D1's own `footprint_tiles` rather than a second rotation-aware
+tile walk. The roadmap's open question ("auto-levels or refuses") resolved
+to **refuses**: levelling means writing blocks, which is W4/W5's job through
+a real `WorldEdit`, and folding that into a read-only fit check would make
+every future caller (E3's every-frame ghost preview included) secretly pay
+for the write path. Ground level within `MAX_FOOTPRINT_STEP` (1 block) fits
+at its *lowest* sampled point — a low corner clips a little into the
+building's own foundation rather than leaving a gap floating under it, given
+nothing here fills terrain in — and anything steeper is `Refused` outright,
+for H1's terraforming to fix later by hand. "Ground" reuses `world::is_solid`
+(not air), the same predicate the mesher already culls faces against, not a
+new fluid-aware classifier — a lake surface counts as ground for now,
+deliberately, per the module's own docs; that refinement is roadmap I3's job.
+No caller yet — E3's ghost preview and E4's commit are the eventual readers,
+the same "proven, not yet used" state ticket 045's `HoveredBlock` landed in.
 
 **E3. Ghost preview and validity.** The B2 mesh at the cursor with a
 translucent material, tinted by validity, snapped to the grid. Needs a

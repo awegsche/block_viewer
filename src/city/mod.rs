@@ -92,6 +92,7 @@
 use std::path::{Path, PathBuf};
 
 mod definition;
+mod grid;
 mod journal;
 mod persistence;
 mod picking;
