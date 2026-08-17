@@ -680,6 +680,14 @@ deliberately, per the module's own docs; that refinement is roadmap I3's job.
 No caller yet — E3's ghost preview and E4's commit are the eventual readers,
 the same "proven, not yet used" state ticket 045's `HoveredBlock` landed in.
 
+`is_solid` turned out to have a second gap, found once E3/E4 actually had a
+building to place near one: it treats a tree or a fence post exactly like
+terrain, so a footprint with an obstruction standing on otherwise-flat
+ground reads as a cliff and is refused, even though E4's own "air is a
+block" policy would clear the obstruction without complaint if the fit
+check weren't in the way. Not fixed here — filed as `tickets/052-terrain-fit-ignores-clutter.md`,
+open, not yet picked up.
+
 **E3. Ghost preview and validity. — done, ticket 047.** The B2 mesh at the
 cursor with a translucent material, tinted by validity, snapped to the grid.
 Needs a second material — the terrain's is `AlphaMode::Mask(0.5)`
@@ -756,6 +764,22 @@ process, so a second concurrent open from this same app fails exactly like
 Minecraft already having the world open — and unlike that case, there's no
 retry built in, so it would have failed one of the two writes outright rather
 than merely delayed it. See `finished_tickets/049-demolish.md`.
+
+**E4/E5/G2 addendum — ticket 051, "defer world writes to a manual Save."**
+Manually testing placement surfaced that every commit, demolition and undo
+above opened its own `WriteSession` and saved to disk immediately — one
+full region-file rewrite per building, per 009's own "a single-block edit
+rewrites 512×512 blocks' worth of file" note. `city::commit::apply_building_edit`
+(the renamed `commit_building`) now applies straight to the shared
+`RegionCache` with `EditPolicy::allow_dirty_regions` and stops — no session,
+no disk write, no `WriteGate` (removed; nothing opens a session per edit any
+more, so the race it prevented no longer exists). A new `city::save`
+module is the one place any of it reaches disk: "Save world" in the city
+panel opens a real `WriteSession` and calls `WriteSession::flush` (built by
+033, unused until now) to write every dirty region at once. `AppExit` also
+flushes, synchronously, before `city.ron`/`journal.ron` are written — the
+one safety net that keeps those two files from describing buildings the
+world never actually got. See `finished_tickets/051-defer-world-writes-to-a-save-button.md`.
 
 ---
 

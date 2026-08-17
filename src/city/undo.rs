@@ -1,6 +1,6 @@
 //! Undo (ticket 050, roadmap G2): the button `journal`'s own module docs
 //! have been pointing at since ticket 044 — "gives undo for free" was D3's
-//! promise, and this is where it actually gets run through the write path.
+//! promise, and this is where it actually gets run.
 //!
 //! ## Following `city::commit`/`city::demolish`'s shape, with one real difference
 //!
@@ -9,7 +9,10 @@
 //! already follow: a click sets [`UndoCommand::requested`], [`start_undo`]
 //! dispatches onto [`AsyncComputeTaskPool`], [`poll_undo`] polls it with the
 //! same `block_on(poll_once(..))` pattern every other task in this crate
-//! uses.
+//! uses. Since ticket 051, that dispatched work applies the reversal to the
+//! shared region cache in memory — see `city::commit`'s module docs'
+//! "Applied to memory, not written to disk" — a manual Save (`city::save`)
+//! is what later writes it out.
 //!
 //! The one place this can't mirror commit/demolish: neither of *those*
 //! decides what to write until a click supplies a target (a hovered tile, a
@@ -17,25 +20,18 @@
 //! [`journal::Journal::undo_last`] does" — and that call **is** the City-side
 //! reversal, not a preview of it; there is no way to ask it what it would do
 //! without it doing it. So [`start_undo`] checks every precondition it can
-//! *without* calling it first — an empty journal, no save loaded, the write
-//! gate already held, the same three guards `try_commit_placement`/
-//! `try_demolish` already check before touching anything — and only calls
-//! `undo_last` once all three are clear. From that point on there is no
-//! going back: [`journal::Journal::undo_last`]'s own docs already name this —
-//! "this call has already moved `city` and the journal on by the time it
-//! returns, on the assumption the caller commits `edit` next." A write
-//! failure after that point is not rolled back — it can't be, the entry that
-//! would describe how is already gone — and [`poll_undo`] says so rather
-//! than pretending otherwise. That's an accepted, documented gap in D3's own
-//! contract, not one this ticket introduces; checking what can be checked
-//! first just keeps it as rare as possible.
-//!
-//! ## One write of any kind at a time
-//!
-//! [`UndoCommand`] acquires [`super::write_gate::WriteGate`] before calling
-//! `undo_last` at all — a third writer alongside `city::commit`/
-//! `city::demolish`, and the gate is exactly what already keeps any two of
-//! the three from racing over the same region files.
+//! *without* calling it first — an empty journal, no save loaded, the same
+//! two guards `try_commit_placement`/`try_demolish` already check before
+//! touching anything — and only calls `undo_last` once both are clear. From
+//! that point on there is no going back: [`journal::Journal::undo_last`]'s
+//! own docs already name this — "this call has already moved `city` and the
+//! journal on by the time it returns, on the assumption the caller commits
+//! `edit` next." An apply failure after that point is not rolled back — it
+//! can't be, the entry that would describe how is already gone — and
+//! [`poll_undo`] says so rather than pretending otherwise. That's an
+//! accepted, documented gap in D3's own contract, not one this ticket
+//! introduces; checking what can be checked first just keeps it as rare as
+//! possible.
 
 use std::sync::{Arc, Mutex};
 
@@ -43,15 +39,12 @@ use bevy::prelude::*;
 use bevy::tasks::{block_on, poll_once, AsyncComputeTaskPool, Task};
 
 use crate::chunk_pipeline::{ChunksEdited, SharedRegionCache};
-use crate::edit::session::{WriteError, WriteSummary};
-use crate::edit::EditPolicy;
+use crate::edit::{EditPolicy, EditRefusal, EditReport};
 use crate::region_cache::RegionCache;
-use crate::LoadedSave;
 
-use super::commit::commit_building;
+use super::commit::apply_building_edit;
 use super::journal::{Journal, JournalEntry};
 use super::state::{BuildingId, City};
-use super::write_gate::WriteGate;
 use super::write_status::{WriteKind, WriteStatus};
 
 /// Which half of a [`JournalEntry`] an undo reversed — `city::ui::city_panel`
@@ -79,7 +72,7 @@ struct PendingUndo {
     building: BuildingId,
     definition: String,
     kind: UndoneKind,
-    task: Task<Result<WriteSummary, WriteError>>,
+    task: Task<Result<EditReport, EditRefusal>>,
 }
 
 /// What an undo command is doing, or last did — sticky terminal states, the
@@ -129,9 +122,8 @@ pub struct UndoPlugin;
 impl Plugin for UndoPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<UndoCommand>()
-            // Idempotent-either-order, the same shape `WriteGate`/`WriteStatus`
-            // already use across `city::commit`/`city::demolish`.
-            .init_resource::<WriteGate>()
+            // Idempotent-either-order, the same shape `WriteStatus` already
+            // uses across `city::commit`/`city::demolish`.
             .init_resource::<WriteStatus>()
             .add_event::<ChunksEdited>()
             .add_systems(Update, (start_undo, poll_undo).chain());
@@ -140,14 +132,12 @@ impl Plugin for UndoPlugin {
 
 /// Dispatches a requested undo: synchronously reverses the journal's most
 /// recent entry against [`City`] (see the module docs for why that can't be
-/// deferred), then commits the resulting edit onto
+/// deferred), then applies the resulting edit onto
 /// [`AsyncComputeTaskPool`].
 fn start_undo(
     mut undo: ResMut<UndoCommand>,
     mut journal: ResMut<Journal>,
     mut city: ResMut<City>,
-    mut write_gate: ResMut<WriteGate>,
-    loaded_save: Option<Res<LoadedSave>>,
     region_cache: Option<Res<SharedRegionCache>>,
 ) {
     if !std::mem::take(&mut undo.requested) {
@@ -164,38 +154,31 @@ fn start_undo(
         JournalEntry::Demolished { .. } => UndoneKind::Demolition,
     };
 
-    let (Some(loaded_save), Some(region_cache)) = (loaded_save, region_cache) else {
+    let Some(region_cache) = region_cache else {
         undo.state = UndoState::Failed { message: "no save is loaded".to_string() };
         return;
     };
-
-    if !write_gate.try_acquire() {
-        undo.state = UndoState::Failed { message: "can't undo right now, a write is already in progress".to_string() };
-        return;
-    }
 
     // The point of no return — see the module docs: `undo_last` has already
     // mutated `City` and popped the journal entry by the time it returns.
     // A failure here (`UndoError::Occupied`) is all-or-nothing against both,
     // per that function's own docs — nothing was touched, so there's nothing
-    // to write, and no write-status line to record either.
+    // to apply, and no write-status line to record either.
     let step = match journal.undo_last(&mut city) {
         Ok(step) => step,
         Err(err) => {
-            write_gate.release();
             undo.state = UndoState::Failed { message: err.to_string() };
             return;
         }
     };
 
-    let save_meta = loaded_save.0.meta.clone();
     let cache: Arc<Mutex<RegionCache>> = region_cache.0.clone();
-    let policy = EditPolicy::default();
+    let policy = EditPolicy { allow_dirty_regions: true, ..EditPolicy::default() };
     let edit = step.edit;
 
     let task = AsyncComputeTaskPool::get().spawn(async move {
         let mut cache = cache.lock().expect("region cache mutex poisoned");
-        commit_building(&save_meta, &mut cache, &edit, &policy)
+        apply_building_edit(&mut cache, &edit, &policy)
     });
 
     undo.pending = Some(PendingUndo { building: step.building, definition, kind, task });
@@ -205,27 +188,26 @@ fn start_undo(
 /// Single non-blocking poll of the in-flight undo — same
 /// `block_on(poll_once(..))` pattern every other task in this crate uses. A
 /// failure here is reported, not rolled back — see the module docs.
-fn poll_undo(mut undo: ResMut<UndoCommand>, mut write_gate: ResMut<WriteGate>, mut write_status: ResMut<WriteStatus>, mut edited: EventWriter<ChunksEdited>) {
+fn poll_undo(mut undo: ResMut<UndoCommand>, mut write_status: ResMut<WriteStatus>, mut edited: EventWriter<ChunksEdited>) {
     let result = {
         let Some(pending) = &mut undo.pending else { return };
         let Some(result) = block_on(poll_once(&mut pending.task)) else {
-            return; // Still writing.
+            return; // Still applying.
         };
         result
     };
     let PendingUndo { definition, kind, .. } = undo.pending.take().expect("just matched Some above");
-    write_gate.release();
 
     match result {
-        Ok(summary) => {
+        Ok(report) => {
             println!(
-                "block_viewer: undid {kind} {definition} ({} block(s) across {} chunk(s))",
-                summary.report.blocks_written,
-                summary.report.chunks.len()
+                "block_viewer: undid {kind} {definition} ({} block(s) across {} chunk(s), not yet saved to disk)",
+                report.blocks_written,
+                report.chunks.len()
             );
-            write_status.record_success(WriteKind::Undo, definition.clone(), &summary);
+            write_status.record_success(WriteKind::Undo, definition.clone(), &report);
             undo.state = UndoState::Done { definition, kind };
-            edited.send(ChunksEdited(summary.report.chunks));
+            edited.send(ChunksEdited(report.chunks));
         }
         Err(err) => {
             println!(
@@ -326,11 +308,7 @@ mod tests {
             definition: "house01".to_string(),
             kind: UndoneKind::Placement,
             task: pool().spawn(async {
-                Ok(WriteSummary {
-                    report: crate::edit::EditReport { blocks_written: 1, chunks: vec![(0, 0)], regions: vec![(0, 0)], replaced: None },
-                    regions_written: vec![(0, 0)],
-                    backups: vec![],
-                })
+                Ok(EditReport { blocks_written: 1, chunks: vec![(0, 0)], regions: vec![(0, 0)], replaced: None })
             }),
         });
         app.world_mut().resource_mut::<UndoCommand>().state = UndoState::Writing;
@@ -357,14 +335,14 @@ mod tests {
             building: super::super::state::City::default().place_building("house01", IVec3::ZERO, Rotation::Deg0, IVec2::ONE).unwrap(),
             definition: "house01".to_string(),
             kind: UndoneKind::Demolition,
-            task: pool().spawn(async { Err(WriteError::WorldIsOpen { save: "world".to_string() }) }),
+            task: pool().spawn(async { Err(EditRefusal::ChunkNotGenerated { chunk: (5, 0) }) }),
         });
         app.world_mut().resource_mut::<UndoCommand>().state = UndoState::Writing;
 
         run_until_settled(&mut app);
 
         let undo = app.world().resource::<UndoCommand>();
-        assert!(matches!(undo.state(), UndoState::Failed { message } if message.contains("open in Minecraft")));
+        assert!(matches!(undo.state(), UndoState::Failed { message } if message.contains("has not been generated")));
 
         let fired = app.world_mut().resource_mut::<Events<ChunksEdited>>().drain().count();
         assert_eq!(fired, 0, "the write never landed, so nothing needs re-meshing");

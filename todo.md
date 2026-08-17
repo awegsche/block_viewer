@@ -786,13 +786,13 @@ these itself (see CLAUDE.md's "Manual/visual verification").
   restart needed.
 
   Then check the City window: building counts update after each placement,
-  the road tile count matches (0 if F hasn't landed yet), and the
-  write-status section shows "Placed <id>: N block(s) across M chunk(s), K
-  region file(s)" in green right after a successful placement, with a
-  listed backup path the first time a given region is touched this session
-  and "No new backups" on a second write to the same region. Demolish that
-  building (via `Delete`, same as 049) and confirm the status line updates
-  to "Demolished …". Finally, click "Undo" and confirm: the console shows
+  the road tile count matches (0 if F hasn't landed yet), and the "Last
+  edit" section shows "Placed <id>: N block(s) across M chunk(s), K region
+  file(s) — not yet saved to disk" in green right after a successful
+  placement (ticket 051 moved the backup/region-write reporting to the new
+  "World save" section below it — see that ticket's own checklist item).
+  Demolish that building (via `Delete`, same as 049) and confirm the status
+  line updates to "Demolished …". Finally, click "Undo" and confirm: the console shows
   an "undid …" line, the write-status section shows "Undid …", the building
   reappears (if the last journal entry was the demolition) or disappears
   (if it was the placement), and clicking Undo again with an empty journal
@@ -800,3 +800,30 @@ these itself (see CLAUDE.md's "Manual/visual verification").
   silently. Also worth trying once: click Undo with no save loaded (the
   citybuilder's `empty_save` placeholder) and confirm it fails cleanly
   rather than panicking.
+
+- [ ] **051 defer world writes to a manual Save: placements don't touch
+  disk until clicked, and nothing is lost on quit.** **Back the world up
+  first** (or run this against a scratch copy) — this can write to a real
+  save, same caveat as every other write-path checklist item above.
+
+  `cargo run --bin citybuilder` against a real save. Note the `.mca` files'
+  modification times for the region(s) you're about to build in (or just
+  watch the directory). Place two or three buildings in the same region
+  without clicking "Save world": confirm (1) the ghost/live mesh updates
+  immediately for each placement, same as before this ticket, (2) the City
+  panel's "Last edit" section says "not yet saved to disk" after each one,
+  (3) the "World save" section reports the growing unsaved-region count,
+  and (4) the region file(s) on disk are untouched (mtime unchanged) the
+  whole time. Then click "Save world": confirm the status line reports the
+  regions written and any new backups, the unsaved-region count drops to
+  0, and the `.mca` file(s) now have a fresh mtime. Open the world in
+  Minecraft afterward and confirm the buildings are actually there.
+
+  Then the exit-safety half: place a building, do **not** click "Save
+  world", and quit the app (close the window). Reopen `cargo run --bin
+  citybuilder` against the same save and confirm the building is still
+  there and the region file was in fact written (mtime updated at quit
+  time, not at the placement). Console output on quit should show a
+  "flushed N unsaved region file(s)" line (or nothing, if you did click
+  Save World before quitting — confirm that case doesn't double-flush or
+  error).

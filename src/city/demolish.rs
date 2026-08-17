@@ -1,10 +1,11 @@
 //! Demolish (ticket 049, roadmap E5): the inverse of E4's commit — removes a
 //! placed building from [`City`] and restores the terrain its own
-//! *placement* baseline (roadmap I1) says stood there before it, written
-//! back through the real write path (W4-W6). Also lands
-//! [`Journal::record_demolition`]'s first real caller, and with it
-//! the `Demolished` half of D3's journal (ticket 044) — undo can now reverse
-//! either direction.
+//! *placement* baseline (roadmap I1) says stood there before it, applied
+//! back to the shared region cache (W4/W5; see `city::commit`'s module docs'
+//! "Applied to memory, not written to disk" for why this no longer touches
+//! disk itself, since ticket 051). Also lands [`Journal::record_demolition`]'s
+//! first real caller, and with it the `Demolished` half of D3's journal
+//! (ticket 044) — undo can now reverse either direction.
 //!
 //! ## Finding the target off the occupancy grid, not a menu
 //!
@@ -18,14 +19,14 @@
 //! a message rather than guessing what terrain to put back — see
 //! [`resolve_demolition_target`].
 //!
-//! ## The world write doesn't need to read the world first
+//! ## The apply doesn't need to read the world first
 //!
 //! Demolition's restoring edit is exactly the *placement*'s own baseline
 //! `previous` — the terrain that stood there before the building went in —
 //! at exactly the positions that baseline recorded
 //! ([`Baseline::restore_edit`]). Nothing here re-derives a volume
 //! from the blueprint or walks the footprint again; the placement baseline
-//! already *is* the answer. What the write *does* still capture
+//! already *is* the answer. What the apply *does* still capture
 //! (`EditPolicy::capture_replaced`) is what the building's blocks actually
 //! were at the moment of demolition — not re-derived from the blueprint
 //! either, so a building that was already damaged demolishes, and undoes, as
@@ -33,31 +34,31 @@
 //! job, called here exactly like `city::commit::poll_commit` calls it, just
 //! reading the *other* half of the baseline it produces.
 //!
-//! ## Removed from `City` only *after* the write succeeds — the mirror image
+//! ## Removed from `City` only *after* the apply succeeds — the mirror image
 //! of commit's ordering
 //!
-//! `city::commit`'s [`City::place_building`] runs *before* its write
+//! `city::commit`'s [`City::place_building`] runs *before* its apply
 //! starts, because a tile has to read occupied the instant a click lands, or
-//! a second click could claim the same tile while the first write is still
+//! a second click could claim the same tile while the first apply is still
 //! in flight. Demolition has the opposite problem: if [`try_demolish`] freed
 //! the tile immediately, a placement could land on it while the restoring
-//! write was still in flight, and whichever of the two writes reached disk
+//! apply was still in flight, and whichever of the two applies landed
 //! last would silently clobber the other's blocks — the tile has to keep
 //! reading occupied for exactly as long as *something* still intends to
 //! write there. So [`City::remove_building`] is called from
-//! [`poll_demolish`], only once the restoring write has actually succeeded,
-//! not from [`try_demolish`] at all. A failed write therefore needs no
+//! [`poll_demolish`], only once the restoring apply has actually succeeded,
+//! not from [`try_demolish`] at all. A failed apply therefore needs no
 //! rollback on the `City` side — nothing was mutated there yet — which is
 //! also why this module's failure path is shorter than commit's.
 //!
-//! ## One write of any kind at a time
+//! ## One demolition in flight at a time
 //!
 //! [`DemolishState::pending`] is this module's own single slot, the same
-//! backpressure shape `city::commit::CommitState` uses. That alone only
-//! rules out a second *demolition*; [`super::write_gate::WriteGate`] is what
-//! also rules out racing a concurrent `city::commit` — see that module's
-//! docs for why two independent `WriteSession`s from this same process is
-//! unsafe, not just wasteful.
+//! backpressure shape `city::commit::CommitState` uses. Before ticket 051 a
+//! shared `WriteGate` also ruled out racing a concurrent `city::commit` over
+//! the save's `session.lock` — see `city::commit`'s module docs for why
+//! neither module opens a session per edit any more, and why the shared
+//! `Arc<Mutex<RegionCache>>` alone is now enough.
 
 use std::sync::{Arc, Mutex};
 
@@ -66,16 +67,13 @@ use bevy::tasks::{block_on, poll_once, AsyncComputeTaskPool, Task};
 
 use crate::camera;
 use crate::chunk_pipeline::{ChunksEdited, SharedRegionCache};
-use crate::edit::session::{WriteError, WriteSummary};
-use crate::edit::{EditPolicy, WorldEdit};
+use crate::edit::{EditPolicy, EditRefusal, EditReport, WorldEdit};
 use crate::region_cache::RegionCache;
-use crate::LoadedSave;
 
-use super::commit::commit_building;
+use super::commit::apply_building_edit;
 use super::journal::{Baseline, Journal};
 use super::picking::{HoveredBlock, PickingSet};
 use super::state::{BuildingId, City, Occupant, PlacedBuilding};
-use super::write_gate::WriteGate;
 use super::write_status::{WriteKind, WriteStatus};
 
 /// A demolition's write, in flight — see the module docs.
@@ -89,7 +87,7 @@ struct PendingDemolition {
     /// demolition's own baseline ([`Baseline::capture`] needs the
     /// edit *and* the report it produced) without recomputing it.
     edit: WorldEdit,
-    task: Task<Result<WriteSummary, WriteError>>,
+    task: Task<Result<EditReport, EditRefusal>>,
 }
 
 /// One demolition at a time — see the module docs.
@@ -103,11 +101,9 @@ pub struct DemolishPlugin;
 impl Plugin for DemolishPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<DemolishState>()
-            // `city::commit::CommitPlugin` initializes the same resource —
-            // see `write_gate`'s module docs; `init_resource` only inserts a
-            // default when one isn't already present.
-            .init_resource::<WriteGate>()
-            // Same idempotent-either-order shape — see `write_status`'s
+            // `city::commit::CommitPlugin`/`city::undo::UndoPlugin`
+            // initialize the same resource — `init_resource` only inserts a
+            // default when one isn't already present. See `write_status`'s
             // module docs.
             .init_resource::<WriteStatus>()
             .add_event::<ChunksEdited>()
@@ -138,7 +134,7 @@ enum DemolitionTarget {
 /// Resolves what `Delete` should demolish at `hovered`'s `(x, z)` tile — a
 /// plain function, not a system, so it's callable directly from a test
 /// against a bare [`City`]/[`Journal`] with no `App` involved, the same split
-/// `city::commit`'s `blueprint_edit`/`commit_building` use.
+/// `city::commit`'s `blueprint_edit`/`apply_building_edit` use.
 fn resolve_demolition_target(hovered: IVec3, city: &City, journal: &Journal) -> DemolitionTarget {
     let tile = IVec2::new(hovered.x, hovered.z);
     let Some(Occupant::Building(building)) = city.occupant_at(tile) else {
@@ -154,7 +150,7 @@ fn resolve_demolition_target(hovered: IVec3, city: &City, journal: &Journal) -> 
     DemolitionTarget::Found { building, placement, baseline: baseline.clone() }
 }
 
-/// `Delete` on a hovered building: dispatches its restoring write onto
+/// `Delete` on a hovered building: dispatches its restoring apply onto
 /// [`AsyncComputeTaskPool`] — see the module docs for why [`City`]
 /// itself isn't touched here at all.
 fn try_demolish(
@@ -164,8 +160,6 @@ fn try_demolish(
     city: Res<City>,
     journal: Res<Journal>,
     mut demolish: ResMut<DemolishState>,
-    mut write_gate: ResMut<WriteGate>,
-    loaded_save: Option<Res<LoadedSave>>,
     region_cache: Option<Res<SharedRegionCache>>,
 ) {
     // Same guard `camera.rs`'s own input systems use — a keystroke egui is
@@ -197,28 +191,18 @@ fn try_demolish(
         return;
     }
 
-    let (Some(loaded_save), Some(region_cache)) = (loaded_save, region_cache) else {
+    let Some(region_cache) = region_cache else {
         println!("block_viewer: can't demolish a building: no save is loaded");
         return;
     };
 
-    if !write_gate.try_acquire() {
-        // Very likely `city::commit` mid-write on some other tile. Nothing
-        // has been mutated on this side yet, so there's nothing to roll
-        // back — the player can just press `Delete` again once the other
-        // write settles. See `write_gate`'s module docs.
-        println!("block_viewer: can't demolish right now, a write is already in progress");
-        return;
-    }
-
-    let save_meta = loaded_save.0.meta.clone();
     let cache: Arc<Mutex<RegionCache>> = region_cache.0.clone();
-    let policy = EditPolicy { capture_replaced: true, ..EditPolicy::default() };
+    let policy = EditPolicy { capture_replaced: true, allow_dirty_regions: true, ..EditPolicy::default() };
     let task_edit = edit.clone();
 
     let task = AsyncComputeTaskPool::get().spawn(async move {
         let mut cache = cache.lock().expect("region cache mutex poisoned");
-        commit_building(&save_meta, &mut cache, &task_edit, &policy)
+        apply_building_edit(&mut cache, &task_edit, &policy)
     });
 
     demolish.pending = Some(PendingDemolition { building, placement, edit, task });
@@ -234,39 +218,37 @@ fn poll_demolish(
     mut demolish: ResMut<DemolishState>,
     mut city: ResMut<City>,
     mut journal: ResMut<Journal>,
-    mut write_gate: ResMut<WriteGate>,
     mut write_status: ResMut<WriteStatus>,
     mut edited: EventWriter<ChunksEdited>,
 ) {
     let result = {
         let Some(pending) = &mut demolish.pending else { return };
         let Some(result) = block_on(poll_once(&mut pending.task)) else {
-            return; // Still writing.
+            return; // Still applying.
         };
         result
     };
     let PendingDemolition { building, placement, edit, .. } = demolish.pending.take().expect("just matched Some above");
-    write_gate.release();
 
     match result {
-        Ok(summary) => {
+        Ok(report) => {
             // Only now does the building actually leave `City` — the tile
-            // was kept "occupied" for the entire write, on purpose.
+            // was kept "occupied" for the entire apply, on purpose.
             city.remove_building(building);
-            let blocks = summary.report.blocks_written;
-            let chunks = summary.report.chunks.len();
+            let blocks = report.blocks_written;
+            let chunks = report.chunks.len();
             println!(
-                "block_viewer: demolished {} ({blocks} block(s) restored across {chunks} chunk(s))",
+                "block_viewer: demolished {} ({blocks} block(s) restored across {chunks} chunk(s), not yet saved to disk)",
                 placement.definition
             );
             // `EditPolicy::capture_replaced` was on, so this is always
             // `Some` here — see the module docs on what each half of this
             // particular baseline means for a demolition.
-            if let Some(baseline) = Baseline::capture(&edit, &summary.report) {
+            if let Some(baseline) = Baseline::capture(&edit, &report) {
                 journal.record_demolition(building, placement.clone(), baseline);
             }
-            write_status.record_success(WriteKind::Demolished, placement.definition, &summary);
-            edited.send(ChunksEdited(summary.report.chunks));
+            write_status.record_success(WriteKind::Demolished, placement.definition, &report);
+            edited.send(ChunksEdited(report.chunks));
         }
         Err(err) => {
             println!("block_viewer: demolition of {} failed, nothing was changed: {err}", placement.definition);
@@ -346,13 +328,13 @@ mod tests {
     // --- try_demolish / poll_demolish: through a real App -------------------
     //
     // Same split `city::commit`'s own tests use: the pure decision logic
-    // (above) is tested directly; the write itself is proven once by
-    // `city::commit`'s own `commit_building` tests (this module reuses that
-    // exact function), so what's left to prove here is the `City`/`Journal`/
-    // `WriteGate` glue, through a task whose result is fixed ahead of time.
+    // (above) is tested directly; the apply itself is proven once by
+    // `city::commit`'s own `apply_building_edit` tests (this module reuses
+    // that exact function), so what's left to prove here is the
+    // `City`/`Journal` glue, through a task whose result is fixed ahead of
+    // time.
 
     use bevy::tasks::{AsyncComputeTaskPool, TaskPool};
-    use crate::edit::EditReport;
 
     fn pool() -> &'static AsyncComputeTaskPool {
         AsyncComputeTaskPool::get_or_init(TaskPool::default)
@@ -392,8 +374,7 @@ mod tests {
             regions: vec![(0, 0)],
             replaced: Some(vec![(IVec3::new(0, 64, 0), state_named("minecraft:stone"))]),
         };
-        let summary = WriteSummary { report, regions_written: vec![(0, 0)], backups: vec![] };
-        let task = pool().spawn(async move { Ok(summary) });
+        let task = pool().spawn(async move { Ok(report) });
 
         app.world_mut().resource_mut::<DemolishState>().pending =
             Some(PendingDemolition { building, placement: a_placement(), edit: task_edit, task });
@@ -429,7 +410,7 @@ mod tests {
             .place_building("house01", IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::new(1, 1))
             .unwrap();
 
-        let task = pool().spawn(async { Err(WriteError::WorldIsOpen { save: "world".to_string() }) });
+        let task = pool().spawn(async { Err(EditRefusal::Empty) });
         app.world_mut().resource_mut::<DemolishState>().pending =
             Some(PendingDemolition { building, placement: a_placement(), edit: WorldEdit::new(), task });
 
@@ -523,20 +504,20 @@ mod tests {
         // baseline exactly like `poll_commit` does.
         let mut place_edit = WorldEdit::new();
         place_edit.set(IVec3::new(1, 5, 1), state_named("minecraft:stone"));
-        let policy = EditPolicy { capture_replaced: true, ..EditPolicy::default() };
-        let place_summary = commit_building(&fixture.meta, &mut cache, &place_edit, &policy).expect("the placement write");
-        let placement_baseline = Baseline::capture(&place_edit, &place_summary.report).unwrap();
+        let policy = EditPolicy { capture_replaced: true, allow_dirty_regions: true, ..EditPolicy::default() };
+        let place_report = apply_building_edit(&mut cache, &place_edit, &policy).expect("the placement apply");
+        let placement_baseline = Baseline::capture(&place_edit, &place_report).unwrap();
         assert_eq!(block_name_at(&mut cache, IVec3::new(1, 5, 1)), "minecraft:stone");
 
         // Now demolish it: the restoring edit is exactly the placement
         // baseline's own `previous` half.
         let restore_edit = placement_baseline.restore_edit();
-        let restore_summary = commit_building(&fixture.meta, &mut cache, &restore_edit, &policy).expect("the restoring write");
+        let restore_report = apply_building_edit(&mut cache, &restore_edit, &policy).expect("the restoring apply");
         assert_eq!(block_name_at(&mut cache, IVec3::new(1, 5, 1)), "minecraft:dirt", "the original terrain is back");
 
         // And the demolition's own baseline recorded the building's actual
         // block (stone) as `previous` — not re-derived from anything.
-        let demolition_baseline = Baseline::capture(&restore_edit, &restore_summary.report).unwrap();
+        let demolition_baseline = Baseline::capture(&restore_edit, &restore_report).unwrap();
         assert_eq!(demolition_baseline.previous, vec![(IVec3::new(1, 5, 1), state_named("minecraft:stone"))]);
         assert_eq!(demolition_baseline.written, vec![(IVec3::new(1, 5, 1), state_named("minecraft:dirt"))]);
     }

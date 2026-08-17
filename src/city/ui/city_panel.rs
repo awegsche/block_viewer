@@ -9,16 +9,29 @@
 //! docs have been pointing at since ticket 044 — [`super::super::undo`] is
 //! the write path behind it; this panel is only the button and the status
 //! line.
+//!
+//! Ticket 051 split "write status" into two sections: [`write_status_section`]
+//! now shows the last placement/demolition/undo *applied to memory*, and
+//! [`save_section`] is new — the "Save world" button and the last actual
+//! disk write's own result, plus how many regions are currently dirty (read
+//! straight off the shared [`crate::region_cache::RegionCache`] via a
+//! `try_lock`, since it's also being written to by whichever of
+//! commit/demolish/undo/save is mid-apply; a UI count one frame stale from a
+//! contended lock is harmless, so this skips the count that frame rather
+//! than blocking on it).
 
 use std::collections::HashMap;
 
 use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts};
 
+use crate::chunk_pipeline::SharedRegionCache;
+
 use super::super::journal::Journal;
+use super::super::save::{SaveCommand, SaveState};
 use super::super::state;
 use super::super::undo::{UndoCommand, UndoState};
-use super::super::write_status::{LastWrite, WriteKind, WriteStatus};
+use super::super::write_status::{LastSave, LastWrite, WriteKind, WriteStatus};
 
 /// A written file's status line is green rather than the default text
 /// colour — the same call `viewer::ui::selection_panel`'s own `WROTE_COLOR`
@@ -51,14 +64,14 @@ fn kind_verb(kind: WriteKind) -> &'static str {
     }
 }
 
-/// The "last write" section: what happened, how many blocks/chunks/regions,
-/// and where the backups went — the roadmap's own "last write, dirty
-/// regions, backup location" in one block. `None` (nothing written this
+/// The "Last edit" section: what happened, how many blocks/chunks/regions —
+/// applied to the shared region cache, not yet written to disk (ticket 051;
+/// see [`save_section`] for the disk side). `None` (nothing applied this
 /// session yet) is a plain message, the same tone every other empty state in
 /// this crate's panels uses.
 fn write_status_section(ui: &mut egui::Ui, last: Option<&LastWrite>) {
     let Some(last) = last else {
-        ui.label("(nothing written to the world yet this session)");
+        ui.label("(nothing built or demolished yet this session)");
         return;
     };
 
@@ -67,7 +80,7 @@ fn write_status_section(ui: &mut egui::Ui, last: Option<&LastWrite>) {
             ui.colored_label(
                 WROTE_COLOR,
                 format!(
-                    "{} {}: {} block(s) across {} chunk(s), {} region file(s)",
+                    "{} {}: {} block(s) across {} chunk(s), {} region file(s) — not yet saved to disk",
                     kind_verb(record.kind),
                     record.building,
                     record.blocks,
@@ -75,18 +88,67 @@ fn write_status_section(ui: &mut egui::Ui, last: Option<&LastWrite>) {
                     record.regions.len(),
                 ),
             );
-            if record.backups.is_empty() {
-                ui.label("No new backups (already backed up earlier this session, or backups are off).");
-            } else {
-                ui.label(format!("Backed up {} region file(s):", record.backups.len()));
+        }
+        LastWrite::Failed { kind, building, message } => {
+            ui.colored_label(egui::Color32::RED, format!("{} {} failed: {message}", kind_verb(*kind), building));
+        }
+    }
+}
+
+/// The "World save" section: the roadmap's own "dirty regions, backup
+/// location" half, plus the button that actually flushes them. The dirty
+/// count is read straight off the shared region cache, `try_lock`ed rather
+/// than blocked on — a save or an in-flight commit/demolish/undo can hold
+/// the same mutex, and a stale count for one frame is harmless where
+/// blocking the UI thread on it would not be.
+fn save_section(ui: &mut egui::Ui, region_cache: Option<&SharedRegionCache>, last_save: Option<&LastSave>, save: &mut SaveCommand) {
+    let dirty = region_cache.and_then(|cache| cache.0.try_lock().ok().map(|cache| cache.dirty_regions().count()));
+
+    match dirty {
+        Some(0) => ui.label("(nothing unsaved)"),
+        Some(n) => ui.label(format!("{n} region file(s) with unsaved changes")),
+        None => ui.label("(unsaved-region count unavailable right now)"),
+    };
+
+    let response = ui.add_enabled(!save.busy(), egui::Button::new("Save world"));
+    if response.clicked() {
+        save.request();
+    }
+    response.on_disabled_hover_text(if save.busy() { "Already saving." } else { "" });
+
+    match save.state() {
+        SaveState::Idle => {}
+        SaveState::Saving => {
+            ui.label("Saving…");
+            ui.spinner();
+        }
+        SaveState::Done { regions, backups } => {
+            ui.colored_label(WROTE_COLOR, format!("Saved {regions} region file(s), {backups} new backup(s)."));
+        }
+        SaveState::Failed { message } => {
+            ui.colored_label(egui::Color32::RED, format!("Save failed: {message}"));
+        }
+    }
+
+    // `SaveState` above already says whether *this* click succeeded or
+    // failed; `last_save` is the roadmap's own "dirty regions, backup
+    // location" — which files the most recent successful save actually
+    // touched and where the originals went, which stays worth showing even
+    // once `SaveState` has moved on to a later click's own `Saving`/`Failed`.
+    match last_save {
+        Some(LastSave::Success(record)) => {
+            ui.label(format!("Last save wrote {} region file(s).", record.regions.len()));
+            if !record.backups.is_empty() {
+                ui.label("Backup location(s):");
                 for path in &record.backups {
                     ui.add(egui::Label::new(egui::RichText::new(path.display().to_string()).monospace().small()).wrap());
                 }
             }
         }
-        LastWrite::Failed { kind, building, message } => {
-            ui.colored_label(egui::Color32::RED, format!("{} {} failed: {message}", kind_verb(*kind), building));
+        Some(LastSave::Failed { message }) => {
+            ui.label(format!("Last save attempt: {message}"));
         }
+        None => {}
     }
 }
 
@@ -120,12 +182,15 @@ fn undo_section(ui: &mut egui::Ui, journal: &Journal, undo: &mut UndoCommand) {
     }
 }
 
-/// Egui window: buildings, roads, write status, undo. See the module docs.
+/// Egui window: buildings, roads, write status, world save, undo. See the
+/// module docs.
 pub(super) fn city_panel(
     mut contexts: EguiContexts,
     city: Res<state::City>,
     journal: Res<Journal>,
     write_status: Res<WriteStatus>,
+    region_cache: Option<Res<SharedRegionCache>>,
+    mut save: ResMut<SaveCommand>,
     mut undo: ResMut<UndoCommand>,
 ) {
     egui::Window::new("City").show(contexts.ctx_mut(), |ui| {
@@ -144,8 +209,12 @@ pub(super) fn city_panel(
         ui.label(format!("{} tile(s)", city.roads().count()));
 
         ui.separator();
-        ui.heading("Write status");
+        ui.heading("Last edit");
         write_status_section(ui, write_status.last());
+
+        ui.separator();
+        ui.heading("World save");
+        save_section(ui, region_cache.as_deref(), write_status.last_save(), &mut save);
 
         ui.separator();
         ui.heading("Undo");

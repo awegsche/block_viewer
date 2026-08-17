@@ -100,31 +100,44 @@
 //! ## Commit (ticket 048, roadmap E4)
 //!
 //! [`commit::CommitPlugin`] is what turns a valid (green) ghost into a real
-//! building: a left click claims the tile in [`state::City`], writes the
-//! rotated blueprint through the real write path (W4-W6) on
-//! `AsyncComputeTaskPool`, and — once that write actually succeeds — records
+//! building: a left click claims the tile in [`state::City`], applies the
+//! rotated blueprint to the shared region cache (W4/W5) on
+//! `AsyncComputeTaskPool`, and — once that apply actually succeeds — records
 //! the as-built baseline in [`journal::Journal`] (roadmap I1, landing here
 //! per the roadmap's own instruction to ship it with E4) and fires
 //! `ChunksEdited` so the building appears without a restart (W7). A failed
-//! write rolls the city entry back rather than leaving a phantom building
-//! behind — see [`commit`]'s module docs for the whole transaction. This is
-//! the first thing in the game that writes to the save at all; everything
-//! before it only read.
+//! apply rolls the city entry back rather than leaving a phantom building
+//! behind — see [`commit`]'s module docs for the whole transaction, and its
+//! "Applied to memory, not written to disk" note (ticket 051): this is the
+//! first thing in the game that changes the save's blocks at all, but
+//! nothing reaches disk until [`save::SavePlugin`] does.
 //!
 //! ## Demolish (ticket 049, roadmap E5)
 //!
 //! [`demolish::DemolishPlugin`] is commit's inverse: `Delete` on a hovered,
-//! placed building removes it from [`state::City`] and writes the terrain
-//! its own placement baseline (roadmap I1) says stood there back through the
-//! write path — no re-derivation from the blueprint, the baseline already
+//! placed building removes it from [`state::City`] and applies the terrain
+//! its own placement baseline (roadmap I1) says stood there back to the
+//! region cache — no re-derivation from the blueprint, the baseline already
 //! *is* the answer. It also lands [`journal::Journal::record_demolition`]'s
 //! first real caller, the `Demolished` half of D3's journal (ticket 044)
 //! that had existed, unused, since then. Unlike commit, the `City` removal
-//! happens *after* the write succeeds rather than before — see
+//! happens *after* the apply succeeds rather than before — see
 //! [`demolish`]'s module docs for why that ordering, not commit's, is the
-//! one that's safe here. [`write_gate::WriteGate`] is a small resource
-//! shared with [`commit::CommitPlugin`] so the two can't both have a
-//! `WriteSession` open at once.
+//! one that's safe here.
+//!
+//! ## Save world (ticket 051)
+//!
+//! Commit, demolish and undo all queue their edits in the shared region
+//! cache and stop — see `city::commit`'s module docs' "Applied to memory,
+//! not written to disk" for why placing a street of houses no longer
+//! rewrites a whole region file per house. [`save::SavePlugin`] is the one
+//! place any of that actually reaches disk: a "Save world" click
+//! (`city::ui::city_panel`) opens a real
+//! [`crate::edit::session::WriteSession`] and flushes every dirty region,
+//! backing each one up once per session. [`flush_world_on_exit`] calls the
+//! same flush synchronously on [`AppExit`], before `city.ron`/`journal.ron`
+//! are written — without it, quitting with something unsaved would leave
+//! those two files describing buildings the world never actually got.
 //!
 //! ## The build menu and city panel (ticket 050, roadmap G)
 //!
@@ -152,10 +165,10 @@ mod journal;
 mod persistence;
 mod picking;
 mod placement;
+mod save;
 mod state;
 mod ui;
 mod undo;
-mod write_gate;
 mod write_status;
 
 use bevy::app::AppExit;
@@ -164,7 +177,8 @@ use bevy::prelude::*;
 use crate::{
     blueprint,
     camera::{self, CameraMode, CameraStartMode},
-    chunk_pipeline::RenderFloor,
+    chunk_pipeline::{RenderFloor, SharedRegionCache},
+    edit::session::WriteSession,
     world::decode::FloorPolicy,
     world_app, LoadedSave,
 };
@@ -209,6 +223,7 @@ pub fn run() {
         .add_plugins(commit::CommitPlugin)
         .add_plugins(demolish::DemolishPlugin)
         .add_plugins(undo::UndoPlugin)
+        .add_plugins(save::SavePlugin)
         .add_plugins(ui::UiPlugin)
         // Ticket 050's build menu/city panel need to have drawn this frame
         // before `drive_camera` and the picking/placement/commit/demolish
@@ -216,7 +231,10 @@ pub fn run() {
         // the same two lines `viewer::run` uses `ui::UiPanelSet` for, see
         // that module's own docs for the fuller argument.
         .configure_sets(Update, camera::CameraSet.after(ui::UiPanelSet))
-        .add_systems(Last, (save_city_on_exit, save_journal_on_exit))
+        // `flush_world_on_exit` first: `city.ron`/`journal.ron` describe
+        // buildings whose blocks need to have actually reached disk by the
+        // time they're written — see the module docs' "Save world".
+        .add_systems(Last, (flush_world_on_exit, save_city_on_exit, save_journal_on_exit).chain())
         .run();
 }
 
@@ -244,6 +262,45 @@ fn load_city(save_root: &Path) -> state::City {
             println!("block_viewer: could not load city save, starting empty: {err}");
             state::City::default()
         }
+    }
+}
+
+/// Flushes every dirty region the shared region cache is holding to disk on
+/// every [`AppExit`] — see the module docs' "Save world" for why this can't
+/// wait for the player to remember to click "Save world" themselves:
+/// `city.ron`/`journal.ron` (written right after this, by
+/// [`save_city_on_exit`]/[`save_journal_on_exit`]) describe buildings whose
+/// blocks need to have actually reached disk, or the three files disagree
+/// the moment the app reopens. Synchronous, not dispatched onto
+/// `AsyncComputeTaskPool` like [`save::start_save`] — the app is already
+/// exiting, so blocking here costs nothing a player would notice, and there
+/// is no later frame for an async task to be polled on. A no-op when either
+/// resource is missing (no real save loaded) or nothing is dirty.
+fn flush_world_on_exit(
+    mut exit_events: EventReader<AppExit>,
+    loaded_save: Option<Res<LoadedSave>>,
+    region_cache: Option<Res<SharedRegionCache>>,
+) {
+    if exit_events.read().count() == 0 {
+        return;
+    }
+    let (Some(loaded_save), Some(region_cache)) = (loaded_save, region_cache) else { return };
+
+    let mut cache = region_cache.0.lock().expect("region cache mutex poisoned");
+    if cache.dirty_regions().count() == 0 {
+        return;
+    }
+
+    match WriteSession::open(&loaded_save.0.meta) {
+        Ok(mut session) => match session.flush(&mut *cache) {
+            Ok(summary) => println!(
+                "block_viewer: flushed {} unsaved region file(s) on exit ({} new backup(s))",
+                summary.regions_written.len(),
+                summary.backups.len()
+            ),
+            Err(err) => println!("block_viewer: could not flush unsaved world edits on exit: {err}"),
+        },
+        Err(err) => println!("block_viewer: could not flush unsaved world edits on exit: {err}"),
     }
 }
 

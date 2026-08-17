@@ -1,8 +1,8 @@
 //! Commit (ticket 048, roadmap E4): turns a valid ghost preview into a real
-//! building — a [`state::City`] entry, blocks written through the real
-//! write path (W4/W5/W6), and a journal entry carrying the as-built
-//! baseline (roadmap I1, which "ships with E4, in iteration 1" per the
-//! roadmap).
+//! building — a [`state::City`] entry, blocks applied to the shared
+//! [`RegionCache`] (see "Applied to memory, not written to disk" below), and
+//! a journal entry carrying the as-built baseline (roadmap I1, which "ships
+//! with E4, in iteration 1" per the roadmap).
 //!
 //! ## Recomputing, not reusing, the ghost's answer
 //!
@@ -14,21 +14,33 @@
 //! (rotation, and ticket 048's own `y_offset`), not a stale answer from
 //! whenever the ghost system last ran.
 //!
-//! ## Synchronous city entry, asynchronous write
+//! ## Applied to memory, not written to disk (ticket 051)
+//!
+//! [`apply_building_edit`] mutates the shared [`RegionCache`] and leaves the
+//! touched region(s) dirty — it does **not** open a
+//! [`crate::edit::session::WriteSession`] and does **not** touch disk.
+//! Ticket 048 originally had every commit open its own session and save
+//! immediately, which meant a street of houses rewrote a whole `.mca` file
+//! per house; ticket 051 deferred the actual write to a manual Save
+//! (`city::save`), which flushes every dirty region at once via
+//! [`crate::edit::session::WriteSession::flush`]. The live mesh still
+//! updates immediately — [`ChunksEdited`] fires off the in-memory apply, the
+//! same as before — only the disk write is deferred.
+//!
+//! ## Synchronous city entry, asynchronous apply
 //!
 //! [`state::City::place_building`] is cheap (an occupancy check over a
 //! `HashMap`, no I/O) and runs the instant a click is accepted — the tile
-//! claim exists before the write starts, which is what stops a second click
-//! on the same spot from racing the first. The actual
-//! [`crate::edit::session::WriteSession::open`]/`commit` — disk I/O, a
-//! `session.lock`, up to four region files — runs on
-//! [`AsyncComputeTaskPool`], the same shape `viewer::paint`'s
-//! `start_paint`/`poll_paint` already established for W8. [`poll_commit`]
+//! claim exists before the apply starts, which is what stops a second click
+//! on the same spot from racing the first. [`apply_building_edit`] still
+//! runs on [`AsyncComputeTaskPool`] (a region not yet resident in the cache
+//! is a disk read), the same shape `viewer::paint`'s
+//! `start_paint`/`poll_paint` established for W8. [`poll_commit`]
 //! is this ticket's mirror of `poll_paint`: on success it journals the
 //! baseline and fires [`ChunksEdited`]; on failure it calls
 //! [`state::City::remove_building`], which is the "transactionally" half of
 //! the roadmap's own wording for E4 — the synchronous entry doesn't survive
-//! a write that didn't happen.
+//! an apply that didn't happen.
 //!
 //! ## `blueprint_edit`: air is written, not skipped
 //!
@@ -44,44 +56,40 @@
 //! a build and the mesh that previewed it never disagree about which corner
 //! is which.
 //!
-//! ## One commit in flight at a time — and, as of ticket 049, one write of
-//! any kind
+//! ## One commit in flight at a time
 //!
 //! [`CommitState::pending`] is a single slot, the same backpressure
 //! [`crate::blueprint::BlueprintExtraction`]/`viewer::paint::PaintCommand`
-//! already use — a second commit racing the first over the same region
-//! files is exactly the failure mode W6 (ticket 033) exists to prevent.
-//! [`try_commit_placement`] simply does nothing while a commit is pending;
-//! there's no build-menu affordance yet to disable, the same "no UI beyond
-//! what already exists" state ticket 047 left this whole feature area in.
+//! already use. [`try_commit_placement`] simply does nothing while a commit
+//! is pending; there's no build-menu affordance yet to disable, the same "no
+//! UI beyond what already exists" state ticket 047 left this whole feature
+//! area in.
 //!
-//! That slot alone only rules out a second *commit*. `city::demolish`
-//! (ticket 049, roadmap E5) opens its own `WriteSession`s the same way, on
-//! its own tiles, and the two modules know nothing about each other's
-//! `pending` — [`super::write_gate::WriteGate`] is the shared flag that
-//! actually serializes them; see its module docs for why that's not just
-//! belt-and-braces.
+//! Before ticket 051, that slot alone only ruled out a second *commit* —
+//! `city::demolish` opened its own `WriteSession` the same way, on its own
+//! tiles, and the two modules knew nothing about each other's `pending`, so
+//! a shared `WriteGate` serialized their session locks. Neither module opens
+//! a session per edit any more (see "Applied to memory, not written to
+//! disk" above), so that race no longer exists — the shared
+//! `Arc<Mutex<RegionCache>>` still serializes concurrent applies correctly
+//! on its own, and `WriteGate` was removed.
 
 use std::sync::{Arc, Mutex};
 
 use bevy::prelude::*;
 use bevy::tasks::{block_on, poll_once, AsyncComputeTaskPool, Task};
-use mc_anvil::SaveMeta;
 
 use crate::blueprint::{self, Blueprint, BuildingCatalogue, Rotation};
 use crate::camera;
 use crate::chunk_pipeline::{ChunksEdited, SharedRegionCache};
-use crate::edit::session::{WriteError, WriteSession, WriteSummary};
-use crate::edit::{EditPolicy, WorldEdit};
+use crate::edit::{EditPolicy, EditRefusal, EditReport, WorldEdit};
 use crate::region_cache::RegionCache;
 use crate::DecodedWorld;
-use crate::LoadedSave;
 
 use super::journal::{self, Journal};
 use super::picking::{HoveredBlock, PickingSet};
 use super::placement::{self, GhostPlacement, PlacementSelection};
 use super::state::{self, BuildingId, PlacedBuilding};
-use super::write_gate::WriteGate;
 use super::write_status::{WriteKind, WriteStatus};
 
 /// A commit's write, in flight — see the module docs.
@@ -92,7 +100,7 @@ struct PendingCommit {
     /// ([`journal::Baseline::capture`] needs the edit *and* the report it
     /// produced) without recomputing it from the blueprint a second time.
     edit: WorldEdit,
-    task: Task<Result<WriteSummary, WriteError>>,
+    task: Task<Result<EditReport, EditRefusal>>,
 }
 
 /// One commit at a time — see the module docs.
@@ -106,13 +114,11 @@ pub struct CommitPlugin;
 impl Plugin for CommitPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<CommitState>()
-            // `city::demolish::DemolishPlugin` initializes the same
-            // resource — `init_resource` only inserts a default when one
-            // isn't already present, so it doesn't matter which plugin adds
-            // to the app first. See `write_gate`'s module docs.
-            .init_resource::<WriteGate>()
-            // Same idempotent-either-order shape as `WriteGate` above — see
-            // `write_status`'s module docs.
+            // `city::demolish::DemolishPlugin`/`city::undo::UndoPlugin`
+            // initialize the same resource — `init_resource` only inserts a
+            // default when one isn't already present, so it doesn't matter
+            // which plugin adds to the app first. See `write_status`'s
+            // module docs.
             .init_resource::<WriteStatus>()
             // Registered here rather than assumed from `ChunkLoadPipelinePlugin`
             // — `add_event` is idempotent, the same defensive call
@@ -150,21 +156,15 @@ fn blueprint_edit(blueprint: &Blueprint, origin: IVec3) -> WorldEdit {
     edit
 }
 
-/// Opens a write session and commits `edit` through `cache` — pulled out on
-/// its own the same way `viewer::paint::commit_fill` is, so it's callable
-/// directly from a test rather than only through a real
-/// `AsyncComputeTaskPool` task. `pub(super)`: `city::demolish` (ticket 049,
-/// roadmap E5) reuses this verbatim for its own restoring write — opening a
-/// session and committing an edit through it doesn't care which direction
-/// the edit is going.
-pub(super) fn commit_building(
-    save: &SaveMeta,
-    cache: &mut RegionCache,
-    edit: &WorldEdit,
-    policy: &EditPolicy,
-) -> Result<WriteSummary, WriteError> {
-    let mut session = WriteSession::open(save)?;
-    session.commit(edit, cache, policy)
+/// Applies `edit` to `cache` in memory — no [`crate::edit::session::WriteSession`],
+/// no disk write; see the module docs' "Applied to memory, not written to
+/// disk". Pulled out on its own the same way `viewer::paint::commit_fill`
+/// is, so it's callable directly from a test rather than only through a real
+/// `AsyncComputeTaskPool` task. `pub(super)`: `city::demolish` and
+/// `city::undo` reuse this verbatim for their own edits — applying an edit
+/// to the cache doesn't care which direction it's going or why.
+pub(super) fn apply_building_edit(cache: &mut RegionCache, edit: &WorldEdit, policy: &EditPolicy) -> Result<EditReport, EditRefusal> {
+    crate::edit::apply_routed(edit, cache, policy)
 }
 
 /// Left-click on a valid placement: claims the tile in [`state::City`]
@@ -180,8 +180,6 @@ fn try_commit_placement(
     world: Res<DecodedWorld>,
     mut city: ResMut<state::City>,
     mut commit: ResMut<CommitState>,
-    mut write_gate: ResMut<WriteGate>,
-    loaded_save: Option<Res<LoadedSave>>,
     region_cache: Option<Res<SharedRegionCache>>,
 ) {
     if commit.pending.is_some() || egui_input.pointer || !mouse.just_pressed(MouseButton::Left) {
@@ -218,7 +216,7 @@ fn try_commit_placement(
         }
     };
 
-    let (Some(loaded_save), Some(region_cache)) = (loaded_save, region_cache) else {
+    let Some(region_cache) = region_cache else {
         println!("block_viewer: can't place a building: no save is loaded");
         return;
     };
@@ -241,25 +239,13 @@ fn try_commit_placement(
     };
     let placed = PlacedBuilding { definition: id, origin, rotation: selection.rotation, footprint: entry.footprint };
 
-    if !write_gate.try_acquire() {
-        // Very likely `city::demolish` mid-write on some other tile —
-        // `CommitState`'s own single slot already rules out a second
-        // commit. Roll the synchronous claim back rather than leaving a
-        // phantom building nobody is actually writing; see `write_gate`'s
-        // module docs for why the two writes can't proceed together.
-        city.remove_building(building);
-        println!("block_viewer: can't place a building right now, a write is already in progress");
-        return;
-    }
-
-    let save_meta = loaded_save.0.meta.clone();
     let cache: Arc<Mutex<RegionCache>> = region_cache.0.clone();
-    let policy = EditPolicy { capture_replaced: true, ..EditPolicy::default() };
+    let policy = EditPolicy { capture_replaced: true, allow_dirty_regions: true, ..EditPolicy::default() };
     let task_edit = edit.clone();
 
     let task = AsyncComputeTaskPool::get().spawn(async move {
         let mut cache = cache.lock().expect("region cache mutex poisoned");
-        commit_building(&save_meta, &mut cache, &task_edit, &policy)
+        apply_building_edit(&mut cache, &task_edit, &policy)
     });
 
     commit.pending = Some(PendingCommit { building, placement: placed, edit, task });
@@ -274,37 +260,35 @@ fn poll_commit(
     mut commit: ResMut<CommitState>,
     mut city: ResMut<state::City>,
     mut journal: ResMut<Journal>,
-    mut write_gate: ResMut<WriteGate>,
     mut write_status: ResMut<WriteStatus>,
     mut edited: EventWriter<ChunksEdited>,
 ) {
     let result = {
         let Some(pending) = &mut commit.pending else { return };
         let Some(result) = block_on(poll_once(&mut pending.task)) else {
-            return; // Still writing.
+            return; // Still applying.
         };
         result
     };
     let PendingCommit { building, placement, edit, .. } = commit.pending.take().expect("just matched Some above");
-    write_gate.release();
 
     match result {
-        Ok(summary) => {
-            let blocks = summary.report.blocks_written;
-            let chunks = summary.report.chunks.len();
+        Ok(report) => {
+            let blocks = report.blocks_written;
+            let chunks = report.chunks.len();
             println!(
-                "block_viewer: placed {} ({blocks} block(s) across {chunks} chunk(s))",
+                "block_viewer: placed {} ({blocks} block(s) across {chunks} chunk(s), not yet saved to disk)",
                 placement.definition
             );
             // `EditPolicy::capture_replaced` was on, so `report.replaced` is
             // `Some` and this always succeeds — the `if let` is the same
             // defensive shape `Baseline::capture`'s own doc comment expects
             // of a caller, not a case this path expects to actually miss.
-            if let Some(baseline) = journal::Baseline::capture(&edit, &summary.report) {
+            if let Some(baseline) = journal::Baseline::capture(&edit, &report) {
                 journal.record_placement(building, placement.clone(), baseline);
             }
-            write_status.record_success(WriteKind::Placed, placement.definition, &summary);
-            edited.send(ChunksEdited(summary.report.chunks));
+            write_status.record_success(WriteKind::Placed, placement.definition, &report);
+            edited.send(ChunksEdited(report.chunks));
         }
         Err(err) => {
             city.remove_building(building);
@@ -375,7 +359,7 @@ mod tests {
         );
     }
 
-    // --- commit_building: the actual write, tested directly and synchronously -
+    // --- apply_building_edit: the actual apply, tested directly and synchronously -
 
     /// A single-region, single-chunk fixture save — a slimmed-down copy of
     /// `viewer::paint::tests::Fixture`, which this module can't reach since
@@ -451,7 +435,7 @@ mod tests {
     }
 
     #[test]
-    fn commit_building_writes_the_blueprint_and_reports_a_baseline() {
+    fn apply_building_edit_writes_the_blueprint_and_reports_a_baseline() {
         let fixture = Fixture::new("write");
         let mut cache = fixture.cache();
         let blueprint = Blueprint {
@@ -463,45 +447,64 @@ mod tests {
             failed_columns: 0,
         };
         let edit = blueprint_edit(&blueprint, IVec3::new(1, 5, 1));
-        let policy = EditPolicy { capture_replaced: true, ..EditPolicy::default() };
+        let policy = EditPolicy { capture_replaced: true, allow_dirty_regions: true, ..EditPolicy::default() };
 
-        let summary = commit_building(&fixture.meta, &mut cache, &edit, &policy).expect("a valid placement");
-        assert_eq!(summary.report.blocks_written, 4);
+        let report = apply_building_edit(&mut cache, &edit, &policy).expect("a valid placement");
+        assert_eq!(report.blocks_written, 4);
+        assert_eq!(cache.dirty_regions().count(), 1, "the edit lands in memory only — no save call here");
 
         for at in [IVec3::new(1, 5, 1), IVec3::new(2, 5, 1), IVec3::new(1, 5, 2), IVec3::new(2, 5, 2)] {
             assert_eq!(block_name_at(&mut cache, at), "minecraft:dirt");
         }
 
-        let baseline = journal::Baseline::capture(&edit, &summary.report).expect("capture_replaced was on");
+        let baseline = journal::Baseline::capture(&edit, &report).expect("capture_replaced was on");
         assert_eq!(baseline.written.len(), 4);
         assert_eq!(baseline.previous.len(), 4);
         assert!(baseline.previous.iter().all(|(_, s)| s.name == "minecraft:stone"), "the ground the building overwrote");
     }
 
     #[test]
-    fn commit_building_refuses_ungenerated_terrain_and_writes_nothing() {
+    fn apply_building_edit_refuses_ungenerated_terrain_and_writes_nothing() {
         let fixture = Fixture::new("refuse");
         let mut cache = fixture.cache();
         let blueprint = small_blueprint();
         // Chunk (5, 0) is outside the fixture's one generated chunk.
         let edit = blueprint_edit(&blueprint, IVec3::new(5 * 16, 5, 0));
-        let policy = EditPolicy { capture_replaced: true, ..EditPolicy::default() };
+        let policy = EditPolicy { capture_replaced: true, allow_dirty_regions: true, ..EditPolicy::default() };
 
-        let err = commit_building(&fixture.meta, &mut cache, &edit, &policy).unwrap_err();
-        assert!(matches!(err, WriteError::Refused(crate::edit::EditRefusal::ChunkNotGenerated { chunk: (5, 0) })));
+        let err = apply_building_edit(&mut cache, &edit, &policy).unwrap_err();
+        assert!(matches!(err, EditRefusal::ChunkNotGenerated { chunk: (5, 0) }));
         assert_eq!(cache.dirty_regions().count(), 0);
+    }
+
+    #[test]
+    fn apply_building_edit_accepts_a_region_an_earlier_placement_already_dirtied() {
+        // The whole point of ticket 051's `allow_dirty_regions: true`: a
+        // second placement in the same region as an unsaved first one must
+        // not be refused with `RegionHasUnsavedChanges`.
+        let fixture = Fixture::new("batch");
+        let mut cache = fixture.cache();
+        let policy = EditPolicy { capture_replaced: true, allow_dirty_regions: true, ..EditPolicy::default() };
+
+        let first = blueprint_edit(&small_blueprint(), IVec3::new(1, 5, 1));
+        apply_building_edit(&mut cache, &first, &policy).expect("first placement");
+        assert_eq!(cache.dirty_regions().count(), 1);
+
+        let second = blueprint_edit(&small_blueprint(), IVec3::new(4, 5, 4));
+        let report = apply_building_edit(&mut cache, &second, &policy).expect("second placement, same region");
+        assert_eq!(report.blocks_written, 4);
+        assert_eq!(cache.dirty_regions().count(), 1, "still one dirty region, now carrying both edits");
     }
 
     // --- poll_commit: the City/journal glue, plumbing tests -------------------
     //
-    // Same split `viewer::paint`'s own tests use: `commit_building` (above) is
-    // tested directly and synchronously against a real fixture; `poll_commit`
+    // Same split `viewer::paint`'s own tests use: `apply_building_edit` (above)
+    // is tested directly and synchronously against a real fixture; `poll_commit`
     // is tested through a real `App` with a task whose result is fixed ahead
     // of time, the same way `viewer::paint::tests::a_finished_commit_reports_done_and_fires_chunks_edited`
     // avoids needing a second real region-file fixture just to prove the
     // transition logic.
 
-    use crate::edit::EditReport;
     use bevy::tasks::TaskPool;
 
     fn pool() -> &'static AsyncComputeTaskPool {
@@ -552,8 +555,7 @@ mod tests {
             regions: vec![(0, 0)],
             replaced: Some(vec![(IVec3::new(0, 64, 0), BlockState::air())]),
         };
-        let summary = WriteSummary { report, regions_written: vec![(0, 0)], backups: vec![] };
-        let task = pool().spawn(async move { Ok(summary) });
+        let task = pool().spawn(async move { Ok(report) });
 
         app.world_mut().resource_mut::<CommitState>().pending =
             Some(PendingCommit { building, placement: a_placement(), edit: task_edit, task });
@@ -583,7 +585,7 @@ mod tests {
             .place_building("house01", IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::new(2, 2))
             .unwrap();
 
-        let task = pool().spawn(async { Err(WriteError::WorldIsOpen { save: "world".to_string() }) });
+        let task = pool().spawn(async { Err(EditRefusal::Empty) });
         app.world_mut().resource_mut::<CommitState>().pending =
             Some(PendingCommit { building, placement: a_placement(), edit: WorldEdit::new(), task });
 
