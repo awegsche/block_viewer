@@ -150,7 +150,7 @@ L1  lib.rs + two bin shims                       <- DONE (ticket 027)
                     I7  display: per-building and city-wide
 
 R  the city view's render depth   (independent of everything above)
-     R1  don't mesh below the terrain surface   <- ticket 030
+     R1  don't mesh below the terrain surface   <- DONE (ticket 030)
 ```
 
 ---
@@ -692,7 +692,7 @@ defaulting: a tint on the building's mesh reusing the vertex colour channel
 
 ## R — The city view's render depth
 
-**R1. Don't mesh below the terrain surface. — ticket 030.** The citybuilder's
+**R1. Don't mesh below the terrain surface. — done, ticket 030.** The citybuilder's
 camera looks at the surface from above and never goes under it, so the ~7
 sections per chunk column below the terrain are decoded, meshed and drawn for
 nothing — and the caves in them are where the invisible face count really is.

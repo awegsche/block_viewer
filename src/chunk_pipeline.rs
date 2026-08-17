@@ -100,6 +100,16 @@ pub struct SharedColorMaps(pub Arc<ColorMaps>);
 #[derive(Resource, Clone)]
 pub struct TerrainMaterial(pub Handle<StandardMaterial>);
 
+/// How much of a chunk column [`load_and_mesh_chunk`] actually decodes
+/// (ticket 030) — a thin `Resource` wrapper around
+/// [`world::decode::FloorPolicy`], which stays free of Bevy itself (see
+/// that module's docs). [`ChunkLoadPipelinePlugin`] gives every app
+/// `FloorPolicy::WholeWorld` by default via `init_resource` — what
+/// `block_viewer` keeps using — and `city::run()` overrides it with
+/// `insert_resource` once [`crate::world_app`] returns.
+#[derive(Resource, Debug, Clone, Copy, Default)]
+pub struct RenderFloor(pub world::decode::FloorPolicy);
+
 /// How many completed chunk-load tasks get uploaded (mesh handed to
 /// `Assets<Mesh>`, entity spawned) per frame — mirrors the parent ticket's
 /// "budget spawns per frame": the expensive work already happened off the
@@ -322,6 +332,7 @@ impl Plugin for ChunkLoadPipelinePlugin {
             .init_resource::<PendingChunkReloads>()
             .init_resource::<InFlightChunkReloads>()
             .init_resource::<ChunkReloadBudget>()
+            .init_resource::<RenderFloor>()
             .add_event::<ChunksEdited>()
             .add_systems(
                 Update,
@@ -380,6 +391,7 @@ pub(crate) fn start_chunk_loads(
     region_cache: Option<Res<SharedRegionCache>>,
     atlas: Option<Res<SharedAtlasIndex>>,
     color_maps: Option<Res<SharedColorMaps>>,
+    render_floor: Res<RenderFloor>,
 ) {
     // All three are inserted by `lib.rs::setup_world` once the real save/atlas/
     // colormaps exist; before that (Startup hasn't finished) there's nothing
@@ -388,6 +400,7 @@ pub(crate) fn start_chunk_loads(
     else {
         return;
     };
+    let floor_policy = render_floor.0;
 
     let pool = AsyncComputeTaskPool::get();
     for &coord in &pending.to_load {
@@ -411,6 +424,7 @@ pub(crate) fn start_chunk_loads(
                 atlas,
                 color_maps,
                 neighbors,
+                floor_policy,
             )
         });
         in_flight.0.insert(coord, task);
@@ -624,6 +638,7 @@ pub(crate) fn start_chunk_reloads(
     region_cache: Option<Res<SharedRegionCache>>,
     atlas: Option<Res<SharedAtlasIndex>>,
     color_maps: Option<Res<SharedColorMaps>>,
+    render_floor: Res<RenderFloor>,
 ) {
     // Mirrors `start_chunk_loads`/`start_chunk_remeshes`: nothing to
     // decode/mesh with before `setup()`.
@@ -631,6 +646,7 @@ pub(crate) fn start_chunk_reloads(
     else {
         return;
     };
+    let floor_policy = render_floor.0;
 
     let ready: Vec<(i32, i32)> = pending
         .0
@@ -661,6 +677,7 @@ pub(crate) fn start_chunk_reloads(
                 atlas,
                 color_maps,
                 neighbors,
+                floor_policy,
             )
         });
         in_flight.0.insert(coord, task);
@@ -827,6 +844,7 @@ fn load_and_mesh_chunk(
     atlas: Arc<AtlasUvIndex>,
     color_maps: Arc<ColorMaps>,
     neighbors: OwnedNeighbors,
+    floor_policy: world::decode::FloorPolicy,
 ) -> Option<ChunkLoadResult> {
     let region_coord = chunk_to_region_coord(coord);
     let (local_x, local_z) = local_chunk_index(coord, region_coord);
@@ -843,7 +861,7 @@ fn load_and_mesh_chunk(
     // to reason about.
     let mut registry = registry.lock().expect("block registry mutex poisoned");
     let mut biome_registry = biome_registry.lock().expect("biome registry mutex poisoned");
-    let column = match world::decode_chunk(&nbt, &mut registry, &mut biome_registry) {
+    let column = match world::decode_chunk(&nbt, &mut registry, &mut biome_registry, floor_policy) {
         Ok(column) => column,
         // Not fully generated is routine at the edge of explored terrain —
         // every real save has plenty of these, so logging it would just be
@@ -1028,6 +1046,7 @@ mod tests {
             x: 0,
             z: 0,
             sections: vec![world::ChunkSection { y: 0, blocks, biomes }],
+            floor_y: world::WORLD_MIN_Y,
         };
 
         let registry = Arc::new(Mutex::new(registry));
@@ -1061,6 +1080,7 @@ mod tests {
             x: 1,
             z: 0,
             sections: vec![world::ChunkSection { y: 0, blocks: east_blocks, biomes: east_biomes }],
+            floor_y: world::WORLD_MIN_Y,
         };
         let neighbors = OwnedNeighbors {
             east: Some(east_neighbor),
@@ -1110,6 +1130,7 @@ mod tests {
             atlas,
             color_maps,
             OwnedNeighbors::default(),
+            world::decode::FloorPolicy::WholeWorld,
         )
         .expect("a real save's region centre should have a fully-generated chunk");
 
@@ -1142,6 +1163,7 @@ mod tests {
             atlas,
             color_maps,
             OwnedNeighbors::default(),
+            world::decode::FloorPolicy::WholeWorld,
         );
         assert!(result.is_none());
     }

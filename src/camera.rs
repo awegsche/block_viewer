@@ -514,6 +514,7 @@ mod tests {
                 x: cx,
                 z: cz,
                 sections: vec![ChunkSection { y: section_y, blocks, biomes }],
+                floor_y: world::decode::WORLD_MIN_Y,
             },
         );
         DecodedWorld {

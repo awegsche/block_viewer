@@ -1,7 +1,7 @@
 # 030 - Citybuilder: stop meshing below the terrain surface
 
 ## Status
-Open
+Done
 
 ## Depends on
 Nothing that isn't landed. `ranvil` 013 (`Heightmaps` pack/unpack) is **done**
@@ -215,3 +215,75 @@ Manual (needs a human at the window — see `CLAUDE.md`): goes in `../todo.md`.
 - The measured before/after is in the Resolution.
 
 ## Resolution
+
+Landed items 1-4 (the static floor) plus the general "below the floor is
+opaque" occlusion rule at chunk boundaries. Item 5 (dynamic floor lowering
+when the city digs) turned out to need **no new code**: `edit`'s default
+`HeightmapPolicy::Delete` (ticket 031) already removes a chunk's `Heightmaps`
+compound on every edit, and `render_floor`'s "no `Heightmaps` -> `WORLD_MIN_Y`"
+fallback (item 4) means the very next reload of that chunk
+(`chunk_pipeline`'s existing `PendingChunkReloads`/`start_chunk_reloads`
+machinery, ticket 034) decodes it in full automatically — never wrong, only
+temporarily slower, exactly the "self-healing" property item 4 was designed
+for. Recorded here rather than implemented separately since there is nothing
+to implement: the citybuilder can't dig yet (roadmap group H/E isn't built),
+so there is no caller for this path today, but the mechanism is already
+correct whenever one arrives.
+
+**How it came out**, against the design:
+
+- `world::decode::{FloorPolicy, render_floor, snap_down_to_section, WORLD_MIN_Y}`
+  — `FloorPolicy` stays free of Bevy (matches the module's existing
+  decoupling), `render_floor` reads `OCEAN_FLOOR` via
+  `mc_anvil::heightmap::read_heightmap` and takes the minimum over the
+  chunk's 256 columns exactly as designed, falling back to `WORLD_MIN_Y` for
+  `WholeWorld` and for a missing `Heightmaps` compound alike.
+- `ChunkColumn::floor_y` is the per-column bottom `decode_chunk` sets it to;
+  sections whose own `Y` index is below the floor's section are skipped in
+  the same loop that already skips uniform-air sections.
+- `world::mesh` reads `column.floor_y` instead of the old `WORLD_MIN_Y`
+  constant (now `world::decode::WORLD_MIN_Y`, the one place it's defined) for
+  the `Down`-face rule. The "below the floor is opaque, not air" rule at
+  chunk boundaries came out as two small functions, `occludes`/`occludes_at`,
+  which subsume the old `block_at`/`is_solid` call pattern everywhere in
+  `mesh_chunk_column` — not just at the boundary — since a `BlockId`-typed
+  sentinel for "opaque, but not a real block" had nowhere to live in
+  `BlockRegistry` without risking a panic on `registry.name()`.
+- `chunk_pipeline::RenderFloor` is the thin `Resource` wrapper the plan
+  called for, defaulted via `ChunkLoadPipelinePlugin::init_resource` (so
+  `block_viewer` needs no explicit opt-out) and threaded into
+  `load_and_mesh_chunk` from both `start_chunk_loads` and
+  `start_chunk_reloads` — the latter is what makes item 5 free, per above.
+  `city::run()` overrides it with `BelowSurface { margin: 16 }` after
+  `world_app()` returns.
+
+**Measured** (`world::mesh::tests::measures_the_render_floors_effect_on_a_real_region`,
+one region of the same `nbt_test` save the rest of the crate's real-save
+tests use, `margin: 16`):
+
+| | sections decoded | vertices emitted | elapsed |
+|---|---|---|---|
+| `WholeWorld` (today's `block_viewer`) | 8292 | 37,489,664 | 2.96s |
+| `BelowSurface(margin=16)` (citybuilder) | 2510 | 10,531,936 | 641ms |
+
+**~70% fewer sections decoded, ~72% fewer vertices, ~4.6x faster** for this
+region — confirms the ticket's motivation section: the saving is real and
+roughly matches the "~7 of 24 sections per column" estimate from the probe
+`ranvil` 013 was written against.
+
+Tests added: `render_floor`'s four cases (flat, ravine-drags-the-chunk-down,
+empty map, missing `Heightmaps`) plus `WholeWorld` ignoring heightmaps
+entirely; `snap_down_to_section` below Y=0; `decode_chunk` dropping sections
+below the floor and keeping the one at the boundary, both under
+`BelowSurface` and (unaffected) under `WholeWorld`; two `world::mesh` tests
+for the boundary occlusion rule (a block right at its own floor has no
+`Down` face; a block next to a neighbour with a *higher* floor has no face
+into it); and the real-region measurement above. The full pre-existing
+suite (282 tests) passes unchanged, which is the `block_viewer`-is-untouched
+regression test the ticket asked for — every existing fixture still builds
+its `ChunkColumn`s at `floor_y = WORLD_MIN_Y` (`FloorPolicy::WholeWorld`),
+bit-identical to before this ticket.
+
+Manual verification (open `cargo run --bin citybuilder` and confirm no
+visible hole/seam from above, and `cargo run --bin block_viewer` still looks
+right) is recorded in `../todo.md`, not done here, per `CLAUDE.md`.

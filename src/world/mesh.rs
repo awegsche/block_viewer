@@ -85,12 +85,6 @@ use super::block::{BlockId, BlockRegistry};
 use super::decode::{ChunkColumn, SECTION_SIZE};
 use super::tint::{BiomeColors, BlockTint, TintSource};
 
-/// World Y of the bottom of the world (1.18+ worlds start at Y=-64). Below
-/// this, there is no column to compare against — it's the underside of the
-/// world, never visible, so [`mesh_chunk_column`] never emits a face there
-/// rather than treating the missing data as "air below".
-const WORLD_MIN_Y: i32 = -64;
-
 /// Block names that don't occlude neighbouring faces. Water and leaves are
 /// ticket 010's problem — treated as solid (opaque, face-culling) for now.
 const NON_SOLID: [&str; 3] = [
@@ -145,7 +139,11 @@ pub struct Neighbors<'a> {
 
 /// Block at chunk-local `(dx, world_y, dz)` within a single column. Missing
 /// sections (uniform-air, see ticket 002) and out-of-range `world_y` both
-/// read back as air.
+/// read back as air — including sections below `column.floor_y` (ticket
+/// 030) that were never decoded at all, which is exactly why callers
+/// checking occlusion go through [`occludes`] rather than this function
+/// directly: "missing == air" is right for a genuinely uniform-air section,
+/// but wrong for one that simply wasn't decoded.
 fn block_in_column(column: &ChunkColumn, dx: usize, world_y: i32, dz: usize) -> BlockId {
     let section_y = world_y.div_euclid(SECTION_SIZE as i32) as i8;
     let local_y = world_y.rem_euclid(SECTION_SIZE as i32) as usize;
@@ -157,41 +155,54 @@ fn block_in_column(column: &ChunkColumn, dx: usize, world_y: i32, dz: usize) -> 
         .unwrap_or(BlockRegistry::AIR)
 }
 
-/// Block at chunk-local `(dx, world_y, dz)`, where `dx`/`dz` may step one
-/// past the 0..16 range — in which case the lookup crosses into the
-/// matching neighbour column (or reads as air if that neighbour isn't
-/// loaded).
-fn block_at(column: &ChunkColumn, neighbors: &Neighbors, dx: i32, world_y: i32, dz: i32) -> BlockId {
+/// Whether chunk-local `(dx, world_y, dz)` within `column` occludes a face
+/// against it: solid per `registry` ([`is_solid`]), or below `column`'s own
+/// render floor (ticket 030). The module docs' "below the floor is opaque,
+/// not air" rule lives here — `column`'s sections below `floor_y` were
+/// never decoded, so [`block_in_column`] would otherwise read them back as
+/// air and draw a face into the removed volume.
+fn occludes(column: &ChunkColumn, registry: &BlockRegistry, dx: usize, world_y: i32, dz: usize) -> bool {
+    world_y < column.floor_y || is_solid(block_in_column(column, dx, world_y, dz), registry)
+}
+
+/// The cross-column counterpart of [`occludes`], for `dx`/`dz` that may step
+/// one past the 0..16 range into a neighbour column — mirrors the old
+/// `block_at`'s boundary dispatch, but returns occlusion directly rather
+/// than a [`BlockId`] a caller has to resolve through [`is_solid`]
+/// separately, which is what let the below-the-floor check disappear into a
+/// registry lookup that has no floor to consult. A neighbour that isn't
+/// loaded yet never occludes — same "seam until it loads" rule ticket 003
+/// already accepted for `block_at`.
+fn occludes_at(
+    column: &ChunkColumn,
+    neighbors: &Neighbors,
+    registry: &BlockRegistry,
+    dx: i32,
+    world_y: i32,
+    dz: i32,
+) -> bool {
     let size = SECTION_SIZE as i32;
     if dx < 0 {
         return neighbors
             .west
-            .map_or(BlockRegistry::AIR, |c| {
-                block_in_column(c, (dx + size) as usize, world_y, dz as usize)
-            });
+            .is_some_and(|c| occludes(c, registry, (dx + size) as usize, world_y, dz as usize));
     }
     if dx >= size {
         return neighbors
             .east
-            .map_or(BlockRegistry::AIR, |c| {
-                block_in_column(c, (dx - size) as usize, world_y, dz as usize)
-            });
+            .is_some_and(|c| occludes(c, registry, (dx - size) as usize, world_y, dz as usize));
     }
     if dz < 0 {
         return neighbors
             .north
-            .map_or(BlockRegistry::AIR, |c| {
-                block_in_column(c, dx as usize, world_y, (dz + size) as usize)
-            });
+            .is_some_and(|c| occludes(c, registry, dx as usize, world_y, (dz + size) as usize));
     }
     if dz >= size {
         return neighbors
             .south
-            .map_or(BlockRegistry::AIR, |c| {
-                block_in_column(c, dx as usize, world_y, (dz - size) as usize)
-            });
+            .is_some_and(|c| occludes(c, registry, dx as usize, world_y, (dz - size) as usize));
     }
-    block_in_column(column, dx as usize, world_y, dz as usize)
+    occludes(column, registry, dx as usize, world_y, dz as usize)
 }
 
 /// The six directions a face can be exposed in, named in Minecraft terms
@@ -523,33 +534,38 @@ pub fn mesh_chunk_column(
 
                     face(
                         Face::East,
-                        !is_solid(block_at(column, neighbors, dx + 1, world_y, dz), registry),
+                        !occludes_at(column, neighbors, registry, dx + 1, world_y, dz),
                     );
                     face(
                         Face::West,
-                        !is_solid(block_at(column, neighbors, dx - 1, world_y, dz), registry),
+                        !occludes_at(column, neighbors, registry, dx - 1, world_y, dz),
                     );
                     face(
                         Face::South,
-                        !is_solid(block_at(column, neighbors, dx, world_y, dz + 1), registry),
+                        !occludes_at(column, neighbors, registry, dx, world_y, dz + 1),
                     );
                     face(
                         Face::North,
-                        !is_solid(block_at(column, neighbors, dx, world_y, dz - 1), registry),
+                        !occludes_at(column, neighbors, registry, dx, world_y, dz - 1),
                     );
                     // Up never needs a special case: "nothing above" is
                     // genuinely air (the top of the world), so the default
-                    // missing-section-is-air behaviour is exactly right.
+                    // missing-section-is-air behaviour is exactly right —
+                    // `occludes` reduces to plain `is_solid` here since
+                    // `world_y + 1` is always above every column's floor.
                     face(
                         Face::Up,
-                        !is_solid(block_in_column(column, lx, world_y + 1, lz), registry),
+                        !occludes(column, registry, lx, world_y + 1, lz),
                     );
-                    // Down does need one: below WORLD_MIN_Y isn't air, it's
-                    // "no world there" — never emit the underside.
+                    // Down does need one: below `column.floor_y` isn't air,
+                    // it's either the true world bottom (ticket 003, under
+                    // `FloorPolicy::WholeWorld`) or the removed volume a
+                    // render floor cut off (ticket 030) — either way, never
+                    // emit the underside.
                     face(
                         Face::Down,
-                        world_y > WORLD_MIN_Y
-                            && !is_solid(block_in_column(column, lx, world_y - 1, lz), registry),
+                        world_y > column.floor_y
+                            && !occludes(column, registry, lx, world_y - 1, lz),
                     );
                 }
             }
@@ -591,7 +607,7 @@ mod tests {
     use super::*;
     use crate::world::biome::BiomeRegistry;
     use crate::world::decode::ChunkSection;
-    use crate::world::decode::{BIOME_GRID_VOLUME, SECTION_VOLUME};
+    use crate::world::decode::{BIOME_GRID_VOLUME, SECTION_VOLUME, WORLD_MIN_Y};
 
     /// Regression test for the "Per-face UV winding" bug (see the module
     /// docs): every one of the four side faces must sample the texture's
@@ -657,8 +673,16 @@ mod tests {
         ChunkSection { y, blocks, biomes: Box::new([BiomeRegistry::PLAINS; BIOME_GRID_VOLUME]) }
     }
 
+    /// [`WORLD_MIN_Y`] floor — every pre-030 test in this module wants the
+    /// old, uncut behaviour, matching `FloorPolicy::WholeWorld`.
     fn column_with(x: i32, z: i32, sections: Vec<ChunkSection>) -> ChunkColumn {
-        ChunkColumn { x, z, sections }
+        column_with_floor(x, z, sections, WORLD_MIN_Y)
+    }
+
+    /// [`column_with`], with an explicit `floor_y` for ticket 030's own
+    /// tests.
+    fn column_with_floor(x: i32, z: i32, sections: Vec<ChunkSection>, floor_y: i32) -> ChunkColumn {
+        ChunkColumn { x, z, sections, floor_y }
     }
 
     fn stone_registry() -> (BlockRegistry, BlockId) {
@@ -742,6 +766,48 @@ mod tests {
             panic!("expected U32 indices");
         };
         // 5 faces instead of 6: the bottom face at the world floor is skipped.
+        assert_eq!(indices.len(), 5 * 6);
+    }
+
+    /// Ticket 030: the same "no underside" rule as
+    /// [`world_floor_has_no_underside`], but for a per-column render floor
+    /// above [`WORLD_MIN_Y`] — a block sitting right at `floor_y` gets no
+    /// `Down` face either, since below it is the removed volume, not air.
+    #[test]
+    fn render_floor_has_no_underside_either() {
+        let (registry, stone) = stone_registry();
+        let column = column_with_floor(0, 0, vec![section_with(2, &[((5, 0, 5), stone)])], 32);
+        let neighbors = Neighbors::default();
+
+        let mesh = mesh_chunk_column(&column, &registry, &neighbors, &uv_table_for(&registry), &no_tint_table_for(&registry), &white_biome_colors()).unwrap();
+        let Indices::U32(indices) = mesh.indices().unwrap() else {
+            panic!("expected U32 indices");
+        };
+        assert_eq!(indices.len(), 5 * 6);
+    }
+
+    /// Ticket 030's other correctness case: chunk A kept its terrain all the
+    /// way down (`floor_y = WORLD_MIN_Y`); its east neighbour B was cut off
+    /// at `floor_y = 32` and never decoded anything below that. A block in A
+    /// right at the shared boundary, well below B's floor, must not draw an
+    /// east face into B's removed volume — otherwise two adjacent chunks
+    /// with different floors would grow a wall of faces at exactly the
+    /// boundary this scheme exists to avoid.
+    #[test]
+    fn a_neighbor_with_a_higher_floor_occludes_below_its_own_floor() {
+        let (registry, stone) = stone_registry();
+        // world_y = 0*16 + 5 = 5, well below the neighbour's floor of 32.
+        let column = column_with(0, 0, vec![section_with(0, &[((15, 5, 0), stone)])]);
+        let east_neighbor = column_with_floor(1, 0, vec![], 32);
+        let neighbors = Neighbors { east: Some(&east_neighbor), ..Default::default() };
+
+        let mesh = mesh_chunk_column(&column, &registry, &neighbors, &uv_table_for(&registry), &no_tint_table_for(&registry), &white_biome_colors()).unwrap();
+        let Indices::U32(indices) = mesh.indices().unwrap() else {
+            panic!("expected U32 indices");
+        };
+        // 5 faces instead of 6: the east face is occluded by the
+        // neighbour's render floor even though the neighbour has no actual
+        // block data there to look up.
         assert_eq!(indices.len(), 5 * 6);
     }
 
@@ -1056,5 +1122,72 @@ mod tests {
         // shared east/west face pair is culled from both blocks: 2 base
         // quads gone, and their 2 matching overlay quads gone with them.
         assert_eq!(indices.len(), (10 * 6 * 2) - (4 * 6));
+    }
+
+    /// Ticket 030 is a performance claim, and nobody had measured it before
+    /// this test existed: decode + mesh every fully-generated chunk in one
+    /// real region twice, once under each [`FloorPolicy`], and print
+    /// sections decoded, vertices emitted and elapsed time for each. Not a
+    /// pass/fail assertion beyond "both runs produced at least one mesh" —
+    /// the numbers themselves are what matter, and they're recorded in the
+    /// ticket's Resolution.
+    #[test]
+    fn measures_the_render_floors_effect_on_a_real_region() {
+        use crate::world::decode::{decode_chunk, FloorPolicy};
+        use mc_anvil::region::REGION_WIDTH_IN_CHUNKS;
+        use std::time::Instant;
+
+        let saves = mc_anvil::get_saves().expect("could not read the Minecraft saves directory");
+        let meta = saves
+            .into_iter()
+            .find(|s| !s.regions.is_empty())
+            .expect("need a save with at least one region");
+        let (rx, rz) = meta.regions[0];
+
+        let mut cache = crate::region_cache::RegionCache::new(meta, 4);
+        let region = cache.get_or_load((rx, rz)).expect("region should load");
+
+        for (label, policy) in [
+            ("WholeWorld", FloorPolicy::WholeWorld),
+            ("BelowSurface(margin=16)", FloorPolicy::BelowSurface { margin: 16 }),
+        ] {
+            let mut registry = BlockRegistry::new();
+            let mut biomes = BiomeRegistry::new();
+            let mut sections_decoded = 0usize;
+            let mut vertices = 0usize;
+            let mut meshed_any = false;
+            let start = Instant::now();
+
+            for cx in 0..REGION_WIDTH_IN_CHUNKS {
+                for cz in 0..REGION_WIDTH_IN_CHUNKS {
+                    let Some(nbt) = region.get_chunk(cx, cz) else { continue };
+                    let nbt = nbt.clone();
+                    let Ok(column) = decode_chunk(&nbt, &mut registry, &mut biomes, policy) else {
+                        continue;
+                    };
+                    sections_decoded += column.sections.len();
+
+                    let uv_table = uv_table_for(&registry);
+                    let block_tint = no_tint_table_for(&registry);
+                    if let Some(mesh) = mesh_chunk_column(
+                        &column,
+                        &registry,
+                        &Neighbors::default(),
+                        &uv_table,
+                        &block_tint,
+                        &white_biome_colors(),
+                    ) {
+                        vertices += mesh.attribute(Mesh::ATTRIBUTE_POSITION).unwrap().len();
+                        meshed_any = true;
+                    }
+                }
+            }
+
+            println!(
+                "ticket 030 measurement [{label}]: {sections_decoded} sections decoded, {vertices} vertices, {:?}",
+                start.elapsed()
+            );
+            assert!(meshed_any, "expected at least one mesh out of a real region under {label}");
+        }
     }
 }

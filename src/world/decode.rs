@@ -28,6 +28,84 @@ pub const BIOME_GRID_SIZE: usize = 4;
 /// cube — ticket 012).
 pub const BIOME_GRID_VOLUME: usize = BIOME_GRID_SIZE * BIOME_GRID_SIZE * BIOME_GRID_SIZE;
 
+/// World Y of the bottom of the world (1.18+ worlds start at Y=-64). The one
+/// place that value is defined — [`render_floor`] falls back to it (no
+/// cutoff), and `world::mesh` reads a decoded column's
+/// [`ChunkColumn::floor_y`] rather than this constant directly, so a
+/// `block_viewer` column (always [`FloorPolicy::WholeWorld`]) stays
+/// bit-identical to how it looked before ticket 030.
+pub const WORLD_MIN_Y: i32 = -64;
+
+/// How much of a chunk column [`decode_chunk`] actually decodes (ticket
+/// 030, roadmap R1). `block_viewer` is the explore-a-save app — caves, the
+/// underside of an overhang, a block at Y=-59 are all things it exists to
+/// show — so it always uses [`FloorPolicy::WholeWorld`]. The citybuilder's
+/// RTS camera looks at the surface from above and never goes underground, so
+/// `city::run()` overrides it with [`FloorPolicy::BelowSurface`]: sections
+/// entirely below a per-chunk floor (see [`render_floor`]) are skipped —
+/// decoding them is the expensive half of a chunk load (packed
+/// `block_states.data`, multi-entry palettes) for terrain that camera can
+/// never see.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FloorPolicy {
+    #[default]
+    WholeWorld,
+    /// Skip sections entirely below the chunk's `OCEAN_FLOOR` heightmap,
+    /// minus `margin` blocks, snapped down to a section boundary.
+    BelowSurface { margin: i32 },
+}
+
+/// The world Y below which [`decode_chunk`] skips a chunk's sections
+/// entirely, under `policy` — always a multiple of [`SECTION_SIZE`], since
+/// the decode unit is the whole section and a floor mid-section buys
+/// nothing.
+///
+/// **One floor per chunk, from the minimum over its 256 columns** — not per
+/// column. A per-column cutoff would make neighbouring columns of different
+/// depth expose vertical walls between them at the chunk boundary, which
+/// *adds* faces; taking the minimum instead means a ravine, a cave mouth or
+/// a cliff face anywhere in the chunk drags the whole chunk's floor down
+/// with it, so the cutoff never slices into a hole visible from above. A
+/// chunk with a 1-column ravine in it saves nothing decode-wise, and that's
+/// the correct outcome.
+///
+/// `OCEAN_FLOOR` specifically, of the four heightmaps `ranvil` exposes: it's
+/// the only one that ignores fluids, so under water it reads the sea bed
+/// rather than the surface, and it's the deepest of the four — what a floor
+/// wants.
+///
+/// Falls back to [`WORLD_MIN_Y`] (no cutoff, decode everything) in two
+/// cases, both "never wrong, only slower": [`FloorPolicy::WholeWorld`], and
+/// a chunk with no `Heightmaps` compound at all. The second isn't
+/// hypothetical — it's exactly what an edited chunk looks like under
+/// roadmap W4's default `HeightmapPolicy::Delete`, until the game rebuilds
+/// the compound on its next load. A chunk in that state quietly starts
+/// being cheap again once it does.
+fn render_floor(chunk_nbt: &NbtField, policy: FloorPolicy) -> i32 {
+    let FloorPolicy::BelowSurface { margin } = policy else {
+        return WORLD_MIN_Y;
+    };
+
+    let Ok(heights) = mc_anvil::heightmap::read_heightmap(
+        chunk_nbt,
+        mc_anvil::heightmap::HeightmapKind::OceanFloor,
+    ) else {
+        return WORLD_MIN_Y;
+    };
+
+    let deepest = heights.iter().copied().min().unwrap_or(WORLD_MIN_Y);
+    snap_down_to_section(deepest - margin).max(WORLD_MIN_Y)
+}
+
+/// Rounds `y` down to the nearest multiple of [`SECTION_SIZE`] —
+/// `div_euclid`, not `/`, so this stays correct below Y=0: `-70` snaps to
+/// `-80`, not `-64` (plain integer division truncates toward zero and would
+/// land one section short, the off-by-one-section trap this exists to
+/// avoid).
+fn snap_down_to_section(y: i32) -> i32 {
+    y.div_euclid(SECTION_SIZE as i32) * SECTION_SIZE as i32
+}
+
 /// One 16x16x16 layer of a chunk column, decoded to a flat array of
 /// [`BlockId`]s. Indexed `x + z*16 + y*256` (locals 0..16 each), matching
 /// the order Minecraft packs `block_states.data` in.
@@ -88,6 +166,18 @@ pub struct ChunkColumn {
     #[allow(dead_code)]
     pub z: i32,
     pub sections: Vec<ChunkSection>,
+    /// World Y below which this column was never decoded (ticket 030) —
+    /// [`WORLD_MIN_Y`] under [`FloorPolicy::WholeWorld`], which is what
+    /// makes a `block_viewer` column's mesh bit-identical to how it looked
+    /// before this field existed. `world::mesh` reads it per-column instead
+    /// of a single world-wide bound, for two rules: a `Down` face is never
+    /// emitted at or below it (the world bottom, or "no world there" under
+    /// the floor), and a horizontal face looking into a *neighbour* column
+    /// below **that neighbour's own** `floor_y` reads as solid rather than
+    /// air — otherwise two adjacent chunks with different floors grow a
+    /// wall of side faces between them at exactly the boundary this scheme
+    /// was trying not to draw.
+    pub floor_y: i32,
 }
 
 impl ChunkColumn {
@@ -157,10 +247,18 @@ impl std::error::Error for DecodeError {}
 /// Returns [`DecodeError::NotFullyGenerated`] for chunks whose `Status`
 /// isn't `"minecraft:full"` — callers should skip these rather than treat
 /// them as a hard failure.
+///
+/// `floor_policy` (ticket 030) decides how much of the column actually gets
+/// decoded — see [`FloorPolicy`] and [`render_floor`]. Sections entirely
+/// below the computed floor are skipped exactly like a uniform-air section
+/// always was: simply absent from `sections`, with the caller (`world::mesh`)
+/// treating "below the floor" as opaque rather than air via
+/// [`ChunkColumn::floor_y`].
 pub fn decode_chunk(
     nbt: &NbtField,
     registry: &mut BlockRegistry,
     biomes: &mut BiomeRegistry,
+    floor_policy: FloorPolicy,
 ) -> Result<ChunkColumn, DecodeError> {
     let status = nbt
         .get_string("Status")
@@ -171,6 +269,11 @@ pub fn decode_chunk(
 
     let x = nbt.get_int("xPos").ok_or(DecodeError::MissingField("xPos"))?;
     let z = nbt.get_int("zPos").ok_or(DecodeError::MissingField("zPos"))?;
+
+    let floor_y = render_floor(nbt, floor_policy);
+    // `floor_y` is already snapped to a section boundary, so "entirely below
+    // it" is exactly "this section's own Y index is below the floor's".
+    let floor_section = floor_y.div_euclid(SECTION_SIZE as i32) as i8;
 
     let section_entries = nbt
         .get_list("sections")
@@ -193,6 +296,13 @@ pub fn decode_chunk(
             continue;
         };
         let y = y as i8;
+
+        // Ticket 030: a section entirely below the render floor is never
+        // decoded — same treatment as a uniform-air section, just skipped
+        // for a different reason.
+        if y < floor_section {
+            continue;
+        }
 
         // Sections without `block_states` (e.g. those lighting-only
         // sentinels) carry no blocks — and since they render nothing, their
@@ -268,7 +378,7 @@ pub fn decode_chunk(
         sections.push(ChunkSection { y, blocks, biomes: section_biomes });
     }
 
-    Ok(ChunkColumn { x, z, sections })
+    Ok(ChunkColumn { x, z, sections, floor_y })
 }
 
 /// Decodes one section's `biomes` compound (a sibling of `block_states`)
@@ -431,6 +541,156 @@ mod tests {
         )
     }
 
+    /// [`chunk_root`] plus a `Heightmaps` compound carrying only
+    /// `OCEAN_FLOOR` (ticket 030's tests never read the other three) — no
+    /// `yPos` tag, so [`mc_anvil::heightmap::chunk_min_y`] falls back to its
+    /// own default, which is exactly [`WORLD_MIN_Y`].
+    fn chunk_root_with_heightmaps(
+        x: i32,
+        z: i32,
+        status: &str,
+        sections: Vec<NbtField>,
+        ocean_floor: &mc_anvil::heightmap::ColumnHeights,
+    ) -> NbtField {
+        let heightmaps = NbtField::new_compound(
+            "Heightmaps",
+            vec![NbtField::new_long_array(
+                mc_anvil::heightmap::HeightmapKind::OceanFloor.key(),
+                mc_anvil::heightmap::pack_heightmap(ocean_floor, WORLD_MIN_Y),
+            )],
+        );
+        NbtField::new_compound(
+            "",
+            vec![
+                NbtField::new_string("Status", status),
+                NbtField::new_i32("xPos", x),
+                NbtField::new_i32("zPos", z),
+                NbtField::new_list("sections", NbtList::Compound(sections)),
+                heightmaps,
+            ],
+        )
+    }
+
+    #[test]
+    fn render_floor_flat_terrain_is_surface_minus_margin_snapped_down() {
+        // Every column's OCEAN_FLOOR reads 70 (one above a surface block at
+        // y=69) -> snap_down(70 - 16) = snap_down(54) = 48.
+        let heights = [70i32; mc_anvil::heightmap::COLUMNS_PER_CHUNK];
+        let root = chunk_root_with_heightmaps(0, 0, "minecraft:full", vec![], &heights);
+        assert_eq!(render_floor(&root, FloorPolicy::BelowSurface { margin: 16 }), 48);
+    }
+
+    #[test]
+    fn render_floor_takes_the_minimum_over_every_column_a_ravine_drags_it_down() {
+        // 255 columns flat at 70 (which alone would floor at 48, per the
+        // test above); one column reads 0 (a ravine, cave mouth or cliff
+        // face) and drags the *whole chunk's* floor down to it instead —
+        // the one case this scheme has to get right, since a per-column
+        // cutoff would slice into the ravine's wall.
+        let mut heights = [70i32; mc_anvil::heightmap::COLUMNS_PER_CHUNK];
+        heights[42] = 0;
+        let root = chunk_root_with_heightmaps(0, 0, "minecraft:full", vec![], &heights);
+        assert_eq!(render_floor(&root, FloorPolicy::BelowSurface { margin: 16 }), -16);
+    }
+
+    #[test]
+    fn render_floor_an_empty_map_gives_no_cutoff() {
+        let heights = [WORLD_MIN_Y; mc_anvil::heightmap::COLUMNS_PER_CHUNK];
+        let root = chunk_root_with_heightmaps(0, 0, "minecraft:full", vec![], &heights);
+        assert_eq!(
+            render_floor(&root, FloorPolicy::BelowSurface { margin: 16 }),
+            WORLD_MIN_Y
+        );
+    }
+
+    #[test]
+    fn render_floor_a_missing_heightmaps_compound_gives_no_cutoff() {
+        // No `Heightmaps` at all — the state roadmap W4's default
+        // (`HeightmapPolicy::Delete`) leaves an edited chunk in.
+        let root = chunk_root(0, 0, "minecraft:full", vec![]);
+        assert_eq!(
+            render_floor(&root, FloorPolicy::BelowSurface { margin: 16 }),
+            WORLD_MIN_Y
+        );
+    }
+
+    #[test]
+    fn render_floor_whole_world_policy_ignores_heightmaps_entirely() {
+        let heights = [70i32; mc_anvil::heightmap::COLUMNS_PER_CHUNK];
+        let root = chunk_root_with_heightmaps(0, 0, "minecraft:full", vec![], &heights);
+        assert_eq!(render_floor(&root, FloorPolicy::WholeWorld), WORLD_MIN_Y);
+    }
+
+    #[test]
+    fn snap_down_to_section_is_correct_below_y_zero() {
+        // The off-by-one-section trap: plain truncating division would give
+        // -64 for -70 (one section short of where -70 actually lives);
+        // `div_euclid` floors toward negative infinity and gives -80.
+        assert_eq!(snap_down_to_section(-70), -80);
+        assert_eq!(snap_down_to_section(-65), -80);
+        assert_eq!(snap_down_to_section(-64), -64);
+        assert_eq!(snap_down_to_section(0), 0);
+        assert_eq!(snap_down_to_section(15), 0);
+        assert_eq!(snap_down_to_section(16), 16);
+    }
+
+    #[test]
+    fn decode_chunk_drops_sections_entirely_below_the_floor_and_keeps_the_one_at_it() {
+        // Flat OCEAN_FLOOR at 1 (surface block at y=0), margin 16 ->
+        // snap_down(1 - 16) = snap_down(-15) = -16, i.e. section y=-1's own
+        // base. Sections y=-4 and y=-2 sit entirely below that and must be
+        // dropped; y=-1 (whose base *is* the floor — floor_y is always a
+        // section boundary, so nothing ever literally straddles mid-section)
+        // and y=0 must both survive.
+        let heights = [1i32; mc_anvil::heightmap::COLUMNS_PER_CHUNK];
+        let root = chunk_root_with_heightmaps(
+            0,
+            0,
+            "minecraft:full",
+            vec![
+                section_uniform(-4, "minecraft:stone"),
+                section_uniform(-2, "minecraft:stone"),
+                section_uniform(-1, "minecraft:stone"),
+                section_uniform(0, "minecraft:grass_block"),
+            ],
+            &heights,
+        );
+        let mut registry = BlockRegistry::new();
+        let mut biomes = BiomeRegistry::new();
+        let column = decode_chunk(&root, &mut registry, &mut biomes, FloorPolicy::BelowSurface { margin: 16 })
+            .unwrap();
+
+        assert_eq!(column.floor_y, -16);
+        let ys: Vec<i8> = column.sections.iter().map(|s| s.y).collect();
+        assert_eq!(
+            ys,
+            vec![-1, 0],
+            "sections entirely below the floor should be dropped, the one at the floor boundary kept"
+        );
+    }
+
+    #[test]
+    fn whole_world_policy_decodes_every_section_regardless_of_heightmaps() {
+        // The same Heightmaps data that floors at -16 under `BelowSurface`
+        // (see the test above) must change nothing under `WholeWorld` — this
+        // is what keeps a `block_viewer` column bit-identical to how it
+        // looked before ticket 030.
+        let heights = [1i32; mc_anvil::heightmap::COLUMNS_PER_CHUNK];
+        let root = chunk_root_with_heightmaps(
+            0,
+            0,
+            "minecraft:full",
+            vec![section_uniform(-4, "minecraft:stone"), section_uniform(0, "minecraft:grass_block")],
+            &heights,
+        );
+        let mut registry = BlockRegistry::new();
+        let mut biomes = BiomeRegistry::new();
+        let column = decode_chunk(&root, &mut registry, &mut biomes, FloorPolicy::WholeWorld).unwrap();
+
+        assert_eq!(column.floor_y, WORLD_MIN_Y);
+        assert_eq!(column.sections.len(), 2);
+    }
+
     #[test]
     fn single_entry_air_section_costs_nothing() {
         let root = chunk_root(
@@ -441,7 +701,7 @@ mod tests {
         );
         let mut registry = BlockRegistry::new();
         let mut biomes = BiomeRegistry::new();
-        let column = decode_chunk(&root, &mut registry, &mut biomes).unwrap();
+        let column = decode_chunk(&root, &mut registry, &mut biomes, FloorPolicy::WholeWorld).unwrap();
         assert!(
             column.sections.is_empty(),
             "uniform air section should be omitted, not stored"
@@ -458,7 +718,7 @@ mod tests {
         );
         let mut registry = BlockRegistry::new();
         let mut biomes = BiomeRegistry::new();
-        let column = decode_chunk(&root, &mut registry, &mut biomes).unwrap();
+        let column = decode_chunk(&root, &mut registry, &mut biomes, FloorPolicy::WholeWorld).unwrap();
         assert_eq!(column.sections.len(), 1);
         let stone = registry.intern("minecraft:stone");
         assert!(column.sections[0].blocks.iter().all(|&b| b == stone));
@@ -484,7 +744,7 @@ mod tests {
         );
         let mut registry = BlockRegistry::new();
         let mut biomes = BiomeRegistry::new();
-        let column = decode_chunk(&root, &mut registry, &mut biomes).unwrap();
+        let column = decode_chunk(&root, &mut registry, &mut biomes, FloorPolicy::WholeWorld).unwrap();
         let dirt = registry.intern("minecraft:dirt");
         assert_eq!(column.sections[0].get(0, 0, 0), dirt);
         assert_eq!(column.sections[0].get(1, 0, 0), BlockRegistry::AIR);
@@ -508,7 +768,7 @@ mod tests {
         );
         let mut registry = BlockRegistry::new();
         let mut biomes = BiomeRegistry::new();
-        let column = decode_chunk(&root, &mut registry, &mut biomes).unwrap();
+        let column = decode_chunk(&root, &mut registry, &mut biomes, FloorPolicy::WholeWorld).unwrap();
         let expected = registry.intern("minecraft:block_16");
         assert_eq!(column.sections[0].get(1, 0, 0), expected);
     }
@@ -528,7 +788,7 @@ mod tests {
         );
         let mut registry = BlockRegistry::new();
         let mut biomes = BiomeRegistry::new();
-        let column = decode_chunk(&root, &mut registry, &mut biomes).unwrap();
+        let column = decode_chunk(&root, &mut registry, &mut biomes, FloorPolicy::WholeWorld).unwrap();
         assert_eq!(column.sections.len(), 2);
 
         let stone = registry.intern("minecraft:stone");
@@ -544,7 +804,7 @@ mod tests {
         let root = chunk_root(0, 0, "minecraft:carvers", vec![]);
         let mut registry = BlockRegistry::new();
         let mut biomes = BiomeRegistry::new();
-        let err = decode_chunk(&root, &mut registry, &mut biomes).unwrap_err();
+        let err = decode_chunk(&root, &mut registry, &mut biomes, FloorPolicy::WholeWorld).unwrap_err();
         assert!(
             matches!(err, DecodeError::NotFullyGenerated(ref status) if status == "minecraft:carvers")
         );
@@ -564,7 +824,7 @@ mod tests {
         );
         let mut registry = BlockRegistry::new();
         let mut biomes = BiomeRegistry::new();
-        let column = decode_chunk(&root, &mut registry, &mut biomes).unwrap();
+        let column = decode_chunk(&root, &mut registry, &mut biomes, FloorPolicy::WholeWorld).unwrap();
 
         let (world_y, id) = column.topmost_non_air(0, 0).unwrap();
         assert_eq!(world_y, SECTION_SIZE as i32 + 15);
@@ -585,7 +845,7 @@ mod tests {
         );
         let mut registry = BlockRegistry::new();
         let mut biomes = BiomeRegistry::new();
-        let column = decode_chunk(&root, &mut registry, &mut biomes).unwrap();
+        let column = decode_chunk(&root, &mut registry, &mut biomes, FloorPolicy::WholeWorld).unwrap();
 
         let forest = biomes.intern("minecraft:forest");
         assert!(column.sections[0].biomes.iter().all(|&b| b == forest));
@@ -610,7 +870,7 @@ mod tests {
         );
         let mut registry = BlockRegistry::new();
         let mut biomes = BiomeRegistry::new();
-        let column = decode_chunk(&root, &mut registry, &mut biomes).unwrap();
+        let column = decode_chunk(&root, &mut registry, &mut biomes, FloorPolicy::WholeWorld).unwrap();
 
         let desert = biomes.intern("minecraft:desert");
         assert_eq!(column.sections[0].biomes[1], desert);
@@ -642,7 +902,7 @@ mod tests {
         );
         let mut registry = BlockRegistry::new();
         let mut biomes = BiomeRegistry::new();
-        let column = decode_chunk(&root, &mut registry, &mut biomes).unwrap();
+        let column = decode_chunk(&root, &mut registry, &mut biomes, FloorPolicy::WholeWorld).unwrap();
 
         let swamp = biomes.intern("minecraft:swamp");
         assert_eq!(column.sections[0].biomes[1], swamp);
@@ -658,7 +918,7 @@ mod tests {
         );
         let mut registry = BlockRegistry::new();
         let mut biomes = BiomeRegistry::new();
-        let column = decode_chunk(&root, &mut registry, &mut biomes).unwrap();
+        let column = decode_chunk(&root, &mut registry, &mut biomes, FloorPolicy::WholeWorld).unwrap();
 
         assert!(column.sections[0]
             .biomes
@@ -711,7 +971,7 @@ mod tests {
         for step in 0..REGION_WIDTH_IN_CHUNKS {
             let Some(nbt) = region.get_chunk(step, step) else { continue };
             let nbt = nbt.clone();
-            match decode_chunk(&nbt, &mut registry, &mut biomes) {
+            match decode_chunk(&nbt, &mut registry, &mut biomes, FloorPolicy::WholeWorld) {
                 Ok(_) => decoded_any = true,
                 Err(DecodeError::NotFullyGenerated(_)) => continue,
                 Err(err) => panic!("failed to decode chunk ({step}, {step}): {err}"),
