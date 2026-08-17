@@ -76,10 +76,23 @@
 //! [`persistence`]'s own unit tests. A save with no real world loaded (ticket
 //! 008's `empty_save` placeholder) skips persistence entirely via
 //! [`CitySavePath`] — there's no save root to read from or write to.
+//!
+//! ## The journal (ticket 044, roadmap D3)
+//!
+//! [`run`] loads and saves [`journal::Journal`] the same way, and right
+//! alongside `city.ron` — `<save>/citybuilder/journal.ron`, via
+//! [`load_journal`]/[`save_journal_on_exit`]. It's the same "proven by the
+//! app lifecycle, not yet fed by gameplay" state ticket 043 landed
+//! [`state::City`] in: nothing calls [`journal::Journal::record_placement`]
+//! yet, since that needs E4's commit, so every real run loads and saves an
+//! empty journal — but the round trip, and the file path it reads and
+//! writes, are exercised now rather than only by [`journal`]'s own unit
+//! tests.
 
 use std::path::{Path, PathBuf};
 
 mod definition;
+mod journal;
 mod persistence;
 mod state;
 
@@ -112,13 +125,15 @@ pub fn run() {
     let mut app = world_app();
     let save_root = app.world().resource::<LoadedSave>().0.meta.path.clone();
     let city = load_city(&save_root);
+    let journal = load_journal(&save_root);
 
     app.insert_resource(RenderFloor(FloorPolicy::BelowSurface { margin: 16 }))
         .insert_resource(catalogue)
         .insert_resource(definitions)
         .insert_resource(city)
+        .insert_resource(journal)
         .insert_resource(CitySavePath(if save_root.as_os_str().is_empty() { None } else { Some(save_root) }))
-        .add_systems(Last, save_city_on_exit)
+        .add_systems(Last, (save_city_on_exit, save_journal_on_exit))
         .run();
 }
 
@@ -162,6 +177,52 @@ fn save_city_on_exit(mut exit_events: EventReader<AppExit>, city: Res<state::Cit
     match persistence::save_city(&city, save_root) {
         Ok(()) => println!("block_viewer: saved city ({} building{})", city.len(), if city.len() == 1 { "" } else { "s" }),
         Err(err) => println!("block_viewer: could not save city: {err}"),
+    }
+}
+
+/// Loads [`journal::Journal`] from `save_root`, same shape as [`load_city`] —
+/// a missing file or no save at all both start from an empty journal, logged
+/// only when there's something to say (a non-empty journal loaded, or a real
+/// load error).
+fn load_journal(save_root: &Path) -> journal::Journal {
+    if save_root.as_os_str().is_empty() {
+        return journal::Journal::default();
+    }
+
+    match journal::load_journal(save_root) {
+        Ok(loaded) => {
+            if !loaded.is_empty() {
+                println!(
+                    "block_viewer: loaded {} journal entr{} from {}",
+                    loaded.len(),
+                    if loaded.len() == 1 { "y" } else { "ies" },
+                    journal::journal_file_path_for_log(save_root).display(),
+                );
+            }
+            loaded
+        }
+        Err(err) => {
+            println!("block_viewer: could not load journal, starting empty: {err}");
+            journal::Journal::default()
+        }
+    }
+}
+
+/// Saves [`journal::Journal`] to [`CitySavePath`] on every [`AppExit`], the
+/// same trigger and the same no-op-when-`None` contract [`save_city_on_exit`]
+/// uses — see that function's docs.
+fn save_journal_on_exit(
+    mut exit_events: EventReader<AppExit>,
+    journal: Res<journal::Journal>,
+    save_path: Res<CitySavePath>,
+) {
+    if exit_events.read().count() == 0 {
+        return;
+    }
+    let Some(save_root) = &save_path.0 else { return };
+
+    if let Err(err) = journal::save_journal(&journal, save_root) {
+        println!("block_viewer: could not save journal: {err}");
     }
 }
 

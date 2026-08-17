@@ -2,7 +2,7 @@
 
 Not a work item; the plan for the citybuilder game and the shared world-edit
 infrastructure it needs. High-level tasks here get split into numbered
-tickets in this directory when they're picked up (next free number: 044).
+tickets in this directory when they're picked up (next free number: 045).
 Companion to `ROADMAP.md`, which covers the viewer 001–029.
 
 ## The goal
@@ -127,7 +127,7 @@ L1  lib.rs + two bin shims                       <- DONE (ticket 027)
      +-- D  city state (authoritative)
           D1  the City resource: buildings, footprints, occupancy  <- DONE (ticket 042)
           D2  city save/load next to the world  <- DONE (ticket 043)
-          D3  journal, undo, world reconciliation
+          D3  journal, undo, world reconciliation  <- DONE (ticket 044)
                |
                +-- E  placement          +-- F  streets
                |    E1  RTS camera, picking    F1  road graph on the grid
@@ -578,13 +578,48 @@ D1's own landing, this ticket gives `City` a real caller on both ends —
 `#[allow(dead_code)]` markers because of it, though `place_building` and
 friends still wait on E1-E4.
 
-**D3. Journal, undo, reconciliation.** Every placement and demolition as an
-appended entry, each carrying the **as-built baseline** (I1): what blocks we
-wrote, and what was there before. Gives undo for free, gives demolish its
-terrain restore (E5), gives a rebuild path if the world's blocks and the
-city list disagree — and gives the damage mechanic (I) the thing it diffs
-against. Four features, one record; see I1 for why they're the same record
-and not four.
+**D3. Journal, undo, reconciliation. — done, ticket 044.** Every placement
+and demolition as an appended entry, each carrying the **as-built baseline**
+(I1): what blocks we wrote, and what was there before. Gives undo for free,
+gives demolish its terrain restore (E5), gives a rebuild path if the world's
+blocks and the city list disagree — and gives the damage mechanic (I) the
+thing it diffs against. Four features, one record; see I1 for why they're
+the same record and not four.
+
+How it came out: `city::journal::{Baseline, JournalEntry, Journal, reconcile,
+repair_edit}`, in one new file rather than split state/persistence the way
+042/043 were — the journal has no derived state (an occupancy grid) that
+justified that split, so a flat append-only log stayed in one place, the
+same call `city::definition` made for its schema and loader. `Baseline`
+turned out to already be half-built: 031's `EditPolicy::capture_replaced`
+records what an edit overwrote, so `Baseline::capture(edit, report)` only
+had to line that up against the edit's own `written` positions, deduped and
+sorted the same way, rather than computing anything new. `JournalEntry`
+snapshots a full `PlacedBuilding` (which picked up `Clone` for this) on
+every entry rather than a lookup key, because undoing a placement removes
+the building from `City` before the entry is read, and undoing a demolition
+needs the whole thing to hand `City::insert_loaded`. `Journal::undo_last`
+is all-or-nothing against the journal and `City` — a failed undo (putting a
+demolished building back onto a tile something else now occupies,
+`UndoError::Occupied`) touches neither — but deliberately *not*
+all-or-nothing against the world: it returns the restoring `WorldEdit`
+uncommitted, the same "apply doesn't save" contract every other edit entry
+point in this crate keeps, for the future E4/E5 caller to run through the
+write path. `reconcile` recomputes the expected world state from every
+currently-placed building's own *placement* baseline (not blueprint
+re-derivation — I1's whole argument), grouped by region the same way
+`edit::route` batches the write side, and reuses `edit::route::refusal_for`'s
+`Display` for a whole-region failure rather than inventing a second message;
+`repair_edit` is the write half, an edit nobody commits automatically.
+Persistence follows 043's mirror-type shape (`SavedJournal`/`SavedEntry`/
+`SavedPlacement`/`SavedBaseline`), with one departure: `blueprint::BlockState`
+picked up `Serialize`/`Deserialize` directly rather than a third mirror type,
+since a baseline can carry thousands of block states per building and both
+its fields were already plain serde-able data. `city::run()` loads and saves
+the journal next to `city.ron`, the same "proven by the app lifecycle, not
+yet fed by gameplay" state 043 landed `City` in — no caller for
+`record_placement`/`record_demolition`/`undo_last`/`reconcile` until E4/E5
+exist.
 
 ---
 

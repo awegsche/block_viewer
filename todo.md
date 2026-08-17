@@ -628,3 +628,13 @@ these itself (see CLAUDE.md's "Manual/visual verification").
   save line appears — Bevy is expected to route both through the same
   `AppExit` event, but this is the one thing worth actually checking rather
   than assuming.
+
+  **044 addendum**: same run, same window close -- confirm
+  `<save folder>/citybuilder/journal.ron` now exists too, with
+  `version: 1, entries: []` (silent on the console: `load_journal`/
+  `save_journal_on_exit` only print when there is a non-empty journal or a
+  real error, and today the journal is always empty -- nothing calls
+  `record_placement`/`record_demolition` yet). This is the same "does
+  `AppExit` really fire and land the file where expected" question 043 already
+  answers above; ride along with that pass rather than running the app a
+  second time just for this.

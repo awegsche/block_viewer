@@ -42,6 +42,7 @@ use bevy::math::IVec3;
 use mc_anvil::region::REGION_WIDTH_IN_CHUNKS;
 use mc_anvil::MCLoadError;
 use rnbt::NbtField;
+use serde::{Deserialize, Serialize};
 
 use crate::chunk_pipeline::local_chunk_index;
 use crate::region_cache::{chunk_to_region_coord, RegionCache};
@@ -72,7 +73,13 @@ pub const FALLBACK_DATA_VERSION: i32 = 3953;
 /// order isn't guaranteed stable, so an unsorted key would emit the same
 /// stair twice under two orderings — bloating the palette and making the
 /// output differ between runs of the same extraction.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+///
+/// `Serialize`/`Deserialize` derived directly (ticket 044, roadmap D3) rather
+/// than through a mirror type — both fields are already plain serde-able
+/// data, and it's the type a journal entry's as-built baseline (roadmap I1)
+/// needs to round-trip through RON, the same call ticket 043 made for
+/// `blueprint::Rotation`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct BlockState {
     pub name: String,
     /// `(key, value)` pairs, sorted by key. Vanilla block-state properties

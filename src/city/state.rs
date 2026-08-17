@@ -93,7 +93,11 @@ impl BuildingId {
 }
 
 /// One building placed in the city.
-#[derive(Debug)]
+///
+/// `Clone` (ticket 044, roadmap D3) so a journal entry can hold its own copy
+/// of a demolished building's placement — the record undo needs to put it
+/// back — without the entry borrowing from `City` and outliving it.
+#[derive(Debug, Clone)]
 pub struct PlacedBuilding {
     /// The building's *type* — a key into
     /// [`super::definition::BuildingDefinitions`]/[`super::blueprint::BuildingCatalogue`],
