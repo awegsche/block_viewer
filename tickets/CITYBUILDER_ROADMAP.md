@@ -2,7 +2,7 @@
 
 Not a work item; the plan for the citybuilder game and the shared world-edit
 infrastructure it needs. High-level tasks here get split into numbered
-tickets in this directory when they're picked up (next free number: 042).
+tickets in this directory when they're picked up (next free number: 044).
 Companion to `ROADMAP.md`, which covers the viewer 001–029.
 
 ## The goal
@@ -126,7 +126,7 @@ L1  lib.rs + two bin shims                       <- DONE (ticket 027)
      |
      +-- D  city state (authoritative)
           D1  the City resource: buildings, footprints, occupancy  <- DONE (ticket 042)
-          D2  city save/load next to the world
+          D2  city save/load next to the world  <- DONE (ticket 043)
           D3  journal, undo, world reconciliation
                |
                +-- E  placement          +-- F  streets
@@ -552,8 +552,31 @@ inserts an empty `City`; no consumer yet — E1/E2 are what will call
 `place_building`, the same "proven, not yet used" state 039-041 landed
 their own resources in.
 
-**D2. City save/load.** RON next to the world — `<save>/citybuilder/city.ron`
-— so a save and its city travel together. Versioned from the first write.
+**D2. City save/load. — done, ticket 043.** RON next to the world —
+`<save>/citybuilder/city.ron` — so a save and its city travel together.
+Versioned from the first write.
+
+How it came out: `city::persistence::{save_city, load_city}`, reading and
+writing a `CitySave`/`SavedBuilding` pair rather than `City` itself —
+`occupancy` is derived, not stored, so `load_city` rebuilds it through
+`City`'s own `insert_loaded`/`add_road`, which means a corrupt or
+hand-edited file with two overlapping buildings fails the load
+(`PersistenceError::Corrupt`) instead of producing a `City` that disagrees
+with itself. `next_id` is the one field that *is* persisted verbatim rather
+than recomputed: removing the highest-numbered building before saving
+doesn't roll it back (`BuildingId`s are never reissued, D1's own rule), so
+recomputing it from only the survivors would have reissued a removed id on
+the next placement after a reload. `blueprint::rotate::Rotation` picked up
+`Serialize`/`Deserialize` directly rather than a mirror enum — a placement's
+orientation on disk is exactly that type. `city::run()` reads the loaded
+save's root before inserting anything else and skips persistence entirely
+when it's ticket 008's `empty_save` placeholder (nowhere to read from or
+write to); otherwise it loads synchronously before `App::run()`, the same
+shape 039/040 use, and a `Last`-schedule system saves on `AppExit`. Unlike
+D1's own landing, this ticket gives `City` a real caller on both ends —
+`buildings()`/`roads()`/`add_road()` lost their "no caller yet"
+`#[allow(dead_code)]` markers because of it, though `place_building` and
+friends still wait on E1-E4.
 
 **D3. Journal, undo, reconciliation.** Every placement and demolition as an
 appended entry, each carrying the **as-built baseline** (I1): what blocks we

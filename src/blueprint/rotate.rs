@@ -28,6 +28,7 @@
 use std::collections::HashMap;
 
 use bevy::math::IVec3;
+use serde::{Deserialize, Serialize};
 
 use super::{BlockState, Blueprint};
 
@@ -36,7 +37,11 @@ use super::{BlockState, Blueprint};
 /// `Deg0` is the identity — it clones the blueprint without touching the
 /// palette at all, so a blueprint carrying a property this table doesn't
 /// recognise still loads and previews at its as-authored orientation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Derives `Serialize`/`Deserialize` for ticket 043 (roadmap D2): a placed
+/// building's orientation on disk is exactly this type, not a mirror enum
+/// invented in the persistence module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Rotation {
     Deg0,
     Deg90,

@@ -74,8 +74,26 @@ use crate::blueprint::Rotation;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct BuildingId(u64);
 
+impl BuildingId {
+    /// The raw instance counter value — ticket 043's persistence module is
+    /// the only caller; everything else names a building by [`BuildingId`]
+    /// itself; not the `u64` underneath it.
+    pub(crate) fn as_u64(self) -> u64 {
+        self.0
+    }
+
+    /// The inverse of [`as_u64`](Self::as_u64), for reconstructing a
+    /// [`BuildingId`] read back off disk. Not a `From<u64>` impl —
+    /// deliberately awkward to reach for outside `persistence::load_city`,
+    /// where alone it's correct to hand back an id [`City::place_building`]
+    /// never minted itself.
+    pub(crate) fn from_u64(id: u64) -> Self {
+        BuildingId(id)
+    }
+}
+
 /// One building placed in the city.
-#[allow(dead_code)] // no caller yet — see the module docs
+#[derive(Debug)]
 pub struct PlacedBuilding {
     /// The building's *type* — a key into
     /// [`super::definition::BuildingDefinitions`]/[`super::blueprint::BuildingCatalogue`],
@@ -96,7 +114,6 @@ pub struct PlacedBuilding {
 }
 
 /// What one tile of the occupancy grid holds.
-#[allow(dead_code)] // no caller yet — see the module docs
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Occupant {
     Building(BuildingId),
@@ -104,7 +121,6 @@ pub enum Occupant {
 }
 
 /// Why a placement was refused.
-#[allow(dead_code)] // no caller yet — see the module docs
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlacementError {
     /// `tile` is already held by `by` — a building, or a road, in the way.
@@ -129,7 +145,6 @@ impl std::error::Error for PlacementError {}
 
 /// How a footprint's `(x, z)` extent changes under a Y rotation: 0°/180°
 /// keep the axes, 90°/270° swap them — see the module docs.
-#[allow(dead_code)] // no caller yet — see the module docs
 pub fn footprint_extent(footprint: IVec2, rotation: Rotation) -> IVec2 {
     match rotation {
         Rotation::Deg0 | Rotation::Deg180 => footprint,
@@ -141,7 +156,6 @@ pub fn footprint_extent(footprint: IVec2, rotation: Rotation) -> IVec2 {
 /// with `rotation` — the rectangle [`footprint_extent`] describes, walked
 /// one tile per block, with `origin` as its minimum corner regardless of
 /// rotation.
-#[allow(dead_code)] // no caller yet — see the module docs
 pub fn footprint_tiles(origin: IVec3, footprint: IVec2, rotation: Rotation) -> impl Iterator<Item = IVec2> {
     let extent = footprint_extent(footprint, rotation);
     let base = IVec2::new(origin.x, origin.z);
@@ -150,10 +164,14 @@ pub fn footprint_tiles(origin: IVec3, footprint: IVec2, rotation: Rotation) -> i
 
 /// The authoritative city state: placed buildings, roads, and the occupancy
 /// grid both are checked against. See the module docs for the rule this
-/// implements and what is deliberately not here yet (persistence, a
-/// journal, anything that reads or writes the actual world).
-#[allow(dead_code)] // fields are read by City's own methods — see the module docs for why those are unused too
-#[derive(Resource, Default)]
+/// implements and what is deliberately not here yet (a journal, anything
+/// that reads or writes the actual world). Persistence (D2, ticket 043) is
+/// [`super::persistence`], which reads and writes this through
+/// [`buildings`](Self::buildings)/[`roads`](Self::roads)/[`insert_loaded`](Self::insert_loaded)/
+/// [`add_road`](Self::add_road) rather than serializing this struct
+/// directly — `occupancy` is derived, not stored.
+#[allow(dead_code)] // remaining fields/methods are exercised only by tests — see the module docs
+#[derive(Resource, Default, Debug)]
 pub struct City {
     buildings: HashMap<BuildingId, PlacedBuilding>,
     next_id: u64,
@@ -210,14 +228,59 @@ impl City {
         self.buildings.get(&id)
     }
 
-    #[allow(dead_code)] // no caller yet — see the module docs
     pub fn buildings(&self) -> impl Iterator<Item = (BuildingId, &PlacedBuilding)> {
         self.buildings.iter().map(|(&id, b)| (id, b))
     }
 
+    /// Inserts a building under an id the caller supplies, rather than
+    /// minting a fresh one — [`place_building`](Self::place_building)'s
+    /// counterpart for [`persistence::load_city`](super::persistence::load_city),
+    /// the only caller: a save file already recorded a [`BuildingId`] for
+    /// every placement, and reissuing new ones on load would let two
+    /// sessions disagree about which id names which building.
+    ///
+    /// Same all-or-nothing shape as `place_building` — every tile is checked
+    /// before any of them is marked occupied — so a save file with two
+    /// overlapping buildings fails the load rather than producing a City
+    /// whose occupancy grid disagrees with itself. Also raises `next_id`
+    /// past `id`, the same bump a fresh placement gets, so an id read back
+    /// off disk is never handed out again by a later `place_building` call.
+    pub(crate) fn insert_loaded(&mut self, id: BuildingId, building: PlacedBuilding) -> Result<(), PlacementError> {
+        let tiles: Vec<IVec2> = footprint_tiles(building.origin, building.footprint, building.rotation).collect();
+        for &tile in &tiles {
+            if let Some(&by) = self.occupancy.get(&tile) {
+                return Err(PlacementError::TileOccupied { tile, by });
+            }
+        }
+
+        for &tile in &tiles {
+            self.occupancy.insert(tile, Occupant::Building(id));
+        }
+        self.next_id = self.next_id.max(id.as_u64() + 1);
+        self.buildings.insert(id, building);
+        Ok(())
+    }
+
+    /// The raw instance counter, for [`persistence::save_city`](super::persistence::save_city)
+    /// to record — see that module's docs for why it has to be persisted
+    /// rather than recomputed from the surviving buildings alone.
+    pub(crate) fn next_id_raw(&self) -> u64 {
+        self.next_id
+    }
+
+    /// Raises `next_id` to `at_least` if it isn't there already — never
+    /// lowers it. [`persistence::load_city`](super::persistence::load_city)'s
+    /// last step: `insert_loaded` already bumped `next_id` past every id it
+    /// inserted, but a building can be removed *after* being placed and
+    /// *before* being saved, which drops its id from `buildings` without
+    /// rolling `next_id` back — the file's own recorded value is what this
+    /// restores, see the module docs' removed-highest-building scenario.
+    pub(crate) fn raise_next_id(&mut self, at_least: u64) {
+        self.next_id = self.next_id.max(at_least);
+    }
+
     /// Marks `tile` as a road. Idempotent if `tile` is already a road;
     /// refused if it's held by a building (or anything else).
-    #[allow(dead_code)] // no caller yet — see the module docs
     pub fn add_road(&mut self, tile: IVec2) -> Result<(), PlacementError> {
         match self.occupancy.get(&tile) {
             Some(Occupant::Road) => Ok(()),
@@ -242,7 +305,6 @@ impl City {
         }
     }
 
-    #[allow(dead_code)] // no caller yet — see the module docs
     pub fn roads(&self) -> impl Iterator<Item = &IVec2> {
         self.roads.iter()
     }

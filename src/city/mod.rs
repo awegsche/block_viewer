@@ -57,19 +57,36 @@
 //!
 //! ## City state (ticket 042, roadmap D1)
 //!
-//! [`run`] also inserts an empty [`state::City`] — placed buildings, roads,
-//! and the footprint occupancy grid both are checked against. Same
-//! "proven, not yet used" state the catalogue and definitions landed in:
-//! nothing calls [`state::City::place_building`] yet, since that needs
-//! picking (E1) and terrain fit (E2) first. Unlike the catalogue and
-//! definitions, there's nothing to load or log — a fresh city starts empty.
+//! [`run`] inserts [`state::City`] — placed buildings, roads, and the
+//! footprint occupancy grid both are checked against. Nothing calls
+//! [`state::City::place_building`] yet, since that needs picking (E1) and
+//! terrain fit (E2) first — the "proven, not yet used" state the catalogue
+//! and definitions landed in, for that half of the type.
+//!
+//! ## City persistence (ticket 043, roadmap D2)
+//!
+//! Unlike the catalogue and definitions, [`state::City`] does have a real
+//! caller either side of "proven, not yet used": [`load_city`] reads
+//! `<save>/citybuilder/city.ron` through [`persistence::load_city`] before
+//! `App::run()`, and [`save_city_on_exit`] writes it back through
+//! [`persistence::save_city`] on [`AppExit`]. Both are no-ops (an empty city
+//! in, nothing to save out) until E1-E4 give something a reason to call
+//! `place_building` — but the round trip itself, and the file path it reads
+//! and writes, are exercised by the real app lifecycle now, not only by
+//! [`persistence`]'s own unit tests. A save with no real world loaded (ticket
+//! 008's `empty_save` placeholder) skips persistence entirely via
+//! [`CitySavePath`] — there's no save root to read from or write to.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 mod definition;
+mod persistence;
 mod state;
 
-use crate::{blueprint, chunk_pipeline::RenderFloor, world::decode::FloorPolicy, world_app};
+use bevy::app::AppExit;
+use bevy::prelude::*;
+
+use crate::{blueprint, chunk_pipeline::RenderFloor, world::decode::FloorPolicy, world_app, LoadedSave};
 
 /// Where [`run`] looks for building blueprints — the flat, non-recursive
 /// directory the roadmap's `assets/city/blueprints/*.nbt` glob names.
@@ -79,18 +96,73 @@ const CATALOGUE_DIR: &str = "assets/city/blueprints";
 /// directory the roadmap's C1 sketch implies alongside `CATALOGUE_DIR`.
 const DEFINITIONS_DIR: &str = "assets/city/buildings";
 
+/// Where [`save_city`](persistence::save_city)/[`load_city`](persistence::load_city)
+/// look, relative to a save's root — `None` when [`world_app`]'s
+/// [`LoadedSave`] is ticket 008's placeholder (`empty_save`, `meta.path`
+/// empty), which has nowhere on disk to read from or write to.
+#[derive(Resource)]
+struct CitySavePath(Option<PathBuf>);
+
 /// Runs the citybuilder. Called by `src/bin/citybuilder.rs`, which is three
 /// lines and nothing else.
 pub fn run() {
     let catalogue = load_building_catalogue();
     let definitions = load_building_definitions(&catalogue);
 
-    world_app()
-        .insert_resource(RenderFloor(FloorPolicy::BelowSurface { margin: 16 }))
+    let mut app = world_app();
+    let save_root = app.world().resource::<LoadedSave>().0.meta.path.clone();
+    let city = load_city(&save_root);
+
+    app.insert_resource(RenderFloor(FloorPolicy::BelowSurface { margin: 16 }))
         .insert_resource(catalogue)
         .insert_resource(definitions)
-        .insert_resource(state::City::default())
+        .insert_resource(city)
+        .insert_resource(CitySavePath(if save_root.as_os_str().is_empty() { None } else { Some(save_root) }))
+        .add_systems(Last, save_city_on_exit)
         .run();
+}
+
+/// Loads [`state::City`] from `save_root`, logging what happened the same
+/// way [`load_building_catalogue`]/[`load_building_definitions`] do. Skips
+/// persistence entirely (starts from an empty city) when `save_root` is
+/// empty — ticket 008's `empty_save` placeholder, with nowhere to read from.
+fn load_city(save_root: &Path) -> state::City {
+    if save_root.as_os_str().is_empty() {
+        println!("block_viewer: no save loaded, starting with an empty city");
+        return state::City::default();
+    }
+
+    match persistence::load_city(save_root) {
+        Ok(city) => {
+            println!(
+                "block_viewer: loaded {} building{} from {}",
+                city.len(),
+                if city.len() == 1 { "" } else { "s" },
+                persistence::city_file_path_for_log(save_root).display(),
+            );
+            city
+        }
+        Err(err) => {
+            println!("block_viewer: could not load city save, starting empty: {err}");
+            state::City::default()
+        }
+    }
+}
+
+/// Saves [`state::City`] to [`CitySavePath`] on every [`AppExit`] — window
+/// close, Alt+F4, or any other route Bevy turns into that event. A no-op
+/// when [`CitySavePath`] is `None` (no real save was loaded, see
+/// [`load_city`]).
+fn save_city_on_exit(mut exit_events: EventReader<AppExit>, city: Res<state::City>, save_path: Res<CitySavePath>) {
+    if exit_events.read().count() == 0 {
+        return;
+    }
+    let Some(save_root) = &save_path.0 else { return };
+
+    match persistence::save_city(&city, save_root) {
+        Ok(()) => println!("block_viewer: saved city ({} building{})", city.len(), if city.len() == 1 { "" } else { "s" }),
+        Err(err) => println!("block_viewer: could not save city: {err}"),
+    }
 }
 
 /// Loads and logs the building catalogue. Split out from [`run`] so the

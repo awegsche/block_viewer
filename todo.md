@@ -605,3 +605,26 @@ these itself (see CLAUDE.md's "Manual/visual verification").
   `block_viewer: loaded 1 building definition from assets/city/buildings`
   followed by a `house01 — "House" tier 1, footprint WxD` line, no `skipped`
   lines, and still no panic before the window opens.
+- [ ] **043 city save/load: the real app lifecycle actually fires the
+  save.** The automated suite covers `persistence::{save_city, load_city}`
+  directly (round trips, the removed-highest-id `next_id` case, corrupt/
+  version-mismatched files) — what it can't cover is whether Bevy's real
+  `AppExit` fires from an actual window close on this machine, and whether
+  the file lands where expected on a real save.
+
+  `cargo run --bin citybuilder` against the real save. Confirm the console
+  prints a `no save loaded, starting with an empty city` line only if no
+  save was found, or otherwise nothing about a missing city file (a first
+  run has no `citybuilder/city.ron` yet, which is silent — `load_city`'s
+  `NotFound` path prints nothing, only `run`'s own no-save-loaded branch
+  does). Close the window normally (the titlebar X). Confirm the console
+  prints `block_viewer: saved city (0 buildings)` before the process exits,
+  and that `<save folder>/citybuilder/city.ron` now exists on disk with
+  `version: 1, next_id: 0, buildings: [], roads: []`. Run it a second time
+  and confirm the console now prints `block_viewer: loaded 0 buildings
+  from <path>\citybuilder\city.ron` — proving the load side reads back
+  what the exit handler actually wrote, not just what a unit test
+  constructed in memory. Also try closing via Alt+F4 and confirm the same
+  save line appears — Bevy is expected to route both through the same
+  `AppExit` event, but this is the one thing worth actually checking rather
+  than assuming.
