@@ -761,3 +761,42 @@ these itself (see CLAUDE.md's "Manual/visual verification").
   than a corrupted region file or two writes racing silently. Not a hard
   failure if the window can't be hit by hand; the automated `write_gate`
   tests already cover the logic itself.
+
+- [ ] **050 build menu and city panel: the first real UI actually reads,
+  clicks and undoes correctly.** The automated suite covers the pure logic
+  (requirement satisfaction, sort order, cost/production formatting,
+  building counts, the write-status/undo state machines) directly; what it
+  can't cover is whether the two egui windows actually render sensibly and
+  whether a real click drives the same pipeline the number keys already
+  proved out in 047-049. **Back the world up first** (or run this against a
+  scratch copy) -- this can write to a real save, same caveat as every
+  other write-path checklist item above.
+
+  `cargo run --bin citybuilder` against a real save with at least two
+  entries in `assets/city/buildings` where one `requires` the other.
+  Confirm: (1) the Build window lists tiers with headings, shows cost
+  ("Cost: 40x oak_planks" or "Cost: Free") and, if the fixture has one, a
+  production line; (2) the locked entry (whose `requires` isn't built yet)
+  is greyed out and hovering it shows "Requires: <name>", both in the
+  tooltip and as a standing "Locked -- requires…" line under the row; (3)
+  clicking an *unlocked* entry selects it exactly like pressing its number
+  key would -- the ghost preview appears and `R`/`PageUp`/`PageDown`/`Home`
+  still work on it. Place the requirement building via a click (not a
+  number key) and confirm the previously-locked entry unlocks live, no
+  restart needed.
+
+  Then check the City window: building counts update after each placement,
+  the road tile count matches (0 if F hasn't landed yet), and the
+  write-status section shows "Placed <id>: N block(s) across M chunk(s), K
+  region file(s)" in green right after a successful placement, with a
+  listed backup path the first time a given region is touched this session
+  and "No new backups" on a second write to the same region. Demolish that
+  building (via `Delete`, same as 049) and confirm the status line updates
+  to "Demolished …". Finally, click "Undo" and confirm: the console shows
+  an "undid …" line, the write-status section shows "Undid …", the building
+  reappears (if the last journal entry was the demolition) or disappears
+  (if it was the placement), and clicking Undo again with an empty journal
+  shows "Undo failed: there is nothing to undo" rather than doing nothing
+  silently. Also worth trying once: click Undo with no save loaded (the
+  citybuilder's `empty_save` placeholder) and confirm it fails cleanly
+  rather than panicking.

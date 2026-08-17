@@ -9,10 +9,6 @@
 //!
 //! What this deliberately does *not* add, and why it looks so empty:
 //!
-//! - **No UI.** The viewer's egui panels ([`crate::viewer::ui`]) are its
-//!   own; the citybuilder's build menu and city panel are roadmap group G.
-//!   Without `EguiPlugin` the camera's [`crate::camera::EguiInputCapture`]
-//!   simply stays at its "nothing captured" default, which is correct here.
 //! - **No selection.** [`crate::selection`] is shared, but the box and its
 //!   drag handles are the explorer's affordance. The citybuilder's own
 //!   picking is roadmap task E1.
@@ -129,6 +125,22 @@
 //! one that's safe here. [`write_gate::WriteGate`] is a small resource
 //! shared with [`commit::CommitPlugin`] so the two can't both have a
 //! `WriteSession` open at once.
+//!
+//! ## The build menu and city panel (ticket 050, roadmap G)
+//!
+//! [`ui::UiPlugin`] is the citybuilder's first real UI — its own
+//! `EguiPlugin` registration, not [`crate::viewer::ui::UiPlugin`] (see
+//! [`ui`]'s own module docs for why a second one). Two windows:
+//! [`ui`]'s build menu replaces ticket 047's number-key stand-in for
+//! *picking* a catalogue entry (rotation/height/clear stay on the keyboard),
+//! grouped by tier with locked entries shown, disabled, and naming what
+//! unlocks them — the roadmap's own G1 wording, word for word. Its city
+//! panel is G2's: building counts, road length, and the last write's own
+//! outcome ([`write_status::WriteStatus`], a new small resource
+//! `commit`/`demolish` both record into), plus an "Undo" button —
+//! [`journal::Journal::undo_last`]'s promised caller, run through the write
+//! path by the new [`undo::UndoPlugin`], the same `request`/`busy`/`state`
+//! shape `commit`/`demolish` already use.
 
 use std::path::{Path, PathBuf};
 
@@ -141,14 +153,17 @@ mod persistence;
 mod picking;
 mod placement;
 mod state;
+mod ui;
+mod undo;
 mod write_gate;
+mod write_status;
 
 use bevy::app::AppExit;
 use bevy::prelude::*;
 
 use crate::{
     blueprint,
-    camera::{CameraMode, CameraStartMode},
+    camera::{self, CameraMode, CameraStartMode},
     chunk_pipeline::RenderFloor,
     world::decode::FloorPolicy,
     world_app, LoadedSave,
@@ -193,6 +208,14 @@ pub fn run() {
         .add_plugins(placement::PlacementPlugin)
         .add_plugins(commit::CommitPlugin)
         .add_plugins(demolish::DemolishPlugin)
+        .add_plugins(undo::UndoPlugin)
+        .add_plugins(ui::UiPlugin)
+        // Ticket 050's build menu/city panel need to have drawn this frame
+        // before `drive_camera` and the picking/placement/commit/demolish
+        // systems that already gate on `camera::EguiInputCapture` read it —
+        // the same two lines `viewer::run` uses `ui::UiPanelSet` for, see
+        // that module's own docs for the fuller argument.
+        .configure_sets(Update, camera::CameraSet.after(ui::UiPanelSet))
         .add_systems(Last, (save_city_on_exit, save_journal_on_exit))
         .run();
 }

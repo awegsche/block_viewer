@@ -82,6 +82,7 @@ use super::picking::{HoveredBlock, PickingSet};
 use super::placement::{self, GhostPlacement, PlacementSelection};
 use super::state::{self, BuildingId, PlacedBuilding};
 use super::write_gate::WriteGate;
+use super::write_status::{WriteKind, WriteStatus};
 
 /// A commit's write, in flight — see the module docs.
 struct PendingCommit {
@@ -110,6 +111,9 @@ impl Plugin for CommitPlugin {
             // isn't already present, so it doesn't matter which plugin adds
             // to the app first. See `write_gate`'s module docs.
             .init_resource::<WriteGate>()
+            // Same idempotent-either-order shape as `WriteGate` above — see
+            // `write_status`'s module docs.
+            .init_resource::<WriteStatus>()
             // Registered here rather than assumed from `ChunkLoadPipelinePlugin`
             // — `add_event` is idempotent, the same defensive call
             // `viewer::paint::PaintPlugin` makes, and it's what lets a
@@ -271,6 +275,7 @@ fn poll_commit(
     mut city: ResMut<state::City>,
     mut journal: ResMut<Journal>,
     mut write_gate: ResMut<WriteGate>,
+    mut write_status: ResMut<WriteStatus>,
     mut edited: EventWriter<ChunksEdited>,
 ) {
     let result = {
@@ -296,13 +301,15 @@ fn poll_commit(
             // defensive shape `Baseline::capture`'s own doc comment expects
             // of a caller, not a case this path expects to actually miss.
             if let Some(baseline) = journal::Baseline::capture(&edit, &summary.report) {
-                journal.record_placement(building, placement, baseline);
+                journal.record_placement(building, placement.clone(), baseline);
             }
+            write_status.record_success(WriteKind::Placed, placement.definition, &summary);
             edited.send(ChunksEdited(summary.report.chunks));
         }
         Err(err) => {
             city.remove_building(building);
             println!("block_viewer: placement of {} failed, rolled back: {err}", placement.definition);
+            write_status.record_failure(WriteKind::Placed, placement.definition, err.to_string());
         }
     }
 }

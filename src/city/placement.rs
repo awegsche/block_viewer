@@ -173,6 +173,21 @@ fn rotate_clockwise(rotation: Rotation) -> Rotation {
     }
 }
 
+/// `Rotation` as a degree figure for display — same reason [`rotate_clockwise`]
+/// exists next to it: `blueprint::rotate::Rotation` has no public numeric
+/// view of itself, `quarter_turns` being private to that module's own
+/// geometry remap. `pub(super)`: `city::ui::build_menu` (ticket 050, roadmap
+/// G1) is the one other caller, for the "Rotation: 90°" line next to the
+/// build menu's selected entry.
+pub(super) fn rotation_degrees(rotation: Rotation) -> u16 {
+    match rotation {
+        Rotation::Deg0 => 0,
+        Rotation::Deg90 => 90,
+        Rotation::Deg180 => 180,
+        Rotation::Deg270 => 270,
+    }
+}
+
 /// Drives [`PlacementSelection`] off the keyboard — see the module docs'
 /// "No build menu yet".
 fn cycle_selection(

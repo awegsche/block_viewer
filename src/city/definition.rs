@@ -237,13 +237,28 @@ impl std::error::Error for DefinitionError {}
 /// One loaded building: an id, where it came from, the parsed [`Building`],
 /// and its footprint resolved against the catalogue.
 pub struct LoadedBuilding {
-    /// The filename stem, e.g. `lumberjack.ron` -> `"lumberjack"`.
+    /// The filename stem, e.g. `lumberjack.ron` -> `"lumberjack"`. A
+    /// *definition* id — not necessarily the same string as
+    /// [`Self::catalogue_id`], since a `.ron` file and the `.nbt` it names
+    /// are free to have different stems (`lumberjack.ron` pointing at
+    /// `house01.nbt` is a legal, if confusing, definition).
     pub id: String,
     pub path: PathBuf,
     pub building: Building,
     /// `(x, z)` — resolved from [`Building::footprint`] against the
     /// matched catalogue entry when it's [`FootprintSpec::FromBlueprint`].
     pub footprint: IVec2,
+    /// [`Building::blueprint`]'s filename stem — the id this definition's
+    /// shape is filed under in [`BuildingCatalogue`], resolved once here
+    /// rather than every caller re-deriving it from
+    /// [`Path::file_stem`](std::path::Path::file_stem). `city::ui::build_menu`
+    /// (ticket 050, roadmap G1) is the reason this needs to be public:
+    /// [`super::placement::PlacementSelection::catalogue_id`] and
+    /// `city::commit`/`city::state::City` all key a placement by *this* id,
+    /// not [`Self::id`] — clicking a build-menu entry has to select the
+    /// catalogue id its blueprint actually loaded under, not the `.ron`
+    /// filename that happened to describe it.
+    pub catalogue_id: String,
 }
 
 /// Every building definition the game currently knows about, keyed by id.
@@ -253,12 +268,9 @@ pub struct BuildingDefinitions {
 }
 
 impl BuildingDefinitions {
-    // No non-test caller yet for `get`/`is_empty` — G1's build menu is what
-    // will do "the building named X" lookups, the same "no caller yet" state
-    // `BuildingCatalogue::get` was in before this ticket. Kept for API
-    // symmetry with `BuildingCatalogue` and exercised directly by this
-    // module's tests.
-    #[allow(dead_code)]
+    /// `city::ui::build_menu` (ticket 050, roadmap G1) is the real caller
+    /// now — a missing-requirement id's display name, and the currently
+    /// selected entry's own name.
     pub fn get(&self, id: &str) -> Option<&LoadedBuilding> {
         self.entries.get(id)
     }
@@ -267,7 +279,9 @@ impl BuildingDefinitions {
         self.entries.len()
     }
 
-    #[allow(dead_code)]
+    /// `city::ui::build_menu`'s real caller now: an empty set is a distinct
+    /// panel message ("no buildings in assets/city/buildings"), not an empty
+    /// window.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -350,7 +364,10 @@ fn load_entry(
         .ok_or_else(|| DefinitionError::UnknownBlueprint(building.blueprint.clone()))?;
 
     let footprint = resolve_footprint(building.footprint, catalogue_entry.footprint);
-    Ok(LoadedBuilding { id, path: path.to_path_buf(), building, footprint })
+    // `blueprint_stem` is `Some` by construction: `catalogue_entry` above
+    // only matched because it was.
+    let catalogue_id = blueprint_stem.expect("catalogue_entry matched on this stem above").to_string();
+    Ok(LoadedBuilding { id, path: path.to_path_buf(), building, footprint, catalogue_id })
 }
 
 /// Whether `path` has a `.ron` extension, case-insensitively — same

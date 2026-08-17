@@ -37,8 +37,9 @@
 //! by this module's tests. [`Journal::record_demolition`] and
 //! [`Baseline::restore_edit`] are called the same way by
 //! `city::demolish::poll_demolish`/`try_demolish` (ticket 049, roadmap E5).
-//! [`Journal::undo_last`]/[`reconcile`] still wait on whatever UI eventually
-//! calls them (G2, roadmap I).
+//! [`Journal::undo_last`] got its real caller in ticket 050 (roadmap G2):
+//! `city::undo::start_undo`, off an "Undo" button in the city panel.
+//! [`reconcile`] still waits on roadmap I.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -176,7 +177,9 @@ impl JournalEntry {
         }
     }
 
-    #[allow(dead_code)] // no caller yet — see the module docs
+    /// `city::undo` (ticket 050, roadmap G2) is the real caller now — the
+    /// display name for "what am I about to undo", read off the entry before
+    /// [`Journal::undo_last`] pops it.
     pub fn placement(&self) -> &PlacedBuilding {
         match self {
             JournalEntry::Placed { placement, .. } | JournalEntry::Demolished { placement, .. } => placement,
@@ -220,7 +223,9 @@ impl Journal {
         self.entries.push(JournalEntry::Demolished { building, placement, baseline });
     }
 
-    #[allow(dead_code)] // no caller yet — see the module docs
+    /// `city::undo` (ticket 050) reads the last entry off this before
+    /// undoing it; `city::ui::city_panel` (roadmap G2) is what will
+    /// eventually show recent activity off it too.
     pub fn entries(&self) -> &[JournalEntry] {
         &self.entries
     }
@@ -265,7 +270,9 @@ impl Journal {
     /// [`crate::edit::apply`]'s: this call has already moved `city` and the
     /// journal on by the time it returns, on the assumption the caller
     /// commits `edit` next.
-    #[allow(dead_code)] // no caller yet — E4/E5 (roadmap), see the module docs
+    /// `city::undo::start_undo` (ticket 050, roadmap G2) is the real caller —
+    /// the button the module docs' "still wait on whatever UI eventually
+    /// calls them" pointed at.
     pub fn undo_last(&mut self, city: &mut City) -> Result<UndoStep, UndoError> {
         let entry = self.entries.last().ok_or(UndoError::Empty)?;
         let edit = entry.baseline().restore_edit();
@@ -295,7 +302,6 @@ impl Journal {
 /// One step of undo: the [`City`] side has already happened by the time this
 /// comes back ([`Journal::undo_last`]); `edit` is what's left — the world
 /// half, for the caller to run through the write path.
-#[allow(dead_code)] // no caller yet — see the module docs
 #[derive(Debug)]
 pub struct UndoStep {
     pub building: BuildingId,

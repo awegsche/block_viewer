@@ -1,0 +1,342 @@
+//! The build menu (ticket 050, roadmap G1): the catalogue grouped by tier,
+//! locked entries visible but disabled and showing what unlocks them, costs
+//! and production shown from C1's data even while iteration 1 leaves both
+//! inert.
+//!
+//! ## Replaces the number-key stand-in, keeps the rest
+//!
+//! Ticket 047's `city::placement::cycle_selection` picked a catalogue entry
+//! with `1`-`9`, explicitly as a stand-in "until a real menu exists" — this
+//! is that menu, and clicking an entry here sets exactly the same
+//! [`PlacementSelection::catalogue_id`] the number keys did. Rotation
+//! (`R`), height (`PageUp`/`PageDown`/`Home`) and clearing (`Escape`) stay on
+//! the keyboard; a build menu doesn't need to reinvent those, only "which
+//! building".
+//!
+//! ## Selecting by definition, placing by catalogue id
+//!
+//! [`PlacementSelection::catalogue_id`] has always named a
+//! [`BuildingCatalogue`](crate::blueprint::BuildingCatalogue) entry — the raw
+//! shape — not a [`BuildingDefinitions`] entry — the game data. A menu built
+//! off definitions (for tier/cost/production/`requires`) has to bridge the
+//! two on every click, which is exactly what
+//! [`LoadedBuilding::catalogue_id`] (ticket 050's own addition to
+//! `definition.rs`) is for: resolved once at load time from
+//! `Building::blueprint`'s filename stem, rather than this panel re-deriving
+//! it from a path every frame.
+//!
+//! ## Unlocking, defined for the first time here
+//!
+//! Nothing before this ticket ever *read* [`Building::requires`] outside of
+//! ticket 041's own cycle/dangling validation — no economy, no separate
+//! "unlocked techs" resource exists in iteration 1 (see the roadmap's C3:
+//! "production simulation... nothing consumes it"). The definition this
+//! panel needs, and the smallest one that uses data already on hand: a
+//! requirement is met once at least one building of that type has actually
+//! been placed — [`missing_requirements`] checks
+//! [`state::City::buildings`]'s own `definition` field, the same "has this
+//! type been built" signal a real tech tree would gate on, without inventing
+//! a second piece of state to track it in.
+
+use bevy::prelude::*;
+use bevy_egui::{egui, EguiContexts};
+
+use super::super::definition::{Building, BuildingDefinitions, Cost, LoadedBuilding, Production};
+use super::super::placement::{rotation_degrees, PlacementSelection};
+use super::super::state;
+
+/// A block or item id's short display form — `"minecraft:oak_planks"` ->
+/// `"oak_planks"`. Every id this panel shows is already namespaced
+/// `minecraft:`, and repeating that prefix on every cost line would be pure
+/// noise in a menu meant to be scanned quickly.
+fn short_name(name: &str) -> &str {
+    name.strip_prefix("minecraft:").unwrap_or(name)
+}
+
+/// `Building::cost` as one line — `"Free"` for an empty list (iteration 1's
+/// starter buildings, per the roadmap's own sketch) rather than a blank line
+/// that reads as a loading glitch.
+fn cost_line(cost: &[Cost]) -> String {
+    if cost.is_empty() {
+        return "Free".to_string();
+    }
+    cost.iter().map(|c| format!("{}x {}", c.count, short_name(&c.block))).collect::<Vec<_>>().join(", ")
+}
+
+/// `Building::production`'s outputs as one line, `None` for iteration 1's
+/// non-functional buildings (`production: None`) — the roadmap's own
+/// wording, "C1 parses and displays these; nothing simulates them yet",
+/// which is exactly what this line is: a display, not a rate anything reads.
+fn production_line(production: &Production) -> Option<String> {
+    if production.outputs.is_empty() {
+        return None;
+    }
+    Some(production.outputs.iter().map(|item| format!("{} {:.1}/min", item.item, item.per_minute)).collect::<Vec<_>>().join(", "))
+}
+
+/// Every `requires` id `building` names that no placed building's own
+/// `definition` currently satisfies — empty means unlocked. See the module
+/// docs' "Unlocking, defined for the first time here". A plain function, not
+/// a system, so it's testable directly against a bare [`state::City`] the
+/// same way [`crate::city::placement::resolve_placement`] is.
+fn missing_requirements(building: &Building, city: &state::City) -> Vec<String> {
+    building
+        .requires
+        .iter()
+        .filter(|req| !city.buildings().any(|(_, placed)| &placed.definition == *req))
+        .cloned()
+        .collect()
+}
+
+/// [`BuildingDefinitions::iter`]'s entries, grouped by tier and sorted by id
+/// within a tier — `BuildingDefinitions` is keyed by a `HashMap`, whose
+/// iteration order a menu can't be built on.
+fn sorted_entries(definitions: &BuildingDefinitions) -> Vec<&LoadedBuilding> {
+    let mut entries: Vec<&LoadedBuilding> = definitions.iter().collect();
+    sort_by_tier_then_id(&mut entries);
+    entries
+}
+
+/// The comparison [`sorted_entries`] applies, split out so it's directly
+/// testable against a hand-built `Vec<&LoadedBuilding>` — every field of
+/// [`LoadedBuilding`] is public, but [`BuildingDefinitions`] itself has no
+/// public constructor beyond loading real files off disk (see
+/// `definition`'s own tests for that path), so a unit test for *ordering
+/// alone* is cheaper built this way, the same reason
+/// [`crate::city::placement::rotate_clockwise`] is tested apart from any
+/// `PlacementSelection`.
+fn sort_by_tier_then_id(entries: &mut [&LoadedBuilding]) {
+    entries.sort_by(|a, b| a.building.tier.cmp(&b.building.tier).then_with(|| a.id.cmp(&b.id)));
+}
+
+/// A missing-requirement id's display name — the definition it names if one
+/// loaded, the raw id otherwise (a dangling `requires` is caught at load
+/// time by ticket 041's `resolve_requirements`, so this fallback is
+/// unreachable through a real [`BuildingDefinitions`], but a menu is a bad
+/// place to `expect()` on it).
+fn requirement_label(id: &str, definitions: &BuildingDefinitions) -> String {
+    definitions.get(id).map(|entry| entry.building.name.clone()).unwrap_or_else(|| id.to_string())
+}
+
+/// One row: name, footprint, cost, production, and either a click target (if
+/// unlocked) or a disabled row naming what's missing (if not).
+fn entry_row(ui: &mut egui::Ui, entry: &LoadedBuilding, definitions: &BuildingDefinitions, selection: &mut PlacementSelection, city: &state::City) {
+    let missing = missing_requirements(&entry.building, city);
+    let unlocked = missing.is_empty();
+    let missing_names = || -> String { missing.iter().map(|id| requirement_label(id, definitions)).collect::<Vec<_>>().join(", ") };
+    let selected = selection.catalogue_id.as_deref() == Some(entry.catalogue_id.as_str());
+
+    let label = format!("{}  ({}x{})", entry.building.name, entry.footprint.x, entry.footprint.y);
+    let response = ui.add_enabled(unlocked, egui::SelectableLabel::new(selected, label));
+    if response.clicked() {
+        selection.catalogue_id = Some(entry.catalogue_id.clone());
+        selection.y_offset = 0;
+    }
+    if !unlocked {
+        response.on_disabled_hover_text(format!("Requires: {}", missing_names()));
+    }
+
+    ui.label(format!("  Cost: {}", cost_line(&entry.building.cost)));
+    if let Some(production) = &entry.building.production {
+        if let Some(line) = production_line(production) {
+            ui.label(format!("  Produces: {line}"));
+        }
+    }
+    if !unlocked {
+        ui.colored_label(egui::Color32::from_rgb(220, 160, 90), format!("  Locked — requires {}", missing_names()));
+    }
+}
+
+/// The currently selected entry's own line, above the tiers — "what am I
+/// about to place, and how" is worth one glance without scrolling a
+/// collapsed tier open.
+fn selected_line(ui: &mut egui::Ui, selection: &PlacementSelection, definitions: &BuildingDefinitions) {
+    let Some(id) = selection.catalogue_id.as_deref() else {
+        ui.label("(nothing selected — click a building below)");
+        return;
+    };
+    let name = definitions
+        .iter()
+        .find(|entry| entry.catalogue_id == id)
+        .map(|entry| entry.building.name.clone())
+        .unwrap_or_else(|| id.to_string());
+    ui.label(format!(
+        "Selected: {name} — rotation {}°{}",
+        rotation_degrees(selection.rotation),
+        if selection.y_offset != 0 { format!(", height {:+}", selection.y_offset) } else { String::new() },
+    ));
+}
+
+/// `R` rotate, `PageUp`/`PageDown`/`Home` height, `Delete` demolish, `Esc`
+/// clear — the keyboard half ticket 047/048/049 already built, restated here
+/// so it's discoverable from the one panel a player actually looks at while
+/// placing something. Collapsed by default, the same call
+/// `viewer::ui::selection_panel::key_legend` makes.
+fn key_legend(ui: &mut egui::Ui) {
+    egui::CollapsingHeader::new("Keys").show(ui, |ui| {
+        egui::Grid::new("build_menu_key_legend").num_columns(2).show(ui, |ui| {
+            ui.label("R");
+            ui.label("rotate the selection 90°");
+            ui.end_row();
+            ui.label("Page Up / Page Down");
+            ui.label("nudge the placement height");
+            ui.end_row();
+            ui.label("Home");
+            ui.label("reset the height to the terrain's own fit");
+            ui.end_row();
+            ui.label("Delete");
+            ui.label("demolish the hovered building");
+            ui.end_row();
+            ui.label("Esc");
+            ui.label("clear the selection");
+            ui.end_row();
+        });
+    });
+}
+
+/// Egui window: the build menu. Empty definitions (nothing loaded, or an
+/// `assets/city/buildings` directory that doesn't exist) shows a plain
+/// message rather than an empty, confusing window — the same "(nothing
+/// selected...)"-style tone the rest of the crate's panels use for an empty
+/// state that isn't an error.
+pub(super) fn build_menu_panel(
+    mut contexts: EguiContexts,
+    definitions: Option<Res<BuildingDefinitions>>,
+    city: Res<state::City>,
+    mut selection: ResMut<PlacementSelection>,
+) {
+    egui::Window::new("Build").show(contexts.ctx_mut(), |ui| {
+        let Some(definitions) = definitions else {
+            ui.label("(no building definitions loaded)");
+            return;
+        };
+        if definitions.is_empty() {
+            ui.label("(no buildings in assets/city/buildings)");
+            return;
+        }
+
+        selected_line(ui, &selection, &definitions);
+        if ui.button("Clear selection").clicked() {
+            selection.catalogue_id = None;
+            selection.y_offset = 0;
+        }
+        ui.separator();
+
+        let entries = sorted_entries(&definitions);
+        let mut current_tier = None;
+        for entry in entries {
+            if current_tier != Some(entry.building.tier) {
+                current_tier = Some(entry.building.tier);
+                ui.heading(format!("Tier {}", entry.building.tier));
+            }
+            entry_row(ui, entry, &definitions, &mut selection, &city);
+            ui.separator();
+        }
+
+        key_legend(ui);
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::blueprint::Rotation;
+    use crate::city::definition::{FootprintSpec, Integrity, ProductionItem};
+    use std::path::PathBuf;
+
+    fn building(name: &str, tier: u32, requires: Vec<&str>) -> Building {
+        Building {
+            name: name.to_string(),
+            blueprint: format!("{name}.nbt"),
+            tier,
+            requires: requires.into_iter().map(str::to_string).collect(),
+            footprint: FootprintSpec::FromBlueprint,
+            production: None,
+            cost: Vec::new(),
+            integrity: Integrity { pristine_above: 0.95, ruined_below: 0.6 },
+        }
+    }
+
+    fn loaded(id: &str, building: Building) -> LoadedBuilding {
+        let catalogue_id = building.blueprint.trim_end_matches(".nbt").to_string();
+        LoadedBuilding { id: id.to_string(), path: PathBuf::new(), building, footprint: IVec2::new(2, 2), catalogue_id }
+    }
+
+    // --- missing_requirements --------------------------------------------
+
+    #[test]
+    fn no_requires_is_always_unlocked() {
+        let city = state::City::default();
+        assert!(missing_requirements(&building("house", 1, vec![]), &city).is_empty());
+    }
+
+    #[test]
+    fn an_unmet_requirement_is_reported() {
+        let city = state::City::default();
+        let missing = missing_requirements(&building("carpenter", 2, vec!["house01"]), &city);
+        assert_eq!(missing, vec!["house01".to_string()]);
+    }
+
+    #[test]
+    fn a_requirement_is_met_once_that_type_is_placed() {
+        let mut city = state::City::default();
+        city.place_building("house01", IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::ONE).unwrap();
+        let missing = missing_requirements(&building("carpenter", 2, vec!["house01"]), &city);
+        assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn only_a_matching_definition_id_satisfies_a_requirement() {
+        let mut city = state::City::default();
+        city.place_building("some_other_building", IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::ONE).unwrap();
+        let missing = missing_requirements(&building("carpenter", 2, vec!["house01"]), &city);
+        assert_eq!(missing, vec!["house01".to_string()]);
+    }
+
+    // --- sort_by_tier_then_id ------------------------------------------------
+
+    #[test]
+    fn entries_are_sorted_by_tier_then_id() {
+        let a = loaded("zzz_tier1", building("Z", 1, vec![]));
+        let b = loaded("aaa_tier1", building("A", 1, vec![]));
+        let c = loaded("mid_tier2", building("M", 2, vec![]));
+        let mut entries = vec![&a, &b, &c];
+
+        sort_by_tier_then_id(&mut entries);
+
+        let ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, vec!["aaa_tier1", "zzz_tier1", "mid_tier2"], "tier 1 before tier 2, alphabetical within a tier");
+    }
+
+    // --- cost_line / production_line ---------------------------------------
+
+    #[test]
+    fn an_empty_cost_reads_free() {
+        assert_eq!(cost_line(&[]), "Free");
+    }
+
+    #[test]
+    fn a_cost_is_formatted_count_and_short_name() {
+        let cost = [Cost { block: "minecraft:oak_planks".to_string(), count: 40 }];
+        assert_eq!(cost_line(&cost), "40x oak_planks");
+    }
+
+    #[test]
+    fn production_with_no_outputs_is_none() {
+        let production = Production { outputs: vec![], inputs: vec![], radius: None };
+        assert!(production_line(&production).is_none());
+    }
+
+    #[test]
+    fn production_outputs_are_joined() {
+        let production = Production {
+            outputs: vec![
+                ProductionItem { item: "wood".to_string(), per_minute: 4.0 },
+                ProductionItem { item: "planks".to_string(), per_minute: 2.5 },
+            ],
+            inputs: vec![],
+            radius: None,
+        };
+        assert_eq!(production_line(&production), Some("wood 4.0/min, planks 2.5/min".to_string()));
+    }
+}

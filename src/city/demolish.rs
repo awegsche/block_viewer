@@ -76,6 +76,7 @@ use super::journal::{Baseline, Journal};
 use super::picking::{HoveredBlock, PickingSet};
 use super::state::{BuildingId, City, Occupant, PlacedBuilding};
 use super::write_gate::WriteGate;
+use super::write_status::{WriteKind, WriteStatus};
 
 /// A demolition's write, in flight — see the module docs.
 struct PendingDemolition {
@@ -106,6 +107,9 @@ impl Plugin for DemolishPlugin {
             // see `write_gate`'s module docs; `init_resource` only inserts a
             // default when one isn't already present.
             .init_resource::<WriteGate>()
+            // Same idempotent-either-order shape — see `write_status`'s
+            // module docs.
+            .init_resource::<WriteStatus>()
             .add_event::<ChunksEdited>()
             // After `PickingSet` for the same reason ticket 047's ghost
             // preview and ticket 048's commit both order there —
@@ -231,6 +235,7 @@ fn poll_demolish(
     mut city: ResMut<City>,
     mut journal: ResMut<Journal>,
     mut write_gate: ResMut<WriteGate>,
+    mut write_status: ResMut<WriteStatus>,
     mut edited: EventWriter<ChunksEdited>,
 ) {
     let result = {
@@ -258,12 +263,14 @@ fn poll_demolish(
             // `Some` here — see the module docs on what each half of this
             // particular baseline means for a demolition.
             if let Some(baseline) = Baseline::capture(&edit, &summary.report) {
-                journal.record_demolition(building, placement, baseline);
+                journal.record_demolition(building, placement.clone(), baseline);
             }
+            write_status.record_success(WriteKind::Demolished, placement.definition, &summary);
             edited.send(ChunksEdited(summary.report.chunks));
         }
         Err(err) => {
             println!("block_viewer: demolition of {} failed, nothing was changed: {err}", placement.definition);
+            write_status.record_failure(WriteKind::Demolished, placement.definition, err.to_string());
         }
     }
 }
