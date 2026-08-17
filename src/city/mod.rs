@@ -88,6 +88,17 @@
 //! empty journal — but the round trip, and the file path it reads and
 //! writes, are exercised now rather than only by [`journal`]'s own unit
 //! tests.
+//!
+//! ## Ghost preview (ticket 047, roadmap E3)
+//!
+//! [`placement::PlacementPlugin`] is the first thing in the game that draws
+//! anything building-shaped: at the tile [`picking::HoveredBlock`] is over,
+//! it shows the currently selected catalogue entry's mesh, translucent and
+//! tinted green or red by whether [`grid::fit_footprint`] (E2) and
+//! [`state::City::is_tile_free`] (D1) both agree it could actually go there.
+//! G1's build menu doesn't exist yet, so a small keyboard stand-in drives
+//! *which* building is selected — see [`placement`]'s module docs. Nothing
+//! commits a placement yet; that's E4.
 
 use std::path::{Path, PathBuf};
 
@@ -96,6 +107,7 @@ mod grid;
 mod journal;
 mod persistence;
 mod picking;
+mod placement;
 mod state;
 
 use bevy::app::AppExit;
@@ -145,6 +157,7 @@ pub fn run() {
         .insert_resource(journal)
         .insert_resource(CitySavePath(if save_root.as_os_str().is_empty() { None } else { Some(save_root) }))
         .add_plugins(picking::PickingPlugin)
+        .add_plugins(placement::PlacementPlugin)
         .add_systems(Last, (save_city_on_exit, save_journal_on_exit))
         .run();
 }

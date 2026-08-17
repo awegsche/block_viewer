@@ -57,7 +57,8 @@
 //! same "proven, not yet used" state 039/040 landed [`super::blueprint`]/
 //! [`super::definition`] in. Every write method below (`place_building` and
 //! everything past it) is exercised only by this module's own tests until
-//! E1's picking and E2's terrain fit exist to drive them; the
+//! E4's commit exists to drive them (E3's ghost preview reads
+//! [`City::is_tile_free`] only, not the mutating half); the
 //! `#[allow(dead_code)]` marks through the rest of the file are that same
 //! situation, not a note-worthy call each time it recurs.
 
@@ -313,7 +314,6 @@ impl City {
         self.roads.iter()
     }
 
-    #[allow(dead_code)] // no caller yet — see the module docs
     pub fn is_tile_free(&self, tile: IVec2) -> bool {
         !self.occupancy.contains_key(&tile)
     }

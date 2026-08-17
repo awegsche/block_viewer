@@ -42,6 +42,13 @@
 //! fills it in. Past the tolerance, placement is refused outright.
 //! Terraforming (H1) is what would later let a player fix a steeper site by
 //! hand, through the write path this module deliberately doesn't touch.
+//!
+//! [`fit_footprint`]'s first real caller is `city::placement` (ticket 047,
+//! roadmap E3)'s ghost preview, called once per frame at the hovered tile.
+//! Occupancy (is a tile already claimed by another building or a road) is a
+//! separate question this module still doesn't answer — that's
+//! [`super::state::City::is_tile_free`], which `placement` checks alongside
+//! this module's terrain fit rather than the two being folded into one.
 
 use bevy::math::{IVec2, IVec3};
 
@@ -100,7 +107,6 @@ pub enum FootprintFit {
 /// block at `tile`, via [`world::ChunkColumn::topmost_non_air`] against
 /// `world.columns` directly — or `None` if `tile`'s chunk isn't decoded, or
 /// nothing solid is in what's decoded. See the module docs.
-#[allow(dead_code)] // no caller outside this module's own tests yet — see the module docs
 pub fn ground_height_at(tile: IVec2, world: &DecodedWorld) -> Option<i32> {
     let size = world::SECTION_SIZE as i32;
     let chunk = (tile.x.div_euclid(size), tile.y.div_euclid(size));
@@ -118,7 +124,6 @@ pub fn ground_height_at(tile: IVec2, world: &DecodedWorld) -> Option<i32> {
 /// streamed edge is refused before every other tile is even sampled, the
 /// same "stop once the answer is already no" shape
 /// [`super::state::City::place_building`] uses for occupancy.
-#[allow(dead_code)] // no caller yet — E3's ghost preview / E4's commit are the eventual readers
 pub fn fit_footprint(
     origin: IVec3,
     footprint: IVec2,

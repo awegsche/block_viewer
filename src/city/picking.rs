@@ -1,8 +1,9 @@
 //! Screen ray → block coordinate for the citybuilder (ticket 045, roadmap
 //! E1). [`HoveredBlock`] is the single per-frame answer to "what block is
-//! the RTS camera's cursor over right now" — E2's grid/footprint fit and
-//! E3's ghost preview are the eventual readers. Nothing consumes it yet,
-//! the same "proven, not yet used" state ticket 042's `City` landed in.
+//! the RTS camera's cursor over right now" — `city::placement` (ticket 047,
+//! roadmap E3) is the first real reader, feeding it into both E2's
+//! `fit_footprint` and its own occupancy check every frame to place and
+//! validity-tint the ghost preview.
 //!
 //! Reuses [`camera::block_under_cursor`] rather than a second raycast — the
 //! same DDA ray-march the viewer's block inspector (007) and orbit re-aim
@@ -24,6 +25,13 @@ pub struct HoveredBlock(pub Option<IVec3>);
 
 pub struct PickingPlugin;
 
+/// Where [`update_hovered_block`] runs, so `city::placement` (ticket 047,
+/// roadmap E3) can order its ghost preview after this frame's
+/// [`HoveredBlock`] rather than reading last frame's — the same reason
+/// [`update_hovered_block`] itself orders after `camera::CameraSet`.
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PickingSet;
+
 impl Plugin for PickingPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<HoveredBlock>()
@@ -31,7 +39,7 @@ impl Plugin for PickingPlugin {
             // once this frame's pan/rotate/zoom has already landed, not the
             // previous frame's — the same reason `viewer::run` orders
             // `CameraSet` relative to the UI panels that read it.
-            .add_systems(Update, update_hovered_block.after(camera::CameraSet));
+            .add_systems(Update, update_hovered_block.in_set(PickingSet).after(camera::CameraSet));
     }
 }
 

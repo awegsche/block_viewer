@@ -2,7 +2,7 @@
 
 Not a work item; the plan for the citybuilder game and the shared world-edit
 infrastructure it needs. High-level tasks here get split into numbered
-tickets in this directory when they're picked up (next free number: 047).
+tickets in this directory when they're picked up (next free number: 048).
 Companion to `ROADMAP.md`, which covers the viewer 001–029.
 
 ## The goal
@@ -135,6 +135,7 @@ L1  lib.rs + two bin shims                       <- DONE (ticket 027)
                |    E2  grid + footprint fit   F2  drag-to-build routing
                |         <- DONE (ticket 046)
                |    E3  ghost + validity       F3  auto-tiling the pieces
+               |         <- DONE (ticket 047)
                |    E4  commit                 F4  connectivity queries
                |    E5  demolish
                |
@@ -677,10 +678,28 @@ deliberately, per the module's own docs; that refinement is roadmap I3's job.
 No caller yet — E3's ghost preview and E4's commit are the eventual readers,
 the same "proven, not yet used" state ticket 045's `HoveredBlock` landed in.
 
-**E3. Ghost preview and validity.** The B2 mesh at the cursor with a
-translucent material, tinted by validity, snapped to the grid. Needs a
-second material — the terrain's is `AlphaMode::Mask(0.5)` (`main.rs:225`),
-which is a cutout, not translucency.
+**E3. Ghost preview and validity. — done, ticket 047.** The B2 mesh at the
+cursor with a translucent material, tinted by validity, snapped to the grid.
+Needs a second material — the terrain's is `AlphaMode::Mask(0.5)`
+(`main.rs:225`), which is a cutout, not translucency.
+
+How it came out: `city::placement`, combining E2's `fit_footprint` (terrain)
+and D1's `City::is_tile_free` (occupancy) into one green/red signal
+(`resolve_placement`) rather than either check growing a second
+responsibility. G1's build menu doesn't exist yet, so a small keyboard
+stand-in (`PlacementSelection`/`cycle_selection` — number keys pick a
+catalogue entry, `R` rotates, `Escape` clears) drives *which* building is
+selected, explicitly not G1 itself, the same role ticket 035's paint command
+played for the write path before any UI did. The ghost mesh and its two
+translucent materials (`AlphaMode::Blend`, `unlit: true` so the tint reads
+the same day or night) are both cached — `(catalogue id, Rotation)` for the
+mesh (needing `Rotation: Hash`, added directly to the type per ticket 043's
+own precedent), a rotation the palette can't support cached as a failure
+right alongside successes rather than retried and re-logged every frame.
+`city::picking` gained a `PickingSet` label so the ghost orders after this
+frame's `HoveredBlock` rather than last frame's. No commit yet — E4 is what
+will call `City::place_building` off the same validity signal this ticket
+computes for the preview.
 
 **E4. Commit.** City state entry + W4/W5 write + W7 re-mesh, in that order,
 transactionally: if the write fails, the city entry doesn't survive either.

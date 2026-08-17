@@ -40,9 +40,13 @@ use super::{BlockState, Blueprint};
 ///
 /// Derives `Serialize`/`Deserialize` for ticket 043 (roadmap D2): a placed
 /// building's orientation on disk is exactly this type, not a mirror enum
-/// invented in the persistence module.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// invented in the persistence module. Derives `Hash` and `Default`
+/// (`Deg0`) for ticket 047 (roadmap E3): `city::placement` keys its ghost
+/// mesh cache on `(id, Rotation)` and needs a starting value for
+/// `PlacementSelection` before the player has rotated anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum Rotation {
+    #[default]
     Deg0,
     Deg90,
     Deg180,

@@ -68,17 +68,16 @@ pub use structure::{write_structure_file, STRUCTURE_BLOCK_MAX_SIZE};
 #[allow(unused_imports)]
 pub use structure::{read_structure, read_structure_file, StructureReadError};
 
-// Ticket 037 (roadmap B2): meshing has no caller yet either — B3/B4
-// (rotation, the asset catalogue) are what will spawn a meshed blueprint
-// into the world — re-exported for the same reason as everything above.
-#[allow(unused_imports)]
+// Ticket 037 (roadmap B2): re-exported for the same reason as everything
+// above. `city::placement` (ticket 047, roadmap E3) is the first real
+// caller — the ghost preview's mesh, rebuilt only on a selection/rotation
+// change (see that module's caching).
 pub use mesh::mesh_blueprint;
 
-// Ticket 038 (roadmap B3): rotation has no caller yet either — B4 (the
-// asset catalogue) and E3 (the placement ghost) are what will call this
-// once a blueprint can actually be placed — re-exported for the same
-// reason as everything above.
-#[allow(unused_imports)]
+// Ticket 038 (roadmap B3): re-exported for the same reason as everything
+// above. `city::placement` (ticket 047, roadmap E3) is the first real
+// caller — a non-`Deg0` ghost preview rotates the blueprint before meshing
+// it, same as a committed placement (E4) will.
 pub use rotate::{rotate_blueprint, Rotation, RotationError};
 
 // Ticket 039 (roadmap B4): the first caller of 036/037/038's primitives —

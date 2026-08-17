@@ -661,3 +661,32 @@ these itself (see CLAUDE.md's "Manual/visual verification").
   *its* camera is untouched -- still starts in `Fly` mode with the free-fly
   controls exactly as before, proving `CameraStartMode`'s override is
   citybuilder-only.
+- [ ] **047 ghost preview: it actually reads as a translucent, validity-tinted
+  building at the cursor.** The automated suite covers `resolve_placement`/
+  `resolve_ghost`/`ghost_mesh`'s decisions and the keyboard selection
+  directly (a bare `App`/hand-built fixtures, no real window, no real
+  materials rendered) -- what it can't cover is whether the ghost is
+  actually legible against real terrain and real lighting.
+
+  `cargo run --bin citybuilder` against the real save, with at least one
+  real `.nbt` under `assets/city/blueprints` (`house01.nbt` from ticket 039
+  is enough). Press `1` and confirm a translucent building-shaped mesh
+  appears at the cursor, following it as the camera pans; confirm it's
+  green over open, flat ground and turns red over terrain too steep for
+  `fit_footprint` (a hillside). E4 (placement) doesn't exist yet, so there's
+  no way to actually occupy a tile and check the red-on-occupied case this
+  way -- that half is unit-tested (`resolve_ghost_shows_the_invalid_material_when_occupied`)
+  and worth re-checking visually once E4 lands. Confirm pressing `R`
+  visibly rotates the mesh 90 degrees each press (four presses back to the
+  start) without the ghost momentarily vanishing or flashing the wrong
+  mesh. Confirm `Escape` hides the ghost, and that switching back and forth
+  between two different catalogue entries (if more than one `.nbt` is
+  present) swaps the mesh cleanly. Watch the console once for the
+  `can't rotate to DegN` line if any fixture building has an unrotatable
+  property at a given rotation -- confirm the ghost simply hides for that
+  combination rather than showing stale geometry or panicking. Also worth
+  a glance: whether the translucency reads as "preview" rather than "glitchy
+  z-fighting" where the ghost's lowest layer sits flush with real terrain
+  (E2's up-to-one-block clip on uneven ground) -- this is a judgement call,
+  not a pass/fail, and a candidate for tuning (depth bias, a higher alpha,
+  an outline) if it looks wrong rather than a bug to fix blind.
