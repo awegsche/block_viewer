@@ -125,7 +125,7 @@ L1  lib.rs + two bin shims                       <- DONE (ticket 027)
      |    C4  hot reload + a definition-error panel
      |
      +-- D  city state (authoritative)
-          D1  the City resource: buildings, footprints, occupancy
+          D1  the City resource: buildings, footprints, occupancy  <- DONE (ticket 042)
           D2  city save/load next to the world
           D3  journal, undo, world reconciliation
                |
@@ -531,9 +531,26 @@ sees. This is what makes balancing tolerable later.
 
 ## D — City state
 
-**D1. The `City` resource.** Placed buildings (id, origin, rotation),
-roads, and a footprint occupancy grid for fast "is this tile free" queries.
-The authoritative state from the rule above.
+**D1. The `City` resource. — done, ticket 042.** Placed buildings (id, origin,
+rotation), roads, and a footprint occupancy grid for fast "is this tile free"
+queries. The authoritative state from the rule above.
+
+How it came out: `city::state::City`, keyed by a `BuildingId` distinct from
+a building's definition id (many placed instances share the second, none
+share the first). One `HashMap<IVec2, Occupant>` is the occupancy grid,
+`Occupant` being `Building(BuildingId) | Road`; `City::place_building`
+computes a footprint's full tile list, checks every tile is free, and only
+then mutates — the same "plan every region before applying any of them"
+shape `edit::route::apply_routed` (W5) already uses, applied here to avoid a
+placement refused partway through leaving a phantom building's tiles marked
+occupied. Rotation matters to occupancy, not just the mesh: a 90°/270°
+placement's occupied rectangle has its `(x, z)` extent swapped from the
+stored (always-unrotated) footprint, via `footprint_extent`/
+`footprint_tiles` — the horizontal counterpart of the axis swap B3's
+`rotate_blueprint` already performs on the block grid itself. `city::run()`
+inserts an empty `City`; no consumer yet — E1/E2 are what will call
+`place_building`, the same "proven, not yet used" state 039-041 landed
+their own resources in.
 
 **D2. City save/load.** RON next to the world — `<save>/citybuilder/city.ron`
 — so a save and its city travel together. Versioned from the first write.

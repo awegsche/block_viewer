@@ -4,9 +4,8 @@
 //! The plan it grows into is `tickets/CITYBUILDER_ROADMAP.md`. The rule the
 //! rest of it follows, worth repeating where the code will live: **the city
 //! state is authoritative, and the blocks in the world are a projection of
-//! it**. Nothing here owns any city state yet — that's roadmap task D1, and
-//! it waits on the write path (group W) proving that blocks can land in a
-//! world Minecraft opens without complaint.
+//! it**. [`state::City`] (ticket 042, roadmap D1) is that state — see its
+//! module docs for the full rule and what still isn't built on top of it.
 //!
 //! What this deliberately does *not* add, and why it looks so empty:
 //!
@@ -55,10 +54,20 @@
 //! `blueprint` field against a real entry rather than trusting the filename.
 //! Same "no consumer yet" state the catalogue landed in: G1's build menu is
 //! what will eventually read [`definition::BuildingDefinitions`].
+//!
+//! ## City state (ticket 042, roadmap D1)
+//!
+//! [`run`] also inserts an empty [`state::City`] — placed buildings, roads,
+//! and the footprint occupancy grid both are checked against. Same
+//! "proven, not yet used" state the catalogue and definitions landed in:
+//! nothing calls [`state::City::place_building`] yet, since that needs
+//! picking (E1) and terrain fit (E2) first. Unlike the catalogue and
+//! definitions, there's nothing to load or log — a fresh city starts empty.
 
 use std::path::Path;
 
 mod definition;
+mod state;
 
 use crate::{blueprint, chunk_pipeline::RenderFloor, world::decode::FloorPolicy, world_app};
 
@@ -80,6 +89,7 @@ pub fn run() {
         .insert_resource(RenderFloor(FloorPolicy::BelowSurface { margin: 16 }))
         .insert_resource(catalogue)
         .insert_resource(definitions)
+        .insert_resource(state::City::default())
         .run();
 }
 
