@@ -130,7 +130,8 @@ L1  lib.rs + two bin shims                       <- DONE (ticket 027)
           D3  journal, undo, world reconciliation  <- DONE (ticket 044)
                |
                +-- E  placement          +-- F  streets
-               |    E1  RTS camera, picking    F1  road graph on the grid
+               |    E1  RTS camera, picking    <- DONE (ticket 045)
+               |                                F1  road graph on the grid
                |    E2  grid + footprint fit   F2  drag-to-build routing
                |    E3  ghost + validity       F3  auto-tiling the pieces
                |    E4  commit                 F4  connectivity queries
@@ -625,13 +626,30 @@ exist.
 
 ## E — Placement
 
-**E1. RTS camera and picking.** Pan/zoom/rotate over the terrain, plus
-screen ray → block coordinate. `camera.rs` already has a ray-march for orbit
-targeting (006) to build on. Note the existing controller owns WASD/QE/
-Shift/Tab and both mouse buttons — 020 hit this and its ticket lists what's
-free; the citybuilder has more freedom since it needn't keep the viewer's
-flight controls, but it *does* need to keep egui's input claim ordering
-(`main.rs:172`).
+**E1. RTS camera and picking. — done, ticket 045.** Pan/zoom/rotate over the
+terrain, plus screen ray → block coordinate. `camera.rs` already has a
+ray-march for orbit targeting (006) to build on. Note the existing
+controller owns WASD/QE/Shift/Tab and both mouse buttons — 020 hit this and
+its ticket lists what's free; the citybuilder has more freedom since it
+needn't keep the viewer's flight controls, but it *does* need to keep
+egui's input claim ordering (`main.rs:172`).
+
+How it came out: a third `camera::CameraMode::Rts`, living in `camera.rs`
+next to `Fly`/`Orbit` rather than a parallel camera stack — `streaming`,
+`unload` and `sky` all find "the camera" via `Query<&Transform,
+With<CameraRig>>`, so a second component would have meant teaching three
+shared systems about it. WASD pans `orbit_target` on the yaw-relative ground
+plane (pitch ignored, so panning never drifts vertically), `Q`/`E` rotate
+yaw, scroll zooms (reusing `Orbit`'s radius math), and right-mouse-drag free
+looks — ungrabbed, unlike `Fly`'s right-drag, since left mouse is reserved
+for E3/E4's picking and the cursor needs to stay visible. A new
+`CameraStartMode` resource (default `Fly`) lets `city::run()` start the rig
+in `Rts` the same way it already overrides `RenderFloor`, so `setup_world`
+stays the one place the camera entity is spawned for both games. Picking
+landed as `city::picking::HoveredBlock`, a per-frame resource built on the
+existing `camera::block_under_cursor` — no second raycast — with no
+consumer yet, the same "proven, not yet used" state ticket 042's `City`
+landed in; E2's grid fit and E3's ghost preview are the eventual readers.
 
 **E2. Grid and footprint fit.** Tile grid, footprint occupancy, and the
 terrain rules: sample heights under the footprint, define what slope is

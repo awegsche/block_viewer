@@ -638,3 +638,26 @@ these itself (see CLAUDE.md's "Manual/visual verification").
   `AppExit` really fire and land the file where expected" question 043 already
   answers above; ride along with that pass rather than running the app a
   second time just for this.
+- [ ] **045 RTS camera: controls feel right at the window.** The automated
+  suite covers `CameraMode::Rts`'s pan/rotate/zoom math and clamps directly
+  (a bare `App`, `Time` advanced by hand, no real window) -- what it can't
+  cover is whether the tuning (`rts_pan_speed_factor`, `rts_rotate_speed`,
+  `rts_pitch_range`) actually feels usable, and whether Bevy's real cursor/
+  input plumbing agrees with the test doubles.
+
+  `cargo run --bin citybuilder` against the real save. Confirm the window
+  opens already in the RTS rig -- panning/zooming/rotating, no Fly-mode
+  flash first, no free-fly WASD. Checklist: `W`/`A`/`S`/`D` pan across the
+  terrain (and the pan direction stays sane after rotating -- `W` should
+  still mean "forward" from the camera's current facing, not always world
+  `-Z`); `Q`/`E` rotate the view; holding the right mouse button and
+  dragging also rotates (yaw and pitch), without hiding or warping the
+  cursor the way `Fly`'s right-drag does in `block_viewer`; scroll zooms in
+  and out and the zoom-out has a bottom (the view should never flip past
+  looking straight down, nor come up level with the horizon -- that's
+  `rts_pitch_range` holding at both ends); holding `Shift` while panning
+  noticeably speeds it up; left mouse does nothing (reserved for E3/E4);
+  `Tab` does nothing. Then open `block_viewer` on the same save and confirm
+  *its* camera is untouched -- still starts in `Fly` mode with the free-fly
+  controls exactly as before, proving `CameraStartMode`'s override is
+  citybuilder-only.

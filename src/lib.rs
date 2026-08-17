@@ -239,6 +239,7 @@ fn setup_world(
     loaded_save: Res<LoadedSave>,
     render_distance: Res<streaming::RenderDistance>,
     sky_palette: Res<sky::SkyPalette>,
+    camera_start_mode: Res<camera::CameraStartMode>,
 ) {
     println!(
         "Active save: {} ({} regions)",
@@ -319,7 +320,7 @@ fn setup_world(
         }),
         camera::atmosphere_fog(render_distance.0, sky_palette.horizon_color),
         Transform::from_translation(eye).looking_at(target, Vec3::Y),
-        camera::CameraRig::looking_at(eye, target),
+        camera::CameraRig::looking_at(eye, target).with_mode(camera_start_mode.0),
     ));
 
     // Ticket 015: a directional light replaces the old `PointLight`, which

@@ -94,12 +94,19 @@ use std::path::{Path, PathBuf};
 mod definition;
 mod journal;
 mod persistence;
+mod picking;
 mod state;
 
 use bevy::app::AppExit;
 use bevy::prelude::*;
 
-use crate::{blueprint, chunk_pipeline::RenderFloor, world::decode::FloorPolicy, world_app, LoadedSave};
+use crate::{
+    blueprint,
+    camera::{CameraMode, CameraStartMode},
+    chunk_pipeline::RenderFloor,
+    world::decode::FloorPolicy,
+    world_app, LoadedSave,
+};
 
 /// Where [`run`] looks for building blueprints — the flat, non-recursive
 /// directory the roadmap's `assets/city/blueprints/*.nbt` glob names.
@@ -128,11 +135,15 @@ pub fn run() {
     let journal = load_journal(&save_root);
 
     app.insert_resource(RenderFloor(FloorPolicy::BelowSurface { margin: 16 }))
+        // Ticket 045, roadmap E1: pan/zoom/rotate over the terrain rather
+        // than the viewer's free-flight rig — see `camera::CameraMode::Rts`.
+        .insert_resource(CameraStartMode(CameraMode::Rts))
         .insert_resource(catalogue)
         .insert_resource(definitions)
         .insert_resource(city)
         .insert_resource(journal)
         .insert_resource(CitySavePath(if save_root.as_os_str().is_empty() { None } else { Some(save_root) }))
+        .add_plugins(picking::PickingPlugin)
         .add_systems(Last, (save_city_on_exit, save_journal_on_exit))
         .run();
 }

@@ -47,6 +47,7 @@ impl Plugin for CameraControllerPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<CameraSettings>()
             .init_resource::<EguiInputCapture>()
+            .init_resource::<CameraStartMode>()
             .add_systems(
                 Update,
                 (drive_camera.in_set(CameraSet), sync_render_distance_effects),
@@ -80,7 +81,31 @@ pub struct EguiInputCapture {
 pub enum CameraMode {
     Fly,
     Orbit,
+    /// Pan/zoom/rotate over the terrain (ticket 045, roadmap E1) — the
+    /// citybuilder's rig. Orbits `orbit_target` the same way [`CameraMode::Orbit`]
+    /// does, but `W`/`A`/`S`/`D` pan the target instead of the camera flying
+    /// free, and rotation lives on the right mouse button (ungrabbed) rather
+    /// than the left, which the citybuilder reserves for picking/placement.
+    Rts,
 }
+
+impl Default for CameraMode {
+    /// [`CameraRig::looking_at`]'s mode, and [`CameraStartMode`]'s default —
+    /// the viewer's rig unless something overrides it.
+    fn default() -> Self {
+        CameraMode::Fly
+    }
+}
+
+/// Which [`CameraMode`] a freshly spawned [`CameraRig`] starts in, read once
+/// by `lib.rs::setup_world` when it constructs the camera entity.
+/// [`CameraControllerPlugin`] inits this to [`CameraMode::Fly`] (the
+/// viewer's rig); [`crate::city::run`] overrides it to [`CameraMode::Rts`]
+/// after [`crate::world_app`] returns and before `App::run()`, the same
+/// override-after-`world_app()` shape ticket 030's `RenderFloor` already
+/// uses.
+#[derive(Resource, Debug, Clone, Copy, Default)]
+pub struct CameraStartMode(pub CameraMode);
 
 /// Per-camera runtime state. Yaw/pitch are shared between both modes so
 /// switching mode never snaps the view: only how translation is derived
@@ -106,13 +131,23 @@ impl CameraRig {
             .rotation;
         let (yaw, pitch, _roll) = rotation.to_euler(EulerRot::YXZ);
         Self {
-            mode: CameraMode::Fly,
+            mode: CameraMode::default(),
             yaw,
             pitch,
             fly_speed: DEFAULT_FLY_SPEED,
             orbit_target: target,
             orbit_radius: eye.distance(target).max(2.0),
         }
+    }
+
+    /// Overrides the mode a rig starts in — `lib.rs::setup_world` calls this
+    /// with [`CameraStartMode`]'s value right after [`Self::looking_at`],
+    /// rather than [`looking_at`](Self::looking_at) taking the mode as a
+    /// third argument, so every existing call site (and every test that
+    /// doesn't care what mode it gets) stays untouched.
+    pub fn with_mode(mut self, mode: CameraMode) -> Self {
+        self.mode = mode;
+        self
     }
 }
 
@@ -131,6 +166,17 @@ pub struct CameraSettings {
     /// How far (blocks) the "what's under the cursor" ray-march searches
     /// before giving up and aiming straight ahead instead.
     pub max_ray_distance: f32,
+    /// [`CameraMode::Rts`]'s own pitch clamp — steeper than `pitch_range`,
+    /// so the citybuilder's camera always looks down at the terrain rather
+    /// than up toward the horizon or straight down at its own feet.
+    pub rts_pitch_range: Range<f32>,
+    /// `Rts` pan speed = `orbit_radius * rts_pan_speed_factor`, so panning
+    /// covers the same visual ground per second regardless of zoom — the
+    /// same "scale with the current radius" idea `orbit_zoom_sensitivity`
+    /// already uses for zoom.
+    pub rts_pan_speed_factor: f32,
+    /// Radians/sec of yaw rotation from `Rts`'s `Q`/`E` keys.
+    pub rts_rotate_speed: f32,
 }
 
 impl Default for CameraSettings {
@@ -145,6 +191,11 @@ impl Default for CameraSettings {
             orbit_zoom_sensitivity: 0.15,
             min_orbit_radius: 2.0,
             max_ray_distance: 300.0,
+            // Roughly -80°..-11°: always angled down at the terrain, never
+            // up toward the horizon and never near straight down.
+            rts_pitch_range: -1.4..-0.2,
+            rts_pan_speed_factor: 1.2,
+            rts_rotate_speed: std::f32::consts::FRAC_PI_2,
         }
     }
 }
@@ -210,7 +261,7 @@ fn drive_camera(
     // also spin the view. `just_released` stays ungated below so a grab
     // that started before a panel opened over the cursor still lets go
     // cleanly.
-    if !egui_input.keyboard && keys.just_pressed(KeyCode::Tab) {
+    if !egui_input.keyboard && rig.mode != CameraMode::Rts && keys.just_pressed(KeyCode::Tab) {
         toggle_mode(
             &mut rig,
             &transform,
@@ -239,12 +290,35 @@ fn drive_camera(
     let look_button = match rig.mode {
         CameraMode::Fly => MouseButton::Right,
         CameraMode::Orbit => MouseButton::Left,
+        // Right, same as `Fly`, but never grabbed (see the `Fly`-only grab
+        // block above) — left mouse stays free for the citybuilder's
+        // picking/placement (E3/E4), and the cursor stays visible.
+        CameraMode::Rts => MouseButton::Right,
     };
     if !egui_input.pointer && mouse_buttons.pressed(look_button) {
         let delta = mouse_motion.delta;
         rig.yaw -= delta.x * settings.mouse_sensitivity;
+        let pitch_range = if rig.mode == CameraMode::Rts {
+            &settings.rts_pitch_range
+        } else {
+            &settings.pitch_range
+        };
         rig.pitch = (rig.pitch - delta.y * settings.mouse_sensitivity)
-            .clamp(settings.pitch_range.start, settings.pitch_range.end);
+            .clamp(pitch_range.start, pitch_range.end);
+    }
+    // `Rts`'s `Q`/`E` yaw rotation is read here, before `rotation` is
+    // computed below, rather than inside the mode match further down — a
+    // same-frame press would otherwise show up in `rig.yaw` but not yet in
+    // `transform.translation`'s orbit offset until the *next* frame.
+    if rig.mode == CameraMode::Rts && !egui_input.keyboard {
+        let mut rotate = 0.0;
+        if keys.pressed(KeyCode::KeyQ) {
+            rotate += settings.rts_rotate_speed;
+        }
+        if keys.pressed(KeyCode::KeyE) {
+            rotate -= settings.rts_rotate_speed;
+        }
+        rig.yaw += rotate * time.delta_secs();
     }
     let rotation = Quat::from_euler(EulerRot::YXZ, rig.yaw, rig.pitch, 0.0);
     transform.rotation = rotation;
@@ -299,6 +373,46 @@ fn drive_camera(
                     * (1.0 - scroll * settings.orbit_zoom_sensitivity))
                     .max(settings.min_orbit_radius);
             }
+            transform.translation = rig.orbit_target + rotation * Vec3::new(0.0, 0.0, rig.orbit_radius);
+        }
+        CameraMode::Rts => {
+            if scroll != 0.0 {
+                rig.orbit_radius = (rig.orbit_radius
+                    * (1.0 - scroll * settings.orbit_zoom_sensitivity))
+                    .max(settings.min_orbit_radius);
+            }
+
+            if !egui_input.keyboard {
+                // Yaw-only, so panning stays on the ground plane regardless
+                // of the current pitch — `rotation` (yaw + pitch) would tilt
+                // "forward" up/down into the terrain or the sky.
+                let yaw_only = Quat::from_rotation_y(rig.yaw);
+                let mut pan_dir = Vec3::ZERO;
+                if keys.pressed(KeyCode::KeyW) {
+                    pan_dir += yaw_only * Vec3::NEG_Z;
+                }
+                if keys.pressed(KeyCode::KeyS) {
+                    pan_dir += yaw_only * Vec3::Z;
+                }
+                if keys.pressed(KeyCode::KeyD) {
+                    pan_dir += yaw_only * Vec3::X;
+                }
+                if keys.pressed(KeyCode::KeyA) {
+                    pan_dir += yaw_only * Vec3::NEG_X;
+                }
+
+                if pan_dir != Vec3::ZERO {
+                    let speed = rig.orbit_radius
+                        * settings.rts_pan_speed_factor
+                        * if keys.pressed(KeyCode::ShiftLeft) {
+                            settings.sprint_multiplier
+                        } else {
+                            1.0
+                        };
+                    rig.orbit_target += pan_dir.normalize() * speed * time.delta_secs();
+                }
+            }
+
             transform.translation = rig.orbit_target + rotation * Vec3::new(0.0, 0.0, rig.orbit_radius);
         }
     }
@@ -604,6 +718,203 @@ mod tests {
             Projection::Perspective(perspective) => assert_eq!(perspective.far, far),
             other => panic!("expected a perspective projection, got {other:?}"),
         }
+    }
+
+    // --- Ticket 045, roadmap E1: `CameraMode::Rts` ---
+
+    /// A [`DecodedWorld`] with nothing decoded in it — `drive_camera` needs
+    /// the resource to exist to run at all, but none of `Rts`'s pan/rotate/
+    /// zoom paths read it (only `Tab`'s orbit-reaim raycast does, and these
+    /// tests never press `Tab` while able to reach that path).
+    fn empty_world() -> DecodedWorld {
+        DecodedWorld {
+            registry: std::sync::Arc::new(std::sync::Mutex::new(world::BlockRegistry::new())),
+            biomes: std::sync::Arc::new(std::sync::Mutex::new(BiomeRegistry::new())),
+            columns: HashMap::new(),
+        }
+    }
+
+    /// A bare `App` with `drive_camera` and every resource it reads, plus one
+    /// spawned camera entity carrying `rig`. No `Window` entity — `Rts`'s
+    /// pan/rotate/zoom never touch the cursor, so `windows.get_single_mut()`
+    /// simply comes back `None`, the same as `sync_render_distance_effects`'s
+    /// existing test not needing one either.
+    fn rts_test_app(rig: CameraRig) -> (App, Entity) {
+        let mut app = App::new();
+        app.init_resource::<CameraSettings>()
+            .init_resource::<EguiInputCapture>()
+            .init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<ButtonInput<MouseButton>>()
+            .init_resource::<AccumulatedMouseMotion>()
+            .init_resource::<AccumulatedMouseScroll>()
+            .init_resource::<Time>()
+            .insert_resource(empty_world())
+            .add_systems(Update, drive_camera);
+
+        let entity = app
+            .world_mut()
+            .spawn((rig, Transform::default(), Camera::default(), GlobalTransform::default()))
+            .id();
+        (app, entity)
+    }
+
+    fn set_rig(app: &mut App, entity: Entity, f: impl FnOnce(&mut CameraRig)) {
+        f(&mut app.world_mut().get_mut::<CameraRig>(entity).unwrap());
+    }
+
+    fn rig_of(app: &App, entity: Entity) -> &CameraRig {
+        app.world().get::<CameraRig>(entity).unwrap()
+    }
+
+    #[test]
+    fn looking_at_with_mode_sets_the_requested_mode() {
+        let rig = CameraRig::looking_at(Vec3::new(0.0, 10.0, 10.0), Vec3::ZERO).with_mode(CameraMode::Rts);
+        assert_eq!(rig.mode, CameraMode::Rts);
+    }
+
+    #[test]
+    fn rts_w_pans_the_target_forward_on_the_yaw_relative_ground_plane() {
+        let rig = CameraRig::looking_at(Vec3::new(0.0, 10.0, 10.0), Vec3::ZERO).with_mode(CameraMode::Rts);
+        let (mut app, entity) = rts_test_app(rig);
+        // Yaw = 0 faces -Z (see `world::mesh`'s bevy.z = -mc.z convention);
+        // pinning it removes any ambiguity about which way "forward" is.
+        set_rig(&mut app, entity, |r| {
+            r.yaw = 0.0;
+            r.pitch = -0.5;
+            r.orbit_target = Vec3::ZERO;
+        });
+
+        app.world_mut().resource_mut::<ButtonInput<KeyCode>>().press(KeyCode::KeyW);
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(std::time::Duration::from_secs_f32(1.0));
+        app.update();
+
+        let target = rig_of(&app, entity).orbit_target;
+        assert!(target.z < 0.0, "W at yaw 0 should pan toward -Z, got {target}");
+        assert_eq!(target.x, 0.0, "W at yaw 0 must not drift on X");
+        assert_eq!(target.y, 0.0, "panning must not move the target vertically");
+    }
+
+    #[test]
+    fn rts_shift_multiplies_pan_speed() {
+        let new_rig = || CameraRig::looking_at(Vec3::new(0.0, 10.0, 10.0), Vec3::ZERO).with_mode(CameraMode::Rts);
+
+        let (mut plain_app, plain_entity) = rts_test_app(new_rig());
+        set_rig(&mut plain_app, plain_entity, |r| {
+            r.yaw = 0.0;
+            r.orbit_target = Vec3::ZERO;
+        });
+        plain_app.world_mut().resource_mut::<ButtonInput<KeyCode>>().press(KeyCode::KeyW);
+        plain_app
+            .world_mut()
+            .resource_mut::<Time>()
+            .advance_by(std::time::Duration::from_secs_f32(1.0));
+        plain_app.update();
+        let plain_distance = rig_of(&plain_app, plain_entity).orbit_target.distance(Vec3::ZERO);
+
+        let (mut sprint_app, sprint_entity) = rts_test_app(new_rig());
+        set_rig(&mut sprint_app, sprint_entity, |r| {
+            r.yaw = 0.0;
+            r.orbit_target = Vec3::ZERO;
+        });
+        sprint_app.world_mut().resource_mut::<ButtonInput<KeyCode>>().press(KeyCode::KeyW);
+        sprint_app.world_mut().resource_mut::<ButtonInput<KeyCode>>().press(KeyCode::ShiftLeft);
+        sprint_app
+            .world_mut()
+            .resource_mut::<Time>()
+            .advance_by(std::time::Duration::from_secs_f32(1.0));
+        sprint_app.update();
+        let sprint_distance = rig_of(&sprint_app, sprint_entity).orbit_target.distance(Vec3::ZERO);
+
+        let multiplier = plain_app.world().resource::<CameraSettings>().sprint_multiplier;
+        assert!(
+            (sprint_distance - plain_distance * multiplier).abs() < 1e-3,
+            "expected {multiplier}x the plain pan distance, got {sprint_distance} vs {plain_distance}"
+        );
+    }
+
+    #[test]
+    fn rts_q_e_rotate_yaw_and_the_same_frame_reflects_it_in_translation() {
+        let rig = CameraRig::looking_at(Vec3::new(0.0, 10.0, 10.0), Vec3::ZERO).with_mode(CameraMode::Rts);
+        let (mut app, entity) = rts_test_app(rig);
+        set_rig(&mut app, entity, |r| {
+            r.yaw = 0.0;
+            r.pitch = -0.5;
+            r.orbit_target = Vec3::ZERO;
+            r.orbit_radius = 10.0;
+        });
+        let rotate_speed = app.world().resource::<CameraSettings>().rts_rotate_speed;
+
+        app.world_mut().resource_mut::<ButtonInput<KeyCode>>().press(KeyCode::KeyE);
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(std::time::Duration::from_secs_f32(1.0));
+        app.update();
+
+        let rig = rig_of(&app, entity);
+        assert!((rig.yaw - (-rotate_speed)).abs() < 1e-4, "E should rotate yaw by -rotate_speed");
+
+        // Proves the ordering fix in `drive_camera`: if `Q`/`E` were applied
+        // after `rotation` is computed, `transform.translation` would still
+        // reflect *last* frame's yaw here.
+        let expected_rotation = Quat::from_euler(EulerRot::YXZ, rig.yaw, rig.pitch, 0.0);
+        let expected_translation = rig.orbit_target + expected_rotation * Vec3::new(0.0, 0.0, rig.orbit_radius);
+        let translation = app.world().get::<Transform>(entity).unwrap().translation;
+        assert!(
+            translation.distance(expected_translation) < 1e-3,
+            "translation lagged a frame behind the yaw it was rotated to: expected {expected_translation}, got {translation}"
+        );
+    }
+
+    #[test]
+    fn rts_scroll_zooms_and_clamps_at_min_orbit_radius() {
+        let rig = CameraRig::looking_at(Vec3::new(0.0, 10.0, 10.0), Vec3::ZERO).with_mode(CameraMode::Rts);
+        let (mut app, entity) = rts_test_app(rig);
+        set_rig(&mut app, entity, |r| r.orbit_radius = 10.0);
+
+        app.world_mut().resource_mut::<AccumulatedMouseScroll>().delta.y = 1.0;
+        app.update();
+        assert!(rig_of(&app, entity).orbit_radius < 10.0, "scrolling in should shrink the radius");
+
+        app.world_mut().resource_mut::<AccumulatedMouseScroll>().delta.y = 1000.0;
+        app.update();
+        let min = app.world().resource::<CameraSettings>().min_orbit_radius;
+        assert_eq!(rig_of(&app, entity).orbit_radius, min, "must clamp at min_orbit_radius, not overshoot to 0 or negative");
+    }
+
+    #[test]
+    fn rts_pitch_clamps_to_its_own_range_not_flys() {
+        let rig = CameraRig::looking_at(Vec3::new(0.0, 10.0, 10.0), Vec3::ZERO).with_mode(CameraMode::Rts);
+        let (mut app, entity) = rts_test_app(rig);
+        set_rig(&mut app, entity, |r| r.pitch = 0.0);
+
+        let (rts_min, fly_min) = {
+            let settings = app.world().resource::<CameraSettings>();
+            (settings.rts_pitch_range.start, settings.pitch_range.start)
+        };
+        assert!(rts_min > fly_min, "test requires the two ranges to actually differ");
+
+        app.world_mut().resource_mut::<ButtonInput<MouseButton>>().press(MouseButton::Right);
+        app.world_mut().resource_mut::<AccumulatedMouseMotion>().delta = Vec2::new(0.0, 1_000_000.0);
+        app.update();
+
+        let pitch = rig_of(&app, entity).pitch;
+        assert!(
+            (pitch - rts_min).abs() < 1e-4,
+            "expected the drag to clamp at rts_pitch_range's bound ({rts_min}), got {pitch} (fly's bound is {fly_min})"
+        );
+    }
+
+    #[test]
+    fn tab_is_a_no_op_in_rts_mode() {
+        let rig = CameraRig::looking_at(Vec3::new(0.0, 10.0, 10.0), Vec3::ZERO).with_mode(CameraMode::Rts);
+        let (mut app, entity) = rts_test_app(rig);
+
+        app.world_mut().resource_mut::<ButtonInput<KeyCode>>().press(KeyCode::Tab);
+        app.update();
+
+        assert_eq!(rig_of(&app, entity).mode, CameraMode::Rts);
     }
 }
 
