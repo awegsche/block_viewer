@@ -690,3 +690,40 @@ these itself (see CLAUDE.md's "Manual/visual verification").
   (E2's up-to-one-block clip on uneven ground) -- this is a judgement call,
   not a pass/fail, and a candidate for tuning (depth bias, a higher alpha,
   an outline) if it looks wrong rather than a bug to fix blind.
+- [ ] **048 commit: a placed building is actually in the save, and the
+  height keys feel usable.** The automated suite covers `blueprint_edit`,
+  the `y_offset` math, and a committed write against a synthetic fixture
+  directly -- what it can't cover is a real click against a real save, or
+  whether `Page Up`/`Page Down`/`Home` feel right at the window.
+  **Back the world up first** (or run this against a scratch copy) -- this
+  writes to a real save, same caveat as ticket 035's item above.
+
+  `cargo run --bin citybuilder` against the real save, with `house01.nbt`
+  (or another real `.nbt`) under `assets/city/blueprints`. Press `1`, aim
+  the green ghost at open ground, left-click. Confirm: (1) the console
+  prints a `placed house01 (N block(s) across M chunk(s))` line and the
+  building appears in the viewport without a restart (W7's live re-mesh);
+  (2) clicking again immediately on the same tile does nothing (occupied)
+  rather than stacking a second building; (3) clicking on a *red* ghost does
+  nothing at all -- no console line, no city entry. Then close the app
+  (which saves `city.ron`/`journal.ron` on exit, per 043/044) and open the
+  save in Minecraft: the building's blocks are actually there, right-side-up
+  and not mirrored, and any interior air (a doorway, a window) reads as
+  actually empty rather than the terrain that was under it -- this is
+  `blueprint_edit`'s "air is written, not skipped" decision, and the one
+  thing a synthetic fixture can't judge against a real hillside. Re-open the
+  save with `cargo run --bin citybuilder` and confirm the building loads
+  back from `city.ron` in the same spot (043's round trip, now fed by a
+  real placement for the first time).
+
+  Separately, test the height keys: select a building, press `Page Up` a
+  few times and confirm the ghost visibly rises one block per press (and
+  `Page Down` lowers it, `Home` snaps back to the terrain fit); place one
+  raised a block or two and confirm the gap underneath it is real floating
+  space in Minecraft, not filled in. Try placing with a *negative* offset
+  into a slope and confirm it doesn't corrupt anything, just buries the
+  lower courses. Finally, try a commit while the previous one is still
+  writing (rapid double-click on adjacent valid tiles) and confirm the
+  second click is silently ignored rather than racing the first -- the
+  console should show only one `placed ...` line per click that actually
+  went through.

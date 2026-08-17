@@ -51,16 +51,15 @@
 //! leaving the first few marked occupied would leave the grid holding a
 //! phantom building nobody actually placed.
 //!
-//! ## No caller yet
+//! ## Real callers, as of ticket 048
 //!
-//! [`city::run`](super::run) inserts an empty [`City`] and nothing else —
-//! same "proven, not yet used" state 039/040 landed [`super::blueprint`]/
-//! [`super::definition`] in. Every write method below (`place_building` and
-//! everything past it) is exercised only by this module's own tests until
-//! E4's commit exists to drive them (E3's ghost preview reads
-//! [`City::is_tile_free`] only, not the mutating half); the
-//! `#[allow(dead_code)]` marks through the rest of the file are that same
-//! situation, not a note-worthy call each time it recurs.
+//! [`City::place_building`]/[`City::remove_building`] were exercised only by
+//! this module's own tests until `city::commit` (ticket 048, roadmap E4)
+//! started calling them — `place_building` on a click, `remove_building` as
+//! the rollback when the write that click started fails. Everything else
+//! past those two (`remove_road`, `occupant_at`, `len`, `is_empty`) is still
+//! only proven by tests; their own `#[allow(dead_code)]` marks are that same
+//! "no caller yet" situation, not a note-worthy call each time it recurs.
 
 use std::collections::{HashMap, HashSet};
 
@@ -189,7 +188,12 @@ impl City {
     /// covering `footprint`'s rotated extent. All-or-nothing: every tile is
     /// checked before any of them is marked occupied, so a refusal never
     /// leaves a partial building behind — see the module docs.
-    #[allow(dead_code)] // no caller yet — see the module docs
+    ///
+    /// Called synchronously by `city::commit::try_commit_placement` (ticket
+    /// 048, roadmap E4) the instant a click is accepted — before the write
+    /// even starts, so the tile claim exists first. See that module's docs
+    /// for why the write is transactional against this call:
+    /// [`remove_building`](Self::remove_building) is the rollback.
     pub fn place_building(
         &mut self,
         definition: impl Into<String>,
@@ -219,7 +223,10 @@ impl City {
     /// Removes a placed building and frees exactly the tiles its own record
     /// covers. `None` if `id` isn't a currently-placed building — removing
     /// twice, or an id that was never valid, isn't a panic.
-    #[allow(dead_code)] // no caller yet — see the module docs
+    ///
+    /// `city::commit::poll_commit` (ticket 048) calls this on a *failed*
+    /// write — the rollback half of [`place_building`](Self::place_building)'s
+    /// docs. E5 (demolish) will be a second, deliberate caller later.
     pub fn remove_building(&mut self, id: BuildingId) -> Option<PlacedBuilding> {
         let building = self.buildings.remove(&id)?;
         for tile in footprint_tiles(building.origin, building.footprint, building.rotation) {

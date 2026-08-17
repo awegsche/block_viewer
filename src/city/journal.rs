@@ -28,15 +28,15 @@
 //! same way so the two line up position-for-position. Nothing here computes
 //! a baseline itself; it only records and replays one.
 //!
-//! ## No caller yet, same as 042
+//! ## A real caller, as of ticket 048
 //!
-//! [`Journal::record_placement`]/[`record_demolition`](Journal::record_demolition)
-//! wait on E4/E5's commit, and [`Journal::undo_last`]/[`reconcile`] wait on
-//! whatever UI eventually calls them (G2, roadmap I). [`city::run`](super::run)
-//! does load and save an empty journal on every real save, the same "proven
-//! by the app lifecycle, not yet fed by gameplay" state ticket 043 landed
-//! [`City`] in — see that module's own docs for why persistence gets a real
-//! caller before the state it persists does.
+//! [`Journal::record_placement`] is called by `city::commit::poll_commit`
+//! (roadmap E4) on every successful placement — the first gameplay caller
+//! this module has had; until then it was only proven by the app lifecycle
+//! (loaded and saved on every real save, per ticket 043's own precedent) and
+//! by this module's tests. [`record_demolition`](Journal::record_demolition)
+//! still waits on E5, and [`Journal::undo_last`]/[`reconcile`] still wait on
+//! whatever UI eventually calls them (G2, roadmap I).
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -86,7 +86,10 @@ impl Baseline {
     /// record of what it overwrote, and a baseline that can't say what was
     /// there before isn't a baseline, only half of one. A caller that might
     /// ever journal, undo or reconcile an edit has to turn that policy on.
-    #[allow(dead_code)] // no caller yet — E4/E5 (roadmap), see the module docs
+    ///
+    /// Called by `city::commit::poll_commit` (ticket 048, roadmap E4) on
+    /// every successful placement — `EditPolicy::capture_replaced` is on
+    /// specifically so this never comes back `None` there.
     pub fn capture(edit: &WorldEdit, report: &EditReport) -> Option<Baseline> {
         let previous = report.replaced.clone()?;
 
@@ -187,11 +190,15 @@ pub struct Journal {
 }
 
 impl Journal {
-    /// Appends a placement entry. `placement` is the [`PlacedBuilding`]
-    /// [`City::place_building`] just inserted under `building` — a caller
-    /// reads it back via [`City::building`] rather than reconstructing it,
-    /// so the two can never drift apart.
-    #[allow(dead_code)] // no caller yet — E4 (roadmap), see the module docs
+    /// Appends a placement entry. `placement` is the same [`PlacedBuilding`]
+    /// [`City::place_building`] just inserted under `building`, built from
+    /// the identical fields rather than read back out of [`City`] — a
+    /// caller that constructs both from one set of values (as
+    /// `city::commit::try_commit_placement` does) can't let them drift
+    /// apart either way.
+    ///
+    /// Called by `city::commit::poll_commit` (ticket 048, roadmap E4) once a
+    /// placement's write has actually succeeded.
     pub fn record_placement(&mut self, building: BuildingId, placement: PlacedBuilding, baseline: Baseline) {
         self.entries.push(JournalEntry::Placed { building, placement, baseline });
     }

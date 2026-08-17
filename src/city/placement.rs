@@ -15,6 +15,19 @@
 //! exists, the same role W8's paint command played for the write path
 //! before any UI did.
 //!
+//! ## Manual height (ticket 048)
+//!
+//! [`PlacementSelection::y_offset`] shifts a placement up or down from
+//! [`grid::fit_footprint`]'s own auto-fit height — `Page Up`/`Page Down` step
+//! it by one block, `Home` resets it to zero, all in [`cycle_selection`]
+//! alongside the rest of the keyboard stand-in. Not the mouse wheel: Rts's
+//! camera already owns scroll for zoom (ticket 045), and every zoom would
+//! otherwise also nudge the height. The offset resets to zero on `Escape`
+//! and whenever a new catalogue entry is picked, so a fresh selection always
+//! starts at the terrain's own fit rather than wherever the last one was
+//! left. [`resolve_placement`] is where it's applied — see that function's
+//! docs.
+//!
 //! ## Validity is two answers, ANDed
 //!
 //! `city::grid::fit_footprint` (E2, terrain) and `state::City::is_tile_free`
@@ -65,12 +78,19 @@ use super::grid::{self, FootprintFit};
 use super::picking::{HoveredBlock, PickingSet};
 use super::state;
 
-/// What building is selected to place, and at what rotation — see the
-/// module docs' "No build menu yet" for how this gets set today.
+/// What building is selected to place, at what rotation, and how far its
+/// height has been nudged from the terrain's own auto-fit — see the module
+/// docs' "No build menu yet" and ticket 048's "Manual height" for how these
+/// get set today.
 #[derive(Resource, Debug, Default, Clone, PartialEq, Eq)]
 pub struct PlacementSelection {
     pub catalogue_id: Option<String>,
     pub rotation: Rotation,
+    /// Added to whichever Y [`resolve_placement`] would otherwise have used
+    /// — [`grid::fit_footprint`]'s `base_y` on a fit, the hovered block's
+    /// height on a refusal. Positive raises the placement, negative sinks
+    /// it. Zero (the default) is the terrain's own auto-fit, untouched.
+    pub y_offset: i32,
 }
 
 /// Marks the one ghost preview entity — see the module docs' "One entity,
@@ -170,9 +190,22 @@ fn cycle_selection(
 
     if keys.just_pressed(KeyCode::Escape) {
         selection.catalogue_id = None;
+        selection.y_offset = 0;
     }
     if keys.just_pressed(KeyCode::KeyR) {
         selection.rotation = rotate_clockwise(selection.rotation);
+    }
+    // Ticket 048's height keys — see the module docs' "Manual height". Not
+    // gated on a selection existing: harmless either way, and simpler than
+    // special-casing "no building picked yet."
+    if keys.just_pressed(KeyCode::PageUp) {
+        selection.y_offset = selection.y_offset.saturating_add(1);
+    }
+    if keys.just_pressed(KeyCode::PageDown) {
+        selection.y_offset = selection.y_offset.saturating_sub(1);
+    }
+    if keys.just_pressed(KeyCode::Home) {
+        selection.y_offset = 0;
     }
 
     let Some(catalogue) = catalogue else { return };
@@ -181,6 +214,7 @@ fn cycle_selection(
         if keys.just_pressed(*key) {
             if let Some(&id) = ids.get(index) {
                 selection.catalogue_id = Some(id.to_string());
+                selection.y_offset = 0;
             }
         }
     }
@@ -283,30 +317,40 @@ fn ensure_materials<'a>(
 }
 
 /// Where a footprint would land, and whether it's actually placeable — see
-/// the module docs' "Validity is two answers, ANDed".
-struct GhostPlacement {
-    origin: IVec3,
-    valid: bool,
+/// the module docs' "Validity is two answers, ANDed". `pub(super)`: ticket
+/// 048's `city::commit` recomputes exactly this on a click, so a commit
+/// never disagrees with the ghost that was on screen when it happened.
+pub(super) struct GhostPlacement {
+    pub(super) origin: IVec3,
+    pub(super) valid: bool,
 }
 
 /// ANDs E2's terrain fit and D1's occupancy check for `footprint`/`rotation`
 /// at `hovered` (the solid block the cursor is over — one below where a
 /// building's floor would sit, the same `+1` [`grid::ground_height_at`]
-/// already applies). A refused fit still returns a placement — at
-/// `hovered`'s height, invalid — so the caller always has *something* to
-/// show; see the module docs.
-fn resolve_placement(
+/// already applies), then applies `y_offset` (ticket 048) to whichever
+/// height that produced. A refused fit still returns a placement — at
+/// `hovered`'s height (plus the offset), invalid — so the caller always has
+/// *something* to show; see the module docs. `saturating_add` rather than
+/// `+`: an offset built purely from key-press counts can't itself overflow
+/// in a real session, but nothing here should panic if it somehow did.
+///
+/// `pub(super)`: `city::commit` (ticket 048) is a second caller, on a click
+/// rather than every frame — see [`GhostPlacement`]'s own docs.
+pub(super) fn resolve_placement(
     hovered: IVec3,
     footprint: IVec2,
     rotation: Rotation,
+    y_offset: i32,
     world: &DecodedWorld,
     city: &state::City,
 ) -> GhostPlacement {
     let probe = IVec3::new(hovered.x, hovered.y + 1, hovered.z);
-    let (origin, terrain_ok) = match grid::fit_footprint(probe, footprint, rotation, world) {
+    let (mut origin, terrain_ok) = match grid::fit_footprint(probe, footprint, rotation, world) {
         FootprintFit::Fits { base_y } => (IVec3::new(hovered.x, base_y, hovered.z), true),
         FootprintFit::Refused(_) => (probe, false),
     };
+    origin.y = origin.y.saturating_add(y_offset);
     let occupancy_ok = state::footprint_tiles(origin, footprint, rotation).all(|tile| city.is_tile_free(tile));
     GhostPlacement { origin, valid: terrain_ok && occupancy_ok }
 }
@@ -349,7 +393,7 @@ fn resolve_ghost(
         return GhostUpdate::Hidden;
     };
 
-    let placement = resolve_placement(hovered, entry.footprint, selection.rotation, world, city);
+    let placement = resolve_placement(hovered, entry.footprint, selection.rotation, selection.y_offset, world, city);
     let ghost_materials = ensure_materials(ghost, terrain_material, materials);
     let material = if placement.valid { ghost_materials.valid.clone() } else { ghost_materials.invalid.clone() };
 
@@ -557,7 +601,7 @@ mod tests {
     fn resolve_placement_is_valid_on_flat_free_ground() {
         let world = flat_world(63);
         let city = state::City::default();
-        let placement = resolve_placement(IVec3::new(2, 63, 2), IVec2::new(3, 3), Rotation::Deg0, &world, &city);
+        let placement = resolve_placement(IVec3::new(2, 63, 2), IVec2::new(3, 3), Rotation::Deg0, 0, &world, &city);
         assert!(placement.valid);
         assert_eq!(placement.origin, IVec3::new(2, 64, 2));
     }
@@ -568,7 +612,7 @@ mod tests {
         let mut city = state::City::default();
         city.place_building("house01", IVec3::new(2, 64, 2), Rotation::Deg0, IVec2::new(1, 1)).unwrap();
 
-        let placement = resolve_placement(IVec3::new(2, 63, 2), IVec2::new(3, 3), Rotation::Deg0, &world, &city);
+        let placement = resolve_placement(IVec3::new(2, 63, 2), IVec2::new(3, 3), Rotation::Deg0, 0, &world, &city);
         assert!(!placement.valid, "the footprint overlaps an already-placed building");
     }
 
@@ -577,9 +621,27 @@ mod tests {
         // No ground at all under this tile — every sample is `NotLoaded`.
         let world = flat_world(63);
         let city = state::City::default();
-        let placement = resolve_placement(IVec3::new(500, 63, 500), IVec2::new(3, 3), Rotation::Deg0, &world, &city);
+        let placement = resolve_placement(IVec3::new(500, 63, 500), IVec2::new(3, 3), Rotation::Deg0, 0, &world, &city);
         assert!(!placement.valid);
         assert_eq!(placement.origin, IVec3::new(500, 64, 500), "still places the ghost somewhere, one above the hovered block");
+    }
+
+    #[test]
+    fn resolve_placement_applies_a_positive_y_offset_on_a_fitting_placement() {
+        let world = flat_world(63);
+        let city = state::City::default();
+        let placement = resolve_placement(IVec3::new(2, 63, 2), IVec2::new(3, 3), Rotation::Deg0, 5, &world, &city);
+        assert!(placement.valid, "the offset moves the building, it doesn't touch terrain/occupancy validity");
+        assert_eq!(placement.origin, IVec3::new(2, 69, 2), "base_y (64) + the offset (5)");
+    }
+
+    #[test]
+    fn resolve_placement_applies_a_negative_y_offset_on_the_refused_fallback() {
+        let world = flat_world(63);
+        let city = state::City::default();
+        let placement = resolve_placement(IVec3::new(500, 63, 500), IVec2::new(3, 3), Rotation::Deg0, -3, &world, &city);
+        assert!(!placement.valid);
+        assert_eq!(placement.origin, IVec3::new(500, 61, 500), "the hovered-height fallback (64) minus the offset (3)");
     }
 
     // --- ghost_mesh ------------------------------------------------------
@@ -669,7 +731,7 @@ mod tests {
     #[test]
     fn resolve_ghost_is_hidden_with_no_hovered_block() {
         let mut ghost = GhostState::default();
-        let selection = PlacementSelection { catalogue_id: Some("house01".to_string()), rotation: Rotation::Deg0 };
+        let selection = PlacementSelection { catalogue_id: Some("house01".to_string()), rotation: Rotation::Deg0, y_offset: 0 };
         let dir = temp_dir("hidden_no_hover");
         let catalogue = catalogue_with(&dir, &[("house01", IVec3::new(2, 2, 2))]);
         let world = flat_world(63);
@@ -689,7 +751,7 @@ mod tests {
     #[test]
     fn resolve_ghost_shows_the_valid_material_on_buildable_free_ground() {
         let mut ghost = GhostState::default();
-        let selection = PlacementSelection { catalogue_id: Some("house01".to_string()), rotation: Rotation::Deg0 };
+        let selection = PlacementSelection { catalogue_id: Some("house01".to_string()), rotation: Rotation::Deg0, y_offset: 0 };
         let dir = temp_dir("shown_valid");
         let catalogue = catalogue_with(&dir, &[("house01", IVec3::new(2, 2, 2))]);
         let world = flat_world(63);
@@ -719,7 +781,7 @@ mod tests {
     #[test]
     fn resolve_ghost_shows_the_invalid_material_when_occupied() {
         let mut ghost = GhostState::default();
-        let selection = PlacementSelection { catalogue_id: Some("house01".to_string()), rotation: Rotation::Deg0 };
+        let selection = PlacementSelection { catalogue_id: Some("house01".to_string()), rotation: Rotation::Deg0, y_offset: 0 };
         let dir = temp_dir("shown_invalid");
         let catalogue = catalogue_with(&dir, &[("house01", IVec3::new(2, 2, 2))]);
         let world = flat_world(63);

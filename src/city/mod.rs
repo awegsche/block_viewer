@@ -97,11 +97,27 @@
 //! tinted green or red by whether [`grid::fit_footprint`] (E2) and
 //! [`state::City::is_tile_free`] (D1) both agree it could actually go there.
 //! G1's build menu doesn't exist yet, so a small keyboard stand-in drives
-//! *which* building is selected — see [`placement`]'s module docs. Nothing
-//! commits a placement yet; that's E4.
+//! *which* building is selected — see [`placement`]'s module docs.
+//! [`placement::PlacementSelection`] also carries a manual height offset
+//! (`Page Up`/`Page Down`/`Home`), added by ticket 048 alongside commit.
+//!
+//! ## Commit (ticket 048, roadmap E4)
+//!
+//! [`commit::CommitPlugin`] is what turns a valid (green) ghost into a real
+//! building: a left click claims the tile in [`state::City`], writes the
+//! rotated blueprint through the real write path (W4-W6) on
+//! `AsyncComputeTaskPool`, and — once that write actually succeeds — records
+//! the as-built baseline in [`journal::Journal`] (roadmap I1, landing here
+//! per the roadmap's own instruction to ship it with E4) and fires
+//! `ChunksEdited` so the building appears without a restart (W7). A failed
+//! write rolls the city entry back rather than leaving a phantom building
+//! behind — see [`commit`]'s module docs for the whole transaction. This is
+//! the first thing in the game that writes to the save at all; everything
+//! before it only read.
 
 use std::path::{Path, PathBuf};
 
+mod commit;
 mod definition;
 mod grid;
 mod journal;
@@ -158,6 +174,7 @@ pub fn run() {
         .insert_resource(CitySavePath(if save_root.as_os_str().is_empty() { None } else { Some(save_root) }))
         .add_plugins(picking::PickingPlugin)
         .add_plugins(placement::PlacementPlugin)
+        .add_plugins(commit::CommitPlugin)
         .add_systems(Last, (save_city_on_exit, save_journal_on_exit))
         .run();
 }
