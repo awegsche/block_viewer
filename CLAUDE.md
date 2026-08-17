@@ -42,6 +42,12 @@ This repo uses a simple file-based ticket protocol for tracking work:
 
 Both directories are created on demand if they don't exist yet.
 
+## Git workflow
+
+Commit directly to `main` — do not create a feature branch first. This
+overrides the harness's default of branching before committing on the
+default branch.
+
 ### Commit message format
 
 Commits that implement a numbered ticket use:
