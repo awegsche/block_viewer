@@ -181,29 +181,47 @@ pub struct ChunkColumn {
 }
 
 impl ChunkColumn {
-    /// Topmost non-air block at local column `(local_x, local_z)` (each
-    /// 0..16), scanning sections top-down. Returns `(world_y, block_id)`.
+    /// Topmost block at local column `(local_x, local_z)` (each 0..16) for
+    /// which `predicate` returns `true`, scanning sections top-down. Returns
+    /// `(world_y, block_id)`.
     ///
-    /// Used to place the camera above the terrain surface at startup by
-    /// ticket 006's original eager-decode version of `lib.rs::spawn_point`;
-    /// ticket 005-e's streaming startup can no longer do that (nothing is
-    /// decoded yet at startup), but this stays for the block-under-cursor
-    /// readout planned in ticket 007.
-    #[allow(dead_code)]
-    pub fn topmost_non_air(&self, local_x: usize, local_z: usize) -> Option<(i32, BlockId)> {
+    /// [`topmost_non_air`](Self::topmost_non_air) is this with
+    /// `predicate = |id| id != BlockRegistry::AIR`; ticket 052 pulled the
+    /// scan itself out to a general predicate so `city::grid` can skip
+    /// clutter (a citybuilder-specific notion) without this module — shared
+    /// with the viewer — growing a second meaning of "solid."
+    pub fn topmost_matching(
+        &self,
+        local_x: usize,
+        local_z: usize,
+        mut predicate: impl FnMut(BlockId) -> bool,
+    ) -> Option<(i32, BlockId)> {
         let mut by_height: Vec<&ChunkSection> = self.sections.iter().collect();
         by_height.sort_by(|a, b| b.y.cmp(&a.y));
 
         for section in by_height {
             for dy in (0..SECTION_SIZE).rev() {
                 let id = section.get(local_x, dy, local_z);
-                if id != BlockRegistry::AIR {
+                if predicate(id) {
                     let world_y = section.y as i32 * SECTION_SIZE as i32 + dy as i32;
                     return Some((world_y, id));
                 }
             }
         }
         None
+    }
+
+    /// Topmost non-air block at local column `(local_x, local_z)`.
+    ///
+    /// Used to place the camera above the terrain surface at startup by
+    /// ticket 006's original eager-decode version of `lib.rs::spawn_point`;
+    /// ticket 005-e's streaming startup can no longer do that (nothing is
+    /// decoded yet at startup), but this stays for the block-under-cursor
+    /// readout planned in ticket 007, and as `city::grid`'s ground-height
+    /// read (ticket 046) until ticket 052 widened it to skip clutter too.
+    #[allow(dead_code)]
+    pub fn topmost_non_air(&self, local_x: usize, local_z: usize) -> Option<(i32, BlockId)> {
+        self.topmost_matching(local_x, local_z, |id| id != BlockRegistry::AIR)
     }
 }
 

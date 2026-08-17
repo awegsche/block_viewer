@@ -19,13 +19,17 @@
 //! the citybuilder's own streaming radius decides what ground is known, the
 //! same way it already decides what the camera can see.
 //!
-//! "Ground" here is [`world::is_solid`]'s notion — not air, the same
-//! predicate the mesher culls faces against — not `ranvil::heightmap`'s
-//! `blocks_motion`. A lake's surface counts as ground the way a stone
-//! hilltop does; iteration 1 doesn't distinguish. That's exactly the kind
-//! of thing roadmap I3's block-classification table will eventually refine
-//! once damage detection needs a real "is this actually a foundation"
-//! answer — nothing here waits on that.
+//! "Ground" here is **not** [`world::is_solid`]'s plain not-air — ticket 052
+//! found that reading a tree, fence post or tall grass as "ground" refuses a
+//! placement `MAX_FOOTPRINT_STEP` (or ten blocks, for a tree) away from real,
+//! flat terrain, even though [`crate::city::commit`]'s own write already
+//! clears the obstruction without complaint. [`is_ground`] narrows the
+//! predicate: still not `ranvil::heightmap`'s `blocks_motion` (a lake's
+//! surface still counts as ground the way a stone hilltop does — iteration 1
+//! doesn't distinguish, and that refinement really is roadmap I3's later
+//! job), but clutter — vegetation, decoration, anything the write path's own
+//! "air is a block" policy would already bulldoze — no longer reads as the
+//! footprint's floor.
 //!
 //! ## No auto-level
 //!
@@ -103,17 +107,131 @@ pub enum FootprintFit {
     Refused(FitError),
 }
 
-/// The world Y one above the topmost solid (non-air, [`world::is_solid`])
-/// block at `tile`, via [`world::ChunkColumn::topmost_non_air`] against
-/// `world.columns` directly — or `None` if `tile`'s chunk isn't decoded, or
-/// nothing solid is in what's decoded. See the module docs.
+/// Block name families [`is_ground`] excludes from "the footprint's floor" —
+/// vegetation, decoration, and anything else the write path's own "air is a
+/// block" policy (`city::commit`'s `blueprint_edit`) already clears without
+/// complaint. See ticket 052 and the module docs.
+///
+/// Deliberately a blocklist, not an allowlist: the overwhelming majority of
+/// registered names really are terrain (every stone/dirt/sand/ore/deepslate
+/// variant among them), so naming the small set of exceptions is far shorter
+/// than trying to enumerate "ground." Suffix matches catch a whole wood/
+/// redstone-component family at once, the same way `world::tint`'s `_leaves`
+/// heuristic does for a different purpose; the exact-match list below is
+/// everything else that isn't itself a suffix family.
+fn is_clutter_name(name: &str) -> bool {
+    const CLUTTER_SUFFIXES: &[&str] = &[
+        "_leaves",
+        "_log",
+        "_wood",
+        "_stem",
+        "_hyphae",
+        "_sapling",
+        "_fence",
+        "_fence_gate",
+        "_sign",
+        "_hanging_sign",
+        "_banner",
+        "_carpet",
+        "_pressure_plate",
+        "_button",
+        "_door",
+        "_trapdoor",
+    ];
+    if CLUTTER_SUFFIXES.iter().any(|suffix| name.ends_with(suffix)) {
+        return true;
+    }
+
+    const CLUTTER_NAMES: &[&str] = &[
+        "short_grass",
+        "tall_grass",
+        "fern",
+        "large_fern",
+        "dead_bush",
+        "vine",
+        "glow_lichen",
+        "lily_pad",
+        "sugar_cane",
+        "cactus",
+        "bamboo",
+        "kelp",
+        "kelp_plant",
+        "seagrass",
+        "tall_seagrass",
+        "dandelion",
+        "poppy",
+        "blue_orchid",
+        "allium",
+        "azure_bluet",
+        "red_tulip",
+        "orange_tulip",
+        "white_tulip",
+        "pink_tulip",
+        "oxeye_daisy",
+        "cornflower",
+        "lily_of_the_valley",
+        "wither_rose",
+        "torchflower",
+        "pitcher_plant",
+        "sunflower",
+        "lilac",
+        "rose_bush",
+        "peony",
+        "brown_mushroom",
+        "red_mushroom",
+        "snow",
+        "cobweb",
+        "ladder",
+        "torch",
+        "wall_torch",
+        "soul_torch",
+        "soul_wall_torch",
+        "redstone_wire",
+        "redstone_torch",
+        "redstone_wall_torch",
+        "tripwire",
+        "tripwire_hook",
+        "lever",
+        "rail",
+        "powered_rail",
+        "detector_rail",
+        "activator_rail",
+    ];
+    CLUTTER_NAMES.contains(&name)
+}
+
+/// Whether `id` counts as *terrain* for [`ground_height_at`] to sample —
+/// [`world::is_solid`]'s not-air check, narrowed by [`is_clutter_name`]. Not
+/// a per-[`world::BlockId`] table the way `world::tint`'s tables are: a
+/// footprint fit samples a few dozen tiles at most, not once per emitted
+/// mesh face, so there's no hot loop here for a table to earn its keep — the
+/// same "name function first, plain lookup second" shape
+/// `world::mesh::is_solid_name`/`is_solid` use for the same reason.
+fn is_ground(id: world::BlockId, registry: &world::BlockRegistry) -> bool {
+    if id == world::BlockRegistry::AIR {
+        return false;
+    }
+    let full_name = registry.name(id);
+    let name = full_name.strip_prefix("minecraft:").unwrap_or(full_name);
+    !is_clutter_name(name)
+}
+
+/// The world Y one above the topmost [`is_ground`] block at `tile`, via
+/// [`world::ChunkColumn::topmost_matching`] against `world.columns` directly
+/// — or `None` if `tile`'s chunk isn't decoded, or nothing counts as ground
+/// in what's decoded (including a footprint standing on clutter all the way
+/// down — see the module docs). Locks `world.registry` once per call, not
+/// once per block: cheap enough at "a few dozen tiles, once a frame."
 pub fn ground_height_at(tile: IVec2, world: &DecodedWorld) -> Option<i32> {
     let size = world::SECTION_SIZE as i32;
     let chunk = (tile.x.div_euclid(size), tile.y.div_euclid(size));
     let column = world.columns.get(&chunk)?;
     let local_x = tile.x.rem_euclid(size) as usize;
     let local_z = tile.y.rem_euclid(size) as usize;
-    column.topmost_non_air(local_x, local_z).map(|(y, _id)| y + 1)
+    let registry = world.registry.lock().unwrap();
+    column
+        .topmost_matching(local_x, local_z, |id| is_ground(id, &registry))
+        .map(|(y, _id)| y + 1)
 }
 
 /// Samples every tile [`footprint_tiles`] covers for `footprint` placed at
@@ -226,6 +344,50 @@ mod tests {
         world_with_ground(&ground)
     }
 
+    /// A single decoded, entirely-air chunk column at chunk `(0, 0)` — for
+    /// tests that build clutter up from nothing via [`add_block`] rather
+    /// than starting from [`world_with_ground`]'s stone floor.
+    fn empty_chunk() -> DecodedWorld {
+        let (registry, _stone) = registry_with_stone();
+        let mut columns: HashMap<(i32, i32), ChunkColumn> = HashMap::new();
+        columns.insert((0, 0), ChunkColumn { x: 0, z: 0, sections: Vec::new(), floor_y: world::WORLD_MIN_Y });
+        DecodedWorld {
+            registry: Arc::new(Mutex::new(registry)),
+            biomes: Arc::new(Mutex::new(BiomeRegistry::new())),
+            columns,
+        }
+    }
+
+    /// Interns `name` (if not already interned) and sets the block at
+    /// `tile`/`y` in `world` to it — `tile`'s chunk must already exist
+    /// (built by [`world_with_ground`]/[`empty_chunk`]), the same
+    /// "no ungenerated chunks" assumption [`ground_height_at`] itself makes.
+    /// Used to stack clutter (a tree trunk, a fence post) onto ground a
+    /// prior helper already built, without duplicating its section-building
+    /// logic.
+    fn add_block(world: &mut DecodedWorld, tile: IVec2, y: i32, name: &str) {
+        let id = world.registry.lock().unwrap().intern(name);
+        let size = world::SECTION_SIZE as i32;
+        let chunk = (tile.x.div_euclid(size), tile.y.div_euclid(size));
+        let (local_x, local_z) = (tile.x.rem_euclid(size) as usize, tile.y.rem_euclid(size) as usize);
+        let section_y = y.div_euclid(size) as i8;
+        let local_y = y.rem_euclid(size) as usize;
+
+        let column = world.columns.get_mut(&chunk).expect("add_block: tile's chunk must already exist");
+        let section = match column.sections.iter().position(|s| s.y == section_y) {
+            Some(index) => index,
+            None => {
+                column.sections.push(ChunkSection {
+                    y: section_y,
+                    blocks: Box::new([BlockRegistry::AIR; world::SECTION_VOLUME]),
+                    biomes: Box::new([BiomeRegistry::PLAINS; world::BIOME_GRID_VOLUME]),
+                });
+                column.sections.len() - 1
+            }
+        };
+        column.sections[section].blocks[ChunkSection::index(local_x, local_y, local_z)] = id;
+    }
+
     #[test]
     fn ground_height_is_one_above_the_topmost_solid_block() {
         let world = world_with_ground(&[(IVec2::new(5, 5), 63)]);
@@ -326,5 +488,76 @@ mod tests {
         let world = flat_chunk(64);
         let fit = fit_footprint(IVec3::new(5, 80, 5), IVec2::new(0, 3), Rotation::Deg0, &world);
         assert_eq!(fit, FootprintFit::Fits { base_y: 80 });
+    }
+
+    // -- ticket 052: clutter shouldn't read as ground --------------------
+
+    #[test]
+    fn is_clutter_name_covers_common_suffix_and_exact_families() {
+        assert!(is_clutter_name("oak_log"));
+        assert!(is_clutter_name("stripped_oak_log"));
+        assert!(is_clutter_name("oak_leaves"));
+        assert!(is_clutter_name("oak_fence"));
+        assert!(is_clutter_name("torch"));
+        assert!(is_clutter_name("short_grass"));
+        assert!(!is_clutter_name("stone"));
+        assert!(!is_clutter_name("oak_planks"));
+        assert!(!is_clutter_name("cobblestone_wall"), "walls are structural, not clutter");
+    }
+
+    #[test]
+    fn a_tree_standing_on_otherwise_flat_ground_does_not_read_as_a_cliff() {
+        let mut world = flat_chunk(64);
+        // A six-log trunk plus leaves in the middle of the footprint — read
+        // as ground, this would be a seven-block discrepancy against the
+        // flat ground everywhere else, well past MAX_FOOTPRINT_STEP.
+        for y in 65..71 {
+            add_block(&mut world, IVec2::new(1, 1), y, "minecraft:oak_log");
+        }
+        add_block(&mut world, IVec2::new(1, 1), 71, "minecraft:oak_leaves");
+
+        let fit = fit_footprint(IVec3::new(0, 0, 0), IVec2::new(3, 3), Rotation::Deg0, &world);
+        assert_eq!(fit, FootprintFit::Fits { base_y: 65 }, "a tree should not refuse an otherwise-flat placement");
+    }
+
+    #[test]
+    fn a_fence_post_on_flat_ground_is_skipped_too() {
+        let mut world = flat_chunk(64);
+        add_block(&mut world, IVec2::new(2, 2), 65, "minecraft:oak_fence");
+
+        let fit = fit_footprint(IVec3::new(0, 0, 0), IVec2::new(3, 3), Rotation::Deg0, &world);
+        assert_eq!(fit, FootprintFit::Fits { base_y: 65 });
+    }
+
+    #[test]
+    fn a_real_slope_still_refuses_even_with_clutter_ignored() {
+        // A genuine 6-block terrain step (not clutter) under one corner —
+        // ignoring clutter must not also start ignoring real elevation.
+        let mut ground: Vec<(IVec2, i32)> = (0..3).flat_map(|x| (0..3).map(move |z| (IVec2::new(x, z), 64))).collect();
+        for entry in ground.iter_mut() {
+            if entry.0 == IVec2::new(2, 2) {
+                entry.1 = 70;
+            }
+        }
+        let world = world_with_ground(&ground);
+
+        let fit = fit_footprint(IVec3::new(0, 0, 0), IVec2::new(3, 3), Rotation::Deg0, &world);
+        assert!(matches!(fit, FootprintFit::Refused(FitError::TooSteep { .. })));
+    }
+
+    #[test]
+    fn a_footprint_standing_on_clutter_all_the_way_down_is_refused_not_crashed() {
+        let mut world = empty_chunk();
+        for x in 0..2 {
+            for z in 0..2 {
+                add_block(&mut world, IVec2::new(x, z), 64, "minecraft:oak_log");
+            }
+        }
+
+        let fit = fit_footprint(IVec3::new(0, 0, 0), IVec2::new(2, 2), Rotation::Deg0, &world);
+        assert!(
+            matches!(fit, FootprintFit::Refused(FitError::NotLoaded { .. })),
+            "no ground anywhere in a decoded column should refuse, not fit at a nonsensical height"
+        );
     }
 }

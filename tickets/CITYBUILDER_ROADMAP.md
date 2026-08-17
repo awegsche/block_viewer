@@ -685,8 +685,14 @@ building to place near one: it treats a tree or a fence post exactly like
 terrain, so a footprint with an obstruction standing on otherwise-flat
 ground reads as a cliff and is refused, even though E4's own "air is a
 block" policy would clear the obstruction without complaint if the fit
-check weren't in the way. Not fixed here — filed as `tickets/052-terrain-fit-ignores-clutter.md`,
-open, not yet picked up.
+check weren't in the way. Not fixed inline — filed as ticket 052, done
+separately (see `finished_tickets/052-terrain-fit-ignores-clutter.md`):
+`ground_height_at` now walks a `city::grid`-local `is_ground`/`is_clutter_name`
+predicate (mirroring `world::mesh::is_solid_name`/`is_solid`'s shape, not
+`world::tint`'s per-`BlockId` table — a footprint fit samples too few tiles
+a frame for a table to earn its keep) instead of plain not-air, off a new
+general `ChunkColumn::topmost_matching` that `topmost_non_air` itself now
+just specialises.
 
 **E3. Ghost preview and validity. — done, ticket 047.** The B2 mesh at the
 cursor with a translucent material, tinted by validity, snapped to the grid.

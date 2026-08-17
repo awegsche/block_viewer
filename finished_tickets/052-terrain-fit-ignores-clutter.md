@@ -1,9 +1,10 @@
 # 052 - Terrain fit shouldn't see trees/clutter as "the ground"
 
 ## Status
-Open — not yet picked up. Filed after manually testing placement (tickets
-048–050) surfaced the gap; not previously covered by any ticket. Roadmap
-group E (`tickets/CITYBUILDER_ROADMAP.md`) is the parent.
+Done — implemented and tested (`cargo build`/`cargo test` clean, 450 tests,
+up from 439). See the Resolution. Filed after manually testing placement
+(tickets 048–050) surfaced the gap; not previously covered by any ticket.
+Roadmap group E (`tickets/CITYBUILDER_ROADMAP.md`) is the parent.
 
 ## The gap
 
@@ -81,4 +82,57 @@ repeating so a future implementer doesn't re-litigate them:
 
 ## Done when
 
-N/A — split into a real ticket, with its own resolution, when picked up.
+- `cargo build`/`cargo test` clean.
+- Tests: a tree/fence standing on otherwise-flat ground fits; a real slope
+  (terrain height varying past tolerance) still refuses; a footprint that's
+  clutter all the way down to bedrock doesn't crash or fit at a nonsensical
+  height.
+
+## Resolution
+
+Landed close to scoped, with one deliberate deviation from the sketch:
+`ChunkColumn::topmost_non_air` (`world::decode`) turned out to already be the
+whole scan — it just hardcoded `predicate = |id| id != AIR`. Rather than a
+second, citybuilder-flavoured walk living next to it, it was pulled apart
+into `topmost_matching(local_x, local_z, predicate)` plus `topmost_non_air`
+as that one-line specialisation. `world::mesh` and ticket 007's read-only
+callers keep calling `topmost_non_air` unchanged; `city::grid` is the only
+caller of the wider `topmost_matching`, so the shared module gained a
+general primitive, not a "ground vs. clutter" concept.
+
+`city::grid` gained `is_clutter_name`/`is_ground`, mirroring
+`world::mesh::is_solid_name`/`is_solid`'s own "name function first, `BlockId`
+wrapper second" split rather than `world::tint`'s per-`BlockId` table shape
+the ticket's own scope section had sketched — a table earns its keep on a
+per-emitted-face hot loop; a footprint fit samples a few dozen tiles once a
+frame, so `is_ground` just locks `world.registry` once per
+`ground_height_at` call and checks names directly during the scan. The
+clutter list is a blocklist (suffix families — `_leaves`, `_log`, `_fence`,
+`_door`, redstone components, … — plus an exact-name list for flowers,
+grasses, vines, rails, torches, and the like), not the allowlist the ticket
+sketched: naming the small set of exceptions is far shorter than trying to
+enumerate every stone/dirt/sand/ore/deepslate variant that counts as
+"terrain." `cobblestone_wall` and similar are deliberately *not* clutter —
+they're structural, not vegetation or decoration, even though the word
+"wall" might suggest otherwise.
+
+`ground_height_at` walks `topmost_matching` with `is_ground` instead of
+`topmost_non_air`; `fit_footprint` itself is unchanged, since the height read
+was always the only place `is_solid`'s not-air notion entered the picture.
+The "no auto-clearing" and "don't reach for I3's damage classifier" rules the
+ticket called out up front were both kept: nothing here writes a block, and
+the clutter list is `city::grid`'s own, not shared with (or blocking on)
+group I's future structural/interaction-state/volatile classifier.
+
+Five new tests in `city::grid`: `is_clutter_name`'s own suffix/exact-name
+coverage, a tree (log + leaves) and a fence post each standing on otherwise-
+flat ground still fitting, a genuine 6-block terrain step still refusing
+(clutter-blindness must not become slope-blindness), and a footprint that's
+clutter all the way down to an empty chunk refusing as `NotLoaded` rather
+than crashing or fitting at a nonsensical height — the exact scenario this
+ticket's scope section named. `tests::add_block`/`tests::empty_chunk` are new
+test-only helpers alongside the existing `world_with_ground`/`flat_chunk`.
+
+No manual verification recorded as done — this is a pure logic change over
+already-decoded in-memory data (no I/O, no new UI), so `../todo.md` doesn't
+gain a new entry for it.
