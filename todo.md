@@ -561,3 +561,29 @@ these itself (see CLAUDE.md's "Manual/visual verification").
   own tests already prove the write lands where a synthetic fixture says it
   should; what only this check can prove is that the fixture's assumptions
   match a real save.
+
+- [ ] **030 citybuilder render floor: no visible hole, seam or missing face
+  from above, and `block_viewer` looks unchanged.** The automated suite
+  covers the arithmetic (`render_floor`, `snap_down_to_section`,
+  `decode_chunk`'s section skipping) and the mesher's boundary-occlusion
+  rule with synthetic fixtures, plus a real-region measurement — what it
+  can't cover is what the real save's actual terrain looks like from above
+  with a chunk of it missing underneath.
+
+  `cargo run --bin citybuilder` against the real save. Fly/orbit the camera
+  over a range of terrain — flat ground, a hillside, and if the save has one
+  nearby, a ravine, cave mouth or cliff edge (the case the whole
+  minimum-over-256-columns design exists for). Confirm: no hole punched
+  through the ground anywhere the camera can see from above; no visible seam
+  or z-fighting at chunk boundaries, including where two neighbouring chunks
+  would plausibly have computed different floors (near a ravine or a steep
+  slope); the framerate/load time visibly benefits versus flying the same
+  path in `block_viewer` (the measured numbers in ticket 030's Resolution are
+  ~70% fewer sections and ~4.6x faster on one region — this is the "does that
+  hold up by eye too" check).
+
+  Then `cargo run --bin block_viewer` over the same area and confirm it looks
+  exactly as it did before this ticket — full underground included, no
+  missing caves. If it doesn't, the bug is in `world::mesh`/`world::decode`
+  shared code, not `city`'s override, since the viewer never sets
+  `FloorPolicy::BelowSurface` at all.

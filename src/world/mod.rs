@@ -27,8 +27,8 @@ pub use biome::{BiomeId, BiomeRegistry};
 pub use block::{BlockId, BlockRegistry};
 #[allow(unused_imports)]
 pub use decode::{
-    decode_chunk, ChunkColumn, ChunkSection, DecodeError, BIOME_GRID_VOLUME, SECTION_SIZE,
-    SECTION_VOLUME,
+    decode_chunk, ChunkColumn, ChunkSection, DecodeError, FloorPolicy, BIOME_GRID_VOLUME,
+    SECTION_SIZE, SECTION_VOLUME, WORLD_MIN_Y,
 };
 #[allow(unused_imports)]
 pub use mesh::{is_solid, mesh_chunk_column, Neighbors};

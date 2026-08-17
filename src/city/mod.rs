@@ -21,11 +21,25 @@
 //! The camera is the viewer's free-flight rig for now. An RTS camera (E1)
 //! replaces it, and is free to drop the flight controls the viewer has to
 //! keep.
+//!
+//! ## Render depth (ticket 030, roadmap R1)
+//!
+//! The one way this binary's world differs from `block_viewer`'s: [`run`]
+//! overrides [`chunk_pipeline::RenderFloor`] with
+//! [`world::decode::FloorPolicy::BelowSurface`]. The RTS camera this game
+//! is built around looks at the surface from above and never goes
+//! underground, so the ~7 sections per column below the terrain — caves
+//! included — are never decoded or meshed. `block_viewer` keeps
+//! [`world_app`]'s default of [`world::decode::FloorPolicy::WholeWorld`],
+//! since it's the explore-a-save app and the underground is exactly what it
+//! exists to show.
 
-use crate::world_app;
+use crate::{chunk_pipeline::RenderFloor, world::decode::FloorPolicy, world_app};
 
 /// Runs the citybuilder. Called by `src/bin/citybuilder.rs`, which is three
 /// lines and nothing else.
 pub fn run() {
-    world_app().run();
+    world_app()
+        .insert_resource(RenderFloor(FloorPolicy::BelowSurface { margin: 16 }))
+        .run();
 }
