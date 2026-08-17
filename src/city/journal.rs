@@ -28,15 +28,17 @@
 //! same way so the two line up position-for-position. Nothing here computes
 //! a baseline itself; it only records and replays one.
 //!
-//! ## A real caller, as of ticket 048
+//! ## Real callers, as of tickets 048 and 049
 //!
 //! [`Journal::record_placement`] is called by `city::commit::poll_commit`
 //! (roadmap E4) on every successful placement — the first gameplay caller
-//! this module has had; until then it was only proven by the app lifecycle
+//! this module had; until then it was only proven by the app lifecycle
 //! (loaded and saved on every real save, per ticket 043's own precedent) and
-//! by this module's tests. [`record_demolition`](Journal::record_demolition)
-//! still waits on E5, and [`Journal::undo_last`]/[`reconcile`] still wait on
-//! whatever UI eventually calls them (G2, roadmap I).
+//! by this module's tests. [`Journal::record_demolition`] and
+//! [`Baseline::restore_edit`] are called the same way by
+//! `city::demolish::poll_demolish`/`try_demolish` (ticket 049, roadmap E5).
+//! [`Journal::undo_last`]/[`reconcile`] still wait on whatever UI eventually
+//! calls them (G2, roadmap I).
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -109,11 +111,14 @@ impl Baseline {
         Some(Baseline { written, previous, data_version: edit.data_version() })
     }
 
-    /// The edit that restores `previous` — undo's world half, and the same
-    /// edit a demolition's own baseline hands E5 for its terrain restore.
-    /// Left uncommitted, like every other edit this crate builds: the caller
-    /// runs it through the write path.
-    fn restore_edit(&self) -> WorldEdit {
+    /// The edit that restores `previous` — undo's world half, and (ticket
+    /// 049, roadmap E5) `city::demolish`'s terrain-restore edit, built from
+    /// the *placement*'s own baseline rather than [`undo_last`](Journal::undo_last)'s
+    /// "always the journal's last entry" — demolish targets an arbitrary
+    /// building, not necessarily the most recent one. `pub(super)` for that
+    /// second caller; left uncommitted, like every other edit this crate
+    /// builds, for the caller to run through the write path.
+    pub(super) fn restore_edit(&self) -> WorldEdit {
         self.previous
             .iter()
             .cloned()
@@ -206,7 +211,11 @@ impl Journal {
     /// Appends a demolition entry. `placement` is what [`City::remove_building`]
     /// just returned — the building as it stood in city state the instant
     /// before it was removed.
-    #[allow(dead_code)] // no caller yet — E5 (roadmap), see the module docs
+    ///
+    /// Called by `city::demolish::poll_demolish` (ticket 049, roadmap E5)
+    /// once a demolition's restoring write has actually succeeded — the same
+    /// "record only after the write lands" ordering [`record_placement`](Self::record_placement)
+    /// already uses.
     pub fn record_demolition(&mut self, building: BuildingId, placement: PlacedBuilding, baseline: Baseline) {
         self.entries.push(JournalEntry::Demolished { building, placement, baseline });
     }
@@ -230,7 +239,11 @@ impl Journal {
     /// separate baseline rather than reusing this). `None` if `building` was
     /// never placed through this journal — an older save, or a building
     /// whose record predates this ticket.
-    #[allow(dead_code)] // no caller yet — I2 (roadmap), see the module docs
+    ///
+    /// Real callers as of ticket 049: `city::demolish::resolve_demolition_target`
+    /// (roadmap E5) refuses to demolish a building this comes back `None`
+    /// for, rather than guessing what terrain to restore. I2 (roadmap) is
+    /// the eventual damage-scan caller.
     pub fn placement_baseline(&self, building: BuildingId) -> Option<&Baseline> {
         self.entries.iter().rev().find_map(|entry| match entry {
             JournalEntry::Placed { building: id, baseline, .. } if *id == building => Some(baseline),

@@ -727,3 +727,37 @@ these itself (see CLAUDE.md's "Manual/visual verification").
   second click is silently ignored rather than racing the first -- the
   console should show only one `placed ...` line per click that actually
   went through.
+
+- [ ] **049 demolish: a demolished building is actually gone from the save,
+  and the terrain underneath is really back.** The automated suite covers
+  target resolution, the `City`/journal glue on success and failure, and a
+  restore write against a synthetic fixture directly -- what it can't cover
+  is a real `Delete` press against a real save, or the write-gate refusal
+  actually being reachable through two real inputs in the same session.
+  **Back the world up first** (or run this against a scratch copy) -- this
+  writes to a real save, same caveat as tickets 035 and 048's items above.
+
+  `cargo run --bin citybuilder` against the real save (ideally the one 048's
+  checklist already placed a building into). Hover the placed building and
+  press `Delete`. Confirm: (1) the console prints a
+  `demolished house01 (N block(s) restored across M chunk(s))` line and the
+  building disappears from the viewport without a restart (W7's live
+  re-mesh); (2) the tile is immediately buildable again (select the same
+  building with `1` and confirm the ghost goes green there); (3) pressing
+  `Delete` again over empty ground or a road tile does nothing at all -- no
+  console line. Then close the app (saves `city.ron`/`journal.ron` on exit)
+  and open the save in Minecraft: the terrain where the building stood
+  should read as whatever was there before it was placed, not a hole and not
+  leftover building blocks. Re-open with `cargo run --bin citybuilder` and
+  confirm the building does *not* reappear (043's `city.ron` round trip,
+  now proving a removal survives a reload too).
+
+  Separately, try to catch the write-gate case: place one building, and
+  before its `placed ...` console line appears, immediately hover a
+  *different*, already-standing building and press `Delete`. This is a
+  narrow timing window (the write is usually fast), so it may take a few
+  tries -- confirm that if it does land mid-write, the console shows the
+  "can't demolish right now, a write is already in progress" line rather
+  than a corrupted region file or two writes racing silently. Not a hard
+  failure if the window can't be hit by hand; the automated `write_gate`
+  tests already cover the logic itself.

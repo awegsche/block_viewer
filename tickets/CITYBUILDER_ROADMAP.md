@@ -2,7 +2,7 @@
 
 Not a work item; the plan for the citybuilder game and the shared world-edit
 infrastructure it needs. High-level tasks here get split into numbered
-tickets in this directory when they're picked up (next free number: 048).
+tickets in this directory when they're picked up (next free number: 050).
 Companion to `ROADMAP.md`, which covers the viewer 001–029.
 
 ## The goal
@@ -137,7 +137,9 @@ L1  lib.rs + two bin shims                       <- DONE (ticket 027)
                |    E3  ghost + validity       F3  auto-tiling the pieces
                |         <- DONE (ticket 047)
                |    E4  commit                 F4  connectivity queries
+               |         <- DONE (ticket 048)
                |    E5  demolish
+               |         <- DONE (ticket 049)
                |
                +-- G  UI: build menu, city panel
                +-- H  terraforming: dig and level
@@ -701,12 +703,59 @@ frame's `HoveredBlock` rather than last frame's. No commit yet — E4 is what
 will call `City::place_building` off the same validity signal this ticket
 computes for the preview.
 
-**E4. Commit.** City state entry + W4/W5 write + W7 re-mesh, in that order,
-transactionally: if the write fails, the city entry doesn't survive either.
+**E4. Commit. — done, ticket 048.** City state entry + W4/W5 write + W7
+re-mesh, in that order, transactionally: if the write fails, the city entry
+doesn't survive either.
 
-**E5. Demolish.** City state removal, then re-project — restoring the
-terrain that was there needs the pre-placement blocks kept in the journal,
-which is a D3 decision to make deliberately rather than discover.
+How it came out: `city::commit::CommitPlugin`, recomputing validity itself
+(`try_commit_placement` calls the same `placement::resolve_placement` E3's
+ghost reads, with *this* frame's inputs) rather than trusting whatever the
+ghost displayed last frame — a click commits exactly what's on screen at the
+moment of the click. `state::City::place_building` runs synchronously the
+instant a click is accepted (cheap — an occupancy check, no I/O), so the tile
+claim exists before `WriteSession::open`/`commit` even starts on
+`AsyncComputeTaskPool`; a single `CommitState::pending` slot is the same
+one-at-a-time backpressure `PaintCommand`/`BlueprintExtraction` already use.
+`blueprint_edit` decided the "air is a block" question `WorldEdit`'s own docs
+left open for this ticket: every grid position is written, air included,
+clearing whatever sliver of terrain E2's footprint-fit tolerance left poking
+into the building rather than leaving it standing. On a successful write:
+`journal::Baseline::capture` (with `EditPolicy::capture_replaced` turned on
+specifically for this caller) and `Journal::record_placement` land I1's
+as-built baseline for real, and `ChunksEdited` fires for W7's live re-mesh.
+On failure: `City::remove_building` — the transactional half the roadmap
+names. A separate, adjacent piece the roadmap didn't call out:
+`PlacementSelection` gained a `y_offset`, stepped by `Page Up`/`Page Down`
+and reset by `Home`, so a placement's height can be nudged off the terrain's
+own auto-fit before committing — not the mouse wheel, which Rts's camera
+already owns for zoom. See `finished_tickets/048-placement-commit.md`.
+
+**E5. Demolish. — done, ticket 049.** City state removal, then re-project —
+restoring the terrain that was there needs the pre-placement blocks kept in
+the journal, which is a D3 decision to make deliberately rather than
+discover.
+
+How it came out: `city::demolish::DemolishPlugin`. No G1 build menu yet, so
+`Delete` on `picking::HoveredBlock`'s tile is the whole UI — `City::occupant_at`
+finds the id, `Journal::placement_baseline` finds what to restore, refusing
+(rather than guessing) when a placed building has no recorded baseline, an
+older-save edge case. The restoring edit needed no new code:
+`journal::Baseline::restore_edit`, already built for D3's undo, is exactly
+the placement baseline's own `previous` half, widened from private to
+`pub(super)` for this second caller. The interesting decision was ordering:
+commit claims the tile in `City` *before* its write starts, so a second click
+can't race it; demolish does the opposite, freeing the tile only *after* its
+restoring write succeeds — freeing it first would let a new placement land on
+the same tile mid-write, and whichever write reached disk last would clobber
+the other. A new `city::write_gate::WriteGate` resource, shared between
+`CommitPlugin` and `DemolishPlugin`, closes a gap neither module's own
+single-pending-slot backpressure covered on its own: two independent
+`WriteSession::open` calls, on unrelated tiles, in the same frame. `ranvil`'s
+session lock is a mandatory lock on a freshly-opened file handle, not on the
+process, so a second concurrent open from this same app fails exactly like
+Minecraft already having the world open — and unlike that case, there's no
+retry built in, so it would have failed one of the two writes outright rather
+than merely delayed it. See `finished_tickets/049-demolish.md`.
 
 ---
 

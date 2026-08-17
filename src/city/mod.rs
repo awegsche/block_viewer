@@ -114,17 +114,34 @@
 //! behind — see [`commit`]'s module docs for the whole transaction. This is
 //! the first thing in the game that writes to the save at all; everything
 //! before it only read.
+//!
+//! ## Demolish (ticket 049, roadmap E5)
+//!
+//! [`demolish::DemolishPlugin`] is commit's inverse: `Delete` on a hovered,
+//! placed building removes it from [`state::City`] and writes the terrain
+//! its own placement baseline (roadmap I1) says stood there back through the
+//! write path — no re-derivation from the blueprint, the baseline already
+//! *is* the answer. It also lands [`journal::Journal::record_demolition`]'s
+//! first real caller, the `Demolished` half of D3's journal (ticket 044)
+//! that had existed, unused, since then. Unlike commit, the `City` removal
+//! happens *after* the write succeeds rather than before — see
+//! [`demolish`]'s module docs for why that ordering, not commit's, is the
+//! one that's safe here. [`write_gate::WriteGate`] is a small resource
+//! shared with [`commit::CommitPlugin`] so the two can't both have a
+//! `WriteSession` open at once.
 
 use std::path::{Path, PathBuf};
 
 mod commit;
 mod definition;
+mod demolish;
 mod grid;
 mod journal;
 mod persistence;
 mod picking;
 mod placement;
 mod state;
+mod write_gate;
 
 use bevy::app::AppExit;
 use bevy::prelude::*;
@@ -175,6 +192,7 @@ pub fn run() {
         .add_plugins(picking::PickingPlugin)
         .add_plugins(placement::PlacementPlugin)
         .add_plugins(commit::CommitPlugin)
+        .add_plugins(demolish::DemolishPlugin)
         .add_systems(Last, (save_city_on_exit, save_journal_on_exit))
         .run();
 }

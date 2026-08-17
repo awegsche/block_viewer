@@ -44,7 +44,8 @@
 //! a build and the mesh that previewed it never disagree about which corner
 //! is which.
 //!
-//! ## One commit in flight at a time
+//! ## One commit in flight at a time — and, as of ticket 049, one write of
+//! any kind
 //!
 //! [`CommitState::pending`] is a single slot, the same backpressure
 //! [`crate::blueprint::BlueprintExtraction`]/`viewer::paint::PaintCommand`
@@ -53,6 +54,13 @@
 //! [`try_commit_placement`] simply does nothing while a commit is pending;
 //! there's no build-menu affordance yet to disable, the same "no UI beyond
 //! what already exists" state ticket 047 left this whole feature area in.
+//!
+//! That slot alone only rules out a second *commit*. `city::demolish`
+//! (ticket 049, roadmap E5) opens its own `WriteSession`s the same way, on
+//! its own tiles, and the two modules know nothing about each other's
+//! `pending` — [`super::write_gate::WriteGate`] is the shared flag that
+//! actually serializes them; see its module docs for why that's not just
+//! belt-and-braces.
 
 use std::sync::{Arc, Mutex};
 
@@ -73,6 +81,7 @@ use super::journal::{self, Journal};
 use super::picking::{HoveredBlock, PickingSet};
 use super::placement::{self, GhostPlacement, PlacementSelection};
 use super::state::{self, BuildingId, PlacedBuilding};
+use super::write_gate::WriteGate;
 
 /// A commit's write, in flight — see the module docs.
 struct PendingCommit {
@@ -96,6 +105,11 @@ pub struct CommitPlugin;
 impl Plugin for CommitPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<CommitState>()
+            // `city::demolish::DemolishPlugin` initializes the same
+            // resource — `init_resource` only inserts a default when one
+            // isn't already present, so it doesn't matter which plugin adds
+            // to the app first. See `write_gate`'s module docs.
+            .init_resource::<WriteGate>()
             // Registered here rather than assumed from `ChunkLoadPipelinePlugin`
             // — `add_event` is idempotent, the same defensive call
             // `viewer::paint::PaintPlugin` makes, and it's what lets a
@@ -135,8 +149,11 @@ fn blueprint_edit(blueprint: &Blueprint, origin: IVec3) -> WorldEdit {
 /// Opens a write session and commits `edit` through `cache` — pulled out on
 /// its own the same way `viewer::paint::commit_fill` is, so it's callable
 /// directly from a test rather than only through a real
-/// `AsyncComputeTaskPool` task.
-fn commit_building(
+/// `AsyncComputeTaskPool` task. `pub(super)`: `city::demolish` (ticket 049,
+/// roadmap E5) reuses this verbatim for its own restoring write — opening a
+/// session and committing an edit through it doesn't care which direction
+/// the edit is going.
+pub(super) fn commit_building(
     save: &SaveMeta,
     cache: &mut RegionCache,
     edit: &WorldEdit,
@@ -159,6 +176,7 @@ fn try_commit_placement(
     world: Res<DecodedWorld>,
     mut city: ResMut<state::City>,
     mut commit: ResMut<CommitState>,
+    mut write_gate: ResMut<WriteGate>,
     loaded_save: Option<Res<LoadedSave>>,
     region_cache: Option<Res<SharedRegionCache>>,
 ) {
@@ -219,6 +237,17 @@ fn try_commit_placement(
     };
     let placed = PlacedBuilding { definition: id, origin, rotation: selection.rotation, footprint: entry.footprint };
 
+    if !write_gate.try_acquire() {
+        // Very likely `city::demolish` mid-write on some other tile —
+        // `CommitState`'s own single slot already rules out a second
+        // commit. Roll the synchronous claim back rather than leaving a
+        // phantom building nobody is actually writing; see `write_gate`'s
+        // module docs for why the two writes can't proceed together.
+        city.remove_building(building);
+        println!("block_viewer: can't place a building right now, a write is already in progress");
+        return;
+    }
+
     let save_meta = loaded_save.0.meta.clone();
     let cache: Arc<Mutex<RegionCache>> = region_cache.0.clone();
     let policy = EditPolicy { capture_replaced: true, ..EditPolicy::default() };
@@ -241,6 +270,7 @@ fn poll_commit(
     mut commit: ResMut<CommitState>,
     mut city: ResMut<state::City>,
     mut journal: ResMut<Journal>,
+    mut write_gate: ResMut<WriteGate>,
     mut edited: EventWriter<ChunksEdited>,
 ) {
     let result = {
@@ -251,6 +281,7 @@ fn poll_commit(
         result
     };
     let PendingCommit { building, placement, edit, .. } = commit.pending.take().expect("just matched Some above");
+    write_gate.release();
 
     match result {
         Ok(summary) => {

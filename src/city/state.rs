@@ -51,15 +51,18 @@
 //! leaving the first few marked occupied would leave the grid holding a
 //! phantom building nobody actually placed.
 //!
-//! ## Real callers, as of ticket 048
+//! ## Real callers, as of tickets 048 and 049
 //!
 //! [`City::place_building`]/[`City::remove_building`] were exercised only by
 //! this module's own tests until `city::commit` (ticket 048, roadmap E4)
 //! started calling them — `place_building` on a click, `remove_building` as
-//! the rollback when the write that click started fails. Everything else
-//! past those two (`remove_road`, `occupant_at`, `len`, `is_empty`) is still
-//! only proven by tests; their own `#[allow(dead_code)]` marks are that same
-//! "no caller yet" situation, not a note-worthy call each time it recurs.
+//! the rollback when the write that click started fails. `city::demolish`
+//! (ticket 049, roadmap E5) is `remove_building`'s second, deliberate
+//! caller, and adds two more: [`City::occupant_at`] finds what's under the
+//! cursor, [`City::building`] looks up its placement. Everything past those
+//! four (`remove_road`, `len`, `is_empty`) is still only proven by tests;
+//! their own `#[allow(dead_code)]` marks are that same "no caller yet"
+//! situation, not a note-worthy call each time it recurs.
 
 use std::collections::{HashMap, HashSet};
 
@@ -226,7 +229,10 @@ impl City {
     ///
     /// `city::commit::poll_commit` (ticket 048) calls this on a *failed*
     /// write — the rollback half of [`place_building`](Self::place_building)'s
-    /// docs. E5 (demolish) will be a second, deliberate caller later.
+    /// docs. `city::demolish::poll_demolish` (ticket 049, roadmap E5) is the
+    /// second, deliberate caller — and, unlike commit's rollback, only after
+    /// its own restoring write has already succeeded; see that module's docs
+    /// for why the two callers free the tile at opposite ends of their write.
     pub fn remove_building(&mut self, id: BuildingId) -> Option<PlacedBuilding> {
         let building = self.buildings.remove(&id)?;
         for tile in footprint_tiles(building.origin, building.footprint, building.rotation) {
@@ -235,7 +241,9 @@ impl City {
         Some(building)
     }
 
-    #[allow(dead_code)] // no caller yet — see the module docs
+    /// `city::demolish::resolve_demolition_target` (ticket 049, roadmap E5)
+    /// is the real caller: `occupant_at` finds the id, this looks up the
+    /// placement itself.
     pub fn building(&self, id: BuildingId) -> Option<&PlacedBuilding> {
         self.buildings.get(&id)
     }
@@ -325,7 +333,9 @@ impl City {
         !self.occupancy.contains_key(&tile)
     }
 
-    #[allow(dead_code)] // no caller yet — see the module docs
+    /// `city::demolish::resolve_demolition_target` (ticket 049, roadmap E5)
+    /// is the real caller — the first check on a `Delete` press: is there
+    /// even a building on this tile.
     pub fn occupant_at(&self, tile: IVec2) -> Option<Occupant> {
         self.occupancy.get(&tile).copied()
     }
