@@ -28,9 +28,11 @@
 //! blueprint was logged and dropped, so the button printed a line that read
 //! like a successful export and wrote nothing.
 
+mod catalogue;
 mod export;
 mod extract;
 mod mesh;
+mod rotate;
 mod structure;
 
 use std::sync::Arc;
@@ -71,6 +73,19 @@ pub use structure::{read_structure, read_structure_file, StructureReadError};
 // into the world — re-exported for the same reason as everything above.
 #[allow(unused_imports)]
 pub use mesh::mesh_blueprint;
+
+// Ticket 038 (roadmap B3): rotation has no caller yet either — B4 (the
+// asset catalogue) and E3 (the placement ghost) are what will call this
+// once a blueprint can actually be placed — re-exported for the same
+// reason as everything above.
+#[allow(unused_imports)]
+pub use rotate::{rotate_blueprint, Rotation, RotationError};
+
+// Ticket 039 (roadmap B4): the first caller of 036/037/038's primitives —
+// `city::run()` loads a `BuildingCatalogue` from `assets/city/blueprints`
+// at startup. Re-exported for the same reason as everything above:
+// `blueprint` is the module a caller reaches for.
+pub use catalogue::{load_catalogue_dir, BuildingCatalogue, CatalogueEntry, CatalogueError};
 
 /// How many palette entries the finished-extraction log prints before
 /// summarising the rest. Long enough to see a structure's whole palette,

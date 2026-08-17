@@ -587,3 +587,15 @@ these itself (see CLAUDE.md's "Manual/visual verification").
   missing caves. If it doesn't, the bug is in `world::mesh`/`world::decode`
   shared code, not `city`'s override, since the viewer never sets
   `FloorPolicy::BelowSurface` at all.
+
+- [ ] **039 blueprint asset catalogue: startup loads and logs it without
+  panicking.** The automated suite covers the load/validate logic directly
+  (missing directory, malformed files, size/palette rejection, the real
+  `house01.nbt` fixture) — what it can't cover is the actual `city::run()`
+  startup path with the real asset directory in place.
+
+  `cargo run --bin citybuilder` against the real save. Confirm the console
+  prints `block_viewer: loaded 1 building from assets/city/blueprints`
+  followed by a `house01 — WxHxD (N states)` line, no `skipped` lines, and
+  no panic before the window opens. Checklist: none yet — this is a small
+  enough surface that the console output above is the whole check.

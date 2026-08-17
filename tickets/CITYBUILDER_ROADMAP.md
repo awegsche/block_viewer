@@ -2,7 +2,7 @@
 
 Not a work item; the plan for the citybuilder game and the shared world-edit
 infrastructure it needs. High-level tasks here get split into numbered
-tickets in this directory when they're picked up (next free number: 038).
+tickets in this directory when they're picked up (next free number: 040).
 Companion to `ROADMAP.md`, which covers the viewer 001–029.
 
 ## The goal
@@ -115,8 +115,8 @@ L1  lib.rs + two bin shims                       <- DONE (ticket 027)
      +-- B  blueprints as building models
      |    B1  structure .nbt reader (inverse of 023)  <- DONE (ticket 036)
      |    B2  Blueprint -> Bevy mesh                  <- DONE (ticket 037)
-     |    B3  rotation, incl. block-state properties
-     |    B4  the building asset catalogue
+     |    B3  rotation, incl. block-state properties  <- DONE (ticket 038)
+     |    B4  the building asset catalogue             <- DONE (ticket 039)
      |
      +-- C  definitions & scripting
      |    C1  building definition schema + loader
@@ -386,16 +386,62 @@ a claim about where the building will stand. Mesh coordinates run
 world height until something places it. No caller yet, same as 036 — B3/B4
 are what will call this.
 
-**B3. Rotation.** 90/180/270 about Y. The mesh part is a transform; the
-*blocks* part is not — a stair's `facing`, a log's `axis`, a door's `hinge`
-all have to be rewritten in the palette, or a rotated building is visibly
-wrong the moment it's written to the world. Iteration 1 can ship with a
-table covering the properties the chosen starter buildings actually use, as
-long as unrotatable properties are *detected* rather than silently kept.
+**B3. Rotation. — done, ticket 038.** 90/180/270 about Y. The mesh part is a
+transform; the *blocks* part is not — a stair's `facing`, a log's `axis`, a
+door's `hinge` all have to be rewritten in the palette, or a rotated
+building is visibly wrong the moment it's written to the world. Iteration 1
+can ship with a table covering the properties the chosen starter buildings
+actually use, as long as unrotatable properties are *detected* rather than
+silently kept.
 
-**B4. The building asset catalogue.** `assets/city/blueprints/*.nbt`,
+How it came out: `blueprint::rotate::rotate_blueprint(&Blueprint, Rotation)
+-> Result<Blueprint, RotationError>`, resolving each palette entry once
+(not once per block) the same way 037's mesher resolves the palette rather
+than the grid. The grid remap composes a single 90°-turn transform `turns`
+times instead of hand-deriving 180°/270° separately. `facing`, `axis`,
+16-way `rotation` (signs/banners) and the `north`/`south`/`east`/`west`
+connection-key group (fences, walls, panes, bars, redstone) all rewrite;
+`shape` turned out to need disambiguating by *value* rather than by block —
+a stair's `shape` values and a rail's are the same property name with
+disjoint value sets, and only the rail set encodes an absolute direction.
+`hinge` (and a chest's `type`) landed in the pass-through whitelist rather
+than a rewrite rule, contrary to how this paragraph reads: both are defined
+relative to the block's own `facing`, so rotating `facing` consistently
+already keeps them correct. Anything outside the table is
+`RotationError::UnrotatableProperty`, except at `Rotation::Deg0`, which
+never inspects the palette at all — the identity case can't fail on a
+property nothing here recognises yet. No caller yet, same as 036/037 —
+B4 and E3 are what will call this.
+
+**B4. The building asset catalogue. — done, ticket 039.** `assets/city/blueprints/*.nbt`,
 loaded and validated at startup: size limits, palette sanity, footprint
 derived from the blueprint's own dimensions.
+
+How it came out: `blueprint::catalogue::load_catalogue_dir(&Path) ->
+(BuildingCatalogue, Vec<(PathBuf, CatalogueError)>)` — a non-recursive scan
+of `*.nbt` files (matched case-insensitively), each read through 036's
+`read_structure_file` and checked against two rules beyond what the reader
+already guarantees: no size axis may be zero or exceed
+`STRUCTURE_BLOCK_MAX_SIZE` (036's own constant, reused rather than
+inventing a second "how big is too big"), and the palette must have more
+than just `minecraft:air` in it. Failure is per-file, not per-directory —
+a missing directory is an empty catalogue (logged, not fatal, the same call
+008 made for a missing saves directory) and a bad file is skipped and
+reported alongside whatever did load, never taking the rest of the
+directory down with it. `city::run()` calls it against
+`assets/city/blueprints`, logs one line per loaded/skipped entry, and
+inserts `BuildingCatalogue` as a resource — the first real caller of
+036/037/038's primitives, though nothing reads the resource back out yet;
+G1's build menu is what will. `assets/city/blueprints/house01.nbt` is the
+first fixture, a real structure-block export rather than a synthetic one.
+
+The one thing worth recording for later callers: two on-disk files can
+collide on id (their shared filename stem) only via `DuplicateId`, detected
+rather than one silently overwriting the other — but on a case-insensitive
+filesystem (Windows' default) that collision can only be observed by
+constructing it directly against the loader's inner path-list function,
+since the OS itself won't let two differently-cased filenames coexist in
+one directory to begin with.
 
 ---
 
