@@ -2,7 +2,7 @@
 
 Not a work item; the plan for the citybuilder game and the shared world-edit
 infrastructure it needs. High-level tasks here get split into numbered
-tickets in this directory when they're picked up (next free number: 041).
+tickets in this directory when they're picked up (next free number: 042).
 Companion to `ROADMAP.md`, which covers the viewer 001–029.
 
 ## The goal
@@ -120,7 +120,7 @@ L1  lib.rs + two bin shims                       <- DONE (ticket 027)
      |
      +-- C  definitions & scripting
      |    C1  building definition schema + loader  <- DONE (ticket 040)
-     |    C2  tiers and tech tree
+     |    C2  tiers and tech tree                  <- DONE (ticket 041)
      |    C3  production fields (data only in iteration 1)
      |    C4  hot reload + a definition-error panel
      |
@@ -498,10 +498,26 @@ sketch doesn't show because 039 had nothing to cross-check against yet.
 needs every definition loaded first to check dangling references and
 cycles against.
 
-**C2. Tiers and the tech tree.** Anno-style: a `tier` per building, plus
-`requires` edges. Needs cycle detection and dangling-reference checks at
-load — a tech tree with a cycle is unwinnable and the failure mode is
-"button greyed out forever" if it isn't caught.
+**C2. Tiers and the tech tree. — done, ticket 041.** Anno-style: a `tier` per
+building, plus `requires` edges. Needs cycle detection and dangling-reference
+checks at load — a tech tree with a cycle is unwinnable and the failure mode
+is "button greyed out forever" if it isn't caught.
+
+How it came out: `city::definition::resolve_requirements` runs as a second
+pass after 040's per-file loop, alternating a dangling-reference check
+against the whole loaded set with a DFS-based cycle check (`find_cycle`)
+until a pass removes nothing. The loop, not a single pass, is the part worth
+noting — removing a cyclic or dangling entry can turn some *other* entry's
+`requires` into a fresh dangling reference, and a single pass would leave
+that dependent looking fine when it can never unlock either. The surviving
+set is the maximal subset of loaded buildings whose `requires` graph,
+restricted to that subset, resolves and has no cycle — order-independent,
+so it doesn't matter which problem gets found first. Two new
+`DefinitionError` variants, `DanglingRequirement` and `CyclicRequirement`
+(carrying the whole loop, not just one id on it), reported through the same
+per-file `skipped` list 039/040 established. No consumer yet — same
+"proven, not yet used" state the rest of group C is in; G1's build menu is
+what will eventually grey out a locked entry using this.
 
 **C3. Production fields, parsed but inert.** Iteration 1 shows rates and
 costs in the build menu and does not simulate them. The point is that the

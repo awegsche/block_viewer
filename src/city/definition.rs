@@ -49,10 +49,26 @@
 //!   `> 0`. `FromBlueprint` can't fail this check — it resolves to the
 //!   catalogue entry's own footprint, already validated by 039.
 //!
-//! `requires` is parsed and carried on [`Building`] but deliberately **not**
-//! checked against other definitions' ids here — dangling-reference and
-//! cycle detection across the whole tree is roadmap C2's job, which needs
-//! every definition loaded first to check against.
+//! ## The tech tree (ticket 041, roadmap C2)
+//!
+//! `requires` names other building ids, and nothing about a single file can
+//! tell you whether those ids exist or form a loop — both questions need
+//! *every* definition loaded first. So [`build_definitions`] runs a second
+//! pass, [`resolve_requirements`], after the per-file loop above: it checks
+//! `requires` edges against the whole loaded set and removes anything that
+//! can never unlock — a [`DefinitionError::DanglingRequirement`] (points at
+//! an id nothing loaded) or a [`DefinitionError::CyclicRequirement`] (on a
+//! loop). Per the roadmap: "a tech tree with a cycle is unwinnable and the
+//! failure mode is 'button greyed out forever' if it isn't caught" — true of
+//! a dangling edge too, for the same reason.
+//!
+//! Removing an entry can turn some *other* entry's `requires` into a fresh
+//! dangling reference (it needed the thing that just got removed for an
+//! unrelated problem), so [`resolve_requirements`] loops — dangling pass,
+//! then cycle pass — until a pass removes nothing. What survives is the
+//! maximal subset of the loaded buildings whose `requires` graph, restricted
+//! to that subset, resolves and has no cycle; that end state doesn't depend
+//! on which order the passes happen to remove things in.
 //!
 //! ## Failure is per-file, not per-directory
 //!
@@ -62,6 +78,7 @@
 //! skipped and reported alongside whatever else loaded.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -81,11 +98,10 @@ pub struct Building {
     /// the [`BuildingCatalogue`] at load time.
     pub blueprint: String,
     pub tier: u32,
-    /// Other building ids this one unlocks after. Parsed, not validated —
-    /// see the module docs. No non-test reader yet — C2's tech tree is what
-    /// will walk this.
+    /// Other building ids this one unlocks after. Checked against the whole
+    /// loaded set by [`resolve_requirements`] — dangling ids and cycles are
+    /// [`DefinitionError`]s, not silently-unreachable build-menu entries.
     #[serde(default)]
-    #[allow(dead_code)]
     pub requires: Vec<String>,
     #[serde(default)]
     pub footprint: FootprintSpec,
@@ -169,6 +185,14 @@ pub enum DefinitionError {
     NoFilenameStem,
     /// Another file in the same directory already claimed this id.
     DuplicateId { id: String, other: PathBuf },
+    /// `requires` names an id that isn't in the final loaded set — either
+    /// nothing on disk claims it, or it was itself removed by
+    /// [`resolve_requirements`] for a problem of its own.
+    DanglingRequirement(String),
+    /// `requires` puts this building on a dependency cycle. Carries every id
+    /// on the cycle, in order, so the message names the whole loop rather
+    /// than just this one building.
+    CyclicRequirement(Vec<String>),
 }
 
 impl std::fmt::Display for DefinitionError {
@@ -197,6 +221,12 @@ impl std::fmt::Display for DefinitionError {
             DefinitionError::NoFilenameStem => write!(f, "filename has no usable stem"),
             DefinitionError::DuplicateId { id, other } => {
                 write!(f, "id {id:?} already claimed by {}", other.display())
+            }
+            DefinitionError::DanglingRequirement(missing) => {
+                write!(f, "requires {missing:?}, which is not a loaded building")
+            }
+            DefinitionError::CyclicRequirement(cycle) => {
+                write!(f, "requires cycle: {}", cycle.join(" -> "))
             }
         }
     }
@@ -383,7 +413,124 @@ fn build_definitions(
         }
     }
 
+    let (entries, mut requirement_errors) = resolve_requirements(entries);
+    skipped.append(&mut requirement_errors);
+
     (BuildingDefinitions { entries }, skipped)
+}
+
+/// Roadmap C2, ticket 041: checks every surviving [`LoadedBuilding`]'s
+/// `requires` against the whole set, and removes anything that can never
+/// unlock — see the module docs for why this has to run after every file has
+/// already loaded, and why it loops instead of making one pass.
+///
+/// Alternates a dangling-reference pass with a cycle pass until one of them
+/// removes nothing. Each pass removes *everything* it finds before the other
+/// runs again, rather than stopping at the first hit, so the final surviving
+/// set doesn't depend on which order problems happen to be discovered in —
+/// it's the maximal subset of `entries` whose `requires` graph, restricted
+/// to that subset, resolves and has no cycle.
+fn resolve_requirements(
+    mut entries: HashMap<String, LoadedBuilding>,
+) -> (HashMap<String, LoadedBuilding>, Vec<(PathBuf, DefinitionError)>) {
+    let mut skipped = Vec::new();
+
+    loop {
+        let ids: HashSet<&str> = entries.keys().map(String::as_str).collect();
+        let dangling: Vec<(String, String)> = entries
+            .iter()
+            .filter_map(|(id, entry)| {
+                entry
+                    .building
+                    .requires
+                    .iter()
+                    .find(|req| !ids.contains(req.as_str()))
+                    .map(|missing| (id.clone(), missing.clone()))
+            })
+            .collect();
+
+        if !dangling.is_empty() {
+            for (id, missing) in dangling {
+                let entry = entries.remove(&id).expect("id came from entries.iter() above");
+                skipped.push((entry.path, DefinitionError::DanglingRequirement(missing)));
+            }
+            continue;
+        }
+
+        let graph: HashMap<String, Vec<String>> = entries
+            .iter()
+            .map(|(id, entry)| (id.clone(), entry.building.requires.clone()))
+            .collect();
+        match find_cycle(&graph) {
+            Some(cycle) => {
+                for id in &cycle {
+                    let entry = entries.remove(id).expect("cycle ids came from entries' own keys");
+                    skipped.push((entry.path, DefinitionError::CyclicRequirement(cycle.clone())));
+                }
+            }
+            None => break,
+        }
+    }
+
+    (entries, skipped)
+}
+
+/// Finds one cycle in `graph` (an id -> its `requires` adjacency list), if
+/// any exists, as the ids on the loop in order. Plain DFS with a recursion
+/// stack: an edge into a node still on the stack (`Visiting`) closes a loop
+/// back to that node. Iterates ids in sorted order so which cycle comes back
+/// first, when several are disjoint, doesn't depend on `HashMap` iteration
+/// order.
+fn find_cycle(graph: &HashMap<String, Vec<String>>) -> Option<Vec<String>> {
+    enum State {
+        Visiting,
+        Done,
+    }
+
+    fn visit(
+        node: &str,
+        graph: &HashMap<String, Vec<String>>,
+        state: &mut HashMap<String, State>,
+        stack: &mut Vec<String>,
+    ) -> Option<Vec<String>> {
+        state.insert(node.to_string(), State::Visiting);
+        stack.push(node.to_string());
+        if let Some(requires) = graph.get(node) {
+            for next in requires {
+                match state.get(next.as_str()) {
+                    Some(State::Visiting) => {
+                        let start = stack.iter().position(|n| n == next).expect(
+                            "a node in the Visiting state is still on the stack by construction",
+                        );
+                        return Some(stack[start..].to_vec());
+                    }
+                    Some(State::Done) => continue,
+                    None => {
+                        if let Some(cycle) = visit(next, graph, state, stack) {
+                            return Some(cycle);
+                        }
+                    }
+                }
+            }
+        }
+        stack.pop();
+        state.insert(node.to_string(), State::Done);
+        None
+    }
+
+    let mut ids: Vec<&String> = graph.keys().collect();
+    ids.sort();
+
+    let mut state: HashMap<String, State> = HashMap::new();
+    let mut stack: Vec<String> = Vec::new();
+    for id in ids {
+        if !matches!(state.get(id.as_str()), Some(State::Done)) {
+            if let Some(cycle) = visit(id, graph, &mut state, &mut stack) {
+                return Some(cycle);
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -652,9 +799,36 @@ Building(
     }
 
     #[test]
-    fn requires_is_carried_but_not_validated() {
+    fn a_valid_requires_edge_is_carried_and_survives() {
         let catalogue = catalogue_with_house01();
-        let dir = temp_dir("requires");
+        let dir = temp_dir("requires_valid");
+        fs::write(dir.join("house01.ron"), VALID_RON).unwrap();
+        fs::write(
+            dir.join("carpenter.ron"),
+            r#"Building(
+                name: "Carpenter",
+                blueprint: "house01.nbt",
+                tier: 2,
+                requires: ["house01"],
+                integrity: Integrity(pristine_above: 0.9, ruined_below: 0.5),
+            )"#,
+        )
+        .unwrap();
+
+        let (definitions, skipped) = load_definitions_dir(&dir, &catalogue);
+        assert!(skipped.is_empty(), "{skipped:?}");
+        let entry = definitions.get("carpenter").unwrap();
+        assert_eq!(entry.building.requires, vec!["house01".to_string()]);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Roadmap C2 (ticket 041): a `requires` id nothing on disk claims can
+    /// never unlock, so it's an error rather than data silently carried.
+    #[test]
+    fn a_dangling_requires_reference_is_skipped() {
+        let catalogue = catalogue_with_house01();
+        let dir = temp_dir("dangling_requires");
         fs::write(
             dir.join("house01.ron"),
             r#"Building(
@@ -668,9 +842,139 @@ Building(
         .unwrap();
 
         let (definitions, skipped) = load_definitions_dir(&dir, &catalogue);
-        assert!(skipped.is_empty(), "{skipped:?}");
-        let entry = definitions.get("house01").unwrap();
-        assert_eq!(entry.building.requires, vec!["a_building_that_does_not_exist".to_string()]);
+        assert!(definitions.is_empty());
+        assert_eq!(skipped.len(), 1);
+        assert!(matches!(
+            &skipped[0].1,
+            DefinitionError::DanglingRequirement(missing) if missing == "a_building_that_does_not_exist"
+        ));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A two-building cycle: both are unwinnable, so both are removed and
+    /// reported, not just whichever one the scan happens to reach first.
+    #[test]
+    fn a_requires_cycle_is_skipped_entirely() {
+        let catalogue = catalogue_with_house01();
+        let dir = temp_dir("requires_cycle");
+        fs::write(
+            dir.join("a.ron"),
+            r#"Building(
+                name: "A",
+                blueprint: "house01.nbt",
+                tier: 1,
+                requires: ["b"],
+                integrity: Integrity(pristine_above: 0.9, ruined_below: 0.5),
+            )"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.join("b.ron"),
+            r#"Building(
+                name: "B",
+                blueprint: "house01.nbt",
+                tier: 1,
+                requires: ["a"],
+                integrity: Integrity(pristine_above: 0.9, ruined_below: 0.5),
+            )"#,
+        )
+        .unwrap();
+
+        let (definitions, skipped) = load_definitions_dir(&dir, &catalogue);
+        assert!(definitions.is_empty(), "both ends of the cycle are unwinnable");
+        assert_eq!(skipped.len(), 2);
+        for (_, err) in &skipped {
+            assert!(matches!(err, DefinitionError::CyclicRequirement(cycle) if cycle.len() == 2));
+        }
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A self-referential building is a one-node cycle.
+    #[test]
+    fn a_building_that_requires_itself_is_a_cycle() {
+        let catalogue = catalogue_with_house01();
+        let dir = temp_dir("requires_self");
+        fs::write(
+            dir.join("a.ron"),
+            r#"Building(
+                name: "A",
+                blueprint: "house01.nbt",
+                tier: 1,
+                requires: ["a"],
+                integrity: Integrity(pristine_above: 0.9, ruined_below: 0.5),
+            )"#,
+        )
+        .unwrap();
+
+        let (definitions, skipped) = load_definitions_dir(&dir, &catalogue);
+        assert!(definitions.is_empty());
+        assert_eq!(skipped.len(), 1);
+        assert!(matches!(&skipped[0].1, DefinitionError::CyclicRequirement(cycle) if cycle == &vec!["a".to_string()]));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Cascading removal: `c` requires `b`, `b` requires `a`, and `a` is
+    /// *itself* cyclic (self-referential). `a` gets removed first for its
+    /// own problem; `b` only becomes dangling once `a` is gone, and `c` only
+    /// becomes dangling once `b` is gone. A single non-looping pass would
+    /// stop at `a` and leave `b`/`c` looking fine when neither can ever
+    /// unlock — this is the case the module docs call out.
+    #[test]
+    fn removing_a_cyclic_entry_cascades_to_its_dependents() {
+        let catalogue = catalogue_with_house01();
+        let dir = temp_dir("cascade");
+        fs::write(
+            dir.join("a.ron"),
+            r#"Building(
+                name: "A",
+                blueprint: "house01.nbt",
+                tier: 1,
+                requires: ["a"],
+                integrity: Integrity(pristine_above: 0.9, ruined_below: 0.5),
+            )"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.join("b.ron"),
+            r#"Building(
+                name: "B",
+                blueprint: "house01.nbt",
+                tier: 2,
+                requires: ["a"],
+                integrity: Integrity(pristine_above: 0.9, ruined_below: 0.5),
+            )"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.join("c.ron"),
+            r#"Building(
+                name: "C",
+                blueprint: "house01.nbt",
+                tier: 3,
+                requires: ["b"],
+                integrity: Integrity(pristine_above: 0.9, ruined_below: 0.5),
+            )"#,
+        )
+        .unwrap();
+
+        let (definitions, skipped) = load_definitions_dir(&dir, &catalogue);
+        assert!(definitions.is_empty(), "a, b and c are all unreachable once a is removed");
+        assert_eq!(skipped.len(), 3);
+        assert!(matches!(
+            skipped.iter().find(|(_, err)| matches!(err, DefinitionError::CyclicRequirement(_))),
+            Some(_)
+        ));
+        let dangling: Vec<&str> = skipped
+            .iter()
+            .filter_map(|(_, err)| match err {
+                DefinitionError::DanglingRequirement(missing) => Some(missing.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(dangling.len(), 2, "b and c both cascade to dangling: {skipped:?}");
 
         fs::remove_dir_all(&dir).ok();
     }
