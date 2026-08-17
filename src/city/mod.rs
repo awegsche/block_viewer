@@ -45,8 +45,20 @@
 //! [`blueprint::BuildingCatalogue`] yet — G1's build menu is the eventual
 //! consumer — so this is only proving the load path end to end, the same
 //! way ticket 024 proved the write path before anything used it.
+//!
+//! ## Building definitions (ticket 040, roadmap C1)
+//!
+//! Right after the catalogue, [`run`] loads `assets/city/buildings` through
+//! [`definition::load_definitions_dir`] — the game data (tier, cost,
+//! production, integrity thresholds) a catalogue entry's shape doesn't
+//! carry. It's handed the catalogue so it can cross-check each definition's
+//! `blueprint` field against a real entry rather than trusting the filename.
+//! Same "no consumer yet" state the catalogue landed in: G1's build menu is
+//! what will eventually read [`definition::BuildingDefinitions`].
 
 use std::path::Path;
+
+mod definition;
 
 use crate::{blueprint, chunk_pipeline::RenderFloor, world::decode::FloorPolicy, world_app};
 
@@ -54,14 +66,20 @@ use crate::{blueprint, chunk_pipeline::RenderFloor, world::decode::FloorPolicy, 
 /// directory the roadmap's `assets/city/blueprints/*.nbt` glob names.
 const CATALOGUE_DIR: &str = "assets/city/blueprints";
 
+/// Where [`run`] looks for building definitions — the flat, non-recursive
+/// directory the roadmap's C1 sketch implies alongside `CATALOGUE_DIR`.
+const DEFINITIONS_DIR: &str = "assets/city/buildings";
+
 /// Runs the citybuilder. Called by `src/bin/citybuilder.rs`, which is three
 /// lines and nothing else.
 pub fn run() {
     let catalogue = load_building_catalogue();
+    let definitions = load_building_definitions(&catalogue);
 
     world_app()
         .insert_resource(RenderFloor(FloorPolicy::BelowSurface { margin: 16 }))
         .insert_resource(catalogue)
+        .insert_resource(definitions)
         .run();
 }
 
@@ -92,4 +110,28 @@ fn load_building_catalogue() -> blueprint::BuildingCatalogue {
     }
 
     catalogue
+}
+
+/// Loads and logs the building definitions, same shape as
+/// [`load_building_catalogue`] — [`definition::load_definitions_dir`] never
+/// panics either, so there's no error path to propagate, only one to print.
+fn load_building_definitions(catalogue: &blueprint::BuildingCatalogue) -> definition::BuildingDefinitions {
+    let (definitions, skipped) = definition::load_definitions_dir(Path::new(DEFINITIONS_DIR), catalogue);
+
+    println!(
+        "block_viewer: loaded {} building definition{} from {DEFINITIONS_DIR}",
+        definitions.len(),
+        if definitions.len() == 1 { "" } else { "s" }
+    );
+    for entry in definitions.iter() {
+        println!(
+            "block_viewer:   {} — {:?} tier {}, footprint {}x{}",
+            entry.id, entry.building.name, entry.building.tier, entry.footprint.x, entry.footprint.y,
+        );
+    }
+    for (path, err) in &skipped {
+        println!("block_viewer:   skipped {}: {err}", path.display());
+    }
+
+    definitions
 }

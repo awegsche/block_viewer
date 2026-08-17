@@ -1,0 +1,18 @@
+// Definition for `assets/city/blueprints/house01.nbt` (ticket 040, roadmap
+// C1). Non-functional, per iteration 1's "place a handful of non-functional
+// buildings" — no `production`.
+Building(
+    name: "House",
+    blueprint: "house01.nbt",
+    tier: 1,
+    requires: [],
+    footprint: FromBlueprint,
+    cost: [
+        (block: "minecraft:oak_planks", count: 40),
+        (block: "minecraft:cobblestone", count: 20),
+    ],
+    integrity: Integrity(
+        pristine_above: 0.95,
+        ruined_below: 0.60,
+    ),
+)

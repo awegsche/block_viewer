@@ -599,3 +599,9 @@ these itself (see CLAUDE.md's "Manual/visual verification").
   followed by a `house01 — WxHxD (N states)` line, no `skipped` lines, and
   no panic before the window opens. Checklist: none yet — this is a small
   enough surface that the console output above is the whole check.
+- [ ] **040 building definitions: startup loads and logs them without
+  panicking.** Rides along with the 039 check above — same binary, same
+  pass. After the catalogue line, confirm the console also prints
+  `block_viewer: loaded 1 building definition from assets/city/buildings`
+  followed by a `house01 — "House" tier 1, footprint WxD` line, no `skipped`
+  lines, and still no panic before the window opens.

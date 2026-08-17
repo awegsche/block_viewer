@@ -33,12 +33,18 @@ flate2 = "1.0.35"
 # support, so this adds no new download.
 image = { version = "0.25.5", default-features = false, features = ["png"] }
 mc_anvil = { package = "ranvil", version = "0.1.0", path = "../ranvil" }
+# Building definitions (ticket 040): RON deserialization for
+# `city::definition::Building`. Both are already in `Cargo.lock`
+# transitively (bevy pulls `serde`; something in the tree already pulls
+# `ron`), so this names existing versions rather than adding new downloads.
+ron = "0.8.1"
 # The native save dialog behind the Export button (ticket 024). The
 # platform's own dialog — including its overwrite prompt — instead of an
 # in-app egui file browser we would have to grow directory navigation,
 # filtering and drive switching into.
 rfd = "0.17.2"
 rnbt = { version = "0.1.0", path = "../rnbt" }
+serde = { version = "1.0.217", features = ["derive"] }
 
 # Enable a small amount of optimization in the dev profile.
 [profile.dev]

@@ -2,7 +2,7 @@
 
 Not a work item; the plan for the citybuilder game and the shared world-edit
 infrastructure it needs. High-level tasks here get split into numbered
-tickets in this directory when they're picked up (next free number: 040).
+tickets in this directory when they're picked up (next free number: 041).
 Companion to `ROADMAP.md`, which covers the viewer 001–029.
 
 ## The goal
@@ -119,7 +119,7 @@ L1  lib.rs + two bin shims                       <- DONE (ticket 027)
      |    B4  the building asset catalogue             <- DONE (ticket 039)
      |
      +-- C  definitions & scripting
-     |    C1  building definition schema + loader
+     |    C1  building definition schema + loader  <- DONE (ticket 040)
      |    C2  tiers and tech tree
      |    C3  production fields (data only in iteration 1)
      |    C4  hot reload + a definition-error panel
@@ -458,8 +458,8 @@ nested/tagged data and beats JSON for hand-editing. Reach for Rhai or Lua
 only when a *behaviour* needs to vary per building rather than a number —
 and by then the data schema will tell us which hook points it needs.
 
-**C1. Building definition schema and loader.** One file per building, or one
-per category. Sketch:
+**C1. Building definition schema and loader. — done, ticket 040.** One file
+per building, or one per category. Sketch:
 
 ```ron
 Building(
@@ -485,6 +485,18 @@ Building(
     ),
 )
 ```
+
+How it came out: `city::definition::{Building, load_definitions_dir}`, one
+`.ron` per building under `assets/city/buildings`, `BuildingCatalogue`-
+validated the same way 039 validates blueprints. Two deviations from the
+sketch above: no inline `id` field — the filename stem is the id, same call
+039 made for blueprints, so a file and its id can't drift apart — and
+`blueprint`'s stem must resolve to a real catalogue entry or the whole
+definition is rejected (`DefinitionError::UnknownBlueprint`), which the
+sketch doesn't show because 039 had nothing to cross-check against yet.
+`requires` is parsed and carried, deliberately unvalidated — C2 is what
+needs every definition loaded first to check dangling references and
+cycles against.
 
 **C2. Tiers and the tech tree.** Anno-style: a `tier` per building, plus
 `requires` edges. Needs cycle detection and dangling-reference checks at
