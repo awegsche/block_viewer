@@ -827,3 +827,37 @@ these itself (see CLAUDE.md's "Manual/visual verification").
   "flushed N unsaved region file(s)" line (or nothing, if you did click
   Save World before quitting — confirm that case doesn't double-flush or
   error).
+
+- [ ] **055 drag-to-build roads: the tool toggle, the drag preview, and a
+  real commit.** Mostly moot until real `.nbt` road pieces exist in
+  `assets/city/roads` (`isolated.nbt`, `dead_end.nbt`, `straight.nbt`,
+  `corner.nbt`, `t.nbt`, `cross.nbt`, each exactly 6 blocks on `x`/`z` —
+  see ticket 054) — without them every cell falls back to the flat quad
+  preview and nothing gets written to the world, only recorded in `City`.
+  **Back the world up first** (or run this against a scratch copy).
+
+  Without real pieces (the state today): `cargo run --bin citybuilder`
+  against a real save, press `T` and confirm the console/city panel imply
+  the road tool is active (the building ghost should stop appearing even
+  with a catalogue entry selected). Left-click-drag across flat ground and
+  release: confirm a translucent flat quad follows the cursor per cell
+  while dragging, tinted green over free ground and red over an occupied
+  tile or a building footprint, and that releasing over invalid ground
+  refuses the whole drag (console message, no cells added — check the City
+  panel's road-cell count doesn't move). Release over valid ground and
+  confirm the City panel's road-cell count goes up by the number of cells
+  dragged over, and the console says "not yet saved to disk" is *not*
+  printed (no real write happened — only a "no road catalogue loaded"/"no
+  matching road pieces loaded" line). Press `T` again and confirm building
+  placement (ghost + click to commit) still works exactly as before this
+  ticket.
+
+  Once real pieces exist: repeat the same drag and confirm (1) the preview
+  shows an actual rotated piece per cell rather than a flat quad, switching
+  shape live as you drag past a bend; (2) on release, the blocks actually
+  land (open the world in Minecraft after a "Save world" click and check);
+  (3) dragging a new branch off an existing straight run re-renders the
+  existing cell it attaches to as a T or a corner, not left as whatever it
+  was; (4) killing the write (e.g. drag into an ungenerated chunk) leaves
+  the City panel's road-cell count unchanged and the console reports a
+  rollback of only the newly-attempted cells, not any pre-existing road.
