@@ -2,7 +2,7 @@
 
 Not a work item; the plan for the citybuilder game and the shared world-edit
 infrastructure it needs. High-level tasks here get split into numbered
-tickets in this directory when they're picked up (next free number: 056).
+tickets in this directory when they're picked up (next free number: 057).
 Companion to `ROADMAP.md`, which covers the viewer 001–029.
 
 ## The goal
@@ -144,6 +144,7 @@ L1  lib.rs + two bin shims                       <- DONE (ticket 027)
                |                                      .nbt pieces still
                |                                      absent)
                |                                 F4  connectivity queries
+               |                                      <- DONE (ticket 056)
                |
                +-- G  UI: build menu, city panel   <- DONE (ticket 050)
                +-- H  terraforming: dig and level
@@ -889,10 +890,40 @@ undo or demolish for a road cell yet, only `City`'s own persistence.
 `city::run` now loads `assets/city/roads` the same way it loads the building
 catalogue (039's own shape), always inserting whatever loaded even if empty.
 
-**F4. Connectivity queries.** "Is this building on the road network", "what
-does this road segment reach". No consumer in iteration 1 — it's the
-substrate every later logistics feature needs, and it's nearly free once
-F1 exists.
+**F4. Connectivity queries. — done, ticket 056.** "Is this building on the
+road network", "what does this road segment reach". No consumer in
+iteration 1 — it's the substrate every later logistics feature needs, and
+it's nearly free once F1 exists.
+
+How it came out: four functions in `city::road`, built entirely on
+`reachable_from`/`is_connected` — the two primitives 053/054 had already
+written and left `#[allow(dead_code)]` for exactly this — rather than a
+second BFS. The missing piece was a bridge from a *building*'s footprint to
+the road cells next to it, since `state::City` had no such query:
+`touching_road_cells(city, building)` walks every footprint tile's four
+block-adjacent neighbours through a new shared `state::cell_of` (the inverse
+of `road_cell_tiles`'s corner math, `div_euclid` so it's correct for
+negative coordinates — `road_build::cell_of`, private until now, became a
+one-line wrapper around it rather than a second copy) and collects whichever
+resolve to a road cell. Redundant over a footprint's interior tiles (an
+interior neighbour is always another footprint tile, never a road cell, so
+it simply never matches) but correct, and simple beats fast for a query nothing
+calls yet. `is_building_connected`/`buildings_connected` take a `BuildingId`
+and return `Option<bool>` — `None` for an id that isn't currently placed,
+distinct from `Some(false)`, the same distinction `city::demolish`'s
+`occupant_at` already draws elsewhere. `buildings_connected` deliberately
+doesn't short-circuit on an empty adjacency set; it hands both buildings'
+touching cells straight to `is_connected` and lets that function's own
+`is_road` checks return `false`, so this ticket's connectivity questions are
+answered by *composing* 053/054's primitives, not reimplementing their edge
+cases. `buildings_reachable_from(city, start)` is the buildings-oriented view
+of `reachable_from` itself. All four, plus `reachable_from`/`is_connected`
+now that they have real (if still unconsumed) callers, stay
+`#[allow(dead_code)]` — nothing outside this module's own tests calls any of
+it yet, the same "proven, not yet used" state F1-F3 themselves landed in; a
+later unconnected-building UI warning or logistics feature is the eventual
+reader. 13 new tests (`state::cell_of`'s negative-coordinate correctness,
+plus 12 across the four new functions) — 496 to 509 per `cargo test --lib`.
 
 ---
 

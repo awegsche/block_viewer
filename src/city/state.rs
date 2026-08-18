@@ -188,6 +188,18 @@ pub fn road_cell_tiles(cell: IVec2) -> impl Iterator<Item = IVec2> {
     (0..ROAD_CELL_SIZE).flat_map(move |dx| (0..ROAD_CELL_SIZE).map(move |dz| base + IVec2::new(dx, dz)))
 }
 
+/// The road cell a Minecraft `(x, z)` block tile falls inside — the inverse
+/// of [`road_cell_tiles`]'s `cell * ROAD_CELL_SIZE` corner math. Uses
+/// `div_euclid`, not plain `/`, so it stays correct for negative coordinates
+/// — `/` truncates toward zero, which would put tile `(-1, -1)` in cell
+/// `(0, 0)` instead of the cell that actually covers it, `(-1, -1)`. Shared
+/// by [`super::road_build::cell_of`] (this exact math specialised to a 3D
+/// block coordinate) and [`super::road`]'s connectivity queries (ticket 056,
+/// roadmap F4), which need it from a building's `(x, z)` footprint tiles.
+pub fn cell_of(tile: IVec2) -> IVec2 {
+    IVec2::new(tile.x.div_euclid(ROAD_CELL_SIZE), tile.y.div_euclid(ROAD_CELL_SIZE))
+}
+
 /// The authoritative city state: placed buildings, roads, and the occupancy
 /// grid both are checked against. See the module docs for the rule this
 /// implements and what is deliberately not here yet (a journal, anything
@@ -572,6 +584,17 @@ mod tests {
         assert_eq!(footprint_extent(footprint, Rotation::Deg180), footprint);
         assert_eq!(footprint_extent(footprint, Rotation::Deg90), IVec2::new(5, 3));
         assert_eq!(footprint_extent(footprint, Rotation::Deg270), IVec2::new(5, 3));
+    }
+
+    #[test]
+    fn cell_of_maps_a_tile_to_the_cell_covering_it_including_negative_coordinates() {
+        assert_eq!(cell_of(IVec2::new(0, 0)), IVec2::new(0, 0));
+        assert_eq!(cell_of(IVec2::new(5, 5)), IVec2::new(0, 0));
+        assert_eq!(cell_of(IVec2::new(6, 5)), IVec2::new(1, 0));
+        // Plain truncating division would put -1 in cell 0, not cell -1.
+        assert_eq!(cell_of(IVec2::new(-1, -1)), IVec2::new(-1, -1));
+        assert_eq!(cell_of(IVec2::new(-6, -6)), IVec2::new(-1, -1));
+        assert_eq!(cell_of(IVec2::new(-7, -6)), IVec2::new(-2, -1));
     }
 
     #[test]

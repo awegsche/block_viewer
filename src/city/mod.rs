@@ -163,10 +163,11 @@
 //! `road_cells()`, landed with D1 but otherwise unread until now). No new
 //! stored state — a road graph is derived from `City::is_road_cell` on
 //! every call, so it can never itself go stale. Not wired into `run` as a
-//! plugin; it's a pure query module, the primitive F2's drag-to-build,
-//! F3's auto-tiling and F4's connectivity queries will each call once they
-//! exist — the same "proven, not yet used" state several earlier tickets
-//! (042, 039, 040) landed their own resources in.
+//! plugin; it's a pure query module. [`road_build::RoadBuildPlugin`] (ticket
+//! 055, below) is F2/F3's real caller; F4's connectivity queries (ticket
+//! 056) are the module's other half — see [`road`]'s own docs — and are
+//! still the "proven, not yet used" state several earlier tickets (042, 039,
+//! 040) landed their own resources in: no UI or logistics reads them yet.
 //!
 //! Ticket 054 redefined a road from a single-block tile to a
 //! [`state::ROAD_CELL_SIZE`]-block cell (a real cross-section, not a 1x1

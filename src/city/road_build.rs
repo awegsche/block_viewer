@@ -190,9 +190,11 @@ impl Plugin for RoadBuildPlugin {
 // ---- pure geometry/logic: cell coordinates, the path, and per-cell validity -------------------
 // -----------------------------------------------------------------------------------------------
 
-/// The road cell a Minecraft block coordinate's `(x, z)` falls in.
+/// The road cell a Minecraft block coordinate's `(x, z)` falls in —
+/// [`state::cell_of`], specialised to a 3D block coordinate (`y` dropped,
+/// the grid is horizontal-only, same as everywhere else in this module).
 pub(super) fn cell_of(block: IVec3) -> IVec2 {
-    IVec2::new(block.x.div_euclid(ROAD_CELL_SIZE), block.z.div_euclid(ROAD_CELL_SIZE))
+    state::cell_of(IVec2::new(block.x, block.z))
 }
 
 /// An L-shaped path of cells from `start` to `end`, inclusive of both — see

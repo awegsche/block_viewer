@@ -32,10 +32,21 @@
 //! the exact pair [`crate::blueprint::rotate_blueprint`] needs once F3 wires
 //! this to a mesh, and what [`super::road_catalogue`] indexes its pieces by.
 //! [`reachable_from`] is the BFS primitive F4's "what does this road segment
-//! reach" is built on; [`is_connected`] is the two-cell special case ("is
-//! this building on the network" tests membership of a footprint's adjacent
-//! cells in a [`reachable_from`] set, which is F4's own job, not this
-//! ticket's).
+//! reach" is built on; [`is_connected`] is the two-cell special case.
+//!
+//! ## F4: bridging a building to the network (ticket 056)
+//!
+//! Everything above works in road-cell space only — nothing yet ties a
+//! *building*'s footprint to the road cells next to it. [`touching_road_cells`]
+//! is that bridge (a building's footprint tiles' block-adjacent neighbours,
+//! resolved to cells via [`state::cell_of`]), and [`is_building_connected`]/
+//! [`buildings_connected`]/[`buildings_reachable_from`] are the roadmap's own
+//! "is this building on the road network"/"what does this road segment
+//! reach" questions, answered by composing it with [`reachable_from`]/
+//! [`is_connected`] rather than a second BFS. No consumer yet, same
+//! "proven, not yet used" state F1-F3 themselves landed in — a later
+//! unconnected-building UI warning, or logistics in a later iteration, are
+//! the eventual readers.
 
 use std::collections::{HashSet, VecDeque};
 
@@ -43,7 +54,10 @@ use bevy::math::IVec2;
 
 use crate::blueprint::Rotation;
 
-use super::state::City;
+use super::state::{self, BuildingId, City, PlacedBuilding};
+
+#[cfg(test)]
+use bevy::math::IVec3;
 
 /// One of the four cardinal directions a road cell can connect in, in
 /// Minecraft's own `x`/`z` convention — see the module docs.
@@ -157,7 +171,12 @@ pub fn connections_at(city: &City, cell: IVec2) -> RoadConnections {
 /// itself isn't a road cell — a non-road cell reaches nothing, not even
 /// itself, so callers can't mistake "reaches only itself" (a one-cell road
 /// island) for "isn't a road at all."
-#[allow(dead_code)] // no caller yet — F4's connectivity queries are
+///
+/// [`buildings_reachable_from`] and [`is_building_connected`] (ticket 056,
+/// roadmap F4) are this function's real callers — no consumer *of those*
+/// yet, so the whole chain still carries `#[allow(dead_code)]` until a UI
+/// affordance or later logistics reads it, same as F1-F3 themselves.
+#[allow(dead_code)] // see the doc comment above
 pub fn reachable_from(city: &City, start: IVec2) -> HashSet<IVec2> {
     let mut visited = HashSet::new();
     if !is_road(city, start) {
@@ -184,9 +203,99 @@ pub fn reachable_from(city: &City, start: IVec2) -> HashSet<IVec2> {
 /// chain of road cells — the two-cell special case of [`reachable_from`].
 /// `false` if either isn't a road cell at all, not just if they're
 /// unreachable from each other.
-#[allow(dead_code)] // no caller yet — F4's connectivity queries are
+///
+/// [`buildings_connected`] (ticket 056, roadmap F4) is this function's real
+/// caller — same "no consumer yet" chain [`reachable_from`]'s doc comment
+/// describes.
+#[allow(dead_code)] // see the doc comment above
 pub fn is_connected(city: &City, a: IVec2, b: IVec2) -> bool {
     is_road(city, a) && is_road(city, b) && reachable_from(city, a).contains(&b)
+}
+
+// -- F4: building <-> road-network queries (ticket 056) ---------------------
+//
+// `reachable_from`/`is_connected` above answer questions about road cells.
+// Nothing in `state::City` links a *building* to the road cells next to it —
+// these four functions are that bridge, built entirely on the cell-level
+// primitives already above rather than a second BFS or a second occupancy
+// walk.
+
+/// Every road cell orthogonally adjacent to `building`'s footprint — the
+/// candidate connection points [`is_building_connected`]/
+/// [`buildings_connected`] check against. A road cell can never overlap a
+/// building's own footprint tiles ([`state::City::place_building`]'s and
+/// [`state::City::add_road_cell`]'s shared occupancy grid rules that out), so
+/// checking every footprint tile's four block-adjacent neighbours — not just
+/// the ones on the footprint's outer edge — is correct, if a little
+/// redundant for a building's interior tiles: an interior neighbour is
+/// always another footprint tile, never a road cell, so it simply never
+/// matches. A large footprint can neighbour more than one cell along a
+/// single edge (a road cell is [`state::ROAD_CELL_SIZE`] blocks wide; a
+/// building's footprint is measured in single blocks) — this returns all of
+/// them, not just the nearest.
+#[allow(dead_code)] // no consumer yet — see the module docs' F4 section
+pub fn touching_road_cells(city: &City, building: &PlacedBuilding) -> HashSet<IVec2> {
+    const BLOCK_NEIGHBOURS: [IVec2; 4] = [IVec2::new(0, -1), IVec2::new(0, 1), IVec2::new(1, 0), IVec2::new(-1, 0)];
+
+    let mut cells = HashSet::new();
+    for tile in state::footprint_tiles(building.origin, building.footprint, building.rotation) {
+        for offset in BLOCK_NEIGHBOURS {
+            let cell = state::cell_of(tile + offset);
+            if is_road(city, cell) {
+                cells.insert(cell);
+            }
+        }
+    }
+    cells
+}
+
+/// Whether `id` names a currently-placed building that touches the road
+/// network at all — "is this building on the road network," the roadmap's
+/// own phrasing for F4. `None` if `id` isn't a currently-placed building;
+/// `Some(false)` is a real building whose footprint simply isn't next to any
+/// road cell, distinct from that.
+///
+/// Doesn't imply the touching cell reaches anywhere beyond itself — a
+/// building next to a single isolated road cell reads as connected here,
+/// same as [`state::City::is_road_cell`] would for that cell. See
+/// [`buildings_connected`] for whether two *specific* buildings share a
+/// network.
+#[allow(dead_code)] // no consumer yet — see the module docs' F4 section
+pub fn is_building_connected(city: &City, id: BuildingId) -> Option<bool> {
+    city.building(id).map(|building| !touching_road_cells(city, building).is_empty())
+}
+
+/// Whether buildings `a` and `b` are connected through an unbroken road
+/// network — at least one of `a`'s touching road cells is [`is_connected`]
+/// to at least one of `b`'s. `None` if either id isn't a currently-placed
+/// building; `Some(false)` covers both "neither touches a road" and "both
+/// touch roads, but on disconnected islands."
+#[allow(dead_code)] // no consumer yet — see the module docs' F4 section
+pub fn buildings_connected(city: &City, a: BuildingId, b: BuildingId) -> Option<bool> {
+    let a = city.building(a)?;
+    let b = city.building(b)?;
+    let a_cells = touching_road_cells(city, a);
+    let b_cells = touching_road_cells(city, b);
+    Some(a_cells.iter().any(|&ac| b_cells.iter().any(|&bc| is_connected(city, ac, bc))))
+}
+
+/// Every currently-placed building whose footprint touches the road network
+/// reachable from `start` — the buildings-oriented view of
+/// [`reachable_from`], "what does this road segment reach" widened from
+/// cells to the buildings sitting next to them. Empty if `start` isn't a
+/// road cell (same as [`reachable_from`]) or if nothing reachable from it
+/// has a building next to it.
+#[allow(dead_code)] // no consumer yet — see the module docs' F4 section
+pub fn buildings_reachable_from(city: &City, start: IVec2) -> HashSet<BuildingId> {
+    let reached = reachable_from(city, start);
+    if reached.is_empty() {
+        return HashSet::new();
+    }
+
+    city.buildings()
+        .filter(|(_, building)| touching_road_cells(city, building).iter().any(|cell| reached.contains(cell)))
+        .map(|(id, _)| id)
+        .collect()
 }
 
 /// Which shape a road cell's connections call for — the piece-selection half
@@ -450,6 +559,176 @@ mod tests {
         city.add_road_cell(IVec2::new(0, 0)).unwrap();
         assert!(!is_connected(&city, IVec2::new(0, 0), IVec2::new(1, 0)));
         assert!(!is_connected(&city, IVec2::new(1, 0), IVec2::new(0, 0)));
+    }
+
+    // -- F4: building <-> road-network queries (ticket 056) -----------------
+
+    #[test]
+    fn touching_road_cells_is_empty_for_a_building_nowhere_near_a_road() {
+        let mut city = City::default();
+        city.add_road_cell(IVec2::new(0, 0)).unwrap(); // block tiles 0..6 x 0..6
+        let id = city
+            .place_building("house01", IVec3::new(100, 64, 100), Rotation::Deg0, IVec2::new(2, 2))
+            .unwrap();
+        let building = city.building(id).unwrap();
+
+        assert!(touching_road_cells(&city, building).is_empty());
+    }
+
+    #[test]
+    fn touching_road_cells_finds_a_cell_just_outside_the_footprint() {
+        let mut city = City::default();
+        city.add_road_cell(IVec2::new(0, 0)).unwrap(); // block tiles 0..6 x 0..6
+        // Directly east of the road cell: x = 6..8, z = 0..2. Its west edge
+        // (x = 6) neighbours x = 5, inside the road cell's tile range.
+        let id = city
+            .place_building("house01", IVec3::new(6, 64, 0), Rotation::Deg0, IVec2::new(2, 2))
+            .unwrap();
+        let building = city.building(id).unwrap();
+
+        assert_eq!(touching_road_cells(&city, building), HashSet::from([IVec2::new(0, 0)]));
+    }
+
+    #[test]
+    fn touching_road_cells_finds_every_cell_along_a_wide_footprint() {
+        let mut city = City::default();
+        city.add_road_cell(IVec2::new(0, 0)).unwrap(); // block tiles 0..6 x 0..6
+        city.add_road_cell(IVec2::new(1, 0)).unwrap(); // block tiles 6..12 x 0..6
+        // South of both cells: x = 0..12, z = 6..8. Its north edge (z = 6)
+        // neighbours z = 5, spanning both road cells' x ranges.
+        let id = city
+            .place_building("house01", IVec3::new(0, 64, 6), Rotation::Deg0, IVec2::new(12, 2))
+            .unwrap();
+        let building = city.building(id).unwrap();
+
+        assert_eq!(touching_road_cells(&city, building), HashSet::from([IVec2::new(0, 0), IVec2::new(1, 0)]));
+    }
+
+    #[test]
+    fn is_building_connected_is_none_for_an_id_that_is_not_placed() {
+        let mut city = City::default();
+        let id = city.place_building("house01", IVec3::ZERO, Rotation::Deg0, IVec2::ONE).unwrap();
+        city.remove_building(id);
+        assert_eq!(is_building_connected(&city, id), None);
+    }
+
+    #[test]
+    fn is_building_connected_distinguishes_touching_from_untouching() {
+        let mut city = City::default();
+        city.add_road_cell(IVec2::new(0, 0)).unwrap();
+        let far = city
+            .place_building("house01", IVec3::new(100, 64, 100), Rotation::Deg0, IVec2::new(2, 2))
+            .unwrap();
+        let touching = city
+            .place_building("house01", IVec3::new(6, 64, 0), Rotation::Deg0, IVec2::new(2, 2))
+            .unwrap();
+
+        assert_eq!(is_building_connected(&city, far), Some(false));
+        assert_eq!(is_building_connected(&city, touching), Some(true));
+    }
+
+    /// A building next to an isolated, single-cell road island still reads
+    /// as "on the network" — connectivity here means "touches a road cell,"
+    /// not "touches a road cell that goes anywhere."
+    #[test]
+    fn is_building_connected_is_true_next_to_an_isolated_road_island() {
+        let mut city = City::default();
+        city.add_road_cell(IVec2::new(0, 0)).unwrap();
+        assert_eq!(connections_at(&city, IVec2::new(0, 0)).count(), 0, "sanity: a lone road cell");
+
+        let id = city
+            .place_building("house01", IVec3::new(6, 64, 0), Rotation::Deg0, IVec2::new(2, 2))
+            .unwrap();
+        assert_eq!(is_building_connected(&city, id), Some(true));
+    }
+
+    #[test]
+    fn buildings_connected_is_none_when_either_id_is_not_placed() {
+        let mut city = City::default();
+        let placed = city.place_building("house01", IVec3::ZERO, Rotation::Deg0, IVec2::ONE).unwrap();
+        let removed = city.place_building("house01", IVec3::new(50, 64, 50), Rotation::Deg0, IVec2::ONE).unwrap();
+        city.remove_building(removed);
+
+        assert_eq!(buildings_connected(&city, placed, removed), None);
+        assert_eq!(buildings_connected(&city, removed, placed), None);
+    }
+
+    #[test]
+    fn buildings_connected_is_true_across_a_shared_road_network() {
+        let mut city = City::default();
+        // A two-cell straight run: (0,0) block tiles 0..6x0..6, (1,0) 6..12x0..6.
+        city.add_road_cell(IVec2::new(0, 0)).unwrap();
+        city.add_road_cell(IVec2::new(1, 0)).unwrap();
+
+        // South of cell (0,0): touches only the west cell.
+        let a = city
+            .place_building("house01", IVec3::new(0, 64, 6), Rotation::Deg0, IVec2::new(2, 2))
+            .unwrap();
+        // South of cell (1,0): touches only the east cell.
+        let b = city
+            .place_building("house01", IVec3::new(6, 64, 6), Rotation::Deg0, IVec2::new(2, 2))
+            .unwrap();
+
+        assert_eq!(buildings_connected(&city, a, b), Some(true));
+    }
+
+    #[test]
+    fn buildings_connected_is_false_across_disconnected_road_islands() {
+        let mut city = City::default();
+        city.add_road_cell(IVec2::new(0, 0)).unwrap();
+        city.add_road_cell(IVec2::new(100, 100)).unwrap();
+
+        let a = city
+            .place_building("house01", IVec3::new(6, 64, 0), Rotation::Deg0, IVec2::new(2, 2))
+            .unwrap();
+        let b = city
+            .place_building("house01", IVec3::new(606, 64, 600), Rotation::Deg0, IVec2::new(2, 2))
+            .unwrap();
+
+        assert_eq!(buildings_connected(&city, a, b), Some(false));
+    }
+
+    #[test]
+    fn buildings_connected_is_false_when_neither_touches_a_road() {
+        let mut city = City::default();
+        let a = city
+            .place_building("house01", IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::new(2, 2))
+            .unwrap();
+        let b = city
+            .place_building("house01", IVec3::new(100, 64, 100), Rotation::Deg0, IVec2::new(2, 2))
+            .unwrap();
+
+        assert_eq!(buildings_connected(&city, a, b), Some(false));
+    }
+
+    #[test]
+    fn buildings_reachable_from_a_non_road_cell_is_empty() {
+        let city = City::default();
+        assert!(buildings_reachable_from(&city, IVec2::new(0, 0)).is_empty());
+    }
+
+    #[test]
+    fn buildings_reachable_from_finds_only_buildings_on_the_same_network() {
+        let mut city = City::default();
+        // Straight run (0,0)-(1,0), plus a disconnected island at (100,100).
+        city.add_road_cell(IVec2::new(0, 0)).unwrap();
+        city.add_road_cell(IVec2::new(1, 0)).unwrap();
+        city.add_road_cell(IVec2::new(100, 100)).unwrap();
+
+        let reachable = city
+            .place_building("house01", IVec3::new(6, 64, 6), Rotation::Deg0, IVec2::new(2, 2))
+            .unwrap(); // south of cell (1,0)
+        let unreachable_island = city
+            .place_building("house01", IVec3::new(606, 64, 600), Rotation::Deg0, IVec2::new(2, 2))
+            .unwrap(); // south of the disconnected cell
+        let untouching = city
+            .place_building("house01", IVec3::new(300, 64, 300), Rotation::Deg0, IVec2::new(2, 2))
+            .unwrap(); // touches nothing
+
+        let found = buildings_reachable_from(&city, IVec2::new(0, 0));
+        assert_eq!(found, HashSet::from([reachable]));
+        assert!(!found.contains(&unreachable_island));
+        assert!(!found.contains(&untouching));
     }
 
     // -- select_piece (ticket 054, roadmap F3's selection half) -------------
