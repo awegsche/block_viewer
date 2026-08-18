@@ -216,10 +216,12 @@ impl ChunkColumn {
     /// Used to place the camera above the terrain surface at startup by
     /// ticket 006's original eager-decode version of `lib.rs::spawn_point`;
     /// ticket 005-e's streaming startup can no longer do that (nothing is
-    /// decoded yet at startup), but this stays for the block-under-cursor
+    /// decoded yet at startup), but this stayed for the block-under-cursor
     /// readout planned in ticket 007, and as `city::grid`'s ground-height
-    /// read (ticket 046) until ticket 052 widened it to skip clutter too.
-    #[allow(dead_code)]
+    /// read (ticket 046) until ticket 052 widened *that* caller to skip
+    /// clutter too. `city::terraform` (ticket 057, roadmap H1) is a real
+    /// caller again — a dig/level edit wants the literal topmost block,
+    /// clutter included, unlike a footprint fit's notion of "ground."
     pub fn topmost_non_air(&self, local_x: usize, local_z: usize) -> Option<(i32, BlockId)> {
         self.topmost_matching(local_x, local_z, |id| id != BlockRegistry::AIR)
     }

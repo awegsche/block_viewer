@@ -46,6 +46,10 @@ pub(super) enum WriteKind {
     /// `BuildingCatalogue`/`BuildingDefinitions` entry at all (see
     /// [`WriteRecord::building`]'s doc comment).
     Road,
+    /// `city::terraform` (ticket 057, roadmap H1) committing a dig or level
+    /// drag — same reasoning as [`WriteKind::Road`]: `building` names a tile
+    /// count ("N tile(s)"), not a catalogue entry.
+    Terraform,
 }
 
 /// What a successful edit actually applied to the region cache, trimmed to

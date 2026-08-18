@@ -168,13 +168,17 @@ fn selected_line(ui: &mut egui::Ui, selection: &PlacementSelection, definitions:
 }
 
 /// `R` rotate, `PageUp`/`PageDown`/`Home` height, `Delete` demolish, `Esc`
-/// clear — the keyboard half ticket 047/048/049 already built, restated here
-/// so it's discoverable from the one panel a player actually looks at while
-/// placing something. Collapsed by default, the same call
+/// clear, `T` switch tool, `Z` switch dig/level — the keyboard half
+/// ticket 047/048/049/055/057 already built, restated here so it's
+/// discoverable from the one panel a player actually looks at while placing
+/// something. Collapsed by default, the same call
 /// `viewer::ui::selection_panel::key_legend` makes.
 fn key_legend(ui: &mut egui::Ui) {
     egui::CollapsingHeader::new("Keys").show(ui, |ui| {
         egui::Grid::new("build_menu_key_legend").num_columns(2).show(ui, |ui| {
+            ui.label("T");
+            ui.label("switch tool (Building / Road / Terraform)");
+            ui.end_row();
             ui.label("R");
             ui.label("rotate the selection 90°");
             ui.end_row();
@@ -189,6 +193,12 @@ fn key_legend(ui: &mut egui::Ui) {
             ui.end_row();
             ui.label("Esc");
             ui.label("clear the selection");
+            ui.end_row();
+            ui.label("Z");
+            ui.label("switch Dig / Level (Terraform tool)");
+            ui.end_row();
+            ui.label("Left-click drag");
+            ui.label("dig or level the dragged area (Terraform tool)");
             ui.end_row();
         });
     });

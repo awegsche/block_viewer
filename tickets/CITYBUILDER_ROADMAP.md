@@ -2,7 +2,7 @@
 
 Not a work item; the plan for the citybuilder game and the shared world-edit
 infrastructure it needs. High-level tasks here get split into numbered
-tickets in this directory when they're picked up (next free number: 057).
+tickets in this directory when they're picked up (next free number: 058).
 Companion to `ROADMAP.md`, which covers the viewer 001–029.
 
 ## The goal
@@ -148,6 +148,8 @@ L1  lib.rs + two bin shims                       <- DONE (ticket 027)
                |
                +-- G  UI: build menu, city panel   <- DONE (ticket 050)
                +-- H  terraforming: dig and level
+               |    H1  level and dig tools        <- DONE (ticket 057)
+               |    H2  yields (inert)
                |    (H's digging is what makes R1's floor move — ticket 030)
                |
                +-- I  damage: the world diffing back
@@ -959,12 +961,40 @@ including the manual-verification checklist it left in `../todo.md`.
 
 ## H — Terraforming
 
-**H1. Level and dig tools.** Reuses W4/W5 wholesale — it's the same write
-path with a different source of block changes.
+**H1. Level and dig tools. — done, ticket 057.** Reuses W4/W5 wholesale —
+it's the same write path with a different source of block changes.
+
+How it came out: a third `city::tool::ActiveTool::Terraform`, `T` now
+cycling three ways instead of flipping two, gated the same way
+`city::road_build` already gates its own drag on `ActiveTool::Road`. The new
+`city::terraform` module reuses `road_build`'s click/hold/release drag shape
+(`TerraformDragState::anchor`) but widened from an L-shaped cell path to a
+plain rectangle (`rect_tiles`) — there's no piece catalogue or cardinal
+adjacency to keep straight here, so a rectangle is the natural shape for "an
+area of ground." Dig clears the topmost block (`world::ChunkColumn::
+topmost_non_air`, not `city::grid`'s clutter-skipping `is_ground` — a dig
+clears a tree exactly like it clears stone) from every tile in the
+rectangle; Level reads the drag's starting tile as a target height and digs
+the high tiles down to it or fills the low ones up to it with a fixed
+`minecraft:dirt` (no material inventory yet to spend from, the iteration-1
+boundary C3/H2 already draw around production) — closing the gap
+`city::grid`'s own docs left open, where E2's `fit_footprint` refuses uneven
+ground rather than levelling it and names this ticket as the fix. Neither
+tool reuses `WorldEdit::fill` despite that function's own forward reference
+to terraforming — both write a *different* value at every position, which
+`fill`'s one-block-everywhere shape doesn't cover. Commits reuse
+`city::commit::apply_building_edit` directly, the same region-cache dispatch
+`commit`/`road_build` already use; unlike either of those, there's no
+`state::City` entry and no journal record for dug or levelled terrain at
+all, so a failed write has nothing to roll back beyond its own `WriteStatus`
+line. No preview mesh — console-only feedback, the same state ticket 035's
+original paint/fill command shipped in before any tool grew a ghost; a named
+follow-up if that turns out to matter in practice.
 
 **H2. Yields.** Dug blocks become resource counts in city state. Inert in
 iteration 1, like C3, but the plumbing is the same shape production will
-need.
+need — still open; `city::terraform`'s dig doesn't record what it removed
+anywhere production could later read.
 
 ---
 
@@ -1221,7 +1251,8 @@ re-mesh, because the blocks under the floor were never decoded to begin with.
 4. **M4 — "a city exists"**: D1, D2, E1–E4, **I1**. Place buildings; they
    persist, they're in the world, and each one records what it built.
 5. **M5 — "streets"**: F1–F3, G1. The iteration-1 deliverable.
-6. **M6 — "and it's mine"**: E5, D3, G2, H1. Demolish, undo, terraform.
+6. **M6 — "and it's mine"**: E5, D3, G2, H1. Demolish, undo, terraform. —
+   done (ticket 057 was the last piece).
 7. **M7 — "the world answers back"**: I2–I7, plus `ranvil` 020. Break a
    wall in Minecraft, come back, and the building says so. The first
    mechanic that makes the round trip *matter* rather than just work — a

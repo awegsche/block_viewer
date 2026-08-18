@@ -62,6 +62,7 @@ fn kind_verb(kind: WriteKind) -> &'static str {
         WriteKind::Demolished => "Demolished",
         WriteKind::Undo => "Undid",
         WriteKind::Road => "Built",
+        WriteKind::Terraform => "Shaped",
     }
 }
 
@@ -251,5 +252,7 @@ mod tests {
         assert_eq!(kind_verb(WriteKind::Placed), "Placed");
         assert_eq!(kind_verb(WriteKind::Demolished), "Demolished");
         assert_eq!(kind_verb(WriteKind::Undo), "Undid");
+        assert_eq!(kind_verb(WriteKind::Road), "Built");
+        assert_eq!(kind_verb(WriteKind::Terraform), "Shaped");
     }
 }

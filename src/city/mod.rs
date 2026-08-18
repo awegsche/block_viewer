@@ -183,6 +183,22 @@
 //! against synthetic fixtures the same way ticket 039's building catalogue
 //! tests were, and isn't wired into `run` until there's something on disk
 //! for it to load.
+//!
+//! ## Terraforming: dig and level (ticket 057, roadmap H1)
+//!
+//! [`terraform::TerraformPlugin`] is a third
+//! [`tool::ActiveTool`] (`T` now cycles Building -> Road -> Terraform ->
+//! Building), gated the same way [`road_build::RoadBuildPlugin`] gates its
+//! own drag on [`tool::ActiveTool::Road`]. A left-click drag over a
+//! rectangle of tiles either digs (clears the topmost block from every
+//! tile, `Z`'s default mode) or levels (flattens the rectangle to the
+//! height the drag started on, digging the high tiles and filling the low
+//! ones with dirt) — see [`terraform`]'s own docs for why neither reuses
+//! [`crate::edit::WorldEdit::fill`] and why there's no city-state entry or
+//! journal record for either. Closes the gap `city::grid`'s own docs left
+//! open for E2's `fit_footprint`: uneven ground under a footprint is
+//! refused, not auto-levelled, with this ticket named as what lets a player
+//! fix it by hand.
 
 use std::path::{Path, PathBuf};
 
@@ -199,6 +215,7 @@ mod road_build;
 mod road_catalogue;
 mod save;
 mod state;
+mod terraform;
 mod tool;
 mod ui;
 mod undo;
@@ -264,6 +281,7 @@ pub fn run() {
         .add_plugins(commit::CommitPlugin)
         .add_plugins(demolish::DemolishPlugin)
         .add_plugins(road_build::RoadBuildPlugin)
+        .add_plugins(terraform::TerraformPlugin)
         .add_plugins(undo::UndoPlugin)
         .add_plugins(save::SavePlugin)
         .add_plugins(ui::UiPlugin)
