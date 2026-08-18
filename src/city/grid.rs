@@ -21,31 +21,46 @@
 //!
 //! "Ground" here is **not** [`world::is_solid`]'s plain not-air — ticket 052
 //! found that reading a tree, fence post or tall grass as "ground" refuses a
-//! placement `MAX_FOOTPRINT_STEP` (or ten blocks, for a tree) away from real,
-//! flat terrain, even though [`crate::city::commit`]'s own write already
-//! clears the obstruction without complaint. [`is_ground`] narrows the
-//! predicate: still not `ranvil::heightmap`'s `blocks_motion` (a lake's
-//! surface still counts as ground the way a stone hilltop does — iteration 1
-//! doesn't distinguish, and that refinement really is roadmap I3's later
-//! job), but clutter — vegetation, decoration, anything the write path's own
-//! "air is a block" policy would already bulldoze — no longer reads as the
-//! footprint's floor.
+//! placement several blocks (ten, for a tree) away from real, flat terrain,
+//! even though [`crate::city::commit`]'s own write already clears the
+//! obstruction without complaint. [`is_ground`] narrows the predicate: still
+//! not `ranvil::heightmap`'s `blocks_motion` (a lake's surface still counts
+//! as ground the way a stone hilltop does — iteration 1 doesn't distinguish,
+//! and that refinement really is roadmap I3's later job), but clutter —
+//! vegetation, decoration, anything the write path's own "air is a block"
+//! policy would already bulldoze — no longer reads as the footprint's floor.
 //!
-//! ## No auto-level
+//! ## No auto-level, and no slope refusal either (ticket 058)
 //!
 //! The roadmap asks this ticket to decide whether uneven ground under a
-//! footprint gets levelled or refused. **Refused.** Levelling means writing
-//! blocks, and writing blocks is W4/W5's job through a real
+//! footprint gets levelled or refused. **Neither, any more.** Levelling
+//! means writing blocks, and writing blocks is W4/W5's job through a real
 //! [`crate::edit::WorldEdit`] — folding it into a read-only fit check would
 //! make "is this buildable" secretly depend on the write path, and every
-//! future caller (E3's every-frame ghost preview included) would pay for
-//! it. [`MAX_FOOTPRINT_STEP`] draws the line: within it, the footprint sits
-//! at its *lowest* sampled point ([`FootprintFit::Fits`]'s `base_y`) and
-//! higher corners clip a little into the building's own foundation, which
-//! reads better than a gap floating over a low corner given nothing here
-//! fills it in. Past the tolerance, placement is refused outright.
-//! Terraforming (H1) is what would later let a player fix a steeper site by
-//! hand, through the write path this module deliberately doesn't touch.
+//! future caller (E3's every-frame ghost preview included) would pay for it.
+//! [`fit_footprint`] originally refused past a 1-block tolerance
+//! (`MAX_FOOTPRINT_STEP`), but a real Minecraft world is inherently uneven,
+//! and a hard height-difference cap restricts where a player can build far
+//! more than it's worth — ticket 058 removed it. `base_y`
+//! ([`FootprintFit::Fits`]) is now purely the footprint's *lowest* sampled
+//! point, used only as the placement's initial suggested height: a higher
+//! corner clips a little into the building's own foundation (better than a
+//! gap floating over a low corner, given nothing here fills terrain in), and
+//! nothing about how steep the rest of the footprint is stops the
+//! placement. `city::placement::PlacementSelection::y_offset` (`Page Up`/
+//! `Page Down`/`Home`) is the player's own override on top of that
+//! suggestion — always was, and is now the *only* way a steep site's height
+//! gets adjusted, since this module no longer has an opinion beyond "here's
+//! the lowest point."
+//!
+//! What a steep placement should *cost* — the roadmap floated build time (or
+//! some future resource) scaling with how many solid blocks a placement
+//! needs to clear, so burying a building in a hillside is expensive rather
+//! than blocked or free — is deliberately not this module's job either, and
+//! isn't implemented anywhere yet; see `CITYBUILDER_ROADMAP.md`'s note under
+//! E2/H2. Terraforming (H1) remains the way a player can flatten a site by
+//! hand if they'd rather not pay whatever that eventual cost turns out to
+//! be, through the write path this module deliberately doesn't touch.
 //!
 //! [`fit_footprint`]'s first real caller is `city::placement` (ticket 047,
 //! roadmap E3)'s ghost preview, called once per frame at the hovered tile.
@@ -61,13 +76,9 @@ use crate::blueprint::Rotation;
 use crate::world;
 use crate::DecodedWorld;
 
-/// Height difference (world Y) tolerated across a footprint's sampled
-/// ground before [`fit_footprint`] refuses the placement outright — see the
-/// module docs' "No auto-level" note. `1`: enough to absorb a single stair
-/// step in the terrain without papering over a real slope.
-pub const MAX_FOOTPRINT_STEP: i32 = 1;
-
-/// Why [`fit_footprint`] refused a placement.
+/// Why [`fit_footprint`] refused a placement. `NotLoaded` is the only
+/// reason left as of ticket 058 — see the module docs' "No auto-level, and
+/// no slope refusal either".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FitError {
     /// `tile`'s chunk isn't decoded in [`DecodedWorld`] yet (outside the
@@ -76,9 +87,6 @@ pub enum FitError {
     /// same call [`super::picking::HoveredBlock`] already makes for its own
     /// `None`.
     NotLoaded { tile: IVec2 },
-    /// The sampled ground varies by more than [`MAX_FOOTPRINT_STEP`] across
-    /// the footprint.
-    TooSteep { min_y: i32, max_y: i32 },
 }
 
 impl std::fmt::Display for FitError {
@@ -87,10 +95,6 @@ impl std::fmt::Display for FitError {
             FitError::NotLoaded { tile } => {
                 write!(f, "ground at ({}, {}) isn't loaded yet", tile.x, tile.y)
             }
-            FitError::TooSteep { min_y, max_y } => write!(
-                f,
-                "ground varies from y={min_y} to y={max_y}, more than the {MAX_FOOTPRINT_STEP}-block limit"
-            ),
         }
     }
 }
@@ -100,9 +104,11 @@ impl std::error::Error for FitError {}
 /// Whether a footprint's ground supports a placement, and at what height.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FootprintFit {
-    /// The footprint's sampled ground is level within [`MAX_FOOTPRINT_STEP`]
-    /// — `base_y` is its lowest point, the world Y a placed building's
-    /// floor belongs at (see the module docs' "No auto-level" note).
+    /// `base_y` is the footprint's lowest sampled ground point — the
+    /// *suggested* world Y for a placed building's floor, freely overridable
+    /// by [`super::placement::PlacementSelection::y_offset`] (see the module
+    /// docs' "No auto-level, and no slope refusal either"). Ticket 058: this
+    /// is returned regardless of how steep the rest of the footprint is.
     Fits { base_y: i32 },
     Refused(FitError),
 }
@@ -236,7 +242,9 @@ pub fn ground_height_at(tile: IVec2, world: &DecodedWorld) -> Option<i32> {
 
 /// Samples every tile [`footprint_tiles`] covers for `footprint` placed at
 /// `origin`/`rotation`, and decides whether it's buildable — see the module
-/// docs for the height read and the no-auto-level rule.
+/// docs for the height read and the "No auto-level, and no slope refusal
+/// either" note — as of ticket 058, the only way this refuses at all is
+/// [`FitError::NotLoaded`].
 ///
 /// Fails fast on the first unresolvable tile — a footprint reaching off the
 /// streamed edge is refused before every other tile is even sampled, the
@@ -248,32 +256,28 @@ pub fn fit_footprint(
     rotation: Rotation,
     world: &DecodedWorld,
 ) -> FootprintFit {
-    // `Option<(min, max)>` rather than `i32::MAX`/`i32::MIN` sentinels: a
-    // zero-extent footprint (not producible by the catalogue, but not
-    // guarded against by `footprint_tiles` either) samples no tiles at all,
-    // and subtracting unset sentinels would overflow rather than just being
-    // wrong.
-    let mut bounds: Option<(i32, i32)> = None;
+    // Only the minimum is tracked — nothing reads a maximum any more now
+    // that steepness can't refuse a placement (ticket 058). `Option` rather
+    // than an `i32::MAX` sentinel: a zero-extent footprint (not producible
+    // by the catalogue, but not guarded against by `footprint_tiles`
+    // either) samples no tiles at all.
+    let mut min_y: Option<i32> = None;
 
     for tile in footprint_tiles(origin, footprint, rotation) {
         let Some(height) = ground_height_at(tile, world) else {
             return FootprintFit::Refused(FitError::NotLoaded { tile });
         };
-        bounds = Some(match bounds {
-            Some((min, max)) => (min.min(height), max.max(height)),
-            None => (height, height),
+        min_y = Some(match min_y {
+            Some(min) => min.min(height),
+            None => height,
         });
     }
 
-    let Some((min_y, max_y)) = bounds else {
+    let Some(min_y) = min_y else {
         // No tiles to check — nothing constrains the height, so leave the
         // placement at whatever Y it was asked for rather than inventing one.
         return FootprintFit::Fits { base_y: origin.y };
     };
-
-    if max_y - min_y > MAX_FOOTPRINT_STEP {
-        return FootprintFit::Refused(FitError::TooSteep { min_y, max_y });
-    }
 
     FootprintFit::Fits { base_y: min_y }
 }
@@ -408,7 +412,7 @@ mod tests {
     }
 
     #[test]
-    fn ground_within_tolerance_fits_at_its_lowest_point() {
+    fn uneven_ground_fits_at_its_lowest_point() {
         // A one-block step under the footprint's middle column.
         let mut ground: Vec<(IVec2, i32)> = (0..3).flat_map(|x| (0..3).map(move |z| (IVec2::new(x, z), 64))).collect();
         for entry in ground.iter_mut() {
@@ -423,17 +427,23 @@ mod tests {
     }
 
     #[test]
-    fn ground_past_tolerance_is_refused_as_too_steep() {
+    fn a_steep_step_still_fits_at_its_lowest_point_ticket_058() {
+        // A genuine 6-block terrain step under one corner — before ticket
+        // 058 this refused as `TooSteep`; now it just fits at the lowest
+        // sampled point, same as `uneven_ground_fits_at_its_lowest_point`'s
+        // one-block step. A real Minecraft world is inherently uneven, so
+        // fit_footprint no longer has an opinion on how steep is "too"
+        // steep — see the module docs.
         let mut ground: Vec<(IVec2, i32)> = (0..3).flat_map(|x| (0..3).map(move |z| (IVec2::new(x, z), 64))).collect();
         for entry in ground.iter_mut() {
             if entry.0 == IVec2::new(2, 2) {
-                entry.1 = 70; // 6 blocks higher, well past MAX_FOOTPRINT_STEP
+                entry.1 = 70; // 6 blocks higher
             }
         }
         let world = world_with_ground(&ground);
 
         let fit = fit_footprint(IVec3::new(0, 0, 0), IVec2::new(3, 3), Rotation::Deg0, &world);
-        assert_eq!(fit, FootprintFit::Refused(FitError::TooSteep { min_y: 65, max_y: 71 }));
+        assert_eq!(fit, FootprintFit::Fits { base_y: 65 }, "fits at the lowest point (64), not refused for the 70-high corner");
     }
 
     #[test]
@@ -449,26 +459,25 @@ mod tests {
 
     #[test]
     fn a_90_degree_rotation_samples_the_rotated_rectangle() {
-        // Asymmetric terrain: a ridge along x=4 (unrotated width is 3, so
-        // x=4 is outside an unrotated 3x5 footprint but inside a rotated
-        // one's swapped 5x3 extent).
-        let mut ground: Vec<(IVec2, i32)> = (0..5).flat_map(|x| (0..5).map(move |z| (IVec2::new(x, z), 64))).collect();
-        for entry in ground.iter_mut() {
-            if entry.0.x == 4 {
-                entry.1 = 70;
-            }
-        }
+        // Ground only exists for x 0..4 (not 4..5) — unrotated width is 3,
+        // so x=4 is outside an unrotated 3x5 footprint but inside a
+        // rotated one's swapped 5x3 extent. Ticket 058 removed the
+        // `TooSteep` refusal this test used to prove rotation with, so the
+        // proof now goes through `NotLoaded` at that same column instead —
+        // still the same "does the sampled rectangle actually rotate"
+        // question, since the only other choice is out-of-bounds terrain.
+        let ground: Vec<(IVec2, i32)> = (0..4).flat_map(|x| (0..5).map(move |z| (IVec2::new(x, z), 64))).collect();
         let world = world_with_ground(&ground);
 
-        // Unrotated: 3 wide (x 0..3), 5 deep — never touches the ridge at x=4.
+        // Unrotated: 3 wide (x 0..3), 5 deep — never touches x=4.
         let unrotated = fit_footprint(IVec3::new(0, 0, 0), IVec2::new(3, 5), Rotation::Deg0, &world);
         assert_eq!(unrotated, FootprintFit::Fits { base_y: 65 });
 
         // Rotated 90°: occupied rectangle becomes 5 wide (x 0..5), 3 deep —
-        // reaches x=4's ridge, which is far past MAX_FOOTPRINT_STEP.
+        // reaches x=4, which has no ground at all.
         let rotated = fit_footprint(IVec3::new(0, 0, 0), IVec2::new(3, 5), Rotation::Deg90, &world);
         assert!(
-            matches!(rotated, FootprintFit::Refused(FitError::TooSteep { .. })),
+            matches!(rotated, FootprintFit::Refused(FitError::NotLoaded { .. })),
             "a rotation bug that keeps sampling the unrotated rectangle would still report Fits here"
         );
     }
@@ -510,14 +519,17 @@ mod tests {
         let mut world = flat_chunk(64);
         // A six-log trunk plus leaves in the middle of the footprint — read
         // as ground, this would be a seven-block discrepancy against the
-        // flat ground everywhere else, well past MAX_FOOTPRINT_STEP.
+        // flat ground everywhere else. Since ticket 058, an unexcluded
+        // discrepancy like that couldn't refuse the placement any more
+        // either way — see `clutter_on_the_lowest_tile_does_not_inflate_base_y`
+        // for the case where clutter exclusion actually changes `base_y`.
         for y in 65..71 {
             add_block(&mut world, IVec2::new(1, 1), y, "minecraft:oak_log");
         }
         add_block(&mut world, IVec2::new(1, 1), 71, "minecraft:oak_leaves");
 
         let fit = fit_footprint(IVec3::new(0, 0, 0), IVec2::new(3, 3), Rotation::Deg0, &world);
-        assert_eq!(fit, FootprintFit::Fits { base_y: 65 }, "a tree should not refuse an otherwise-flat placement");
+        assert_eq!(fit, FootprintFit::Fits { base_y: 65 }, "the tree doesn't crash the fit or otherwise disturb it");
     }
 
     #[test]
@@ -530,19 +542,26 @@ mod tests {
     }
 
     #[test]
-    fn a_real_slope_still_refuses_even_with_clutter_ignored() {
-        // A genuine 6-block terrain step (not clutter) under one corner —
-        // ignoring clutter must not also start ignoring real elevation.
-        let mut ground: Vec<(IVec2, i32)> = (0..3).flat_map(|x| (0..3).map(move |z| (IVec2::new(x, z), 64))).collect();
+    fn clutter_on_the_lowest_tile_does_not_inflate_base_y() {
+        // Ticket 058 made `base_y` (the lowest sampled point) the only thing
+        // `is_ground`'s clutter exclusion still affects — with no refusal
+        // left to test against, this replaces the old "still refuses" check
+        // with a direct assertion on that value. Every tile's true terrain
+        // is high (70) except one (1,1), whose true terrain is low (64) but
+        // has a solid fence post sitting on it. If clutter weren't excluded,
+        // that tile would sample as the fence's height (66) rather than the
+        // ground beneath it (65), one block too high.
+        let mut ground: Vec<(IVec2, i32)> = (0..3).flat_map(|x| (0..3).map(move |z| (IVec2::new(x, z), 70))).collect();
         for entry in ground.iter_mut() {
-            if entry.0 == IVec2::new(2, 2) {
-                entry.1 = 70;
+            if entry.0 == IVec2::new(1, 1) {
+                entry.1 = 64;
             }
         }
-        let world = world_with_ground(&ground);
+        let mut world = world_with_ground(&ground);
+        add_block(&mut world, IVec2::new(1, 1), 65, "minecraft:oak_fence");
 
         let fit = fit_footprint(IVec3::new(0, 0, 0), IVec2::new(3, 3), Rotation::Deg0, &world);
-        assert!(matches!(fit, FootprintFit::Refused(FitError::TooSteep { .. })));
+        assert_eq!(fit, FootprintFit::Fits { base_y: 65 }, "base_y should read the true ground under the fence, not the fence itself");
     }
 
     #[test]

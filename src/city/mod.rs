@@ -195,10 +195,12 @@
 //! height the drag started on, digging the high tiles and filling the low
 //! ones with dirt) — see [`terraform`]'s own docs for why neither reuses
 //! [`crate::edit::WorldEdit::fill`] and why there's no city-state entry or
-//! journal record for either. Closes the gap `city::grid`'s own docs left
-//! open for E2's `fit_footprint`: uneven ground under a footprint is
-//! refused, not auto-levelled, with this ticket named as what lets a player
-//! fix it by hand.
+//! journal record for either. Originally justified as the fix for E2's
+//! `fit_footprint` refusing uneven ground outright; ticket 058 removed that
+//! refusal (a real Minecraft world is inherently uneven, and the game
+//! shouldn't block a placement over it), so terraforming is no longer the
+//! only way to build on a rough site — it's now how a player *chooses* to
+//! flatten one anyway, by hand, rather than build into the slope.
 
 use std::path::{Path, PathBuf};
 

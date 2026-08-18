@@ -701,6 +701,33 @@ a frame for a table to earn its keep) instead of plain not-air, off a new
 general `ChunkColumn::topmost_matching` that `topmost_non_air` itself now
 just specialises.
 
+**Revised by ticket 058: the "refuses past `MAX_FOOTPRINT_STEP`" half is
+gone.** User-directed: a real Minecraft world is inherently uneven, and a
+hard 1-block cap on how much a footprint's ground could vary restricted
+where a player could build far more than it was worth — refusing outright is
+a much bigger cost to the player than the mild clipping/floating a steep
+site produces. `fit_footprint` still samples ground and still returns
+`base_y` at the footprint's lowest point exactly as before; what's gone is
+the `max_y - min_y > MAX_FOOTPRINT_STEP` check and `FitError::TooSteep`
+itself — `NotLoaded` is the only refusal reason left. `base_y` is now purely
+the placement's *initial suggested* height, same as it always fed into
+`PlacementSelection::y_offset` (ticket 048, `Page Up`/`Page Down`/`Home`);
+nothing here stops a steep placement, it just isn't auto-levelled either.
+H1's terraforming is no longer load-bearing for placement at all — it's a
+player's own choice to flatten a site rather than build into the slope. See
+`finished_tickets/058-remove-footprint-slope-refusal.md`.
+
+Noted for later, not scoped or scheduled: rather than a hard block, an
+extreme placement (heavily embedded in a hillside, mostly floating over a
+low spot) could cost something instead — build time, or a future resource,
+scaling with the number of solid blocks the placement needs to clear. That's
+a genuinely new mechanic (counting blocks cleared under/around a footprint,
+and *some* notion of cost to charge it against — neither exists; see C3/H2's
+own "inert" state) and sits naturally next to H2's already-open "yields"
+task, which has the same "count blocks a terraform/placement action
+disturbs" shape. No ticket yet — it needs a real cost system to hang off
+first.
+
 **E3. Ghost preview and validity. — done, ticket 047.** The B2 mesh at the
 cursor with a translucent material, tinted by validity, snapped to the grid.
 Needs a second material — the terrain's is `AlphaMode::Mask(0.5)`
@@ -994,7 +1021,12 @@ follow-up if that turns out to matter in practice.
 **H2. Yields.** Dug blocks become resource counts in city state. Inert in
 iteration 1, like C3, but the plumbing is the same shape production will
 need — still open; `city::terraform`'s dig doesn't record what it removed
-anywhere production could later read.
+anywhere production could later read. E2's own "noted for later" addendum
+(ticket 058) is the same shape read the other direction: a *placement's*
+own footprint clearing solid blocks, charged as build time or a resource
+cost rather than refused outright. Whichever lands first (a dig's yield, or
+a placement's clearing cost) is likely most of the plumbing the other one
+needs too — worth picking up together rather than twice.
 
 ---
 

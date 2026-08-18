@@ -1,10 +1,15 @@
 //! Terraforming: dig and level (ticket 057, roadmap H1) — "reuses W4/W5
 //! wholesale; it's the same write path with a different source of block
-//! changes," per the roadmap's own one-line spec for this task. Closes the
-//! gap `city::grid`'s own docs left open: E2's `fit_footprint` refuses
-//! uneven ground under a footprint rather than levelling it, and names this
-//! ticket as "what would later let a player fix a steeper site by hand,
-//! through the write path this module deliberately doesn't touch."
+//! changes," per the roadmap's own one-line spec for this task. Originally
+//! justified as the fix for a gap `city::grid`'s own docs left open — E2's
+//! `fit_footprint` refused uneven ground under a footprint rather than
+//! levelling it, and this ticket was named as "what would later let a
+//! player fix a steeper site by hand." Ticket 058 removed that refusal
+//! outright (a real world is inherently uneven; the game shouldn't block a
+//! placement over it), so these tools are no longer load-bearing for
+//! placement at all — they're a player's own choice to flatten a site they'd
+//! rather not build into, through the write path this module deliberately
+//! doesn't touch.
 //!
 //! ## A third tool, a drag rectangle, the same commit shape as the other two
 //!

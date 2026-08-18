@@ -47,11 +47,13 @@
 //! [`crate::edit::WorldEdit`]'s own docs already name this as an E4
 //! decision to make: a building's declared-empty interior (a doorway, the
 //! space above a floor) writes `minecraft:air` over whatever was there,
-//! rather than leaving it standing. That's also what clears the sliver of
-//! terrain [`grid::MAX_FOOTPRINT_STEP`]'s tolerance can leave poking into a
-//! footprint on uneven ground — there is no second pass here that goes
-//! looking for that sliver, the blueprint's own bottom layer already covers
-//! it. [`blueprint_edit`] mirrors [`crate::blueprint::mesh_blueprint`]'s own
+//! rather than leaving it standing. That's also what clears whatever terrain
+//! [`grid::fit_footprint`]'s lowest-point `base_y` leaves poking into a
+//! footprint on uneven ground — since ticket 058 removed the old refusal on
+//! steep ground, that sliver can now be a good deal more than one block on a
+//! genuinely rough site, and there is still no second pass here that goes
+//! looking for it: the blueprint's own bottom layer already covers whatever
+//! there is. [`blueprint_edit`] mirrors [`crate::blueprint::mesh_blueprint`]'s own
 //! `dy*sz*sx + dz*sx + dx` indexing (see `blueprint::mesh`'s `block_at`) so
 //! a build and the mesh that previewed it never disagree about which corner
 //! is which.
