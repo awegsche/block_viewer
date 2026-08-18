@@ -861,3 +861,34 @@ these itself (see CLAUDE.md's "Manual/visual verification").
   was; (4) killing the write (e.g. drag into an ungenerated chunk) leaves
   the City panel's road-cell count unchanged and the console reports a
   rollback of only the newly-attempted cells, not any pre-existing road.
+
+- [ ] **057 terraforming: dig and level tools.** **Back the world up first**
+  (or run this against a scratch copy) — this writes to a real save.
+
+  `cargo run --bin citybuilder` against a real save. Press `T` twice to
+  cycle to the Terraform tool (Building -> Road -> Terraform); confirm the
+  building ghost and the road drag preview both stop reacting to clicks
+  while it's active. With the default Dig mode, left-click-drag a small
+  rectangle over varied terrain (a hill, a tree) and release: confirm the
+  console reports a tile count and block count, the City panel's "Last
+  edit" section shows a "Shaped" line ("not yet saved to disk"), and the
+  live mesh updates immediately to show the topmost layer cleared across
+  the dragged rectangle — including a tree's trunk/leaves, which should
+  clear same as stone would. Drag over the same spot again and confirm it
+  digs one layer deeper each time.
+
+  Press `Z` to switch to Level mode (no on-screen indicator exists yet —
+  watch the console/city-panel line after a drag to tell which mode is
+  active). Start a drag on a low or high point and release on an uneven
+  patch nearby: confirm every tile in the rectangle ends up visually flush
+  with the tile the drag started on — high points cut down to bare dirt/
+  stone at that height, low points filled up with dirt, the starting tile
+  itself untouched. Try a drag that's already flat and confirm the console
+  says there's nothing to change (no edit dispatched).
+
+  Click "Save world" and confirm the region(s) actually get written (mtime
+  changes), then open the world in Minecraft and confirm the dig/level
+  results are really there — including that a levelled area's fill reads
+  as ordinary dirt, not some placeholder block. Also confirm `T` still
+  cycles back to Building afterward and placement/road tools are unaffected.
+
