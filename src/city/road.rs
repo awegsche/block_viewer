@@ -78,7 +78,6 @@ impl Direction {
     /// and `blueprint::rotate`'s own `Cardinal` table use — [`select_piece`]
     /// rotates a canonical connection pattern through this to find the
     /// [`Rotation`] that reproduces an actual one.
-    #[allow(dead_code)] // used via RoadConnections::rotated, see the module docs
     fn rotated(self, turns: u8) -> Direction {
         const ORDER: [Direction; 4] = [Direction::North, Direction::East, Direction::South, Direction::West];
         let index = ORDER.iter().position(|&d| d == self).expect("ORDER covers every Direction");
@@ -90,7 +89,6 @@ impl Direction {
 /// F3's auto-tiling picks a piece from. Built by [`connections_at`], which
 /// is the only way to construct one: this type is a pure answer, not
 /// something a caller assembles field-by-field.
-#[allow(dead_code)] // no caller yet — F2/F3 are, see the module docs
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RoadConnections {
     pub north: bool,
@@ -104,7 +102,6 @@ impl RoadConnections {
     /// end), 2 (straight or corner, depending on *which* two), 3 (a T), or 4
     /// (a cross). [`select_piece`] is what turns this, and *which* two
     /// neighbours, into a [`RoadPieceKind`].
-    #[allow(dead_code)] // no non-test caller yet — select_piece and F3's auto-tiling are
     pub fn count(self) -> u32 {
         self.north as u32 + self.south as u32 + self.east as u32 + self.west as u32
     }
@@ -112,7 +109,6 @@ impl RoadConnections {
     /// This pattern, rotated `turns` quarter-turns clockwise — every `true`
     /// direction walked through [`Direction::rotated`]. [`select_piece`]'s
     /// own primitive for matching a canonical pattern against an actual one.
-    #[allow(dead_code)] // used via select_piece/matching_rotation, see the module docs
     fn rotated(self, turns: u8) -> RoadConnections {
         let mut out = RoadConnections::default();
         for (present, dir) in [
@@ -147,7 +143,6 @@ fn is_road(city: &City, cell: IVec2) -> bool {
 /// committing, the same way E3's ghost preview asks
 /// [`super::grid::fit_footprint`] before
 /// [`super::state::City::place_building`].
-#[allow(dead_code)] // no caller yet — F2/F3's auto-tiling are, see the module docs
 pub fn connections_at(city: &City, cell: IVec2) -> RoadConnections {
     RoadConnections {
         north: is_road(city, cell + Direction::North.offset()),
@@ -199,7 +194,6 @@ pub fn is_connected(city: &City, a: IVec2, b: IVec2) -> bool {
 /// splits into straight and corner, since a rotated straight piece can't
 /// stand in for a bend — see ticket 054). [`super::road_catalogue`] loads
 /// exactly one `.nbt` blueprint per kind.
-#[allow(dead_code)] // no non-test caller yet — road_catalogue and F3's auto-tiling are
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RoadPieceKind {
     /// No neighbours at all.
@@ -220,7 +214,6 @@ pub enum RoadPieceKind {
 impl RoadPieceKind {
     /// Every kind, for [`super::road_catalogue`] to iterate when loading the
     /// fixed set of `.nbt` files it expects one of.
-    #[allow(dead_code)] // no non-test caller yet — road_catalogue is
     pub const ALL: [RoadPieceKind; 6] = [
         RoadPieceKind::Isolated,
         RoadPieceKind::DeadEnd,
@@ -237,7 +230,6 @@ impl RoadPieceKind {
 /// connections; [`RoadPieceKind::Isolated`]/[`RoadPieceKind::Cross`] aren't
 /// here because neither has an orientation to search over (see
 /// [`select_piece`]).
-#[allow(dead_code)] // used via select_piece/matching_rotation, see the module docs
 fn canonical_pattern(kind: RoadPieceKind) -> RoadConnections {
     match kind {
         RoadPieceKind::Isolated => RoadConnections::default(),
@@ -256,7 +248,6 @@ fn canonical_pattern(kind: RoadPieceKind) -> RoadConnections {
 /// see [`select_piece`]), so this panics rather than returning `Option` if
 /// it doesn't: a mismatch here is a bug in this module's own table, not
 /// something a caller needs to handle.
-#[allow(dead_code)] // used via select_piece, see the module docs
 fn matching_rotation(canonical: RoadConnections, actual: RoadConnections) -> Rotation {
     for turns in 0..4u8 {
         if canonical.rotated(turns) == actual {
@@ -279,7 +270,6 @@ fn matching_rotation(canonical: RoadConnections, actual: RoadConnections) -> Rot
 /// [`RoadPieceKind::Isolated`] and [`RoadPieceKind::Cross`] always come back
 /// [`Rotation::Deg0`] — neither has an orientation (no neighbours, or all
 /// four) for a rotation to mean anything about.
-#[allow(dead_code)] // no non-test caller yet — F3's auto-tiling is, see the module docs
 pub fn select_piece(connections: RoadConnections) -> (RoadPieceKind, Rotation) {
     match connections.count() {
         0 => (RoadPieceKind::Isolated, Rotation::Deg0),

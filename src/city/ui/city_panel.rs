@@ -61,6 +61,7 @@ fn kind_verb(kind: WriteKind) -> &'static str {
         WriteKind::Placed => "Placed",
         WriteKind::Demolished => "Demolished",
         WriteKind::Undo => "Undid",
+        WriteKind::Road => "Built",
     }
 }
 

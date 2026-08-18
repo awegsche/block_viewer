@@ -38,6 +38,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use bevy::math::IVec3;
+use bevy::prelude::Resource;
 
 use crate::blueprint::{read_structure_file, Blueprint, StructureReadError, STRUCTURE_BLOCK_MAX_SIZE};
 
@@ -45,7 +46,6 @@ use super::road::RoadPieceKind;
 use super::state::ROAD_CELL_SIZE;
 
 /// Why a road piece file didn't become a catalogue entry.
-#[allow(dead_code)] // no non-test caller yet — see the module docs' "No real assets yet"
 #[derive(Debug)]
 pub enum RoadCatalogueError {
     /// No file exists at the expected path — see [`filename_for`].
@@ -92,12 +92,15 @@ fn filename_for(kind: RoadPieceKind) -> &'static str {
 
 /// Every loaded road piece, keyed by kind — [`super::road::select_piece`]'s
 /// own output is exactly this catalogue's key.
-#[allow(dead_code)] // no non-test caller yet — see the module docs' "No real assets yet"
+///
+/// `Resource` (ticket 055): `city::run` inserts this the same way it inserts
+/// `BuildingCatalogue`, and `city::road_build` reads it via
+/// `Option<Res<RoadCatalogue>>`.
+#[derive(Resource)]
 pub struct RoadCatalogue {
     pieces: HashMap<RoadPieceKind, Blueprint>,
 }
 
-#[allow(dead_code)] // no non-test caller yet — see the module docs' "No real assets yet"
 impl RoadCatalogue {
     pub fn get(&self, kind: RoadPieceKind) -> Option<&Blueprint> {
         self.pieces.get(&kind)
@@ -107,6 +110,7 @@ impl RoadCatalogue {
         self.pieces.len()
     }
 
+    #[allow(dead_code)] // no non-test caller yet — mirrors `BuildingCatalogue::is_empty`
     pub fn is_empty(&self) -> bool {
         self.pieces.is_empty()
     }
@@ -148,7 +152,6 @@ fn load_piece(dir: &Path, kind: RoadPieceKind) -> Result<Blueprint, RoadCatalogu
 /// absent from the returned catalogue, reported in the second return value —
 /// the same per-file tolerance [`crate::blueprint::load_catalogue_dir`]
 /// gives buildings.
-#[allow(dead_code)] // no non-test caller yet — see the module docs' "No real assets yet"
 pub fn load_road_catalogue_dir(dir: &Path) -> (RoadCatalogue, Vec<(RoadPieceKind, RoadCatalogueError)>) {
     let mut pieces = HashMap::new();
     let mut skipped = Vec::new();

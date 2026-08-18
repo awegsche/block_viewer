@@ -90,6 +90,7 @@ use super::journal::{self, Journal};
 use super::picking::{HoveredBlock, PickingSet};
 use super::placement::{self, GhostPlacement, PlacementSelection};
 use super::state::{self, BuildingId, PlacedBuilding};
+use super::tool::ActiveTool;
 use super::write_status::{WriteKind, WriteStatus};
 
 /// A commit's write, in flight — see the module docs.
@@ -138,7 +139,12 @@ impl Plugin for CommitPlugin {
 /// responsible for it already being wherever the rotated blueprint should
 /// sit ([`placement::resolve_placement`]'s `origin`, not the raw hovered
 /// block).
-fn blueprint_edit(blueprint: &Blueprint, origin: IVec3) -> WorldEdit {
+///
+/// `pub(super)`: `city::road_build` (ticket 055, roadmap F2/F3) reuses this
+/// verbatim for a road piece's own blueprint — building a `WorldEdit` from a
+/// rotated blueprint at an origin doesn't care whether the blueprint is a
+/// building or a road piece.
+pub(super) fn blueprint_edit(blueprint: &Blueprint, origin: IVec3) -> WorldEdit {
     let (sx, sy, sz) = (blueprint.size.x, blueprint.size.y, blueprint.size.z);
     let mut edit = WorldEdit::new().with_data_version(blueprint.data_version);
 
@@ -181,7 +187,16 @@ fn try_commit_placement(
     mut city: ResMut<state::City>,
     mut commit: ResMut<CommitState>,
     region_cache: Option<Res<SharedRegionCache>>,
+    tool: Option<Res<ActiveTool>>,
 ) {
+    // Ticket 055, roadmap F2: a left click while the road tool is active is
+    // `city::road_build`'s to react to, not this. `Option` and a default of
+    // `Building` — see `tool`'s module docs — so a minimal test `App` that
+    // never adds `tool::ToolPlugin` keeps committing exactly as it did before
+    // this ticket.
+    if !matches!(tool.as_deref(), None | Some(ActiveTool::Building)) {
+        return;
+    }
     if commit.pending.is_some() || egui_input.pointer || !mouse.just_pressed(MouseButton::Left) {
         return;
     }

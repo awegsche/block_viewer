@@ -194,9 +194,11 @@ mod persistence;
 mod picking;
 mod placement;
 mod road;
+mod road_build;
 mod road_catalogue;
 mod save;
 mod state;
+mod tool;
 mod ui;
 mod undo;
 mod write_status;
@@ -221,6 +223,11 @@ const CATALOGUE_DIR: &str = "assets/city/blueprints";
 /// directory the roadmap's C1 sketch implies alongside `CATALOGUE_DIR`.
 const DEFINITIONS_DIR: &str = "assets/city/buildings";
 
+/// Where [`run`] looks for road pieces (ticket 054/055, roadmap F1/F3) — the
+/// fixed six-file directory [`road_catalogue::load_road_catalogue_dir`]
+/// expects.
+const ROAD_CATALOGUE_DIR: &str = "assets/city/roads";
+
 /// Where [`save_city`](persistence::save_city)/[`load_city`](persistence::load_city)
 /// look, relative to a save's root — `None` when [`world_app`]'s
 /// [`LoadedSave`] is ticket 008's placeholder (`empty_save`, `meta.path`
@@ -233,6 +240,7 @@ struct CitySavePath(Option<PathBuf>);
 pub fn run() {
     let catalogue = load_building_catalogue();
     let definitions = load_building_definitions(&catalogue);
+    let road_catalogue = load_road_catalogue();
 
     let mut app = world_app();
     let save_root = app.world().resource::<LoadedSave>().0.meta.path.clone();
@@ -245,13 +253,16 @@ pub fn run() {
         .insert_resource(CameraStartMode(CameraMode::Rts))
         .insert_resource(catalogue)
         .insert_resource(definitions)
+        .insert_resource(road_catalogue)
         .insert_resource(city)
         .insert_resource(journal)
         .insert_resource(CitySavePath(if save_root.as_os_str().is_empty() { None } else { Some(save_root) }))
+        .add_plugins(tool::ToolPlugin)
         .add_plugins(picking::PickingPlugin)
         .add_plugins(placement::PlacementPlugin)
         .add_plugins(commit::CommitPlugin)
         .add_plugins(demolish::DemolishPlugin)
+        .add_plugins(road_build::RoadBuildPlugin)
         .add_plugins(undo::UndoPlugin)
         .add_plugins(save::SavePlugin)
         .add_plugins(ui::UiPlugin)
@@ -447,4 +458,27 @@ fn load_building_definitions(catalogue: &blueprint::BuildingCatalogue) -> defini
     }
 
     definitions
+}
+
+/// Loads and logs the road piece catalogue (ticket 054/055, roadmap F1/F3),
+/// same shape as [`load_building_catalogue`] —
+/// [`road_catalogue::load_road_catalogue_dir`] never panics either, so
+/// there's no error path to propagate, only one to print. Missing pieces are
+/// expected today (see that module's own "No real assets yet") — `run`
+/// always inserts whatever loaded, even an entirely empty catalogue, so
+/// `road_build` can read it unconditionally rather than through a second
+/// `Option`.
+fn load_road_catalogue() -> road_catalogue::RoadCatalogue {
+    let (catalogue, skipped) = road_catalogue::load_road_catalogue_dir(Path::new(ROAD_CATALOGUE_DIR));
+
+    println!(
+        "block_viewer: loaded {} road piece{} from {ROAD_CATALOGUE_DIR}",
+        catalogue.len(),
+        if catalogue.len() == 1 { "" } else { "s" }
+    );
+    for (kind, err) in &skipped {
+        println!("block_viewer:   skipped {kind:?}: {err}");
+    }
+
+    catalogue
 }

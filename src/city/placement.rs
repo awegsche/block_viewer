@@ -77,6 +77,7 @@ use crate::DecodedWorld;
 use super::grid::{self, FootprintFit};
 use super::picking::{HoveredBlock, PickingSet};
 use super::state;
+use super::tool::ActiveTool;
 
 /// What building is selected to place, at what rotation, and how far its
 /// height has been nudged from the terrain's own auto-fit — see the module
@@ -385,6 +386,15 @@ fn ghost_transform(origin: IVec3) -> Transform {
 /// a validity-tinted material, and a transform otherwise. Kept separate
 /// from [`update_ghost_preview`] so it's callable from a test with plain
 /// `Assets`, no `App`/`Commands`/`Query` involved.
+///
+/// `tool` (ticket 055, roadmap F2/F3): `Hidden` outright when it isn't
+/// [`ActiveTool::Building`] — `city::road_build` owns the preview while the
+/// road tool is active, and the two must never both draw at once. A plain
+/// value, not a resource: [`update_ghost_preview`] is the one place that
+/// reads [`ActiveTool`] off the world (defaulting to `Building` when the
+/// resource is absent — see [`super::tool`]'s module docs), so every other
+/// caller of this function, tests included, stays explicit about which tool
+/// it's asking about.
 #[allow(clippy::too_many_arguments)]
 fn resolve_ghost(
     ghost: &mut GhostState,
@@ -398,7 +408,11 @@ fn resolve_ghost(
     terrain_material: &Handle<StandardMaterial>,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
+    tool: ActiveTool,
 ) -> GhostUpdate {
+    if tool != ActiveTool::Building {
+        return GhostUpdate::Hidden;
+    }
     let Some(id) = selection.catalogue_id.as_deref() else { return GhostUpdate::Hidden };
     let Some(catalogue) = catalogue else { return GhostUpdate::Hidden };
     let Some(entry) = catalogue.get(id) else { return GhostUpdate::Hidden };
@@ -475,6 +489,7 @@ fn update_ghost_preview(
     atlas: Option<Res<SharedAtlasIndex>>,
     color_maps: Option<Res<SharedColorMaps>>,
     terrain_material: Option<Res<TerrainMaterial>>,
+    tool: Option<Res<ActiveTool>>,
     mut ghost: ResMut<GhostState>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
@@ -497,6 +512,7 @@ fn update_ghost_preview(
         &terrain_material.0,
         &mut meshes,
         &mut materials,
+        tool.map(|t| *t).unwrap_or_default(),
     );
     apply_ghost_update(update, &mut commands, &mut ghost, &mut query);
 }
@@ -738,6 +754,7 @@ mod tests {
             &terrain_material,
             &mut meshes,
             &mut materials,
+            ActiveTool::Building,
         );
         assert!(matches!(update, GhostUpdate::Hidden));
         std::fs::remove_dir_all(&dir).ok();
@@ -758,6 +775,40 @@ mod tests {
 
         let update = resolve_ghost(
             &mut ghost, &selection, Some(&catalogue), None, &world, &maps, &city, &atlas, &terrain_material, &mut meshes, &mut materials,
+            ActiveTool::Building,
+        );
+        assert!(matches!(update, GhostUpdate::Hidden));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resolve_ghost_is_hidden_while_the_road_tool_is_active() {
+        // Ticket 055, roadmap F2/F3: the two tools' previews must never both
+        // draw at once — `city::road_build` owns the preview here.
+        let mut ghost = GhostState::default();
+        let selection = PlacementSelection { catalogue_id: Some("house01".to_string()), rotation: Rotation::Deg0, y_offset: 0 };
+        let dir = temp_dir("hidden_road_tool");
+        let catalogue = catalogue_with(&dir, &[("house01", IVec3::new(2, 2, 2))]);
+        let world = flat_world(63);
+        let (atlas, maps) = atlas_and_maps();
+        let city = state::City::default();
+        let mut meshes = Assets::<Mesh>::default();
+        let mut materials = Assets::<StandardMaterial>::default();
+        let terrain_material = materials.add(StandardMaterial::default());
+
+        let update = resolve_ghost(
+            &mut ghost,
+            &selection,
+            Some(&catalogue),
+            Some(IVec3::new(2, 63, 2)),
+            &world,
+            &maps,
+            &city,
+            &atlas,
+            &terrain_material,
+            &mut meshes,
+            &mut materials,
+            ActiveTool::Road,
         );
         assert!(matches!(update, GhostUpdate::Hidden));
         std::fs::remove_dir_all(&dir).ok();
@@ -788,6 +839,7 @@ mod tests {
             &terrain_material,
             &mut meshes,
             &mut materials,
+            ActiveTool::Building,
         );
         let GhostUpdate::Shown { material, .. } = update else { panic!("expected a ghost to be shown") };
         assert_eq!(material, ghost.materials.as_ref().unwrap().valid);
@@ -819,6 +871,7 @@ mod tests {
             &terrain_material,
             &mut meshes,
             &mut materials,
+            ActiveTool::Building,
         );
         let GhostUpdate::Shown { material, .. } = update else { panic!("expected a ghost to be shown") };
         assert_eq!(material, ghost.materials.as_ref().unwrap().invalid);

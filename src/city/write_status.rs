@@ -41,6 +41,11 @@ pub(super) enum WriteKind {
     /// journal entry comes out of it either way), so it gets a third label
     /// rather than borrowing one of the two above.
     Undo,
+    /// `city::road_build` (ticket 055, roadmap F2/F3) committing a drag —
+    /// not `Placed`, since a road commit's `building` field names no
+    /// `BuildingCatalogue`/`BuildingDefinitions` entry at all (see
+    /// [`WriteRecord::building`]'s doc comment).
+    Road,
 }
 
 /// What a successful edit actually applied to the region cache, trimmed to
@@ -54,6 +59,9 @@ pub(super) struct WriteRecord {
     /// The building's definition id — `PlacedBuilding::definition`, not a
     /// display name (the panel doesn't have `BuildingDefinitions` to hand at
     /// every call site that might record one; the id is enough to read).
+    /// For [`WriteKind::Road`] (ticket 055): a short description of the
+    /// drag (`"N road cell(s)"`) rather than an id — a road commit names no
+    /// single catalogue entry.
     pub(super) building: String,
     pub(super) blocks: usize,
     pub(super) chunks: usize,

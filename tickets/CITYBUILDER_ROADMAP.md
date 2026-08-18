@@ -2,7 +2,7 @@
 
 Not a work item; the plan for the citybuilder game and the shared world-edit
 infrastructure it needs. High-level tasks here get split into numbered
-tickets in this directory when they're picked up (next free number: 055).
+tickets in this directory when they're picked up (next free number: 056).
 Companion to `ROADMAP.md`, which covers the viewer 001–029.
 
 ## The goal
@@ -135,13 +135,17 @@ L1  lib.rs + two bin shims                       <- DONE (ticket 027)
                |    E2  grid + footprint fit        <- DONE (053, revised 054)
                |         <- DONE (ticket 046)   F1b road cells + piece
                |    E3  ghost + validity           selection <- DONE (054)
-               |         <- DONE (ticket 047)   F2  drag-to-build routing
-               |    E4  commit                 F3  auto-tiling the pieces
-               |         <- DONE (ticket 048)       (selection done, ticket
-               |    E5  demolish                    054; rendering open)
-               |         <- DONE (ticket 049)   F4  connectivity queries
+               |         <- DONE (ticket 047)   F2  drag-to-build, wired to
+               |    E4  commit                      F3's mesh+write
+               |         <- DONE (ticket 048)        <- DONE (ticket 055)
+               |    E5  demolish                 F3  auto-tiling the pieces
+               |         <- DONE (ticket 049)        <- DONE (054 selection,
+               |                                      055 mesh+write; real
+               |                                      .nbt pieces still
+               |                                      absent)
+               |                                 F4  connectivity queries
                |
-               +-- G  UI: build menu, city panel
+               +-- G  UI: build menu, city panel   <- DONE (ticket 050)
                +-- H  terraforming: dig and level
                |    (H's digging is what makes R1's floor move — ticket 030)
                |
@@ -846,16 +850,44 @@ tests — same "proven, not yet used" state tickets 039/040/042 landed their
 own resources in; F2 is the first one due, and what will call `select_piece`
 and `road_catalogue::RoadCatalogue::get` to actually mesh and write a cell.
 
-**F2. Drag-to-build.** Click-drag from A to B, routed over the grid, with a
-live preview of the cells it would claim and their cost.
+**F2. Drag-to-build. — done, ticket 055.** Click-drag from A to B, routed
+over the grid, with a live preview of the cells it would claim and their
+cost.
 
-**F3. Auto-tiling.** Selection is done (ticket 054, above): each cell's
-`select_piece` answer is the kind and rotation to render, re-picked when a
-neighbour changes. What's left is wiring that to a spawned/rotated mesh
-(the same `blueprint::rotate_blueprint` + `blueprint::mesh_blueprint` path
-E3's ghost preview already uses) and to the write path (W4/W5) once F2
-gives it something to place. Slopes are the hard part and are a legitimate
-iteration-2 deferral if they bite.
+**F3. Auto-tiling. — selection done, ticket 054; mesh+write done, ticket
+055.** Each cell's `select_piece` answer is the kind and rotation to render,
+re-picked when a neighbour changes. Wired to a spawned/rotated mesh (the same
+`blueprint::rotate_blueprint` + `blueprint::mesh_blueprint` path E3's ghost
+preview already uses) and to the write path (W4/W5) once F2 gave it
+something to place. Slopes are the hard part and remain a legitimate
+iteration-2 deferral if they bite — 055 reuses E2's `fit_footprint` as-is
+rather than relaxing or working around it.
+
+How 055 came out: `city::road_build`, gated by a new `city::tool::ActiveTool`
+(`Building | Road`, `T` to switch — `placement`'s ghost and `commit`'s click
+handler both no-op unless `Building`, so the two tools never react to the
+same input). A drag is an L-shaped `drag_path` (start's row, then end's
+column) rather than a diagonal — every consecutive cell stays a cardinal
+neighbour of the next, which `select_piece` assumes throughout. The preview
+uses a real, rotated catalogue piece where one exists and a flat translucent
+quad otherwise (no real `.nbt` road pieces exist yet — see 054's own "no real
+assets"), tinted green/red the same way E3's ghost preview is; mid-drag, a
+`connections_with_path` variant treats the rest of the current path as road
+too, so a straight run previews as a run of `Straight` pieces rather than
+disconnected dead ends. Committing validates the whole path before touching
+any of it (the same "plan before apply" shape `place_building`/
+`add_road_cell` already use, lifted to a multi-cell drag), claims every cell
+in `City` synchronously before the write starts, and batches one merged
+`WorldEdit` across every *affected* cell — the path plus any already-road
+neighbour whose own piece might now need to change (a dead end that grew a
+neighbour becomes a straight or a corner). A cell with no matching catalogue
+piece keeps its `City` entry but contributes nothing to the write — the
+state is authoritative regardless of whether there's an asset to render it
+with. A failed write rolls back only the cells *this* drag newly added, not
+a pre-existing neighbour that merely needed re-tiling. Not journaled — no
+undo or demolish for a road cell yet, only `City`'s own persistence.
+`city::run` now loads `assets/city/roads` the same way it loads the building
+catalogue (039's own shape), always inserting whatever loaded even if empty.
 
 **F4. Connectivity queries.** "Is this building on the road network", "what
 does this road segment reach". No consumer in iteration 1 — it's the
@@ -866,14 +898,31 @@ F1 exists.
 
 ## G — UI
 
-**G1. Build menu.** Catalogue grouped by tier, with locked entries visible
-but disabled and showing what unlocks them — the Anno affordance that makes
-a tier tree readable. Shows costs and production from C1 even while inert.
+**G1. Build menu. — done, ticket 050.** Catalogue grouped by tier, with
+locked entries visible but disabled and showing what unlocks them — the Anno
+affordance that makes a tier tree readable. Shows costs and production from
+C1 even while inert.
 
-**G2. City panel.** Building counts, road length, and the write status —
-last write, dirty regions, backup location. That last part matters more than
-it sounds: the user needs to know whether what they see has actually reached
-the world.
+**G2. City panel. — done, ticket 050; write/save split by 051.** Building
+counts, road length, and the write status — last write, dirty regions,
+backup location. That last part matters more than it sounds: the user needs
+to know whether what they see has actually reached the world.
+
+How it came out: `city::ui::UiPlugin`, a second `EguiPlugin` registration
+independent of the viewer's own (which carries panels this game has no use
+for, several built around `crate::selection` that `city` deliberately
+doesn't use). The build menu bridges `PlacementSelection::catalogue_id`
+(a `BuildingCatalogue` key) against `BuildingDefinitions` (tier/cost/
+production/`requires`) via a new `LoadedBuilding::catalogue_id` field, and
+defines "unlocked" for the first time in the project — a `requires` id is met
+once at least one building of that type has actually been placed in `City`,
+the smallest rule that uses data already on hand rather than inventing a
+"researched techs" resource C3's own docs say iteration 1 has no use for. The
+city panel adds a `WriteStatus` resource (recorded by `commit`/`demolish`,
+later `road_build`) and an "Undo" button through a new `city::undo` module,
+`Journal::undo_last`'s promised caller since ticket 044. See
+`finished_tickets/050-build-menu-and-city-panel.md` for the full account,
+including the manual-verification checklist it left in `../todo.md`.
 
 ---
 
