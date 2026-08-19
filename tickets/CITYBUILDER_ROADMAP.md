@@ -2,7 +2,7 @@
 
 Not a work item; the plan for the citybuilder game and the shared world-edit
 infrastructure it needs. High-level tasks here get split into numbered
-tickets in this directory when they're picked up (next free number: 060).
+tickets in this directory when they're picked up (next free number: 061).
 Companion to `ROADMAP.md`, which covers the viewer 001–029.
 
 ## The goal
@@ -611,6 +611,29 @@ the keyboard stand-in for choosing a style, the same role ticket 047's
 number keys play for buildings. `CitySave.road_cells` gained a `style`
 field, version bumped 2→3. Still no real `.nbt` pieces for any style — see
 `finished_tickets/059-multiple-road-styles.md`.
+
+**Revised by ticket 060: a road type schema.** 059's `RoadCatalogue` is
+geometry only; a style has no *properties*. `city::road_definition` adds the
+missing half, mirroring buildings' own geometry/data split
+(`blueprint::catalogue::BuildingCatalogue` vs `city::definition::BuildingDefinitions`):
+one RON file per style under `assets/city/road_types` (new directory,
+alongside `assets/city/roads` the way `assets/city/buildings` sits alongside
+`assets/city/blueprints`), carrying `name`, `travel_speed` and `capacity`.
+The filename stem **is** the style id — no separate field to name it, since
+`RoadCatalogue` is already keyed by that same name, unlike a building's
+`.ron`/`.nbt` pair which need one. Validated against the geometry catalogue
+(`RoadDefinitionError::UnknownStyle` for a type file naming a style with no
+`.nbt` pieces) the same way a building definition's `blueprint` reference is
+checked. **Schema only, inert** — per the user's own framing and this
+project's C3 precedent: nothing simulates travel speed or capacity: there is
+no traffic/logistics system anywhere in this codebase to hang a real
+simulation off, and building one is a project of its own. `city::run()`
+loads and logs a `RoadTypes` resource the same way it does
+`BuildingDefinitions`; `RoadStyleSelection`'s `[`/`]` cycle keeps reading
+geometry (`RoadCatalogue::styles()`), not this — placing a road only needs
+its shape, not its (still-unused) numbers. No consumer yet — same
+"proven, not yet used" state every other data-only resource in this crate
+has landed in. See `finished_tickets/060-road-type-schema.md`.
 
 **F2. Drag-to-build. — done, ticket 055.** Click-drag from A to B, routed
 over the grid, with a live preview of the cells it would claim and their

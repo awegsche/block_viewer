@@ -227,6 +227,7 @@ mod placement;
 mod road;
 mod road_build;
 mod road_catalogue;
+mod road_definition;
 mod save;
 mod state;
 mod terraform;
@@ -255,10 +256,17 @@ const CATALOGUE_DIR: &str = "assets/city/blueprints";
 /// directory the roadmap's C1 sketch implies alongside `CATALOGUE_DIR`.
 const DEFINITIONS_DIR: &str = "assets/city/buildings";
 
-/// Where [`run`] looks for road pieces (ticket 054/055, roadmap F1/F3) — the
-/// fixed six-file directory [`road_catalogue::load_road_catalogue_dir`]
-/// expects.
+/// Where [`run`] looks for road pieces (ticket 054/055, roadmap F1/F3;
+/// styled subdirectories added by 059) — the directory
+/// [`road_catalogue::load_road_catalogue_dir`] scans for style folders.
 const ROAD_CATALOGUE_DIR: &str = "assets/city/roads";
+
+/// Where [`run`] looks for road type definitions (ticket 060, roadmap F1b/F3
+/// follow-up) — the flat, non-recursive directory
+/// [`road_definition::load_road_types_dir`] expects, alongside
+/// `ROAD_CATALOGUE_DIR` the same way `DEFINITIONS_DIR` sits alongside
+/// `CATALOGUE_DIR`.
+const ROAD_TYPES_DIR: &str = "assets/city/road_types";
 
 /// Where [`save_city`](persistence::save_city)/[`load_city`](persistence::load_city)
 /// look, relative to a save's root — `None` when [`world_app`]'s
@@ -273,6 +281,7 @@ pub fn run() {
     let catalogue = load_building_catalogue();
     let definitions = load_building_definitions(&catalogue);
     let road_catalogue = load_road_catalogue();
+    let road_types = load_road_types(&road_catalogue);
 
     let mut app = world_app();
     let save_root = app.world().resource::<LoadedSave>().0.meta.path.clone();
@@ -286,6 +295,7 @@ pub fn run() {
         .insert_resource(catalogue)
         .insert_resource(definitions)
         .insert_resource(road_catalogue)
+        .insert_resource(road_types)
         .insert_resource(city)
         .insert_resource(journal)
         .insert_resource(CitySavePath(if save_root.as_os_str().is_empty() { None } else { Some(save_root) }))
@@ -514,4 +524,31 @@ fn load_road_catalogue() -> road_catalogue::RoadCatalogue {
     }
 
     catalogue
+}
+
+/// Loads and logs road type definitions (ticket 060, roadmap F1b/F3
+/// follow-up), same shape as [`load_building_definitions`] —
+/// [`road_definition::load_road_types_dir`] never panics either, so there's
+/// no error path to propagate, only one to print. Validated against
+/// `catalogue` the same way [`load_building_definitions`] validates against
+/// the blueprint catalogue.
+fn load_road_types(catalogue: &road_catalogue::RoadCatalogue) -> road_definition::RoadTypes {
+    let (types, skipped) = road_definition::load_road_types_dir(Path::new(ROAD_TYPES_DIR), catalogue);
+
+    println!(
+        "block_viewer: loaded {} road type{} from {ROAD_TYPES_DIR}",
+        types.len(),
+        if types.len() == 1 { "" } else { "s" }
+    );
+    for entry in types.iter() {
+        println!(
+            "block_viewer:   {} — {:?} (speed {}, capacity {})",
+            entry.id, entry.road_type.name, entry.road_type.travel_speed, entry.road_type.capacity,
+        );
+    }
+    for (path, err) in &skipped {
+        println!("block_viewer:   skipped {}: {err}", path.display());
+    }
+
+    types
 }
