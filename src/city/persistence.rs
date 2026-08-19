@@ -37,6 +37,12 @@
 //! same `(i32, i32)` shape on disk, so a version-1 file would parse cleanly
 //! and silently misplace every road cell 6x if this weren't caught by the
 //! version check rather than left to guess.
+//!
+//! Bumped again to `3` by ticket 059: a road cell now remembers which style
+//! (`super::road_catalogue::RoadCatalogue`'s key) it was built as, so
+//! [`SavedRoadCell`] gained a `style` field a version-2 file's bare
+//! `(i32, i32)` tuple doesn't have — same call as the 1 -> 2 bump, refused
+//! rather than guessed at.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -49,7 +55,7 @@ use crate::blueprint::Rotation;
 
 /// The `CitySave` schema version this build writes and reads. Bumped only
 /// alongside a migration path — see the module docs.
-pub const CURRENT_VERSION: u32 = 2;
+pub const CURRENT_VERSION: u32 = 3;
 
 /// Where [`save_city`]/[`load_city`] look, relative to a save's root
 /// (`SaveMeta::path`) — the roadmap's own `<save>/citybuilder/city.ron`.
@@ -68,9 +74,9 @@ struct CitySave {
     version: u32,
     next_id: u64,
     buildings: Vec<SavedBuilding>,
-    /// Cell coordinates (ticket 054), not block tiles — see the module
-    /// docs' version-bump note.
-    road_cells: Vec<(i32, i32)>,
+    /// Cell coordinates (ticket 054), not block tiles, each carrying its own
+    /// style (ticket 059) — see the module docs' version-bump notes.
+    road_cells: Vec<SavedRoadCell>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -80,6 +86,15 @@ struct SavedBuilding {
     origin: (i32, i32, i32),
     rotation: Rotation,
     footprint: (i32, i32),
+}
+
+/// One saved road cell — cell coordinates plus the style
+/// (`super::road_catalogue::RoadCatalogue`'s key) it was built as.
+#[derive(Debug, Serialize, Deserialize)]
+struct SavedRoadCell {
+    x: i32,
+    z: i32,
+    style: String,
 }
 
 /// Why [`save_city`] or [`load_city`] failed.
@@ -140,8 +155,11 @@ pub fn save_city(city: &City, save_root: &Path) -> Result<(), PersistenceError> 
         .collect();
     buildings.sort_by_key(|b| b.id);
 
-    let mut road_cells: Vec<(i32, i32)> = city.road_cells().map(|cell| (cell.x, cell.y)).collect();
-    road_cells.sort();
+    let mut road_cells: Vec<SavedRoadCell> = city
+        .road_cells_with_styles()
+        .map(|(cell, style)| SavedRoadCell { x: cell.x, z: cell.y, style: style.to_string() })
+        .collect();
+    road_cells.sort_by_key(|cell| (cell.x, cell.z));
 
     let save = CitySave { version: CURRENT_VERSION, next_id: city.next_id_raw(), buildings, road_cells };
     // Pretty-printed: a person may want to read or hand-edit this file, the
@@ -185,9 +203,9 @@ pub fn load_city(save_root: &Path) -> Result<City, PersistenceError> {
     }
 
     let mut road_cells = save.road_cells;
-    road_cells.sort();
-    for (x, z) in road_cells {
-        city.add_road_cell(IVec2::new(x, z)).map_err(PersistenceError::Corrupt)?;
+    road_cells.sort_by_key(|cell| (cell.x, cell.z));
+    for cell in road_cells {
+        city.add_road_cell(IVec2::new(cell.x, cell.z), cell.style).map_err(PersistenceError::Corrupt)?;
     }
 
     // `insert_loaded` already raised `next_id` past every id it inserted;
@@ -246,8 +264,8 @@ mod tests {
         let b = city
             .place_building("house01", IVec3::new(0, 70, 0), Rotation::Deg90, IVec2::new(3, 5))
             .unwrap();
-        city.add_road_cell(IVec2::new(50, 50)).unwrap();
-        city.add_road_cell(IVec2::new(50, 51)).unwrap();
+        city.add_road_cell(IVec2::new(50, 50), "dirt").unwrap();
+        city.add_road_cell(IVec2::new(50, 51), "paved").unwrap();
 
         save_city(&city, &dir).unwrap();
         let loaded = load_city(&dir).unwrap();
@@ -266,6 +284,10 @@ mod tests {
 
         assert_eq!(loaded.road_cells().count(), 2);
         assert!(loaded.is_road_cell(IVec2::new(50, 50)));
+        // Ticket 059: each cell's own style round-trips too, not just its
+        // coordinate.
+        assert_eq!(loaded.road_style_at(IVec2::new(50, 50)), Some("dirt"));
+        assert_eq!(loaded.road_style_at(IVec2::new(50, 51)), Some("paved"));
     }
 
     /// The scenario the module docs call out: the *highest*-id building is
@@ -329,6 +351,23 @@ mod tests {
         assert!(matches!(err, PersistenceError::Parse(_)), "{err:?}");
     }
 
+    /// Ticket 059: a version-2 file's `road_cells` was a bare `(i32, i32)`
+    /// tuple — no `style` field. Refused the same way, not silently loaded
+    /// with every cell guessing at a style it never actually had.
+    #[test]
+    fn an_old_styleless_road_cell_save_is_refused_not_silently_defaulted() {
+        let dir = temp_dir("old_road_cell_shape");
+        fs::create_dir_all(dir.join("citybuilder")).unwrap();
+        fs::write(
+            dir.join("citybuilder/city.ron"),
+            "(version: 2, next_id: 0, buildings: [], road_cells: [(5, 5)])",
+        )
+        .unwrap();
+
+        let err = load_city(&dir).unwrap_err();
+        assert!(matches!(err, PersistenceError::Parse(_) | PersistenceError::UnsupportedVersion(2)), "{err:?}");
+    }
+
     #[test]
     fn garbage_ron_is_a_parse_error_not_a_panic() {
         let dir = temp_dir("garbage");
@@ -346,7 +385,7 @@ mod tests {
         fs::write(
             dir.join("citybuilder/city.ron"),
             r#"(
-                version: 2,
+                version: 3,
                 next_id: 2,
                 buildings: [
                     (id: 0, definition: "house01", origin: (0, 64, 0), rotation: Deg0, footprint: (4, 4)),
@@ -368,12 +407,12 @@ mod tests {
         fs::write(
             dir.join("citybuilder/city.ron"),
             r#"(
-                version: 2,
+                version: 3,
                 next_id: 1,
                 buildings: [
                     (id: 0, definition: "house01", origin: (0, 64, 0), rotation: Deg0, footprint: (2, 2)),
                 ],
-                road_cells: [(0, 0)],
+                road_cells: [(x: 0, z: 0, style: "dirt")],
             )"#,
         )
         .unwrap();

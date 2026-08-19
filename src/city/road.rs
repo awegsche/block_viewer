@@ -416,7 +416,7 @@ mod tests {
     #[test]
     fn connections_at_reports_no_neighbours_for_an_isolated_road_cell() {
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(0, 0)).unwrap();
+        city.add_road_cell(IVec2::new(0, 0), "dirt").unwrap();
 
         let connections = connections_at(&city, IVec2::new(0, 0));
         assert_eq!(connections, RoadConnections::default());
@@ -427,9 +427,9 @@ mod tests {
     fn connections_at_reports_exactly_the_road_neighbours() {
         let mut city = City::default();
         // A road cell with north and east neighbours, but not south or west.
-        city.add_road_cell(IVec2::new(0, 0)).unwrap();
-        city.add_road_cell(IVec2::new(0, -1)).unwrap(); // north
-        city.add_road_cell(IVec2::new(1, 0)).unwrap(); // east
+        city.add_road_cell(IVec2::new(0, 0), "dirt").unwrap();
+        city.add_road_cell(IVec2::new(0, -1), "dirt").unwrap(); // north
+        city.add_road_cell(IVec2::new(1, 0), "dirt").unwrap(); // east
 
         let connections = connections_at(&city, IVec2::new(0, 0));
         assert_eq!(connections, RoadConnections { north: true, south: false, east: true, west: false });
@@ -439,7 +439,7 @@ mod tests {
     #[test]
     fn connections_at_ignores_a_building_neighbour() {
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(0, 0)).unwrap();
+        city.add_road_cell(IVec2::new(0, 0), "dirt").unwrap();
         // Cell (0, -1) is north of (0, 0): block tiles -6..0 x z. Place a
         // building inside that block range so it's the road cell's north
         // neighbour, but as a building, not a road.
@@ -453,7 +453,7 @@ mod tests {
     #[test]
     fn connections_at_works_from_a_cell_that_is_not_itself_a_road() {
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(0, -1)).unwrap();
+        city.add_road_cell(IVec2::new(0, -1), "dirt").unwrap();
 
         // Asking "what would connect here" before placing anything.
         let connections = connections_at(&city, IVec2::new(0, 0));
@@ -463,9 +463,9 @@ mod tests {
     #[test]
     fn connections_at_reports_a_full_cross() {
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(0, 0)).unwrap();
+        city.add_road_cell(IVec2::new(0, 0), "dirt").unwrap();
         for offset in [IVec2::new(0, -1), IVec2::new(0, 1), IVec2::new(1, 0), IVec2::new(-1, 0)] {
-            city.add_road_cell(offset).unwrap();
+            city.add_road_cell(offset, "dirt").unwrap();
         }
 
         assert_eq!(connections_at(&city, IVec2::new(0, 0)).count(), 4);
@@ -480,7 +480,7 @@ mod tests {
     #[test]
     fn reachable_from_a_single_cell_island_is_only_itself() {
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(5, 5)).unwrap();
+        city.add_road_cell(IVec2::new(5, 5), "dirt").unwrap();
         assert_eq!(reachable_from(&city, IVec2::new(5, 5)), HashSet::from([IVec2::new(5, 5)]));
     }
 
@@ -488,7 +488,7 @@ mod tests {
     fn reachable_from_walks_a_straight_run() {
         let mut city = City::default();
         for x in 0..5 {
-            city.add_road_cell(IVec2::new(x, 0)).unwrap();
+            city.add_road_cell(IVec2::new(x, 0), "dirt").unwrap();
         }
 
         let reached = reachable_from(&city, IVec2::new(0, 0));
@@ -501,9 +501,9 @@ mod tests {
         let mut city = City::default();
         // A horizontal run with one cell branching south from the middle.
         for x in 0..3 {
-            city.add_road_cell(IVec2::new(x, 0)).unwrap();
+            city.add_road_cell(IVec2::new(x, 0), "dirt").unwrap();
         }
-        city.add_road_cell(IVec2::new(1, 1)).unwrap();
+        city.add_road_cell(IVec2::new(1, 1), "dirt").unwrap();
 
         let reached = reachable_from(&city, IVec2::new(0, 0));
         assert_eq!(
@@ -517,7 +517,7 @@ mod tests {
         let mut city = City::default();
         // A 2x2 loop of road cells.
         for cell in [IVec2::new(0, 0), IVec2::new(1, 0), IVec2::new(0, 1), IVec2::new(1, 1)] {
-            city.add_road_cell(cell).unwrap();
+            city.add_road_cell(cell, "dirt").unwrap();
         }
 
         let reached = reachable_from(&city, IVec2::new(0, 0));
@@ -527,10 +527,10 @@ mod tests {
     #[test]
     fn reachable_from_does_not_cross_to_a_disconnected_island() {
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(0, 0)).unwrap();
-        city.add_road_cell(IVec2::new(1, 0)).unwrap();
+        city.add_road_cell(IVec2::new(0, 0), "dirt").unwrap();
+        city.add_road_cell(IVec2::new(1, 0), "dirt").unwrap();
         // A second island, far away and not adjacent to the first.
-        city.add_road_cell(IVec2::new(100, 100)).unwrap();
+        city.add_road_cell(IVec2::new(100, 100), "dirt").unwrap();
 
         let reached = reachable_from(&city, IVec2::new(0, 0));
         assert_eq!(reached, HashSet::from([IVec2::new(0, 0), IVec2::new(1, 0)]));
@@ -540,7 +540,7 @@ mod tests {
     fn is_connected_is_true_within_one_island() {
         let mut city = City::default();
         for x in 0..3 {
-            city.add_road_cell(IVec2::new(x, 0)).unwrap();
+            city.add_road_cell(IVec2::new(x, 0), "dirt").unwrap();
         }
         assert!(is_connected(&city, IVec2::new(0, 0), IVec2::new(2, 0)));
     }
@@ -548,15 +548,15 @@ mod tests {
     #[test]
     fn is_connected_is_false_across_two_islands() {
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(0, 0)).unwrap();
-        city.add_road_cell(IVec2::new(100, 100)).unwrap();
+        city.add_road_cell(IVec2::new(0, 0), "dirt").unwrap();
+        city.add_road_cell(IVec2::new(100, 100), "dirt").unwrap();
         assert!(!is_connected(&city, IVec2::new(0, 0), IVec2::new(100, 100)));
     }
 
     #[test]
     fn is_connected_is_false_when_an_endpoint_is_not_a_road_cell() {
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(0, 0)).unwrap();
+        city.add_road_cell(IVec2::new(0, 0), "dirt").unwrap();
         assert!(!is_connected(&city, IVec2::new(0, 0), IVec2::new(1, 0)));
         assert!(!is_connected(&city, IVec2::new(1, 0), IVec2::new(0, 0)));
     }
@@ -566,7 +566,7 @@ mod tests {
     #[test]
     fn touching_road_cells_is_empty_for_a_building_nowhere_near_a_road() {
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(0, 0)).unwrap(); // block tiles 0..6 x 0..6
+        city.add_road_cell(IVec2::new(0, 0), "dirt").unwrap(); // block tiles 0..6 x 0..6
         let id = city
             .place_building("house01", IVec3::new(100, 64, 100), Rotation::Deg0, IVec2::new(2, 2))
             .unwrap();
@@ -578,7 +578,7 @@ mod tests {
     #[test]
     fn touching_road_cells_finds_a_cell_just_outside_the_footprint() {
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(0, 0)).unwrap(); // block tiles 0..6 x 0..6
+        city.add_road_cell(IVec2::new(0, 0), "dirt").unwrap(); // block tiles 0..6 x 0..6
         // Directly east of the road cell: x = 6..8, z = 0..2. Its west edge
         // (x = 6) neighbours x = 5, inside the road cell's tile range.
         let id = city
@@ -592,8 +592,8 @@ mod tests {
     #[test]
     fn touching_road_cells_finds_every_cell_along_a_wide_footprint() {
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(0, 0)).unwrap(); // block tiles 0..6 x 0..6
-        city.add_road_cell(IVec2::new(1, 0)).unwrap(); // block tiles 6..12 x 0..6
+        city.add_road_cell(IVec2::new(0, 0), "dirt").unwrap(); // block tiles 0..6 x 0..6
+        city.add_road_cell(IVec2::new(1, 0), "dirt").unwrap(); // block tiles 6..12 x 0..6
         // South of both cells: x = 0..12, z = 6..8. Its north edge (z = 6)
         // neighbours z = 5, spanning both road cells' x ranges.
         let id = city
@@ -615,7 +615,7 @@ mod tests {
     #[test]
     fn is_building_connected_distinguishes_touching_from_untouching() {
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(0, 0)).unwrap();
+        city.add_road_cell(IVec2::new(0, 0), "dirt").unwrap();
         let far = city
             .place_building("house01", IVec3::new(100, 64, 100), Rotation::Deg0, IVec2::new(2, 2))
             .unwrap();
@@ -633,7 +633,7 @@ mod tests {
     #[test]
     fn is_building_connected_is_true_next_to_an_isolated_road_island() {
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(0, 0)).unwrap();
+        city.add_road_cell(IVec2::new(0, 0), "dirt").unwrap();
         assert_eq!(connections_at(&city, IVec2::new(0, 0)).count(), 0, "sanity: a lone road cell");
 
         let id = city
@@ -657,8 +657,8 @@ mod tests {
     fn buildings_connected_is_true_across_a_shared_road_network() {
         let mut city = City::default();
         // A two-cell straight run: (0,0) block tiles 0..6x0..6, (1,0) 6..12x0..6.
-        city.add_road_cell(IVec2::new(0, 0)).unwrap();
-        city.add_road_cell(IVec2::new(1, 0)).unwrap();
+        city.add_road_cell(IVec2::new(0, 0), "dirt").unwrap();
+        city.add_road_cell(IVec2::new(1, 0), "dirt").unwrap();
 
         // South of cell (0,0): touches only the west cell.
         let a = city
@@ -675,8 +675,8 @@ mod tests {
     #[test]
     fn buildings_connected_is_false_across_disconnected_road_islands() {
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(0, 0)).unwrap();
-        city.add_road_cell(IVec2::new(100, 100)).unwrap();
+        city.add_road_cell(IVec2::new(0, 0), "dirt").unwrap();
+        city.add_road_cell(IVec2::new(100, 100), "dirt").unwrap();
 
         let a = city
             .place_building("house01", IVec3::new(6, 64, 0), Rotation::Deg0, IVec2::new(2, 2))
@@ -711,9 +711,9 @@ mod tests {
     fn buildings_reachable_from_finds_only_buildings_on_the_same_network() {
         let mut city = City::default();
         // Straight run (0,0)-(1,0), plus a disconnected island at (100,100).
-        city.add_road_cell(IVec2::new(0, 0)).unwrap();
-        city.add_road_cell(IVec2::new(1, 0)).unwrap();
-        city.add_road_cell(IVec2::new(100, 100)).unwrap();
+        city.add_road_cell(IVec2::new(0, 0), "dirt").unwrap();
+        city.add_road_cell(IVec2::new(1, 0), "dirt").unwrap();
+        city.add_road_cell(IVec2::new(100, 100), "dirt").unwrap();
 
         let reachable = city
             .place_building("house01", IVec3::new(6, 64, 6), Rotation::Deg0, IVec2::new(2, 2))

@@ -64,7 +64,7 @@
 //! their own `#[allow(dead_code)]` marks are that same "no caller yet"
 //! situation, not a note-worthy call each time it recurs.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use bevy::math::{IVec2, IVec3};
 use bevy::prelude::Resource;
@@ -213,13 +213,15 @@ pub fn cell_of(tile: IVec2) -> IVec2 {
 pub struct City {
     buildings: HashMap<BuildingId, PlacedBuilding>,
     next_id: u64,
-    /// Cell coordinates (ticket 054) — not block tiles. `occupancy` still
+    /// Cell coordinates (ticket 054) — not block tiles, keyed to the style
+    /// id (ticket 059) the cell was built as — `assets/city/roads/<style>`,
+    /// `super::road_catalogue::RoadCatalogue`'s own key. `occupancy` still
     /// holds a block-tile [`Occupant::Road`] for every one of a cell's 36
     /// tiles, kept in lockstep by [`add_road_cell`](Self::add_road_cell)/
-    /// [`remove_road_cell`](Self::remove_road_cell); this set is the source
-    /// of truth for "is this cell a road," the way `buildings` is for
-    /// buildings.
-    road_cells: HashSet<IVec2>,
+    /// [`remove_road_cell`](Self::remove_road_cell); this map is the source
+    /// of truth for "is this cell a road, and which style," the way
+    /// `buildings` is for buildings.
+    road_cells: HashMap<IVec2, String>,
     occupancy: HashMap<IVec2, Occupant>,
 }
 
@@ -337,14 +339,18 @@ impl City {
     }
 
     /// Marks `cell` (cell coordinates, ticket 054 — see [`ROAD_CELL_SIZE`])
-    /// as a road, occupying all 36 block tiles [`road_cell_tiles`] lists for
-    /// it. Idempotent if `cell` is already a road; all-or-nothing and
-    /// refused if *any* of those 36 tiles are held by a building or another
-    /// road cell — the same "plan every tile before marking any of them"
-    /// shape [`place_building`](Self::place_building) uses, so a refused
-    /// road cell never leaves a partial one behind.
-    pub fn add_road_cell(&mut self, cell: IVec2) -> Result<(), PlacementError> {
-        if self.road_cells.contains(&cell) {
+    /// as a road built in `style` (ticket 059 —
+    /// `super::road_catalogue::RoadCatalogue`'s own key), occupying all 36
+    /// block tiles [`road_cell_tiles`] lists for it. Idempotent if `cell` is
+    /// already a road — `style` is ignored in that case and the cell's
+    /// *existing* style is kept; repainting a road cell to a different style
+    /// is out of scope here (a demolish-and-rebuild away, for now). Refused,
+    /// all-or-nothing, if *any* of the 36 tiles a *new* cell would claim are
+    /// held by a building or another road cell — the same "plan every tile
+    /// before marking any of them" shape [`place_building`](Self::place_building)
+    /// uses, so a refused road cell never leaves a partial one behind.
+    pub fn add_road_cell(&mut self, cell: IVec2, style: impl Into<String>) -> Result<(), PlacementError> {
+        if self.road_cells.contains_key(&cell) {
             return Ok(());
         }
 
@@ -358,7 +364,7 @@ impl City {
         for &tile in &tiles {
             self.occupancy.insert(tile, Occupant::Road);
         }
-        self.road_cells.insert(cell);
+        self.road_cells.insert(cell, style.into());
         Ok(())
     }
 
@@ -366,7 +372,7 @@ impl City {
     /// whether `cell` was actually a road cell beforehand.
     #[allow(dead_code)] // no caller yet — see the module docs
     pub fn remove_road_cell(&mut self, cell: IVec2) -> bool {
-        if self.road_cells.remove(&cell) {
+        if self.road_cells.remove(&cell).is_some() {
             for tile in road_cell_tiles(cell) {
                 self.occupancy.remove(&tile);
             }
@@ -376,15 +382,36 @@ impl City {
         }
     }
 
+    /// Cell coordinates only — every currently-placed road cell, regardless
+    /// of style. [`road_cells_with_styles`](Self::road_cells_with_styles) is
+    /// the counterpart that also names each cell's style; most callers (a
+    /// count for the city panel, `city::road`'s connectivity queries) only
+    /// ever wanted "is this a road cell," so this stays the cheaper, more
+    /// common shape rather than making every caller unpack a tuple it
+    /// doesn't need.
     pub fn road_cells(&self) -> impl Iterator<Item = &IVec2> {
-        self.road_cells.iter()
+        self.road_cells.keys()
+    }
+
+    /// Every currently-placed road cell alongside the style it was built
+    /// as — [`super::persistence::save_city`]'s own iteration order, and
+    /// what [`super::road_build::road_write_edit`] reads per affected cell
+    /// once a commit already recorded it here.
+    pub fn road_cells_with_styles(&self) -> impl Iterator<Item = (&IVec2, &str)> {
+        self.road_cells.iter().map(|(cell, style)| (cell, style.as_str()))
+    }
+
+    /// The style `cell` was built as, if it's a road cell at all — `None`
+    /// for a cell that isn't road, never an empty string.
+    pub fn road_style_at(&self, cell: IVec2) -> Option<&str> {
+        self.road_cells.get(&cell).map(String::as_str)
     }
 
     /// Whether `cell` is a road cell — [`city::road`](super::road)'s own
     /// adjacency queries go through this rather than re-deriving it from
     /// [`occupant_at`](Self::occupant_at) at one of the cell's 36 tiles.
     pub fn is_road_cell(&self, cell: IVec2) -> bool {
-        self.road_cells.contains(&cell)
+        self.road_cells.contains_key(&cell)
     }
 
     pub fn is_tile_free(&self, tile: IVec2) -> bool {
@@ -414,6 +441,8 @@ impl City {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
 
     #[test]
@@ -483,7 +512,7 @@ mod tests {
     #[test]
     fn placing_a_road_cell_occupies_exactly_its_36_tiles() {
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(1, 2)).unwrap();
+        city.add_road_cell(IVec2::new(1, 2), "dirt").unwrap();
 
         for x in 6..12 {
             for z in 12..18 {
@@ -506,14 +535,14 @@ mod tests {
 
         // Cell (0, 0) covers block tiles 0..6 x 0..6, which overlaps the
         // building's 2x2 footprint at its very first checked tile.
-        let err = city.add_road_cell(IVec2::new(0, 0)).unwrap_err();
+        let err = city.add_road_cell(IVec2::new(0, 0), "dirt").unwrap_err();
         assert!(matches!(
             err,
             PlacementError::TileOccupied { tile, by: Occupant::Building(id) }
                 if tile == IVec2::new(0, 0) && id == building_id
         ));
 
-        city.add_road_cell(IVec2::new(5, 5)).expect("an empty cell should accept a road");
+        city.add_road_cell(IVec2::new(5, 5), "dirt").expect("an empty cell should accept a road");
         // Cell (5, 5) covers block tiles 30..36 x 30..36.
         let err = city
             .place_building("house01", IVec3::new(30, 64, 30), Rotation::Deg0, IVec2::new(1, 1))
@@ -527,9 +556,50 @@ mod tests {
     #[test]
     fn adding_the_same_road_cell_twice_is_a_no_op() {
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(1, 1)).unwrap();
-        city.add_road_cell(IVec2::new(1, 1)).expect("re-adding the same road cell should succeed");
+        city.add_road_cell(IVec2::new(1, 1), "dirt").unwrap();
+        city.add_road_cell(IVec2::new(1, 1), "dirt").expect("re-adding the same road cell should succeed");
         assert_eq!(city.road_cells().count(), 1);
+    }
+
+    // -- road cell style (ticket 059) ----------------------------------------
+
+    #[test]
+    fn road_style_at_reports_the_style_a_cell_was_built_as() {
+        let mut city = City::default();
+        city.add_road_cell(IVec2::new(0, 0), "paved").unwrap();
+        assert_eq!(city.road_style_at(IVec2::new(0, 0)), Some("paved"));
+    }
+
+    #[test]
+    fn road_style_at_is_none_for_a_tile_that_is_not_a_road_cell() {
+        let city = City::default();
+        assert_eq!(city.road_style_at(IVec2::new(0, 0)), None);
+    }
+
+    /// Re-adding an already-road cell is a no-op (per its own doc comment)
+    /// — a second `add_road_cell` call with a *different* style must not
+    /// silently repaint it. Changing a cell's style is out of scope for
+    /// ticket 059; see `add_road_cell`'s docs.
+    #[test]
+    fn re_adding_an_existing_road_cell_keeps_its_original_style() {
+        let mut city = City::default();
+        city.add_road_cell(IVec2::new(0, 0), "dirt").unwrap();
+        city.add_road_cell(IVec2::new(0, 0), "paved").unwrap();
+        assert_eq!(city.road_style_at(IVec2::new(0, 0)), Some("dirt"));
+    }
+
+    #[test]
+    fn road_cells_with_styles_iterates_every_cell_and_its_style() {
+        let mut city = City::default();
+        city.add_road_cell(IVec2::new(0, 0), "dirt").unwrap();
+        city.add_road_cell(IVec2::new(5, 5), "paved").unwrap();
+
+        let found: HashSet<(IVec2, String)> =
+            city.road_cells_with_styles().map(|(&cell, style)| (cell, style.to_string())).collect();
+        assert_eq!(
+            found,
+            HashSet::from([(IVec2::new(0, 0), "dirt".to_string()), (IVec2::new(5, 5), "paved".to_string())])
+        );
     }
 
     #[test]
@@ -561,14 +631,14 @@ mod tests {
     fn remove_road_cell_reports_whether_a_cell_was_actually_a_road() {
         let mut city = City::default();
         assert!(!city.remove_road_cell(IVec2::new(0, 0)), "never added");
-        city.add_road_cell(IVec2::new(0, 0)).unwrap();
+        city.add_road_cell(IVec2::new(0, 0), "dirt").unwrap();
         assert!(city.remove_road_cell(IVec2::new(0, 0)));
         assert!(city.is_tile_free(IVec2::new(0, 0)));
         assert!(!city.is_road_cell(IVec2::new(0, 0)));
 
         // Removing frees every one of the cell's 36 tiles, not just its
         // corner.
-        city.add_road_cell(IVec2::new(0, 0)).unwrap();
+        city.add_road_cell(IVec2::new(0, 0), "dirt").unwrap();
         city.remove_road_cell(IVec2::new(0, 0));
         for x in 0..6 {
             for z in 0..6 {
@@ -602,8 +672,8 @@ mod tests {
         let mut city = City::default();
         let a = city.place_building("house01", IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::ONE).unwrap();
         let b = city.place_building("house01", IVec3::new(5, 64, 5), Rotation::Deg0, IVec2::ONE).unwrap();
-        city.add_road_cell(IVec2::new(2, 2)).unwrap();
-        city.add_road_cell(IVec2::new(2, 3)).unwrap();
+        city.add_road_cell(IVec2::new(2, 2), "dirt").unwrap();
+        city.add_road_cell(IVec2::new(2, 3), "dirt").unwrap();
 
         let ids: HashSet<BuildingId> = city.buildings().map(|(id, _)| id).collect();
         assert_eq!(ids, HashSet::from([a, b]));

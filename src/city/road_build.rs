@@ -31,17 +31,40 @@
 //! throughout; a diagonal "path" would need pieces this catalogue doesn't
 //! have.
 //!
+//! ## Which style: `[`/`]`, auto-picking the first loaded one (ticket 059)
+//!
+//! [`super::road_catalogue::RoadCatalogue`] can hold more than one road
+//! style side by side (`assets/city/roads/<style>/...`), so *placing* a road
+//! cell needs to say which one — the same "no build menu yet" gap ticket 047
+//! filled for buildings with [`super::placement::PlacementSelection`].
+//! [`RoadStyleSelection`] is that stand-in here: `[`/`]` cycle through
+//! [`super::road_catalogue::RoadCatalogue::styles`] (sorted, so the order is
+//! stable), gated on [`super::tool::ActiveTool::Road`] being active — unlike
+//! the building keys, these are new and unused elsewhere, so there's no
+//! reason not to keep them scoped to the tool they mean something for. The
+//! first loaded style is auto-selected the moment the catalogue has one, so
+//! a single-style setup needs no keypress at all.
+//!
+//! A road cell's style, once placed, lives on [`super::state::City`] itself
+//! (`add_road_cell`'s own `style` argument, `City::road_style_at`) — not
+//! carried around separately — so [`road_write_edit`] and the preview both
+//! read a *placed* cell's style back off `City` rather than needing it
+//! threaded through as a parameter. [`RoadStyleSelection::current`] only
+//! matters for a cell that's brand new to the current drag and has no
+//! recorded style yet.
+//!
 //! ## The preview: a real piece where one exists, a flat quad otherwise
 //!
-//! [`resolve_piece`] mirrors [`super::road::select_piece`], but against a
-//! *hypothetical* connectivity that treats every other cell in the current
-//! drag path as road too — so a straight run previews as a run of
+//! [`road::select_piece`] decides shape against a *hypothetical*
+//! connectivity that treats every other cell in the current drag path as
+//! road too — so a straight run previews as a run of
 //! [`super::road::RoadPieceKind::Straight`] pieces while the drag is still in
 //! progress, not six disconnected dead ends. When [`super::road_catalogue::RoadCatalogue`]
-//! actually has a piece for the resolved kind, [`preview_mesh`] meshes it the
-//! same way ticket 047's `placement::ghost_mesh` meshes a building — rotated,
-//! cached by `(RoadPieceKind, Rotation)` (six kinds, four rotations: at most
-//! 24 entries, no eviction needed). No real `.nbt` road pieces ship yet (see
+//! actually has a piece for the resolved `(style, kind)`, [`preview_mesh`]
+//! meshes it the same way ticket 047's `placement::ghost_mesh` meshes a
+//! building — rotated, cached by `(style, RoadPieceKind, Rotation)` (a
+//! handful of styles times six kinds times four rotations: small, no
+//! eviction needed). No real `.nbt` road pieces ship yet for any style (see
 //! ticket 054's own "no real assets yet"), so in practice every cell falls
 //! back to [`quad_mesh`]: one flat, unrotated plane per cell, tinted the same
 //! green/red [`super::placement`] uses — proof the drag mechanic and its
@@ -120,6 +143,54 @@ struct RoadDragState {
     start: Option<IVec2>,
 }
 
+/// Which road style (ticket 059) new cells get built as — the road tool's
+/// counterpart of `city::placement::PlacementSelection::catalogue_id`. See
+/// the module docs' "Which style". `pub(super)` so `city::ui`'s eventual
+/// style picker (mirroring the build menu's role for
+/// `PlacementSelection`) can read/set it without this whole module needing
+/// to be `pub`.
+#[derive(Resource, Default)]
+pub(super) struct RoadStyleSelection {
+    pub(super) current: Option<String>,
+}
+
+/// `[`/`]` cycle [`RoadStyleSelection::current`] through
+/// [`RoadCatalogue::styles`], and auto-pick the first one the moment the
+/// catalogue has any and nothing is selected yet — see the module docs.
+/// Gated on [`ActiveTool::Road`] (unlike `placement::cycle_selection`'s
+/// number keys, which react regardless of tool): these are new keys with no
+/// meaning outside the road tool, so there's nothing lost by scoping them.
+fn cycle_road_style(
+    keys: Res<ButtonInput<KeyCode>>,
+    egui_input: Res<camera::EguiInputCapture>,
+    tool: Option<Res<ActiveTool>>,
+    catalogue: Option<Res<RoadCatalogue>>,
+    mut selection: ResMut<RoadStyleSelection>,
+) {
+    if egui_input.keyboard || !matches!(tool.as_deref(), Some(ActiveTool::Road)) {
+        return;
+    }
+    let Some(catalogue) = catalogue else { return };
+    let styles = catalogue.styles();
+    if styles.is_empty() {
+        return;
+    }
+
+    if selection.current.is_none() {
+        selection.current = Some(styles[0].to_string());
+    }
+
+    let forward = keys.just_pressed(KeyCode::BracketRight);
+    let backward = keys.just_pressed(KeyCode::BracketLeft);
+    if !forward && !backward {
+        return;
+    }
+
+    let current_index = selection.current.as_deref().and_then(|current| styles.iter().position(|&s| s == current)).unwrap_or(0);
+    let next_index = if forward { (current_index + 1) % styles.len() } else { (current_index + styles.len() - 1) % styles.len() };
+    selection.current = Some(styles[next_index].to_string());
+}
+
 /// A committed drag's write, in flight — the road-cell counterpart of
 /// `city::commit::PendingCommit`.
 struct PendingRoadBuild {
@@ -148,7 +219,7 @@ struct RoadPreviewState {
     entities: Vec<Entity>,
     quad_mesh: Option<Handle<Mesh>>,
     materials: Option<PreviewMaterials>,
-    piece_meshes: HashMap<(RoadPieceKind, Rotation), Option<Handle<Mesh>>>,
+    piece_meshes: HashMap<(String, RoadPieceKind, Rotation), Option<Handle<Mesh>>>,
 }
 
 /// The two translucent preview materials — a separate pair from
@@ -173,15 +244,20 @@ impl Plugin for RoadBuildPlugin {
         app.init_resource::<RoadDragState>()
             .init_resource::<RoadBuildState>()
             .init_resource::<RoadPreviewState>()
+            .init_resource::<RoadStyleSelection>()
             // Same idempotent-either-order shape `city::commit`/`city::demolish`
             // already document for this resource.
             .init_resource::<WriteStatus>()
             .add_event::<ChunksEdited>()
             // After `PickingSet`, same reason every other per-frame reader of
-            // `HoveredBlock` orders there.
+            // `HoveredBlock` orders there. `cycle_road_style` first, so a
+            // `[`/`]` press this frame is reflected in this same frame's
+            // preview and commit.
             .add_systems(
                 Update,
-                (update_drag_state, update_drag_preview, try_commit_drag, poll_road_build).chain().after(PickingSet),
+                (cycle_road_style, update_drag_state, update_drag_preview, try_commit_drag, poll_road_build)
+                    .chain()
+                    .after(PickingSet),
             );
     }
 }
@@ -285,6 +361,15 @@ fn connections_with_path(city: &City, path: &[IVec2], cell: IVec2) -> RoadConnec
     }
 }
 
+/// The style to preview or write `cell` at (ticket 059): its own recorded
+/// style if `city` already has it as a road cell, or `selected` (the
+/// currently-picked [`RoadStyleSelection::current`]) if it's new to this
+/// drag. `None` only when `cell` is new *and* nothing is selected — see the
+/// module docs' "Which style".
+fn style_for_cell<'a>(cell: IVec2, city: &'a City, selected: Option<&'a str>) -> Option<&'a str> {
+    city.road_style_at(cell).or(selected)
+}
+
 /// Every cell a commit needs to (re)render/(re)write: `path` itself, plus any
 /// of their cardinal neighbours that are *already* road cells in `city` — a
 /// pre-existing dead end that just grew a neighbour may need to become a
@@ -375,13 +460,16 @@ fn plains_biome_colors(world: &DecodedWorld, maps: &world::ColorMaps) -> BiomeCo
     table.get(world::BiomeRegistry::PLAINS.0 as usize).copied().unwrap_or_else(white_biome)
 }
 
-/// Resolves (and caches) the preview mesh for `(kind, rotation)`: the real
-/// piece from `catalogue`, meshed via B2/B3's own path, if one has loaded —
-/// [`quad_mesh`] otherwise. The quad itself is cached once, not per kind —
-/// every kind's fallback is the same flat square.
+/// Resolves (and caches) the preview mesh for `(style, kind, rotation)`: the
+/// real piece from `catalogue`, meshed via B2/B3's own path, if one has
+/// loaded — [`quad_mesh`] otherwise (including when `style` is `None`: a
+/// cell new to this drag with nothing selected yet still needs *some*
+/// preview). The quad itself is cached once, not per style/kind — every
+/// fallback is the same flat square.
 #[allow(clippy::too_many_arguments)]
 fn preview_mesh(
     preview: &mut RoadPreviewState,
+    style: Option<&str>,
     kind: RoadPieceKind,
     rotation: Rotation,
     catalogue: Option<&RoadCatalogue>,
@@ -390,11 +478,14 @@ fn preview_mesh(
     color_maps: &world::ColorMaps,
     meshes: &mut Assets<Mesh>,
 ) -> Handle<Mesh> {
-    let Some(piece) = catalogue.and_then(|c| c.get(kind)) else {
+    let Some(style) = style else {
+        return preview.quad_mesh.get_or_insert_with(|| meshes.add(quad_mesh())).clone();
+    };
+    let Some(piece) = catalogue.and_then(|c| c.get(style, kind)) else {
         return preview.quad_mesh.get_or_insert_with(|| meshes.add(quad_mesh())).clone();
     };
 
-    let key = (kind, rotation);
+    let key = (style.to_string(), kind, rotation);
     if let Some(cached) = preview.piece_meshes.get(&key) {
         if let Some(handle) = cached {
             return handle.clone();
@@ -414,7 +505,7 @@ fn preview_mesh(
                 &rotated
             }
             Err(err) => {
-                println!("block_viewer: road preview: {kind:?} can't rotate to {rotation:?}: {err}");
+                println!("block_viewer: road preview: {style}/{kind:?} can't rotate to {rotation:?}: {err}");
                 preview.piece_meshes.insert(key, None);
                 return preview.quad_mesh.get_or_insert_with(|| meshes.add(quad_mesh())).clone();
             }
@@ -479,6 +570,7 @@ fn update_drag_preview(
     atlas: Option<Res<SharedAtlasIndex>>,
     color_maps: Option<Res<SharedColorMaps>>,
     terrain_material: Option<Res<TerrainMaterial>>,
+    style_selection: Option<Res<RoadStyleSelection>>,
     mut preview: ResMut<RoadPreviewState>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
@@ -495,12 +587,23 @@ fn update_drag_preview(
         return;
     };
 
+    let selected_style = style_selection.as_deref().and_then(|s| s.current.as_deref());
     for (index, &cell) in path.iter().enumerate() {
         let Some(height) = cell_height(cell, &world) else { continue };
         let valid = cell_valid(cell, &world, &city);
+        let style = style_for_cell(cell, &city, selected_style);
         let (kind, rotation) = road::select_piece(connections_with_path(&city, &path, cell));
-        let mesh =
-            preview_mesh(&mut preview, kind, rotation, catalogue.as_deref(), &atlas.0, &world, &color_maps.0, &mut meshes);
+        let mesh = preview_mesh(
+            &mut preview,
+            style,
+            kind,
+            rotation,
+            catalogue.as_deref(),
+            &atlas.0,
+            &world,
+            &color_maps.0,
+            &mut meshes,
+        );
         let ghost_materials = ensure_materials(&mut preview, &terrain_material.0, &mut materials);
         let material = if valid { ghost_materials.valid.clone() } else { ghost_materials.invalid.clone() };
         let transform = cell_transform(cell, height);
@@ -536,15 +639,19 @@ fn update_drag_preview(
 
 /// Builds one merged [`WorldEdit`] out of every affected cell that has a
 /// catalogue piece — see the module docs' "Committing". A cell with no
-/// piece contributes nothing (its `City` entry alone is the whole of what
-/// this ticket can do for it — see "The preview").
+/// recorded style yet (shouldn't happen — every affected cell is either
+/// already in `city`, or was just added there by this same commit, before
+/// this runs) or no matching piece for its style contributes nothing (its
+/// `City` entry alone is the whole of what this ticket can do for it — see
+/// "The preview").
 fn road_write_edit(affected: &[IVec2], catalogue: &RoadCatalogue, city: &City) -> WorldEdit {
     let mut merged = WorldEdit::new();
     let mut data_version = None;
 
     for &cell in affected {
+        let Some(style) = city.road_style_at(cell) else { continue };
         let (kind, rotation) = road::select_piece(road::connections_at(city, cell));
-        let Some(piece) = catalogue.get(kind) else { continue };
+        let Some(piece) = catalogue.get(style, kind) else { continue };
 
         let rotated;
         let blueprint: &Blueprint = if rotation == Rotation::Deg0 {
@@ -556,7 +663,7 @@ fn road_write_edit(affected: &[IVec2], catalogue: &RoadCatalogue, city: &City) -
                     &rotated
                 }
                 Err(err) => {
-                    println!("block_viewer: road build: {kind:?} can't rotate to {rotation:?}, skipping cell: {err}");
+                    println!("block_viewer: road build: {style}/{kind:?} can't rotate to {rotation:?}, skipping cell: {err}");
                     continue;
                 }
             }
@@ -587,6 +694,7 @@ fn try_commit_drag(
     world: Res<DecodedWorld>,
     mut city: ResMut<City>,
     catalogue: Option<Res<RoadCatalogue>>,
+    style_selection: Option<Res<RoadStyleSelection>>,
     mut build: ResMut<RoadBuildState>,
     region_cache: Option<Res<SharedRegionCache>>,
     mut drag: ResMut<RoadDragState>,
@@ -605,12 +713,23 @@ fn try_commit_drag(
         return;
     }
 
+    // Ticket 059: any *new* cell in this path needs a style to be recorded
+    // under. An already-road cell keeps whatever it already has — see
+    // `add_road_cell`'s own docs — so it's fine for `selected_style` to go
+    // unused in a drag that only re-crosses existing road.
+    let selected_style = style_selection.and_then(|selection| selection.current.clone());
+    if path.iter().any(|&cell| !city.is_road_cell(cell)) && selected_style.is_none() {
+        println!("block_viewer: road drag refused: no road style selected ([ or ] to pick one)");
+        return;
+    }
+    let build_style = selected_style.unwrap_or_default();
+
     let newly_added: Vec<IVec2> = path.iter().copied().filter(|&cell| !city.is_road_cell(cell)).collect();
     for &cell in &path {
         // Already validated above; `add_road_cell` only fails on occupancy,
         // which `cell_valid` just confirmed clear (or already-road, which is
         // idempotent) — see the module docs' "Committing".
-        if let Err(err) = city.add_road_cell(cell) {
+        if let Err(err) = city.add_road_cell(cell, build_style.clone()) {
             println!("block_viewer: road drag refused partway through (a race with another edit?): {err}");
             for cell in &newly_added {
                 city.remove_road_cell(*cell);
@@ -757,7 +876,7 @@ mod tests {
     fn cell_occupancy_ok_is_true_for_free_or_already_road_ground() {
         let mut city = City::default();
         assert!(cell_occupancy_ok(IVec2::new(0, 0), &city));
-        city.add_road_cell(IVec2::new(0, 0)).unwrap();
+        city.add_road_cell(IVec2::new(0, 0), "dirt").unwrap();
         assert!(cell_occupancy_ok(IVec2::new(0, 0), &city), "already-road counts as ok, not blocked");
     }
 
@@ -771,8 +890,8 @@ mod tests {
     #[test]
     fn affected_cells_includes_the_path_and_its_already_road_neighbours() {
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(-1, 0)).unwrap(); // west neighbour of (0, 0)
-        city.add_road_cell(IVec2::new(5, 5)).unwrap(); // unrelated, far away
+        city.add_road_cell(IVec2::new(-1, 0), "dirt").unwrap(); // west neighbour of (0, 0)
+        city.add_road_cell(IVec2::new(5, 5), "dirt").unwrap(); // unrelated, far away
 
         let affected = affected_cells(&[IVec2::new(0, 0)], &city);
         assert!(affected.contains(&IVec2::new(0, 0)));
@@ -784,7 +903,7 @@ mod tests {
     #[test]
     fn affected_cells_does_not_duplicate_a_neighbour_shared_by_two_path_cells() {
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(1, 1)).unwrap();
+        city.add_road_cell(IVec2::new(1, 1), "dirt").unwrap();
 
         // Both (0, 1) and (2, 1) border (1, 1); (1, 0)/(1, 2) also border it.
         let affected = affected_cells(&[IVec2::new(0, 1), IVec2::new(2, 1)], &city);
@@ -807,7 +926,7 @@ mod tests {
     #[test]
     fn connections_with_path_still_sees_real_city_roads() {
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(0, -1)).unwrap(); // north of (0, 0)
+        city.add_road_cell(IVec2::new(0, -1), "dirt").unwrap(); // north of (0, 0)
         let connections = connections_with_path(&city, &[IVec2::new(0, 0)], IVec2::new(0, 0));
         assert!(connections.north);
     }
@@ -847,20 +966,29 @@ mod tests {
         dir
     }
 
-    /// A catalogue with only [`RoadPieceKind::Isolated`] loaded — enough for
-    /// a single, disconnected cell.
+    /// Writes `blueprint` at `piece_path(dir, style, kind)`, creating the
+    /// style subdirectory first — same reason
+    /// `road_catalogue::tests::write_piece` needs to.
+    fn write_piece(dir: &std::path::Path, style: &str, kind: RoadPieceKind, blueprint: &Blueprint) {
+        std::fs::create_dir_all(dir.join(style)).expect("should create style dir");
+        write_structure_file(&piece_path(dir, style, kind), blueprint).unwrap();
+    }
+
+    /// A catalogue with only [`RoadPieceKind::Isolated`] loaded, under style
+    /// `"dirt"` — enough for a single, disconnected cell.
     fn catalogue_with_isolated(dir: &std::path::Path) -> RoadCatalogue {
-        write_structure_file(&piece_path(dir, RoadPieceKind::Isolated), &one_stone_piece()).unwrap();
+        write_piece(dir, "dirt", RoadPieceKind::Isolated, &one_stone_piece());
         let (catalogue, _skipped) = load_road_catalogue_dir(dir);
         catalogue
     }
 
     /// A catalogue with [`RoadPieceKind::Isolated`] *and*
-    /// [`RoadPieceKind::Straight`] — enough to prove [`road_write_edit`]
-    /// picks a different piece per cell and merges both into one edit.
+    /// [`RoadPieceKind::Straight`], both under style `"dirt"` — enough to
+    /// prove [`road_write_edit`] picks a different piece per cell and merges
+    /// both into one edit.
     fn catalogue_with_isolated_and_straight(dir: &std::path::Path) -> RoadCatalogue {
-        write_structure_file(&piece_path(dir, RoadPieceKind::Isolated), &one_stone_piece()).unwrap();
-        write_structure_file(&piece_path(dir, RoadPieceKind::Straight), &one_stone_piece()).unwrap();
+        write_piece(dir, "dirt", RoadPieceKind::Isolated, &one_stone_piece());
+        write_piece(dir, "dirt", RoadPieceKind::Straight, &one_stone_piece());
         let (catalogue, _skipped) = load_road_catalogue_dir(dir);
         catalogue
     }
@@ -869,11 +997,27 @@ mod tests {
     fn road_write_edit_writes_the_isolated_piece_for_a_lone_cell() {
         let dir = temp_dir("write_edit_isolated");
         let catalogue = catalogue_with_isolated(&dir);
-        let city = City::default();
+        let mut city = City::default();
+        city.add_road_cell(IVec2::new(0, 0), "dirt").unwrap();
 
         let edit = road_write_edit(&[IVec2::new(0, 0)], &catalogue, &city);
         assert_eq!(edit.len(), (ROAD_CELL_SIZE * ROAD_CELL_SIZE) as usize, "every block in the one cell's piece");
         assert_eq!(edit.data_version(), Some(4438));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A cell recorded under a style the catalogue has no pieces for at all
+    /// contributes nothing — same "skipped, not guessed at" contract a
+    /// missing *kind* gets.
+    #[test]
+    fn road_write_edit_is_empty_for_a_cell_whose_style_is_not_in_the_catalogue() {
+        let dir = temp_dir("write_edit_unknown_style");
+        let catalogue = catalogue_with_isolated(&dir); // only "dirt" is loaded
+        let mut city = City::default();
+        city.add_road_cell(IVec2::new(0, 0), "paved").unwrap();
+
+        let edit = road_write_edit(&[IVec2::new(0, 0)], &catalogue, &city);
+        assert!(edit.is_empty());
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -882,9 +1026,10 @@ mod tests {
         let dir = temp_dir("write_edit_no_piece");
         // A catalogue with only Straight — this cell resolves to Isolated,
         // which the catalogue doesn't have.
-        write_structure_file(&piece_path(&dir, RoadPieceKind::Straight), &one_stone_piece()).unwrap();
+        write_piece(&dir, "dirt", RoadPieceKind::Straight, &one_stone_piece());
         let (catalogue, _skipped) = load_road_catalogue_dir(&dir);
-        let city = City::default();
+        let mut city = City::default();
+        city.add_road_cell(IVec2::new(0, 0), "dirt").unwrap();
 
         let edit = road_write_edit(&[IVec2::new(0, 0)], &catalogue, &city);
         assert!(edit.is_empty());
@@ -895,7 +1040,9 @@ mod tests {
     fn road_write_edit_offsets_each_cells_piece_by_its_own_corner() {
         let dir = temp_dir("write_edit_offset");
         let catalogue = catalogue_with_isolated(&dir);
-        let city = City::default();
+        let mut city = City::default();
+        city.add_road_cell(IVec2::new(0, 0), "dirt").unwrap();
+        city.add_road_cell(IVec2::new(2, 0), "dirt").unwrap();
 
         let edit = road_write_edit(&[IVec2::new(0, 0), IVec2::new(2, 0)], &catalogue, &city);
         let positions: std::collections::HashSet<IVec3> = edit.edits().iter().map(|e| e.at).collect();
@@ -914,15 +1061,38 @@ mod tests {
         // A straight run of three cells: the middle one sees a north *and*
         // a south neighbour, resolving to Straight — the two ends resolve
         // to DeadEnd, which this catalogue has no piece for.
-        city.add_road_cell(IVec2::new(0, -1)).unwrap();
-        city.add_road_cell(IVec2::new(0, 0)).unwrap();
-        city.add_road_cell(IVec2::new(0, 1)).unwrap();
+        city.add_road_cell(IVec2::new(0, -1), "dirt").unwrap();
+        city.add_road_cell(IVec2::new(0, 0), "dirt").unwrap();
+        city.add_road_cell(IVec2::new(0, 1), "dirt").unwrap();
 
         let edit = road_write_edit(&[IVec2::new(0, -1), IVec2::new(0, 0), IVec2::new(0, 1)], &catalogue, &city);
         assert_eq!(
             edit.len(),
             (ROAD_CELL_SIZE * ROAD_CELL_SIZE) as usize,
             "only the middle (Straight) cell has a matching piece; the two DeadEnd ends are skipped, not guessed at"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Ticket 059's own reason to exist: two cells built as *different*
+    /// styles each pull their piece from their own style's set, not one
+    /// style's set applied to both.
+    #[test]
+    fn road_write_edit_reads_each_cells_own_recorded_style() {
+        let dir = temp_dir("write_edit_two_styles");
+        write_piece(&dir, "dirt", RoadPieceKind::Isolated, &one_stone_piece());
+        write_piece(&dir, "paved", RoadPieceKind::Isolated, &one_stone_piece());
+        let (catalogue, _skipped) = load_road_catalogue_dir(&dir);
+
+        let mut city = City::default();
+        city.add_road_cell(IVec2::new(0, 0), "dirt").unwrap();
+        city.add_road_cell(IVec2::new(100, 100), "paved").unwrap();
+
+        let edit = road_write_edit(&[IVec2::new(0, 0), IVec2::new(100, 100)], &catalogue, &city);
+        assert_eq!(
+            edit.len(),
+            2 * (ROAD_CELL_SIZE * ROAD_CELL_SIZE) as usize,
+            "both cells' pieces should be written, one from each style"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -962,7 +1132,7 @@ mod tests {
     #[test]
     fn poll_road_build_success_fires_chunks_edited_and_records_the_write() {
         let mut app = road_build_test_app();
-        app.world_mut().resource_mut::<City>().add_road_cell(IVec2::new(0, 0)).unwrap();
+        app.world_mut().resource_mut::<City>().add_road_cell(IVec2::new(0, 0), "dirt").unwrap();
 
         let report = EditReport { blocks_written: 36, chunks: vec![(0, 0)], regions: vec![(0, 0)], replaced: None };
         let task = pool().spawn(async move { Ok(report) });
@@ -984,8 +1154,8 @@ mod tests {
         let mut app = road_build_test_app();
         {
             let mut city = app.world_mut().resource_mut::<City>();
-            city.add_road_cell(IVec2::new(0, 0)).unwrap(); // pre-existing neighbour, not newly added
-            city.add_road_cell(IVec2::new(1, 0)).unwrap(); // this drag's own new cell
+            city.add_road_cell(IVec2::new(0, 0), "dirt").unwrap(); // pre-existing neighbour, not newly added
+            city.add_road_cell(IVec2::new(1, 0), "dirt").unwrap(); // this drag's own new cell
         }
 
         let task = pool().spawn(async { Err(EditRefusal::Empty) });
@@ -1000,5 +1170,96 @@ mod tests {
 
         let fired = app.world_mut().resource_mut::<Events<ChunksEdited>>().drain().count();
         assert_eq!(fired, 0, "nothing changed in the world, so nothing needs re-meshing");
+    }
+
+    // --- style_for_cell (ticket 059) ----------------------------------------
+
+    #[test]
+    fn style_for_cell_prefers_a_cells_own_recorded_style_over_the_selection() {
+        let mut city = City::default();
+        city.add_road_cell(IVec2::new(0, 0), "dirt").unwrap();
+        assert_eq!(style_for_cell(IVec2::new(0, 0), &city, Some("paved")), Some("dirt"));
+    }
+
+    #[test]
+    fn style_for_cell_falls_back_to_the_selection_for_a_new_cell() {
+        let city = City::default();
+        assert_eq!(style_for_cell(IVec2::new(0, 0), &city, Some("paved")), Some("paved"));
+    }
+
+    #[test]
+    fn style_for_cell_is_none_for_a_new_cell_with_nothing_selected() {
+        let city = City::default();
+        assert_eq!(style_for_cell(IVec2::new(0, 0), &city, None), None);
+    }
+
+    // --- cycle_road_style ---------------------------------------------------
+
+    fn cycle_test_app(styles: &[&str]) -> (App, std::path::PathBuf) {
+        let dir = temp_dir("cycle_road_style");
+        for &style in styles {
+            for kind in RoadPieceKind::ALL {
+                write_piece(&dir, style, kind, &one_stone_piece());
+            }
+        }
+        let (catalogue, _skipped) = load_road_catalogue_dir(&dir);
+
+        let mut app = App::new();
+        app.init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<camera::EguiInputCapture>()
+            .init_resource::<RoadStyleSelection>()
+            .insert_resource(ActiveTool::Road)
+            .insert_resource(catalogue)
+            .add_systems(Update, cycle_road_style);
+        (app, dir)
+    }
+
+    fn press(app: &mut App, key: KeyCode) {
+        app.world_mut().resource_mut::<ButtonInput<KeyCode>>().press(key);
+        app.update();
+        app.world_mut().resource_mut::<ButtonInput<KeyCode>>().release(key);
+    }
+
+    #[test]
+    fn cycle_road_style_auto_picks_the_first_style_with_no_keypress() {
+        let (mut app, dir) = cycle_test_app(&["dirt", "paved"]);
+        app.update();
+        assert_eq!(app.world().resource::<RoadStyleSelection>().current.as_deref(), Some("dirt"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn bracket_right_cycles_forward_and_wraps() {
+        let (mut app, dir) = cycle_test_app(&["dirt", "gravel", "paved"]);
+        app.update();
+        press(&mut app, KeyCode::BracketRight);
+        assert_eq!(app.world().resource::<RoadStyleSelection>().current.as_deref(), Some("gravel"));
+        press(&mut app, KeyCode::BracketRight);
+        assert_eq!(app.world().resource::<RoadStyleSelection>().current.as_deref(), Some("paved"));
+        press(&mut app, KeyCode::BracketRight);
+        assert_eq!(app.world().resource::<RoadStyleSelection>().current.as_deref(), Some("dirt"), "wraps back around");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn bracket_left_cycles_backward_and_wraps() {
+        let (mut app, dir) = cycle_test_app(&["dirt", "gravel", "paved"]);
+        app.update();
+        press(&mut app, KeyCode::BracketLeft);
+        assert_eq!(
+            app.world().resource::<RoadStyleSelection>().current.as_deref(),
+            Some("paved"),
+            "wraps to the last style"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn cycle_road_style_does_nothing_outside_the_road_tool() {
+        let (mut app, dir) = cycle_test_app(&["dirt", "paved"]);
+        app.insert_resource(ActiveTool::Building);
+        app.update();
+        assert_eq!(app.world().resource::<RoadStyleSelection>().current, None, "not auto-picked outside the road tool");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

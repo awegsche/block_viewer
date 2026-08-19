@@ -178,11 +178,23 @@
 //! auto-tiling needs (which of six piece shapes a cell's connections call
 //! for, and the rotation that reproduces them), and [`road_catalogue`], a
 //! loader for the six `.nbt` blueprints — one per shape — that
-//! `select_piece` picks between. No real `.nbt` pieces ship yet (they need
-//! an actual Minecraft structure-block export); `road_catalogue` is proven
-//! against synthetic fixtures the same way ticket 039's building catalogue
-//! tests were, and isn't wired into `run` until there's something on disk
-//! for it to load.
+//! `select_piece` picks between.
+//!
+//! Ticket 059 gave that catalogue a second dimension: **style**.
+//! `assets/city/roads/<style>/*.nbt` — one subdirectory per style, holding
+//! its own six pieces — instead of one flat, system-wide set. A road cell
+//! now records which style it was built as directly on [`state::City`]
+//! (`add_road_cell`'s own argument, `City::road_style_at`), and
+//! [`road_build::RoadStyleSelection`] (`[`/`]`, gated on the road tool) is
+//! how a player picks which style *new* cells get built as — the same
+//! keyboard-stand-in role ticket 047's number keys play for buildings.
+//! Connectivity and shape selection (`road::connections_at`/`select_piece`)
+//! stay entirely style-blind — style only decides which `.nbt` gets
+//! meshed/written once the shape is already chosen. No real `.nbt` pieces
+//! ship for any style yet (they need an actual Minecraft structure-block
+//! export); `road_catalogue` is proven against synthetic fixtures the same
+//! way ticket 039's building catalogue tests were, and isn't wired into
+//! `run` until there's something on disk for it to load.
 //!
 //! ## Terraforming: dig and level (ticket 057, roadmap H1)
 //!
@@ -497,8 +509,8 @@ fn load_road_catalogue() -> road_catalogue::RoadCatalogue {
         catalogue.len(),
         if catalogue.len() == 1 { "" } else { "s" }
     );
-    for (kind, err) in &skipped {
-        println!("block_viewer:   skipped {kind:?}: {err}");
+    for (style, kind, err) in &skipped {
+        println!("block_viewer:   skipped {style}/{kind:?}: {err}");
     }
 
     catalogue
