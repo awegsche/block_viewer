@@ -892,3 +892,31 @@ these itself (see CLAUDE.md's "Manual/visual verification").
   as ordinary dirt, not some placeholder block. Also confirm `T` still
   cycles back to Building afterward and placement/road tools are unaffected.
 
+- [ ] **059 multiple road styles: the `[`/`]` style cycle.** Mostly moot
+  until real `.nbt` road pieces exist for more than one style under
+  `assets/city/roads/<style>/` (see ticket 054's own still-open note) —
+  without them every cell falls back to the flat quad preview regardless
+  of which style is selected, so there's nothing to *see* differ yet. The
+  one thing worth checking without real assets: `cargo run --bin
+  citybuilder` against a real save, press `T` to the Road tool, and
+  left-click-drag a cell with no `RoadCatalogue` loaded at all (the normal
+  case today, no `assets/city/roads` on disk) — confirm the drag still
+  commits (console/City panel road-cell count moves), since a missing
+  catalogue is a "nothing to render" case, not a "no style selected"
+  refusal.
+
+  Once at least two real styles exist (e.g. `assets/city/roads/dirt/` and
+  `assets/city/roads/paved/`, each with all six pieces): confirm pressing
+  `[`/`]` while the Road tool is active visibly changes which piece the
+  drag preview shows (no on-screen style name exists yet — go by the mesh
+  itself), that the *first* loaded style is already selected the moment
+  you switch to the Road tool with no keypress, that `[`/`]` wrap around
+  at both ends, and that they do nothing while a different tool is active
+  or while typing in an egui panel. Drag two separate runs with two
+  different styles selected, confirm both commit and render correctly
+  side by side (each keeps the style it was built with even after
+  switching the selection and dragging elsewhere), then click "Save
+  world", reload the save, and confirm each run still shows its own style
+  after the reload (persistence round-trip, not just the in-memory
+  session).
+
