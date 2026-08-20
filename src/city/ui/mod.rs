@@ -28,6 +28,7 @@
 
 mod build_menu;
 mod city_panel;
+mod definition_errors;
 
 use bevy::prelude::*;
 use bevy_egui::{EguiContexts, EguiPlugin};
@@ -45,7 +46,11 @@ pub struct UiPlugin;
 impl Plugin for UiPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(EguiPlugin)
-            .add_systems(Update, (build_menu::build_menu_panel, city_panel::city_panel).in_set(UiPanelSet))
+            .add_systems(
+                Update,
+                (build_menu::build_menu_panel, city_panel::city_panel, definition_errors::definition_errors_panel)
+                    .in_set(UiPanelSet),
+            )
             .add_systems(Update, sync_egui_input_capture.after(UiPanelSet));
     }
 }

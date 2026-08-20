@@ -932,3 +932,39 @@ these itself (see CLAUDE.md's "Manual/visual verification").
   after the reload (persistence round-trip, not just the in-memory
   session).
 
+- [ ] **061 definition hot reload and error panel: a live edit actually
+  gets picked up, and a bad file actually shows up in the panel.** The
+  automated suite covers `dir_snapshot`'s file-level detection directly
+  (temp directories, hand-set mtimes) — what it can't cover is a real
+  editor saving a real file while the game is running, or whether the new
+  "Definition Errors" egui window actually reads as useful rather than
+  just present.
+
+  `cargo run --bin citybuilder` against a real save with at least one real
+  `.ron` under `assets/city/buildings` (`house01.ron` from ticket 040 is
+  enough). Confirm the "Definition Errors" window is there (collapsed,
+  title "Definition Errors", body "(no problems)" if expanded) alongside
+  the Build menu and City panel. With the game still running, open
+  `assets/city/buildings/house01.ron` in a text editor and change its
+  `name:` field, save it, and switch back to the game window within a
+  couple of seconds — confirm (1) the console prints a `reloaded 1 building
+  definition from assets/city/buildings` line without you touching
+  anything in-game, and (2) the Build menu's entry for that building now
+  shows the new name, live, no restart. Then break the file on purpose —
+  change `tier: 1` to `tier: "one"` (a type error) or delete the trailing
+  `)` — save again, and confirm: the console prints a `skipped
+  assets/city/buildings/house01.ron: ...` line, the "Definition Errors"
+  window's title-bar dot/expand shows something changed (it auto-expands
+  the first time an error exists after a clean start — check this only
+  fires once, not on every subsequent poll), and the body lists the file
+  path and a parse-error message under a "Buildings" heading. Fix the file
+  back and confirm the error clears within a second or two without a
+  restart, and the Build menu's entry comes back. Repeat once for
+  `assets/city/road_types/*.ron` if a fixture exists there, to check the
+  "Road types" heading and `RoadTypes` reload path independently of the
+  buildings one. Finally, confirm editing an unrelated file in either
+  directory (e.g. touching a stray `.txt`, or a `.nbt` in the sibling
+  geometry directories) does **not** print a reload line — only `.ron`
+  changes in `assets/city/buildings`/`assets/city/road_types` should
+  trigger anything.
+

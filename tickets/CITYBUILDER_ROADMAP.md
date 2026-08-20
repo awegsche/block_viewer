@@ -2,7 +2,7 @@
 
 Not a work item; the plan for the citybuilder game and the shared world-edit
 infrastructure it needs. High-level tasks here get split into numbered
-tickets in this directory when they're picked up (next free number: 061).
+tickets in this directory when they're picked up (next free number: 062).
 Companion to `ROADMAP.md`, which covers the viewer 001–029.
 
 ## The goal
@@ -121,8 +121,8 @@ L1  lib.rs + two bin shims                       <- DONE (ticket 027)
      +-- C  definitions & scripting
      |    C1  building definition schema + loader  <- DONE (ticket 040)
      |    C2  tiers and tech tree                  <- DONE (ticket 041)
-     |    C3  production fields (data only in iteration 1)
-     |    C4  hot reload + a definition-error panel
+     |    C3  production fields (data only in iteration 1)  <- DONE (050 shows them; iteration 1 stops there)
+     |    C4  hot reload + a definition-error panel  <- DONE (ticket 061)
      |
      +-- D  city state (authoritative)
           D1  the City resource: buildings, footprints, occupancy  <- DONE (ticket 042)
@@ -409,13 +409,31 @@ dangle another. Result is the maximal subset of loaded buildings whose
 `DanglingRequirement`, `CyclicRequirement` (carries the whole loop). No
 consumer yet — G1's build menu is the eventual reader.
 
-**C3. Production fields, parsed but inert.** Iteration 1 shows rates and
-costs in the build menu and does not simulate them. The point is that the
-schema is exercised — a schema that nothing reads drifts from reality.
+**C3. Production fields, parsed but inert. — done, ticket 050.** Iteration 1
+shows rates and costs in the build menu and does not simulate them. The
+point is that the schema is exercised — a schema that nothing reads drifts
+from reality.
 
-**C4. Hot reload and an error panel.** Definition files reload on change;
-errors go to an egui panel rather than a panic or a console line nobody
-sees. This is what makes balancing tolerable later.
+*How it came out:* landed as a side effect of G1's build menu (ticket 050)
+rather than its own ticket — `city::ui::build_menu`'s `cost_line`/
+`production_line` read `Building::cost`/`Building::production` directly and
+show them on every catalogue row. Nothing simulates either; per the
+roadmap's own "deliberately not in this iteration" list, that stays true.
+
+**C4. Hot reload and an error panel. — done, ticket 061.** Definition files
+reload on change; errors go to an egui panel rather than a panic or a
+console line nobody sees. This is what makes balancing tolerable later.
+
+*How it came out:* `city::hot_reload::DefinitionHotReloadPlugin` polls a
+`(path, mtime)` snapshot of `assets/city/buildings`/`assets/city/road_types`
+once a second (no filesystem-watcher dependency — see the ticket) and
+reloads/replaces `BuildingDefinitions`/`RoadTypes` wholesale when either
+changes. `city::ui::definition_errors` is the new third window (alongside
+050's build menu/city panel): every currently-skipped `.ron` file, seeded
+from startup's own load so a bad file is visible from the first frame, not
+only after a live edit. Scoped to the two RON *data* directories — the
+`.nbt` geometry catalogues (blueprints, road pieces) aren't watched; see
+`finished_tickets/061-definition-hot-reload-and-error-panel.md`.
 
 ---
 

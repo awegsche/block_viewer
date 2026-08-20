@@ -213,6 +213,20 @@
 //! shouldn't block a placement over it), so terraforming is no longer the
 //! only way to build on a rough site — it's now how a player *chooses* to
 //! flatten one anyway, by hand, rather than build into the slope.
+//!
+//! ## Definition hot reload and the error panel (ticket 061, roadmap C4)
+//!
+//! [`hot_reload::DefinitionHotReloadPlugin`] closes the roadmap's C group:
+//! editing a `.ron` under `DEFINITIONS_DIR`/`ROAD_TYPES_DIR` while the game
+//! is running now reloads [`definition::BuildingDefinitions`]/
+//! [`road_definition::RoadTypes`] within a second, rather than needing a
+//! restart to try a balance change — see [`hot_reload`]'s own docs for why
+//! polling a directory snapshot beats a filesystem-watcher dependency here.
+//! [`ui::UiPlugin`] grew a third window alongside ticket 050's build
+//! menu/city panel: [`hot_reload::DefinitionErrors`] (seeded from [`run`]'s
+//! own startup load, then kept current by the same plugin) is what a bad
+//! `.ron` file shows up in now, in place of a console line that only 040's
+//! own `../todo.md` check was ever going to read.
 
 use std::path::{Path, PathBuf};
 
@@ -220,6 +234,7 @@ mod commit;
 mod definition;
 mod demolish;
 mod grid;
+mod hot_reload;
 mod journal;
 mod persistence;
 mod picking;
@@ -279,9 +294,20 @@ struct CitySavePath(Option<PathBuf>);
 /// lines and nothing else.
 pub fn run() {
     let catalogue = load_building_catalogue();
-    let definitions = load_building_definitions(&catalogue);
+    let (definitions, building_errors) = load_building_definitions(&catalogue);
     let road_catalogue = load_road_catalogue();
-    let road_types = load_road_types(&road_catalogue);
+    let (road_types, road_type_errors) = load_road_types(&road_catalogue);
+
+    // Ticket 061, roadmap C4: seed the hot-reload snapshots from the same
+    // scan the load above already did, and the error panel from that load's
+    // own `skipped` list — see `hot_reload`'s module docs' "first tick"
+    // note for why this avoids an immediate, redundant reload.
+    let building_snapshot = hot_reload::dir_snapshot(Path::new(DEFINITIONS_DIR));
+    let road_type_snapshot = hot_reload::dir_snapshot(Path::new(ROAD_TYPES_DIR));
+    let definition_errors = hot_reload::DefinitionErrors {
+        buildings: building_errors.into_iter().map(|(path, err)| (path, err.to_string())).collect(),
+        road_types: road_type_errors.into_iter().map(|(path, err)| (path, err.to_string())).collect(),
+    };
 
     let mut app = world_app();
     let save_root = app.world().resource::<LoadedSave>().0.meta.path.clone();
@@ -299,6 +325,12 @@ pub fn run() {
         .insert_resource(city)
         .insert_resource(journal)
         .insert_resource(CitySavePath(if save_root.as_os_str().is_empty() { None } else { Some(save_root) }))
+        // Ticket 061, roadmap C4: hot reload, seeded above so the first
+        // `Update` tick doesn't immediately redo the load just above.
+        .insert_resource(hot_reload::DefinitionSnapshot(building_snapshot))
+        .insert_resource(hot_reload::RoadTypeSnapshot(road_type_snapshot))
+        .insert_resource(definition_errors)
+        .add_plugins(hot_reload::DefinitionHotReloadPlugin)
         .add_plugins(tool::ToolPlugin)
         .add_plugins(picking::PickingPlugin)
         .add_plugins(placement::PlacementPlugin)
@@ -482,7 +514,12 @@ fn load_building_catalogue() -> blueprint::BuildingCatalogue {
 /// Loads and logs the building definitions, same shape as
 /// [`load_building_catalogue`] — [`definition::load_definitions_dir`] never
 /// panics either, so there's no error path to propagate, only one to print.
-fn load_building_definitions(catalogue: &blueprint::BuildingCatalogue) -> definition::BuildingDefinitions {
+/// Returns the `skipped` list too (unlike [`load_building_catalogue`]) —
+/// ticket 061's [`hot_reload::DefinitionErrors`] needs it seeded with
+/// startup's own failures, not only whatever a later reload finds.
+fn load_building_definitions(
+    catalogue: &blueprint::BuildingCatalogue,
+) -> (definition::BuildingDefinitions, Vec<(PathBuf, definition::DefinitionError)>) {
     let (definitions, skipped) = definition::load_definitions_dir(Path::new(DEFINITIONS_DIR), catalogue);
 
     println!(
@@ -500,7 +537,7 @@ fn load_building_definitions(catalogue: &blueprint::BuildingCatalogue) -> defini
         println!("block_viewer:   skipped {}: {err}", path.display());
     }
 
-    definitions
+    (definitions, skipped)
 }
 
 /// Loads and logs the road piece catalogue (ticket 054/055, roadmap F1/F3),
@@ -531,8 +568,11 @@ fn load_road_catalogue() -> road_catalogue::RoadCatalogue {
 /// [`road_definition::load_road_types_dir`] never panics either, so there's
 /// no error path to propagate, only one to print. Validated against
 /// `catalogue` the same way [`load_building_definitions`] validates against
-/// the blueprint catalogue.
-fn load_road_types(catalogue: &road_catalogue::RoadCatalogue) -> road_definition::RoadTypes {
+/// the blueprint catalogue. Returns the `skipped` list too, for the same
+/// reason [`load_building_definitions`] now does.
+fn load_road_types(
+    catalogue: &road_catalogue::RoadCatalogue,
+) -> (road_definition::RoadTypes, Vec<(PathBuf, road_definition::RoadDefinitionError)>) {
     let (types, skipped) = road_definition::load_road_types_dir(Path::new(ROAD_TYPES_DIR), catalogue);
 
     println!(
@@ -550,5 +590,5 @@ fn load_road_types(catalogue: &road_catalogue::RoadCatalogue) -> road_definition
         println!("block_viewer:   skipped {}: {err}", path.display());
     }
 
-    types
+    (types, skipped)
 }
