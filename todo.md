@@ -1034,3 +1034,35 @@ camera is that world's:
 Also worth confirming once: place a building in a save opened by name, hit
 "Save world", quit, and reopen that same save by name — the city comes back
 (`city.ron`/`journal.ron` are read from the *selected* save's root).
+
+## 065 - roads visible at ground level (manual/visual check)
+
+Roads were being written at a hardcoded Y=0 (buried in the deepslate), so
+every road ever built in the citybuilder was invisible. Fixed to write at the
+cell's fitted ground, with the piece's surface course flush with the terrain.
+Needs a human at the window:
+
+`cargo run --bin citybuilder -- nbt_test`, press `T` for the road tool, then:
+
+1. **Drag a straight run on flat ground.** The dirt path should appear at
+   ground level, flush with the surrounding grass — not floating a block
+   above it, not sunk a block into it, and not missing entirely.
+2. **The ghost should stand where the blocks land.** While dragging, the
+   translucent green preview should sit exactly on the terrain the road ends
+   up occupying — in particular it must not be slid ~3 blocks diagonally off
+   the cell (the corner-vs-centre anchoring this ticket also fixed; it was
+   invisible while every cell previewed as the flat fallback quad).
+3. **Drag an L.** The corner piece should orient correctly and the two
+   straights either side of it should meet it cleanly, all at the same level.
+4. **Extend an existing road by one cell.** The previously-placed dead end
+   re-tiles to a straight — check it stays at its original height and does
+   *not* climb a block. Repeat two or three times: any upward staircase means
+   the stored `base_y` isn't being respected somewhere.
+5. **Build across a slope.** Each 6x6 cell fits to its own lowest ground, so
+   a step between cells is expected — what to look for is whether it's
+   tolerable or whether roads need real slope handling (roadmap F3's
+   acknowledged iteration-2 gap).
+6. **Save, quit, reopen.** The roads come back at the same height.
+
+Note: any road built with a *previous* build of the app is still sitting at
+Y=0 in the world and won't be cleaned up by this fix — see the ticket.

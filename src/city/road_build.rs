@@ -64,11 +64,32 @@
 //! meshes it the same way ticket 047's `placement::ghost_mesh` meshes a
 //! building — rotated, cached by `(style, RoadPieceKind, Rotation)` (a
 //! handful of styles times six kinds times four rotations: small, no
-//! eviction needed). No real `.nbt` road pieces ship yet for any style (see
-//! ticket 054's own "no real assets yet"), so in practice every cell falls
-//! back to [`quad_mesh`]: one flat, unrotated plane per cell, tinted the same
-//! green/red [`super::placement`] uses — proof the drag mechanic and its
-//! validity signal work end to end before there's real geometry to show.
+//! eviction needed). Ticket 063's `dirt` style is the first to ship real
+//! `.nbt` pieces; a style (or a kind) with none still falls back to
+//! [`quad_mesh`]: one flat, unrotated plane per cell, tinted the same
+//! green/red [`super::placement`] uses.
+//!
+//! The two are anchored differently — a meshed piece starts at its own
+//! minimum corner, the quad is centred on its origin — which is what
+//! [`PreviewAnchor`] and [`cell_transform`] exist to keep straight. While
+//! every cell fell back to the quad this didn't matter; ticket 065 is where
+//! it started to.
+//!
+//! ## Height: fitted once, remembered, offset by the piece's subgrade
+//!
+//! Ticket 065. A cell's ground is read *once*, when the drag that places it
+//! commits ([`cell_height`], the same [`super::grid::fit_footprint`] the
+//! preview meshes against), and stored on the cell as
+//! [`super::state::RoadCell::base_y`] — never re-derived, because once a
+//! piece has been written [`super::grid::ground_height_at`] samples the road
+//! surface as ground and a re-tiled neighbour would climb a block per
+//! rewrite. [`cell_write_origin`] turns that reading into the piece's actual
+//! write origin, dropping it by [`ROAD_PIECE_SUBGRADE_DEPTH`] so the piece's
+//! surface course lands flush with the terrain rather than perched above it.
+//!
+//! Before that ticket the write origin's Y was a hardcoded `0`: every road
+//! ever built went into the deepslate, reported as written, and was never
+//! seen.
 //!
 //! ## Terrain fit, reusing E2 rather than reinventing it for cells
 //!
@@ -314,9 +335,45 @@ fn cell_occupancy_ok(cell: IVec2, city: &City) -> bool {
 }
 
 /// The base Minecraft `(x, z)` corner of `cell` — every terrain/occupancy
-/// sample in this module starts here.
+/// sample in this module starts here. The `y` is a placeholder `0`, not a
+/// height: [`cell_fit`] only ever reads the `(x, z)` out of this, and the
+/// one caller that needs a real Y ([`road_write_edit`]) overwrites it with
+/// the cell's own recorded [`super::state::RoadCell::base_y`].
 fn cell_min_corner(cell: IVec2) -> IVec3 {
     IVec3::new(cell.x * ROAD_CELL_SIZE, 0, cell.y * ROAD_CELL_SIZE)
+}
+
+/// How many layers of a road piece sit *below* its surface course — the
+/// subgrade a piece carries under the paving a player actually walks on.
+///
+/// The shipped `dirt` pieces (`assets/city/roads/dirt`, ticket 063) are
+/// 6x5x6 and laid out `y=0` solid dirt, `y=1` the surface course
+/// (`dirt_path`/`grass_block`/`cobblestone_stairs`), `y=2..4` air. Those air
+/// layers are deliberate clearance — they mow whatever grew over the road —
+/// which only does its job if `y=1` lands *at* the terrain surface (the
+/// topmost ground block, [`super::grid::ground_height_at`]'s answer minus
+/// one), leaving the clearance directly above it. Anchoring the piece's
+/// bottom at that surface instead would put the paving a block proud of the
+/// grass beside it and waste the clearance on empty sky.
+///
+/// A constant rather than per-style data: [`super::road_definition::RoadType`]
+/// (`assets/city/road_types/*.ron`) is *game* data — travel speed, capacity —
+/// and isn't threaded into the write path at all. If a style ever ships
+/// pieces with a different subgrade depth, this is the thing that becomes a
+/// field there.
+const ROAD_PIECE_SUBGRADE_DEPTH: i32 = 1;
+
+/// Where a cell's piece is written: [`cell_min_corner`]'s `(x, z)`, and a Y
+/// that puts the piece's surface course at the terrain surface — see
+/// [`ROAD_PIECE_SUBGRADE_DEPTH`]. `base_y` is the cell's recorded
+/// [`super::state::RoadCell::base_y`], i.e. `fit_footprint`'s "one above the
+/// ground", so the surface itself is `base_y - 1`.
+///
+/// Shared by [`road_write_edit`] and the drag preview so the ghost stands
+/// exactly where the blocks will land — before ticket 065 the two disagreed
+/// by the whole height of the world.
+fn cell_write_origin(cell: IVec2, base_y: i32) -> IVec3 {
+    cell_min_corner(cell).with_y(base_y - 1 - ROAD_PIECE_SUBGRADE_DEPTH)
 }
 
 /// [`super::grid::fit_footprint`] against `cell`'s own square footprint at
@@ -466,6 +523,10 @@ fn plains_biome_colors(world: &DecodedWorld, maps: &world::ColorMaps) -> BiomeCo
 /// cell new to this drag with nothing selected yet still needs *some*
 /// preview). The quad itself is cached once, not per style/kind — every
 /// fallback is the same flat square.
+///
+/// The [`PreviewAnchor`] alongside the handle says which of the two came
+/// back, since [`cell_transform`] has to place them differently — see its
+/// own docs.
 #[allow(clippy::too_many_arguments)]
 fn preview_mesh(
     preview: &mut RoadPreviewState,
@@ -477,22 +538,22 @@ fn preview_mesh(
     world: &DecodedWorld,
     color_maps: &world::ColorMaps,
     meshes: &mut Assets<Mesh>,
-) -> Handle<Mesh> {
+) -> (Handle<Mesh>, PreviewAnchor) {
     let Some(style) = style else {
-        return preview.quad_mesh.get_or_insert_with(|| meshes.add(quad_mesh())).clone();
+        return (preview.quad_mesh.get_or_insert_with(|| meshes.add(quad_mesh())).clone(), PreviewAnchor::Quad);
     };
     let Some(piece) = catalogue.and_then(|c| c.get(style, kind)) else {
-        return preview.quad_mesh.get_or_insert_with(|| meshes.add(quad_mesh())).clone();
+        return (preview.quad_mesh.get_or_insert_with(|| meshes.add(quad_mesh())).clone(), PreviewAnchor::Quad);
     };
 
     let key = (style.to_string(), kind, rotation);
     if let Some(cached) = preview.piece_meshes.get(&key) {
         if let Some(handle) = cached {
-            return handle.clone();
+            return (handle.clone(), PreviewAnchor::Piece);
         }
         // A cached rotation failure for a *real* piece: still show
         // something rather than nothing.
-        return preview.quad_mesh.get_or_insert_with(|| meshes.add(quad_mesh())).clone();
+        return (preview.quad_mesh.get_or_insert_with(|| meshes.add(quad_mesh())).clone(), PreviewAnchor::Quad);
     }
 
     let rotated;
@@ -507,7 +568,7 @@ fn preview_mesh(
             Err(err) => {
                 println!("block_viewer: road preview: {style}/{kind:?} can't rotate to {rotation:?}: {err}");
                 preview.piece_meshes.insert(key, None);
-                return preview.quad_mesh.get_or_insert_with(|| meshes.add(quad_mesh())).clone();
+                return (preview.quad_mesh.get_or_insert_with(|| meshes.add(quad_mesh())).clone(), PreviewAnchor::Quad);
             }
         }
     };
@@ -515,7 +576,10 @@ fn preview_mesh(
     let biome = plains_biome_colors(world, color_maps);
     let handle = blueprint::mesh_blueprint(blueprint, atlas, biome).map(|mesh| meshes.add(mesh));
     preview.piece_meshes.insert(key, handle.clone());
-    handle.unwrap_or_else(|| preview.quad_mesh.get_or_insert_with(|| meshes.add(quad_mesh())).clone())
+    match handle {
+        Some(handle) => (handle, PreviewAnchor::Piece),
+        None => (preview.quad_mesh.get_or_insert_with(|| meshes.add(quad_mesh())).clone(), PreviewAnchor::Quad),
+    }
 }
 
 /// The two translucent preview materials, built once — same shape and same
@@ -545,14 +609,38 @@ fn ensure_materials<'a>(
     })
 }
 
-/// World-space transform for a cell's preview at Minecraft `(x, z)` origin
-/// and world-Y `height` — the same `bevy.z = -mc.z` translation
-/// `placement::ghost_transform` uses, centred on the cell rather than at its
-/// minimum corner (the quad/piece mesh is centred on its own origin).
-fn cell_transform(cell: IVec2, height: i32) -> Transform {
-    let corner = cell_min_corner(cell);
-    let half = ROAD_CELL_SIZE as f32 / 2.0;
-    Transform::from_xyz(corner.x as f32 + half, height as f32, -(corner.z as f32 + half))
+/// Which of [`preview_mesh`]'s two possible meshes came back, because the
+/// two are anchored differently and so need different transforms — the
+/// distinction ticket 065 had to draw once real pieces started resolving.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreviewAnchor {
+    /// A real catalogue piece meshed by [`blueprint::mesh_blueprint`], whose
+    /// geometry starts at the blueprint's own *minimum corner* — exactly
+    /// like `placement`'s building ghost.
+    Piece,
+    /// [`quad_mesh`]'s flat fallback plane, which is built centred on its
+    /// own origin and so needs half a cell added back in `(x, z)`.
+    Quad,
+}
+
+/// World-space transform for a cell's preview — the same `bevy.z = -mc.z`
+/// translation `placement::ghost_transform` uses, at
+/// [`cell_write_origin`]'s Y so the ghost stands where the blocks will
+/// actually land.
+///
+/// `anchor` is why this isn't one expression: a real piece's mesh is
+/// corner-anchored and drops straight onto the cell's minimum corner, while
+/// the fallback quad is centred on its own origin and needs half a cell
+/// added to reach the same footprint. Before ticket 065 this centred *both*
+/// — invisible while every cell fell back to the quad, a 3-block diagonal
+/// slide the moment ticket 063's real `dirt` pieces started resolving.
+fn cell_transform(cell: IVec2, base_y: i32, anchor: PreviewAnchor) -> Transform {
+    let origin = cell_write_origin(cell, base_y);
+    let offset = match anchor {
+        PreviewAnchor::Piece => 0.0,
+        PreviewAnchor::Quad => ROAD_CELL_SIZE as f32 / 2.0,
+    };
+    Transform::from_xyz(origin.x as f32 + offset, origin.y as f32, -(origin.z as f32 + offset))
 }
 
 /// Updates every entity in the preview pool for this frame's drag path —
@@ -593,7 +681,7 @@ fn update_drag_preview(
         let valid = cell_valid(cell, &world, &city);
         let style = style_for_cell(cell, &city, selected_style);
         let (kind, rotation) = road::select_piece(connections_with_path(&city, &path, cell));
-        let mesh = preview_mesh(
+        let (mesh, anchor) = preview_mesh(
             &mut preview,
             style,
             kind,
@@ -606,7 +694,7 @@ fn update_drag_preview(
         );
         let ghost_materials = ensure_materials(&mut preview, &terrain_material.0, &mut materials);
         let material = if valid { ghost_materials.valid.clone() } else { ghost_materials.invalid.clone() };
-        let transform = cell_transform(cell, height);
+        let transform = cell_transform(cell, height, anchor);
 
         let entity = match preview.entities.get(index) {
             Some(&entity) => entity,
@@ -649,9 +737,9 @@ fn road_write_edit(affected: &[IVec2], catalogue: &RoadCatalogue, city: &City) -
     let mut data_version = None;
 
     for &cell in affected {
-        let Some(style) = city.road_style_at(cell) else { continue };
+        let Some(road) = city.road_cell_at(cell) else { continue };
         let (kind, rotation) = road::select_piece(road::connections_at(city, cell));
-        let Some(piece) = catalogue.get(style, kind) else { continue };
+        let Some(piece) = catalogue.get(&road.style, kind) else { continue };
 
         let rotated;
         let blueprint: &Blueprint = if rotation == Rotation::Deg0 {
@@ -663,14 +751,17 @@ fn road_write_edit(affected: &[IVec2], catalogue: &RoadCatalogue, city: &City) -
                     &rotated
                 }
                 Err(err) => {
-                    println!("block_viewer: road build: {style}/{kind:?} can't rotate to {rotation:?}, skipping cell: {err}");
+                    println!("block_viewer: road build: {}/{kind:?} can't rotate to {rotation:?}, skipping cell: {err}", road.style);
                     continue;
                 }
             }
         };
 
-        let corner = cell_min_corner(cell);
-        let edit = blueprint_edit(blueprint, corner);
+        // Ticket 065: the piece goes at the cell's *recorded* ground, not at
+        // `cell_min_corner`'s placeholder Y of 0 (which buried every road in
+        // the deepslate) and not at a freshly resampled height either — see
+        // `state::RoadCell`'s docs for why re-deriving it drifts.
+        let edit = blueprint_edit(blueprint, cell_write_origin(cell, road.base_y));
         data_version = data_version.or(edit.data_version());
         for crate::edit::BlockEdit { at, state } in edit.edits() {
             merged.set(*at, state.clone());
@@ -713,6 +804,20 @@ fn try_commit_drag(
         return;
     }
 
+    // Ticket 065: each cell's write height, resolved here — once, off the
+    // same fit the preview meshed against — and handed to `add_road_cell` to
+    // be remembered. `cell_valid` just confirmed every cell `Fits`, so this
+    // can't actually be `None`; refusing rather than defaulting keeps a road
+    // from being buried at Y=0 again if that ever stops holding.
+    let mut heights = Vec::with_capacity(path.len());
+    for &cell in &path {
+        let Some(height) = cell_height(cell, &world) else {
+            println!("block_viewer: road drag refused: no ground height for cell {cell}");
+            return;
+        };
+        heights.push(height);
+    }
+
     // Ticket 059: any *new* cell in this path needs a style to be recorded
     // under. An already-road cell keeps whatever it already has — see
     // `add_road_cell`'s own docs — so it's fine for `selected_style` to go
@@ -725,11 +830,12 @@ fn try_commit_drag(
     let build_style = selected_style.unwrap_or_default();
 
     let newly_added: Vec<IVec2> = path.iter().copied().filter(|&cell| !city.is_road_cell(cell)).collect();
-    for &cell in &path {
+    for (&cell, &base_y) in path.iter().zip(&heights) {
         // Already validated above; `add_road_cell` only fails on occupancy,
         // which `cell_valid` just confirmed clear (or already-road, which is
-        // idempotent) — see the module docs' "Committing".
-        if let Err(err) = city.add_road_cell(cell, build_style.clone()) {
+        // idempotent — and keeps its own recorded style and height) — see the
+        // module docs' "Committing".
+        if let Err(err) = city.add_road_cell(cell, build_style.clone(), base_y) {
             println!("block_viewer: road drag refused partway through (a race with another edit?): {err}");
             for cell in &newly_added {
                 city.remove_road_cell(*cell);
@@ -741,8 +847,8 @@ fn try_commit_drag(
     let affected = affected_cells(&path, &city);
     let Some(catalogue) = catalogue else {
         // No `RoadCatalogue` resource at all — the cells are recorded; there
-        // is nothing to mesh or write yet. See the module docs' "No real
-        // assets" (ticket 054) note.
+        // is nothing to mesh or write. See the module docs' "The preview" for
+        // why a `City` entry without geometry is still a legitimate state.
         println!("block_viewer: built {} road cell(s) (no road catalogue loaded, nothing written to the world)", path.len());
         return;
     };
@@ -876,7 +982,7 @@ mod tests {
     fn cell_occupancy_ok_is_true_for_free_or_already_road_ground() {
         let mut city = City::default();
         assert!(cell_occupancy_ok(IVec2::new(0, 0), &city));
-        city.add_road_cell(IVec2::new(0, 0), "dirt").unwrap();
+        city.add_road_cell(IVec2::new(0, 0), "dirt", 64).unwrap();
         assert!(cell_occupancy_ok(IVec2::new(0, 0), &city), "already-road counts as ok, not blocked");
     }
 
@@ -890,8 +996,8 @@ mod tests {
     #[test]
     fn affected_cells_includes_the_path_and_its_already_road_neighbours() {
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(-1, 0), "dirt").unwrap(); // west neighbour of (0, 0)
-        city.add_road_cell(IVec2::new(5, 5), "dirt").unwrap(); // unrelated, far away
+        city.add_road_cell(IVec2::new(-1, 0), "dirt", 64).unwrap(); // west neighbour of (0, 0)
+        city.add_road_cell(IVec2::new(5, 5), "dirt", 64).unwrap(); // unrelated, far away
 
         let affected = affected_cells(&[IVec2::new(0, 0)], &city);
         assert!(affected.contains(&IVec2::new(0, 0)));
@@ -903,7 +1009,7 @@ mod tests {
     #[test]
     fn affected_cells_does_not_duplicate_a_neighbour_shared_by_two_path_cells() {
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(1, 1), "dirt").unwrap();
+        city.add_road_cell(IVec2::new(1, 1), "dirt", 64).unwrap();
 
         // Both (0, 1) and (2, 1) border (1, 1); (1, 0)/(1, 2) also border it.
         let affected = affected_cells(&[IVec2::new(0, 1), IVec2::new(2, 1)], &city);
@@ -926,7 +1032,7 @@ mod tests {
     #[test]
     fn connections_with_path_still_sees_real_city_roads() {
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(0, -1), "dirt").unwrap(); // north of (0, 0)
+        city.add_road_cell(IVec2::new(0, -1), "dirt", 64).unwrap(); // north of (0, 0)
         let connections = connections_with_path(&city, &[IVec2::new(0, 0)], IVec2::new(0, 0));
         assert!(connections.north);
     }
@@ -1006,7 +1112,7 @@ mod tests {
         let dir = temp_dir("write_edit_isolated");
         let catalogue = catalogue_with_isolated(&dir);
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(0, 0), "dirt").unwrap();
+        city.add_road_cell(IVec2::new(0, 0), "dirt", 64).unwrap();
 
         let edit = road_write_edit(&[IVec2::new(0, 0)], &catalogue, &city);
         assert_eq!(edit.len(), (ROAD_CELL_SIZE * ROAD_CELL_SIZE) as usize, "every block in the one cell's piece");
@@ -1022,7 +1128,7 @@ mod tests {
         let dir = temp_dir("write_edit_unknown_style");
         let catalogue = catalogue_with_isolated(&dir); // only "dirt" is loaded
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(0, 0), "paved").unwrap();
+        city.add_road_cell(IVec2::new(0, 0), "paved", 64).unwrap();
 
         let edit = road_write_edit(&[IVec2::new(0, 0)], &catalogue, &city);
         assert!(edit.is_empty());
@@ -1037,7 +1143,7 @@ mod tests {
         write_piece(&dir, "dirt", RoadPieceKind::Straight, &one_stone_piece());
         let (catalogue, _skipped) = load_road_catalogue_dir(&dir);
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(0, 0), "dirt").unwrap();
+        city.add_road_cell(IVec2::new(0, 0), "dirt", 64).unwrap();
 
         let edit = road_write_edit(&[IVec2::new(0, 0)], &catalogue, &city);
         assert!(edit.is_empty());
@@ -1049,15 +1155,86 @@ mod tests {
         let dir = temp_dir("write_edit_offset");
         let catalogue = catalogue_with_isolated(&dir);
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(0, 0), "dirt").unwrap();
-        city.add_road_cell(IVec2::new(2, 0), "dirt").unwrap();
+        city.add_road_cell(IVec2::new(0, 0), "dirt", 64).unwrap();
+        city.add_road_cell(IVec2::new(2, 0), "dirt", 64).unwrap();
 
         let edit = road_write_edit(&[IVec2::new(0, 0), IVec2::new(2, 0)], &catalogue, &city);
         let positions: std::collections::HashSet<IVec3> = edit.edits().iter().map(|e| e.at).collect();
-        // Cell (2, 0)'s corner is (12, 0, 0) — two cells over.
-        assert!(positions.contains(&IVec3::new(0, 0, 0)));
-        assert!(positions.contains(&IVec3::new(2 * ROAD_CELL_SIZE, 0, 0)));
+        // Cell (2, 0)'s corner is (12, _, 0) — two cells over. The Y is
+        // `cell_write_origin`'s, not `base_y` itself; that's this test's
+        // neighbours' business, not its own.
+        let y = cell_write_origin(IVec2::ZERO, 64).y;
+        assert!(positions.contains(&IVec3::new(0, y, 0)));
+        assert!(positions.contains(&IVec3::new(2 * ROAD_CELL_SIZE, y, 0)));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Ticket 065, the bug that made every built road invisible: the piece
+    /// is written relative to the cell's *recorded* `base_y`, not at
+    /// `cell_min_corner`'s placeholder Y of 0 (which buried it ~60 blocks
+    /// down in the deepslate). The exact offset from `base_y` is
+    /// `cell_write_origin`'s business — see the test below it; all this one
+    /// asserts is that the height is being read at all.
+    #[test]
+    fn road_write_edit_writes_relative_to_the_cells_recorded_base_y_not_zero() {
+        let dir = temp_dir("write_edit_base_y");
+        let catalogue = catalogue_with_isolated(&dir);
+        let mut city = City::default();
+        city.add_road_cell(IVec2::new(0, 0), "dirt", 71).unwrap();
+
+        let edit = road_write_edit(&[IVec2::new(0, 0)], &catalogue, &city);
+        assert!(!edit.is_empty());
+        let y = cell_write_origin(IVec2::ZERO, 71).y;
+        assert!(y > 60, "a road on ground at 71 must not land anywhere near the deepslate");
+        assert!(
+            edit.edits().iter().all(|e| e.at.y == y),
+            "every block of a one-layer piece should land on the cell's own ground, not at Y=0"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The anchoring itself: a piece's *surface course*
+    /// ([`ROAD_PIECE_SUBGRADE_DEPTH`] layers up from its bottom) lands on the
+    /// terrain's topmost ground block — `base_y - 1`, `base_y` being
+    /// `fit_footprint`'s "one *above* the ground". Flush with the grass
+    /// beside it, with the shipped pieces' air layers as clearance above.
+    #[test]
+    fn cell_write_origin_puts_the_surface_course_at_the_terrain_surface() {
+        let surface = cell_write_origin(IVec2::ZERO, 64).y + ROAD_PIECE_SUBGRADE_DEPTH;
+        assert_eq!(surface, 63, "ground at 64 means the topmost ground block is 63");
+    }
+
+    /// Two cells fitted to different ground each keep their own height —
+    /// a single drag across a step doesn't flatten to one shared Y.
+    #[test]
+    fn road_write_edit_uses_each_cells_own_base_y() {
+        let dir = temp_dir("write_edit_two_heights");
+        let catalogue = catalogue_with_isolated(&dir);
+        let mut city = City::default();
+        city.add_road_cell(IVec2::new(0, 0), "dirt", 64).unwrap();
+        city.add_road_cell(IVec2::new(2, 0), "dirt", 70).unwrap();
+
+        let edit = road_write_edit(&[IVec2::new(0, 0), IVec2::new(2, 0)], &catalogue, &city);
+        let positions: std::collections::HashSet<IVec3> = edit.edits().iter().map(|e| e.at).collect();
+        assert!(positions.contains(&IVec3::new(0, cell_write_origin(IVec2::ZERO, 64).y, 0)));
+        assert!(positions.contains(&IVec3::new(2 * ROAD_CELL_SIZE, cell_write_origin(IVec2::new(2, 0), 70).y, 0)));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The preview and the write must agree, cell for cell — the disagreement
+    /// ticket 065 exists to close. A real piece's ghost is corner-anchored
+    /// and stands exactly at `cell_write_origin`; only the fallback quad
+    /// (centred on its own origin) gets half a cell added back.
+    #[test]
+    fn cell_transform_stands_a_piece_ghost_exactly_where_the_write_lands() {
+        let cell = IVec2::new(3, -2);
+        let origin = cell_write_origin(cell, 68);
+        let piece = cell_transform(cell, 68, PreviewAnchor::Piece);
+        assert_eq!(piece.translation, Vec3::new(origin.x as f32, origin.y as f32, -(origin.z as f32)));
+
+        let half = ROAD_CELL_SIZE as f32 / 2.0;
+        let quad = cell_transform(cell, 68, PreviewAnchor::Quad);
+        assert_eq!(quad.translation, Vec3::new(origin.x as f32 + half, origin.y as f32, -(origin.z as f32 + half)));
     }
 
     #[test]
@@ -1069,9 +1246,9 @@ mod tests {
         // A straight run of three cells: the middle one sees a north *and*
         // a south neighbour, resolving to Straight — the two ends resolve
         // to DeadEnd, which this catalogue has no piece for.
-        city.add_road_cell(IVec2::new(0, -1), "dirt").unwrap();
-        city.add_road_cell(IVec2::new(0, 0), "dirt").unwrap();
-        city.add_road_cell(IVec2::new(0, 1), "dirt").unwrap();
+        city.add_road_cell(IVec2::new(0, -1), "dirt", 64).unwrap();
+        city.add_road_cell(IVec2::new(0, 0), "dirt", 64).unwrap();
+        city.add_road_cell(IVec2::new(0, 1), "dirt", 64).unwrap();
 
         let edit = road_write_edit(&[IVec2::new(0, -1), IVec2::new(0, 0), IVec2::new(0, 1)], &catalogue, &city);
         assert_eq!(
@@ -1093,8 +1270,8 @@ mod tests {
         let (catalogue, _skipped) = load_road_catalogue_dir(&dir);
 
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(0, 0), "dirt").unwrap();
-        city.add_road_cell(IVec2::new(100, 100), "paved").unwrap();
+        city.add_road_cell(IVec2::new(0, 0), "dirt", 64).unwrap();
+        city.add_road_cell(IVec2::new(100, 100), "paved", 64).unwrap();
 
         let edit = road_write_edit(&[IVec2::new(0, 0), IVec2::new(100, 100)], &catalogue, &city);
         assert_eq!(
@@ -1140,7 +1317,7 @@ mod tests {
     #[test]
     fn poll_road_build_success_fires_chunks_edited_and_records_the_write() {
         let mut app = road_build_test_app();
-        app.world_mut().resource_mut::<City>().add_road_cell(IVec2::new(0, 0), "dirt").unwrap();
+        app.world_mut().resource_mut::<City>().add_road_cell(IVec2::new(0, 0), "dirt", 64).unwrap();
 
         let report = EditReport { blocks_written: 36, chunks: vec![(0, 0)], regions: vec![(0, 0)], replaced: None };
         let task = pool().spawn(async move { Ok(report) });
@@ -1162,8 +1339,8 @@ mod tests {
         let mut app = road_build_test_app();
         {
             let mut city = app.world_mut().resource_mut::<City>();
-            city.add_road_cell(IVec2::new(0, 0), "dirt").unwrap(); // pre-existing neighbour, not newly added
-            city.add_road_cell(IVec2::new(1, 0), "dirt").unwrap(); // this drag's own new cell
+            city.add_road_cell(IVec2::new(0, 0), "dirt", 64).unwrap(); // pre-existing neighbour, not newly added
+            city.add_road_cell(IVec2::new(1, 0), "dirt", 64).unwrap(); // this drag's own new cell
         }
 
         let task = pool().spawn(async { Err(EditRefusal::Empty) });
@@ -1185,7 +1362,7 @@ mod tests {
     #[test]
     fn style_for_cell_prefers_a_cells_own_recorded_style_over_the_selection() {
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(0, 0), "dirt").unwrap();
+        city.add_road_cell(IVec2::new(0, 0), "dirt", 64).unwrap();
         assert_eq!(style_for_cell(IVec2::new(0, 0), &city, Some("paved")), Some("dirt"));
     }
 

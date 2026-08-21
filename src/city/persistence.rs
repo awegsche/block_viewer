@@ -43,6 +43,13 @@
 //! [`SavedRoadCell`] gained a `style` field a version-2 file's bare
 //! `(i32, i32)` tuple doesn't have — same call as the 1 -> 2 bump, refused
 //! rather than guessed at.
+//!
+//! Bumped again to `4` by ticket 065: a road cell also remembers the world
+//! `y` it was built at ([`super::state::RoadCell::base_y`]) — before that
+//! fix every road piece was written at a hardcoded Y of 0, so a version-3
+//! file's cells have no height to recover and defaulting them to *anything*
+//! would either re-bury them or drop them on terrain they were never fitted
+//! to. Refused rather than guessed at, same as the two bumps before it.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -55,7 +62,7 @@ use crate::blueprint::Rotation;
 
 /// The `CitySave` schema version this build writes and reads. Bumped only
 /// alongside a migration path — see the module docs.
-pub const CURRENT_VERSION: u32 = 3;
+pub const CURRENT_VERSION: u32 = 4;
 
 /// Where [`save_city`]/[`load_city`] look, relative to a save's root
 /// (`SaveMeta::path`) — the roadmap's own `<save>/citybuilder/city.ron`.
@@ -89,11 +96,15 @@ struct SavedBuilding {
 }
 
 /// One saved road cell — cell coordinates plus the style
-/// (`super::road_catalogue::RoadCatalogue`'s key) it was built as.
+/// (`super::road_catalogue::RoadCatalogue`'s key) it was built as and the
+/// world Y its piece sits at (ticket 065).
 #[derive(Debug, Serialize, Deserialize)]
 struct SavedRoadCell {
     x: i32,
     z: i32,
+    /// World Y, *not* a cell coordinate — unlike `x`/`z`, which are cell
+    /// coordinates (ticket 054). See [`super::state::RoadCell::base_y`].
+    y: i32,
     style: String,
 }
 
@@ -156,8 +167,8 @@ pub fn save_city(city: &City, save_root: &Path) -> Result<(), PersistenceError> 
     buildings.sort_by_key(|b| b.id);
 
     let mut road_cells: Vec<SavedRoadCell> = city
-        .road_cells_with_styles()
-        .map(|(cell, style)| SavedRoadCell { x: cell.x, z: cell.y, style: style.to_string() })
+        .road_cells_with_data()
+        .map(|(cell, road)| SavedRoadCell { x: cell.x, z: cell.y, y: road.base_y, style: road.style.clone() })
         .collect();
     road_cells.sort_by_key(|cell| (cell.x, cell.z));
 
@@ -205,7 +216,7 @@ pub fn load_city(save_root: &Path) -> Result<City, PersistenceError> {
     let mut road_cells = save.road_cells;
     road_cells.sort_by_key(|cell| (cell.x, cell.z));
     for cell in road_cells {
-        city.add_road_cell(IVec2::new(cell.x, cell.z), cell.style).map_err(PersistenceError::Corrupt)?;
+        city.add_road_cell(IVec2::new(cell.x, cell.z), cell.style, cell.y).map_err(PersistenceError::Corrupt)?;
     }
 
     // `insert_loaded` already raised `next_id` past every id it inserted;
@@ -264,8 +275,8 @@ mod tests {
         let b = city
             .place_building("house01", IVec3::new(0, 70, 0), Rotation::Deg90, IVec2::new(3, 5))
             .unwrap();
-        city.add_road_cell(IVec2::new(50, 50), "dirt").unwrap();
-        city.add_road_cell(IVec2::new(50, 51), "paved").unwrap();
+        city.add_road_cell(IVec2::new(50, 50), "dirt", 64).unwrap();
+        city.add_road_cell(IVec2::new(50, 51), "paved", 71).unwrap();
 
         save_city(&city, &dir).unwrap();
         let loaded = load_city(&dir).unwrap();
@@ -287,6 +298,10 @@ mod tests {
         // Ticket 059: each cell's own style round-trips too, not just its
         // coordinate.
         assert_eq!(loaded.road_style_at(IVec2::new(50, 50)), Some("dirt"));
+        // Ticket 065: so does the height it was built at — two cells at
+        // different heights come back at their own, not at a shared default.
+        assert_eq!(loaded.road_cell_at(IVec2::new(50, 50)).map(|road| road.base_y), Some(64));
+        assert_eq!(loaded.road_cell_at(IVec2::new(50, 51)).map(|road| road.base_y), Some(71));
         assert_eq!(loaded.road_style_at(IVec2::new(50, 51)), Some("paved"));
     }
 
@@ -368,6 +383,28 @@ mod tests {
         assert!(matches!(err, PersistenceError::Parse(_) | PersistenceError::UnsupportedVersion(2)), "{err:?}");
     }
 
+    /// Ticket 065: a version-3 file's `road_cells` had no `y` — every road
+    /// in it was written at the hardcoded Y=0 that ticket fixed, so there is
+    /// no height to recover and nothing sensible to default to. Refused, the
+    /// same call the 1 -> 2 and 2 -> 3 bumps made.
+    #[test]
+    fn an_old_heightless_road_cell_save_is_refused_not_silently_defaulted() {
+        let dir = temp_dir("old_road_cell_height");
+        fs::create_dir_all(dir.join("citybuilder")).unwrap();
+        fs::write(
+            dir.join("citybuilder/city.ron"),
+            r#"(version: 3, next_id: 0, buildings: [], road_cells: [(x: 5, z: 5, style: "dirt")])"#,
+        )
+        .unwrap();
+
+        // Which of the two it trips is incidental — RON deserializes the
+        // whole file (and misses `y`) before `load_city` ever gets to look at
+        // `version` — so this asserts the same either-way shape ticket 059's
+        // own 2 -> 3 test does. What matters is that it's refused.
+        let err = load_city(&dir).unwrap_err();
+        assert!(matches!(err, PersistenceError::Parse(_) | PersistenceError::UnsupportedVersion(3)), "{err:?}");
+    }
+
     #[test]
     fn garbage_ron_is_a_parse_error_not_a_panic() {
         let dir = temp_dir("garbage");
@@ -385,7 +422,7 @@ mod tests {
         fs::write(
             dir.join("citybuilder/city.ron"),
             r#"(
-                version: 3,
+                version: 4,
                 next_id: 2,
                 buildings: [
                     (id: 0, definition: "house01", origin: (0, 64, 0), rotation: Deg0, footprint: (4, 4)),
@@ -407,12 +444,12 @@ mod tests {
         fs::write(
             dir.join("citybuilder/city.ron"),
             r#"(
-                version: 3,
+                version: 4,
                 next_id: 1,
                 buildings: [
                     (id: 0, definition: "house01", origin: (0, 64, 0), rotation: Deg0, footprint: (2, 2)),
                 ],
-                road_cells: [(x: 0, z: 0, style: "dirt")],
+                road_cells: [(x: 0, z: 0, y: 64, style: "dirt")],
             )"#,
         )
         .unwrap();

@@ -190,11 +190,11 @@
 //! keyboard-stand-in role ticket 047's number keys play for buildings.
 //! Connectivity and shape selection (`road::connections_at`/`select_piece`)
 //! stay entirely style-blind — style only decides which `.nbt` gets
-//! meshed/written once the shape is already chosen. No real `.nbt` pieces
-//! ship for any style yet (they need an actual Minecraft structure-block
-//! export); `road_catalogue` is proven against synthetic fixtures the same
-//! way ticket 039's building catalogue tests were, and isn't wired into
-//! `run` until there's something on disk for it to load.
+//! meshed/written once the shape is already chosen. Ticket 063's `dirt`
+//! style is the first with real structure-block exports on disk;
+//! `road_catalogue` is still proven against synthetic fixtures the same way
+//! ticket 039's building catalogue tests were, so a style shipping no
+//! geometry stays a supported (if invisible) state rather than a failure.
 //!
 //! ## Terraforming: dig and level (ticket 057, roadmap H1)
 //!
@@ -578,10 +578,10 @@ fn load_building_definitions(
 /// same shape as [`load_building_catalogue`] —
 /// [`road_catalogue::load_road_catalogue_dir`] never panics either, so
 /// there's no error path to propagate, only one to print. Missing pieces are
-/// expected today (see that module's own "No real assets yet") — `run`
-/// always inserts whatever loaded, even an entirely empty catalogue, so
-/// `road_build` can read it unconditionally rather than through a second
-/// `Option`.
+/// still a supported state (only ticket 063's `dirt` style ships geometry so
+/// far) — `run` always inserts whatever loaded, even an entirely empty
+/// catalogue, so `road_build` can read it unconditionally rather than through
+/// a second `Option`.
 fn load_road_catalogue() -> road_catalogue::RoadCatalogue {
     let (catalogue, skipped) = road_catalogue::load_road_catalogue_dir(Path::new(ROAD_CATALOGUE_DIR));
 

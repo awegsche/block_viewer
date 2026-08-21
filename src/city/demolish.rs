@@ -296,7 +296,7 @@ mod tests {
     fn resolve_demolition_target_is_nothing_on_a_road_tile() {
         let mut city = City::default();
         // Cell (0, 0) covers block tiles 0..6 x 0..6, which includes (5, 5).
-        city.add_road_cell(IVec2::new(0, 0), "dirt").unwrap();
+        city.add_road_cell(IVec2::new(0, 0), "dirt", 64).unwrap();
         let journal = Journal::default();
         let result = resolve_demolition_target(IVec3::new(5, 64, 5), &city, &journal);
         assert!(matches!(result, DemolitionTarget::Nothing));
