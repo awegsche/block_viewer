@@ -106,7 +106,10 @@ fn filename_for(kind: RoadPieceKind) -> &'static str {
         RoadPieceKind::Corner => "corner",
         RoadPieceKind::T => "t",
         RoadPieceKind::Cross => "cross",
-        RoadPieceKind::Stair => "stair",
+        // Ticket 068: `stairs`, plural — that's what the shipped export is
+        // called, and what the Minecraft block family it's built out of is
+        // called. The `RoadPieceKind` variant stays singular.
+        RoadPieceKind::Stair => "stairs",
     }
 }
 
@@ -405,6 +408,71 @@ mod tests {
         }
     }
 
+    /// The stair's own geometry check (ticket 068), pinning the three things
+    /// `city::road_build`'s height planning takes on faith about it: that its
+    /// **low** end is the south edge (so the piece follows ticket 066's "every
+    /// piece opens south" convention, and `stair_rotation`'s "canonical
+    /// ascends north" is true of the actual file), that its **high** end is
+    /// the north edge, and that the two are exactly `ROAD_STAIR_RISE` apart —
+    /// the number every level in a `plan_drag` profile is a multiple of. A
+    /// re-export with a five-block rise would leave every road built from it
+    /// with a one-block lip at each ramp, and nothing else would notice.
+    #[test]
+    fn the_shipped_stair_climbs_north_by_exactly_one_stair_rise() {
+        let (catalogue, _skipped) = load_road_catalogue_dir(Path::new("assets/city/roads"));
+        let Some(piece) = catalogue.get("dirt", RoadPieceKind::Stair) else {
+            panic!("assets/city/roads/dirt/{}.nbt should be checked in", filename_for(RoadPieceKind::Stair));
+        };
+
+        let (sx, sz) = (piece.size.x as usize, piece.size.z as usize);
+        let at = |x: usize, y: usize, z: usize| {
+            piece.palette[piece.blocks[y * sz * sx + z * sx + x] as usize].name.as_str()
+        };
+        let low = super::super::road_build::ROAD_PIECE_SUBGRADE_DEPTH as usize;
+        let high = low + super::super::road_build::ROAD_STAIR_RISE as usize;
+        assert!(piece.size.y as usize > high, "a stair needs at least its own rise plus clearance");
+
+        // The surface course is whatever paves the low end's centre —
+        // `dirt_path` for this style, but read rather than assumed, the same
+        // way `open_edges` does it.
+        let mid = (ROAD_CELL_SIZE / 2) as usize;
+        let surface = at(mid, low, sz - 1);
+
+        for x in [mid - 1, mid] {
+            assert_eq!(at(x, low, sz - 1), surface, "the stair's low end should pave the SOUTH edge at y={low}");
+            assert_eq!(at(x, high, 0), surface, "the stair's high end should pave the NORTH edge at y={high}");
+        }
+        // And not level: a flat piece would pave both edges on the same layer,
+        // which is exactly what this test exists to tell apart.
+        assert_ne!(at(mid, low, 0), surface, "the NORTH edge must be fill at the low layer, not road");
+    }
+
+    /// `road_write_edit` reacts to a `RotationError` by printing one line and
+    /// **skipping the cell** — an invisible hole in a road. So every shipped
+    /// piece is rotated through all four rotations here, where an
+    /// unrotatable property is a test failure naming the block instead.
+    /// Ticket 068: the stair piece is the most property-dense one yet
+    /// (cobblestone stairs with `outer_left`/`outer_right` shapes, oak fences
+    /// with four connection booleans).
+    #[test]
+    fn every_shipped_piece_rotates_through_all_four_rotations() {
+        use crate::blueprint::{rotate_blueprint, Rotation};
+
+        let (catalogue, _skipped) = load_road_catalogue_dir(Path::new("assets/city/roads"));
+        for style in catalogue.styles() {
+            for kind in RoadPieceKind::ALL {
+                let Some(piece) = catalogue.get(&style, kind) else { continue };
+                for rotation in [Rotation::Deg0, Rotation::Deg90, Rotation::Deg180, Rotation::Deg270] {
+                    let rotated = rotate_blueprint(piece, rotation)
+                        .unwrap_or_else(|err| panic!("{style}/{}.nbt at {rotation:?}: {err}", filename_for(kind)));
+                    // A quarter turn swaps x and z; a road piece is square, so
+                    // every rotation of one has to come back the same size.
+                    assert_eq!(rotated.size, piece.size, "{style}/{}.nbt at {rotation:?}", filename_for(kind));
+                }
+            }
+        }
+    }
+
     /// The guard ticket 066 exists because nothing had: the `.nbt` files
     /// checked into `assets/city/roads/dirt` are read, and each one's real
     /// open edges are compared against the orientation
@@ -413,19 +481,29 @@ mod tests {
     /// assets, fails here rather than silently rotating every corner in the
     /// world by 180°.
     ///
-    /// [`RoadPieceKind::Isolated`] is skipped: `isolated.nbt` currently ships
-    /// as a byte-identical copy of `dead_end.nbt` (a south-pointing stub),
-    /// which the canonical "connects to nothing" can't describe and
-    /// `select_piece` — which always answers `Deg0` for an unoriented piece —
-    /// has no rotation to fix it with. Re-exporting a real island piece is
-    /// noted in `todo.md`; it needs Minecraft, not code.
+    /// Two kinds are skipped.
+    ///
+    /// [`RoadPieceKind::Isolated`]: `isolated.nbt` currently ships as a
+    /// byte-identical copy of `dead_end.nbt` (a south-pointing stub), which
+    /// the canonical "connects to nothing" can't describe and `select_piece`
+    /// — which always answers `Deg0` for an unoriented piece — has no
+    /// rotation to fix it with. Re-exporting a real island piece is noted in
+    /// `todo.md`; it needs Minecraft, not code.
+    ///
+    /// [`RoadPieceKind::Stair`] (ticket 068): [`open_edges`] reads *one*
+    /// layer, which is the whole story for a flat piece and meaningless for
+    /// a ramp whose two ends are `ROAD_STAIR_RISE` layers apart — at the
+    /// subgrade layer the stair's high edge is solid fill, so this rule would
+    /// read it as opening the wrong way entirely. See
+    /// [`the_shipped_stair_climbs_north_by_exactly_one_stair_rise`], which
+    /// pins more about it than this could.
     #[test]
     fn the_shipped_dirt_pieces_are_authored_at_the_canonical_orientations() {
         let (catalogue, _skipped) = load_road_catalogue_dir(Path::new("assets/city/roads"));
         assert!(catalogue.get("dirt", RoadPieceKind::Straight).is_some(), "the dirt style should be checked in");
 
         for kind in RoadPieceKind::ALL {
-            if kind == RoadPieceKind::Isolated {
+            if matches!(kind, RoadPieceKind::Isolated | RoadPieceKind::Stair) {
                 continue; // see the doc comment
             }
             let Some(piece) = catalogue.get("dirt", kind) else {

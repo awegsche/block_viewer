@@ -21,7 +21,7 @@ The rule, in one line: **every piece opens to the south.** Per file:
 | `corner.nbt`   | south + west           |
 | `t.nbt`        | north + south + east   |
 | `cross.nbt`    | all four               |
-| `stair.nbt`    | north + south, ascending toward **north** (ticket 067) |
+| `stairs.nbt`   | north + south, ascending toward **north** (tickets 067/068) |
 
 `city::road_catalogue`'s
 `the_shipped_dirt_pieces_are_authored_at_the_canonical_orientations` reads
@@ -41,21 +41,25 @@ kerb / shoulder. Vertically the six flat pieces are `6x5x6`:
 `city::road_build::ROAD_PIECE_SUBGRADE_DEPTH` is the `1` in "the surface
 course is one layer up"; see that module's docs.
 
-### `stair.nbt` (ticket 067)
+### `stairs.nbt` (tickets 067/068)
 
-The piece that bridges two road levels. Same `6` x/z footprint, but it
-climbs `ROAD_STAIR_RISE = 4` blocks across the cell:
+The piece that bridges two road levels. Same `6` x/z footprint, `6x8x6` as
+shipped, climbing `ROAD_STAIR_RISE = 4` blocks across the cell:
 
 - `y=0` — subgrade under the whole cell, as above
-- `y=1` — the surface course at the **south** edge (the low end)
-- `y=1..5` — the surface steps up one block at a time toward the **north**
-  edge, which finishes at `y=5`; everything under each step is solid fill,
-  not air
-- three air layers of clearance above the highest step
+- `y=1` — the surface course on the **south** edge: the ramp's *low* end
+- `y=2..5` — one step per layer walking north, with solid fill behind each
+  (not air — a player has to be able to walk up it)
+- `y=5` — the surface course again on the **north** edge: the *high* end
+- `y=6..7` — air clearance
 
-so the piece is `6x9x6`. A road cell records its stair's *low* end as its
-`base_y`, and the flat cell on the high side records `base_y + 4` — see
-`city::road_build`'s "Height" docs.
+A road cell records its stair's **low** end as its `base_y`, and the flat
+cell on the high side records `base_y + 4` — see `city::road_build`'s
+"Height" docs. The four-block rise isn't decoration: it's
+`ROAD_STAIR_RISE`, and every level in a planned drag is a multiple of it, so
+a re-export with a different rise leaves a lip at every ramp.
+`city::road_catalogue`'s `the_shipped_stair_climbs_north_by_exactly_one_stair_rise`
+checks all three of those properties against the real file.
 
 ## Game data
 

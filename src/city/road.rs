@@ -50,7 +50,7 @@
 //! | `corner.nbt`   | **south + west**      |
 //! | `t.nbt`        | north + south + east  |
 //! | `cross.nbt`    | all four              |
-//! | `stair.nbt`    | north + south, **ascending north** (ticket 067) |
+//! | `stairs.nbt`   | north + south, **ascending north** (ticket 067) |
 //!
 //! Read off the shipped `dirt` pieces (ticket 063) rather than imposed on
 //! them — every one of the six already connects south, so "south is always
@@ -406,7 +406,7 @@ impl RoadPieceKind {
 }
 
 /// The [`Rotation`] a [`RoadPieceKind::Stair`] piece needs to climb toward
-/// `ascent`. The canonical `stair.nbt` ascends toward **north** (see
+/// `ascent`. The canonical `stairs.nbt` ascends toward **north** (see
 /// [`canonical_pattern`] and the module docs' authoring convention), so this
 /// is just "how far is `ascent` from north, clockwise" — derived through
 /// [`Direction`]'s own order rather than a second four-way table that could

@@ -2,7 +2,7 @@
 
 Not a work item: the design document for the citybuilder game and the shared
 world-edit infrastructure it uses. High-level tasks here get split into
-numbered tickets in this directory when picked up (**next free number: 068**).
+numbered tickets in this directory when picked up (**next free number: 069**).
 Companion to `ROADMAP.md`, which covers the viewer 001–029.
 
 ## The goal
@@ -334,7 +334,7 @@ Building(
   rotates every style's pieces through the same table. The rule: **every
   piece opens to the south** — `dead_end` south, `straight` north+south,
   `corner` south+west, `t` north+south+east, `cross` all four,
-  `stair` north+south ascending north. Read off ticket 063's shipped `dirt`
+  `stairs` north+south ascending north. Read off ticket 063's shipped `dirt`
   pieces rather than imposed on them; the table originally disagreed with
   them, which rotated every dead end and corner 180° and every T 90°
   (straight and cross are symmetric under exactly the turn they were wrong
@@ -342,7 +342,7 @@ Building(
   `the_shipped_dirt_pieces_are_authored_at_the_canonical_orientations` reads
   the real `.nbt` files and fails if code and assets ever drift apart again.
 - **Styles** — `assets/city/roads` is a directory *of styles*:
-  `assets/city/roads/<style>/{isolated,dead_end,straight,corner,t,cross,stair}.nbt`,
+  `assets/city/roads/<style>/{isolated,dead_end,straight,corner,t,cross,stairs}.nbt`,
   each piece required to be exactly `ROAD_CELL_SIZE` on x/z; the subdirectory
   name is the style id. `RoadCatalogue` is keyed by `(style, RoadPieceKind)`;
   a missing piece is skipped, not fatal, and `RoadCatalogue::styles()` only
@@ -365,10 +365,11 @@ Building(
   under `assets/city/roads/dirt/` plus `assets/city/road_types/dirt.ron`
   (`travel_speed: 1.0`, `capacity: 4`). See that directory's `README.md` for
   the fixed filenames, the orientation convention and the cross-section the
-  loader and the write path expect. Two gaps in it: there is no `stair.nbt`
-  yet (ticket 067 works without one — every road is flat until it lands), and
+  loader and the write path expect. `stairs.nbt` landed with ticket 068 —
+  `6x8x6`, ascending north, rising exactly `ROAD_STAIR_RISE` = 4, which is
+  what makes 067's stair planning do anything. One gap remains:
   `isolated.nbt` is a byte-identical copy of `dead_end.nbt`, so a lone road
-  cell renders as a south-pointing stub rather than an island. Both need
+  cell renders as a south-pointing stub rather than an island. That needs
   Minecraft, not code.
 - **`road_build`** — drag-to-build, gated by `city::tool::ActiveTool`
   (`Building | Road | Terraform`, `T` cycles; placement/commit no-op unless
@@ -393,9 +394,9 @@ Building(
   them are spread evenly over the path's straight interior (never an end,
   never the L's corner, never a cell something else branches into). A drag
   needing more steps than it has room for is refused whole. With no
-  `stair.nbt` loaded — the shipped state — every drag is flat at its first
-  cell's level, which is the simple "one Y per road" rule as the degenerate
-  case. Ends prefer an existing road cell's recorded level over the terrain
+  `stairs.nbt` loaded, every drag is flat at its first cell's level — the
+  simple "one Y per road" rule as the degenerate case rather than a second
+  mode. Ends prefer an existing road cell's recorded level over the terrain
   (`anchor_level`), so consecutive drags join flush; a stair is read on the
   *edge* being joined, since its two ends are four blocks apart. Preview and
   write share `plan_drag` and `cell_write_origin` so the ghost cannot stand

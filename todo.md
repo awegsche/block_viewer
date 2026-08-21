@@ -1094,7 +1094,7 @@ Y=0 in the world and won't be cleaned up by this fix — see the ticket.
 - [ ] **067 road height: a drag builds one continuous road, not a staircase
   of cliffs.** Same launch. Roads used to fit each 6x6 cell to its own
   ground; now the whole drag gets one level (from its first cell), with
-  optional 4-block steps via `stair.nbt`.
+  optional 4-block steps via `stairs.nbt`.
 
   1. **Drag a long run across a slope.** Every cell should sit at the same Y
      — the one the cell you *started* the drag on was fitted to. No
@@ -1109,13 +1109,15 @@ Y=0 in the world and won't be cleaned up by this fix — see the ticket.
      road should continue at the *existing* road's height, not drop back to
      the ground under it. That's `anchor_level`; a seam means it isn't
      firing.
-  4. **Once `assets/city/roads/dirt/stair.nbt` exists** (see that directory's
-     README for the orientation and cross-section to author it to): drag a
-     run whose two ends are ~4+ blocks apart in height. One stair cell should
-     appear in the middle of the run, its low end flush with the flat road
-     behind it and its top step flush with the flat road ahead. A run that's
-     too short for the climb should refuse the whole drag with a message in
-     the console rather than building a cliff.
+  4. **Ramps** — `assets/city/roads/dirt/stairs.nbt` is in (ticket 068), so
+     this is live. Drag a run whose two ends are ~4+ blocks apart in height.
+     One stair cell should appear in the middle of the run, its low end flush
+     with the flat road behind it and its top step flush with the flat road
+     ahead — walkable end to end, no lip at either join. ~8+ blocks apart
+     should give two ramps, spread rather than stacked. A run too short for
+     the climb should refuse the *whole* drag with a message in the console
+     ("the ends are N step(s) apart ... only M cell(s) on the path can be
+     stairs") rather than building a cliff.
   5. **Save, quit, reopen.** Heights and stairs come back. Note: an existing
      `<save>/citybuilder/city.ron` is version 4 and will be *refused* on load
      (`city save is version 4, this build reads version 5`) — delete it to

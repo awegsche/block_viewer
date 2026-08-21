@@ -101,7 +101,7 @@
 //!   change and it bridges exactly four blocks;
 //! - the cells **between** run flat, except for the few [`spread_evenly`]
 //!   picks to be stairs, each climbing one step;
-//! - with no `stair.nbt` loaded, or with both ends on one level, the whole
+//! - with no `stairs.nbt` loaded, or with both ends on one level, the whole
 //!   drag is flat at the first cell's level — the plain "one Y per road"
 //!   rule, as the degenerate case rather than a second mode.
 //!
@@ -435,7 +435,7 @@ fn cell_height(cell: IVec2, world: &DecodedWorld) -> Option<i32> {
 /// which is why a drag's end level snaps to a multiple of this.
 ///
 /// A constant for the same reason [`ROAD_PIECE_SUBGRADE_DEPTH`] is one: it
-/// describes the shipped geometry (`assets/city/roads/<style>/stair.nbt`,
+/// describes the shipped geometry (`assets/city/roads/<style>/stairs.nbt`,
 /// authored to climb four blocks), and `assets/city/road_types/*.ron` is
 /// game data that never reaches the write path. A style shipping a
 /// differently-pitched stair is what turns this into a field there.
@@ -657,8 +657,8 @@ fn plan_drag(
 
 /// Whether `style` has a stair piece loaded — the one thing [`plan_drag`]
 /// needs to know about the catalogue. `false` (every cell flat) when there's
-/// no catalogue, no selected style, or no `stair.nbt` for it, which is the
-/// state the shipped `dirt` style is in until one is exported.
+/// no catalogue, no selected style, or no `stairs.nbt` for it, which is the
+/// state a style is in until a `stairs.nbt` is exported for it.
 fn stair_available(catalogue: Option<&RoadCatalogue>, style: Option<&str>) -> bool {
     matches!((catalogue, style), (Some(catalogue), Some(style)) if catalogue.get(style, RoadPieceKind::Stair).is_some())
 }
