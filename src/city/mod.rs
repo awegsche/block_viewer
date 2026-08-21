@@ -293,6 +293,7 @@ use crate::{
     camera::{self, CameraMode, CameraStartMode},
     chunk_pipeline::{RenderFloor, SharedRegionCache},
     edit::session::WriteSession,
+    streaming::RenderDistance,
     world::decode::FloorPolicy,
     world_app, LoadedSave,
 };
@@ -349,6 +350,15 @@ pub fn run() {
     let journal = load_journal(&save_root);
 
     app.insert_resource(RenderFloor(FloorPolicy::BelowSurface { margin: 16 }))
+        // Ticket 070: further than the viewer's default 10. The RTS camera
+        // looks *across* a city rather than out of a head, so terrain
+        // running out inside the frustum is the normal view rather than an
+        // edge case — and this is the app that can afford the extra chunks,
+        // since the render floor two lines up already keeps ~7 sections per
+        // column out of decode, mesh and draw. `recommended_capacity` is
+        // flat from 10 to 32 (25 resident regions either way), so the
+        // region cache doesn't grow with it.
+        .insert_resource(RenderDistance(16))
         // Ticket 045, roadmap E1: pan/zoom/rotate over the terrain rather
         // than the viewer's free-flight rig — see `camera::CameraMode::Rts`.
         .insert_resource(CameraStartMode(CameraMode::Rts))

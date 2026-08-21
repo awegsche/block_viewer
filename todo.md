@@ -1143,3 +1143,29 @@ Y=0 in the world and won't be cleaned up by this fix — see the ticket.
      the game's own datafixers run over them. Walk the road built in step
      1 — dirt path, stairs and all — and confirm nothing came back as
      `air`, a missing block, or the wrong stair facing.
+
+- [ ] **070 citybuilder render distance + lazy unloading.**
+  `cargo run --bin citybuilder` (release if the debug build is too slow to
+  judge frame rate).
+  1. **Distance** — terrain should reach visibly further than before
+     (`RenderDistance(16)` against the viewer's 10: a 33x33-chunk square,
+     ~528 blocks across, against 21x21/~336). Fog and the far plane follow
+     it automatically, so the horizon should still fade into fog rather
+     than ending at a hard edge, and shadows should look unchanged (the
+     cascade distance is capped well below the far plane). Watch the frame
+     rate while panning — if it's meaningfully worse than at 10, say so;
+     the render floor is supposed to be paying for this.
+  2. **No thrash at the boundary** — pan a few chunks in one direction and
+     straight back, inside half a minute. Nothing should reload: no hitch,
+     no chunk visibly popping back in, and the console should print no
+     `Chunk streaming: ... to load` line for ground you already had. This
+     is the hysteresis margin (2 chunks) plus the 30s grace.
+  3. **The grace does expire** — pan far away (several render distances),
+     park for a minute, and watch memory settle back down rather than
+     climbing forever. In `block_viewer` (not the citybuilder) the Status
+     panel now reads `Loaded chunks: N (M lingering)`; M should rise as
+     you move and fall back toward 0 about 30 seconds after you stop.
+  4. **A long flight stays bounded** — in `block_viewer`, fly in one
+     direction for several minutes without stopping. `M lingering` should
+     plateau at 256 (the cap shedding the farthest ones early) rather than
+     growing with the length of the flight, and RSS should plateau with it.

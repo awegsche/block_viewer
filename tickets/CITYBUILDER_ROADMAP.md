@@ -2,7 +2,7 @@
 
 Not a work item: the design document for the citybuilder game and the shared
 world-edit infrastructure it uses. High-level tasks here get split into
-numbered tickets in this directory when picked up (**next free number: 070**).
+numbered tickets in this directory when picked up (**next free number: 071**).
 Companion to `ROADMAP.md`, which covers the viewer 001–029.
 
 ## The goal
@@ -469,6 +469,21 @@ drags the floor down with it, so the cutoff never slices into a visible hole.
 `block_viewer` still renders everything; the floor is switched on by
 `city::run()` only. Digging is what later moves the floor — a re-*decode*, not
 a re-mesh, since blocks under the floor were never decoded at all.
+
+**Render distance and retention (ticket 070).** The floor is what pays for the
+citybuilder's `RenderDistance(16)` — an RTS camera looks across a city, so the
+viewer's default 10 ran out of terrain inside the frustum, and
+`region_cache::recommended_capacity` is flat from 10 to 32 so the region cache
+doesn't grow with it. Separately, and for both binaries, *what to load* and
+*what to keep* stopped being the same square: `streaming::ChunkRetention` keeps
+columns out to `render_distance + margin` (hysteresis, kills boundary thrash),
+then holds anything past that as a timestamped *lingering* candidate for a
+`grace` before unloading (going somewhere and coming back is free), with
+`max_lingering` bounding the trail a long straight flight leaves behind by
+evicting the farthest first. Defaults 2 / 30s / 256. Two consequences worth
+remembering: `unload`'s in-flight cancellation is computed against the retain
+square, not the load square, and a lingering entry deliberately survives being
+emitted into `PendingChunkWork::to_unload` (nothing drains that list).
 
 ---
 

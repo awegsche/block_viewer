@@ -8,7 +8,7 @@ use bevy_egui::{egui, EguiContexts};
 
 use crate::chunk_pipeline::{InFlightChunkLoads, SharedRegionCache};
 use crate::sky::{self, ShadowSettings, TimeOfDay};
-use crate::streaming::{PendingChunkWork, RenderDistance};
+use crate::streaming::{LingeringChunks, PendingChunkWork, RenderDistance};
 use crate::{world, DecodedWorld};
 
 /// Quick-jump buttons (ticket 018's UI section: "what someone actually
@@ -39,6 +39,7 @@ pub(crate) fn status_panel(
     diagnostics: Res<DiagnosticsStore>,
     decoded_world: Res<DecodedWorld>,
     pending: Res<PendingChunkWork>,
+    lingering: Res<LingeringChunks>,
     in_flight_loads: Res<InFlightChunkLoads>,
     region_cache: Option<Res<SharedRegionCache>>,
     mut render_distance: ResMut<RenderDistance>,
@@ -52,7 +53,15 @@ pub(crate) fn status_panel(
             .unwrap_or(0.0);
         ui.label(format!("FPS: {fps:.0}"));
 
-        ui.label(format!("Loaded chunks: {}", decoded_world.columns.len()));
+        // Ticket 070: the count includes columns the retention grace is
+        // still holding past render distance, so it's worth saying how many
+        // of them are that — a steady "Loaded chunks" well above the render
+        // distance square is retention working, not a leak.
+        ui.label(format!(
+            "Loaded chunks: {} ({} lingering)",
+            decoded_world.columns.len(),
+            lingering.len()
+        ));
         // "Queued" covers both ends of the pipeline: coordinates diffed in
         // but not yet dispatched (`to_load`), and tasks already running.
         ui.label(format!(

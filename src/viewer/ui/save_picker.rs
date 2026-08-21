@@ -32,6 +32,7 @@ pub(crate) struct WorldReset<'w, 's> {
     shared_region_cache: Option<ResMut<'w, SharedRegionCache>>,
     pending: ResMut<'w, PendingChunkWork>,
     last_chunk: ResMut<'w, streaming::LastCameraChunk>,
+    lingering: ResMut<'w, streaming::LingeringChunks>,
     in_flight_loads: ResMut<'w, InFlightChunkLoads>,
     in_flight_remeshes: ResMut<'w, InFlightChunkRemeshes>,
     pending_remeshes: ResMut<'w, PendingChunkRemeshes>,
@@ -71,6 +72,11 @@ impl WorldReset<'_, '_> {
         *self.pending_remeshes = PendingChunkRemeshes::default();
         *self.pending = PendingChunkWork::default();
         *self.last_chunk = streaming::LastCameraChunk::default();
+        // Ticket 070: entries here name chunks of the save being left. The
+        // next recompute would drop them anyway (they're no longer loaded),
+        // but leaving them in would briefly count the old save's columns
+        // against the new save's lingering cap.
+        *self.lingering = streaming::LingeringChunks::default();
 
         if let Some(shared) = &mut self.shared_region_cache {
             let capacity = region_cache::recommended_capacity(render_distance);

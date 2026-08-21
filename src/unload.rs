@@ -13,7 +13,8 @@
 //!   happen. This module recomputes the desired set itself every frame
 //!   (the same cheap `HashSet` build 005-a's own diff does — see
 //!   `streaming`'s module docs) and cancels any in-flight task that's
-//!   fallen outside it.
+//!   fallen outside it — against the retain square (ticket 070), not the
+//!   render-distance square; see [`cancel_out_of_range_in_flight_work`].
 //!
 //! Region cache eviction (005-b) needs no code here: `RegionCache`'s
 //! capacity is already sized to one render distance's worth of regions
@@ -25,7 +26,11 @@
 //! No per-frame unload budget: a flying (not teleporting) camera only ever
 //! crosses one chunk boundary at a time, so nothing so far unloads more
 //! than a render-distance ring's edge per diff tick — add a budget only if
-//! a large jump is measured to spike a frame.
+//! a large jump is measured to spike a frame. Ticket 070's retention adds
+//! one case that unloads a batch rather than a ring's edge: enough lingering
+//! columns overrunning `ChunkRetention::max_lingering`, which sheds the
+//! excess in one go. That's despawn + free, not decode + mesh, and the cap
+//! only trips after a long uninterrupted run in one direction.
 
 use std::collections::HashSet;
 
@@ -38,7 +43,7 @@ use crate::chunk_pipeline::{
     InFlightChunkReloads, InFlightChunkRemeshes, PendingChunkReloads, PendingChunkRemeshes,
     SpawnedChunkEntities,
 };
-use crate::streaming::{self, PendingChunkWork, RenderDistance};
+use crate::streaming::{self, ChunkRetention, PendingChunkWork, RenderDistance};
 use crate::DecodedWorld;
 
 /// Adds the two unload systems. Ordered `.before()` `chunk_pipeline`'s own
@@ -98,7 +103,7 @@ fn unload_chunks(
 }
 
 /// Cancels (drops) any in-flight chunk-load, chunk-re-mesh (005-f) or
-/// chunk-reload (034/W7) task whose coordinate has left render distance
+/// chunk-reload (034/W7) task whose coordinate has left the *retain* square
 /// since it was kicked off, and drops any coordinate still waiting in
 /// [`PendingChunkRemeshes`]/[`PendingChunkReloads`] the same way. Simply
 /// dropping a `Task` cancels it (`bevy_tasks::Task::cancel`'s doc comment:
@@ -107,9 +112,18 @@ fn unload_chunks(
 /// complete later and, finding no entity left in [`SpawnedChunkEntities`]
 /// to update, respawn one — see [`InFlightChunkRemeshes::cancel_out_of_range`]'s
 /// docs.
+///
+/// The retain square rather than the render-distance square (ticket 070):
+/// `streaming` keeps columns loaded out to `render_distance + margin`, so a
+/// coordinate that slipped out of render distance mid-load is one the
+/// retain ring is about to hold on to anyway — canceling it there would
+/// throw away work that's already nearly done, and (worse) leave a hole
+/// inside the retained ring that nothing re-queues until the camera comes
+/// back. Anything outside retention is still canceled the same as before.
 fn cancel_out_of_range_in_flight_work(
     camera: Query<&Transform, With<camera::CameraRig>>,
     render_distance: Res<RenderDistance>,
+    retention: Res<ChunkRetention>,
     mut in_flight: ResMut<InFlightChunkLoads>,
     mut in_flight_remeshes: ResMut<InFlightChunkRemeshes>,
     mut pending_remeshes: ResMut<PendingChunkRemeshes>,
@@ -121,10 +135,11 @@ fn cancel_out_of_range_in_flight_work(
     };
 
     let center = streaming::camera_chunk_coord(transform.translation);
-    let desired: HashSet<(i32, i32)> = streaming::desired_chunks(center, render_distance.0);
-    in_flight.cancel_out_of_range(&desired);
-    in_flight_remeshes.cancel_out_of_range(&desired);
-    pending_remeshes.cancel_out_of_range(&desired);
-    in_flight_reloads.cancel_out_of_range(&desired);
-    pending_reloads.cancel_out_of_range(&desired);
+    let retained: HashSet<(i32, i32)> =
+        streaming::desired_chunks(center, retention.retain_radius(render_distance.0));
+    in_flight.cancel_out_of_range(&retained);
+    in_flight_remeshes.cancel_out_of_range(&retained);
+    pending_remeshes.cancel_out_of_range(&retained);
+    in_flight_reloads.cancel_out_of_range(&retained);
+    pending_reloads.cancel_out_of_range(&retained);
 }
