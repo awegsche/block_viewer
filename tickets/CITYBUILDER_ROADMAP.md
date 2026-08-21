@@ -2,7 +2,7 @@
 
 Not a work item: the design document for the citybuilder game and the shared
 world-edit infrastructure it uses. High-level tasks here get split into
-numbered tickets in this directory when picked up (**next free number: 075**).
+numbered tickets in this directory when picked up (**next free number: 076**).
 Companion to `ROADMAP.md`, which covers the viewer 001–029.
 
 ## The goal
@@ -607,6 +607,21 @@ world is made of are the economy's own units.
   - **The conversion is part of the placement's ledger** — consumed joins
     `debited`, produced joins `credited`, so undo hands back the logs rather
     than the planks they became, and a failed apply reverses it the same way.
+  - **Interchangeable groups (ticket 075)** — wood type survives the whole
+    trip (`drops.ron`'s "a block drops itself" keeps `birch_log` as
+    `birch_log`), which left a birch forest unable to build anything priced
+    in oak. `economy.ron`'s `interchangeable` lists are the answer: every
+    member converts to every other **1:1**, so the *payment* stops caring
+    while the pile goes on saying what the map actually gave. Ratios stay in
+    `conversions` — a ratio means the two aren't the same material after
+    all, and an explicit ratio is tried before a synonym. Groups are
+    expanded at lookup (`routes_to`), not at load: the shipped 44-name log
+    group would otherwise become ~1,900 `Conversion` structs, and the build
+    menu prices every visible row every frame. A name in two groups is a
+    load error, since "which group wins" isn't a question the file should be
+    able to ask. Collapsing wood to one id in `drops.ron` was the
+    alternative, and it would have made a building that genuinely wants
+    birch impossible to express.
 - **Still open**: production, warehouses, and haulage along roads —
   a producer's output has to reach a warehouse, and how long that takes comes
   from the road distance and each road type's `travel_speed` (loaded and

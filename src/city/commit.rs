@@ -334,7 +334,7 @@ fn try_commit_placement(
     // since nothing between here and there touches the stock. Ticket 074:
     // the shortfall reported is the one that survives conversions, so the
     // message never asks for planks a log in the pile would have covered.
-    let payment = economy::plan_payment(&stock, &costs, &economy.conversions);
+    let payment = economy::plan_payment(&stock, &costs, &economy);
     if !payment.affordable() {
         let shortfall = &payment.shortfall;
         println!("block_viewer: can't afford {id}: needs {shortfall}");

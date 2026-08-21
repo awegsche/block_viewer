@@ -1,20 +1,26 @@
-// The economy's tunable numbers (ticket 074). See `src/city/economy.rs`.
+// The economy's tunable numbers (tickets 074, 075). See `src/city/economy.rs`.
 //
-// Two knobs:
+// Three knobs:
 //
-//   start_stock  what a city with NO `citybuilder/stock.ron` is founded
-//                with. A save that already has a stock file is never
-//                topped up, however empty it is.
-//   conversions  trivially transformable materials, applied automatically
-//                when a placement is paid for and ONLY then — never on a
-//                demolition's backfill or a terraform's fill, and never to
-//                the pile at large. A conversion runs whole: needing 2
-//                planks with one log in stock converts the log and leaves
-//                the other 2 planks behind.
+//   start_stock     what a city with NO `citybuilder/stock.ron` is founded
+//                   with. A save that already has a stock file is never
+//                   topped up, however empty it is.
+//   conversions     trivially transformable materials at a stated RATIO,
+//                   applied automatically when a placement is paid for and
+//                   ONLY then — never on a demolition's backfill or a
+//                   terraform's fill, and never to the pile at large. A
+//                   conversion runs whole: needing 2 planks with one log in
+//                   stock converts the log and leaves the other 2 behind.
+//   interchangeable sets of materials that are the same material under a
+//                   different name, converting 1:1 in every direction. Use
+//                   this where a ratio would be 1:1 anyway — it's why a
+//                   birch forest can build a house priced in oak planks
+//                   while the stock still says `birch_log`.
 //
 // Bare names are read as `minecraft:<name>`. An input `count` left out is 1.
 // Chains work (logs -> planks -> sticks); a cycle is caught and refused
-// rather than followed.
+// rather than followed. An explicit `conversions` ratio is always tried
+// before an `interchangeable` synonym.
 (
     // ---- the founding grant ---------------------------------------------
     // Enough to lay out a first street without terraforming for it: the
@@ -27,39 +33,65 @@
         "oak_log": 64,
     },
 
-    // ---- trivially transformable ----------------------------------------
+    // ---- the same material under a different name -----------------------
+    // Wood type is kept all the way through the world and the stock — break
+    // a birch tree and the pile says `birch_log`. These groups are what stop
+    // that from meaning a birch forest can't build anything: the payment
+    // stops caring, the ledger doesn't.
+    interchangeable: [
+        // every plank is a plank
+        [
+            "oak_planks", "spruce_planks", "birch_planks", "jungle_planks",
+            "acacia_planks", "dark_oak_planks", "mangrove_planks", "cherry_planks",
+            "pale_oak_planks", "bamboo_planks", "crimson_planks", "warped_planks",
+        ],
+        // every log is a log — including bark blocks and stripped variants,
+        // which are one click apart from the log they came off
+        [
+            "oak_log", "oak_wood", "stripped_oak_log", "stripped_oak_wood",
+            "spruce_log", "spruce_wood", "stripped_spruce_log", "stripped_spruce_wood",
+            "birch_log", "birch_wood", "stripped_birch_log", "stripped_birch_wood",
+            "jungle_log", "jungle_wood", "stripped_jungle_log", "stripped_jungle_wood",
+            "acacia_log", "acacia_wood", "stripped_acacia_log", "stripped_acacia_wood",
+            "dark_oak_log", "dark_oak_wood", "stripped_dark_oak_log", "stripped_dark_oak_wood",
+            "mangrove_log", "mangrove_wood", "stripped_mangrove_log", "stripped_mangrove_wood",
+            "cherry_log", "cherry_wood", "stripped_cherry_log", "stripped_cherry_wood",
+            "pale_oak_log", "pale_oak_wood", "stripped_pale_oak_log", "stripped_pale_oak_wood",
+            "crimson_stem", "crimson_hyphae", "stripped_crimson_stem", "stripped_crimson_hyphae",
+            "warped_stem", "warped_hyphae", "stripped_warped_stem", "stripped_warped_hyphae",
+        ],
+        // cobblestone and its deepslate twin: the same wall either way
+        ["cobblestone", "cobbled_deepslate"],
+        // and the same for the smoothed forms
+        ["stone", "deepslate", "andesite", "diorite", "granite", "tuff"],
+    ],
+
+    // ---- trivially transformable, at a ratio ----------------------------
     // Vanilla recipes with no ambiguity about the result. Nothing here
     // models a workbench, a furnace or fuel — the point is only that a city
-    // holding logs shouldn't be unable to build with planks.
+    // holding logs shouldn't be unable to build with planks. Only one wood
+    // type needs a line, since the groups above make the rest reachable.
     conversions: [
-        // logs -> planks, one per wood type
-        (from: (item: "oak_log"),           to: (item: "oak_planks",           count: 4)),
-        (from: (item: "spruce_log"),        to: (item: "spruce_planks",        count: 4)),
-        (from: (item: "birch_log"),         to: (item: "birch_planks",         count: 4)),
-        (from: (item: "jungle_log"),        to: (item: "jungle_planks",        count: 4)),
-        (from: (item: "acacia_log"),        to: (item: "acacia_planks",        count: 4)),
-        (from: (item: "dark_oak_log"),      to: (item: "dark_oak_planks",      count: 4)),
-        (from: (item: "mangrove_log"),      to: (item: "mangrove_planks",      count: 4)),
-        (from: (item: "cherry_log"),        to: (item: "cherry_planks",        count: 4)),
-        (from: (item: "crimson_stem"),      to: (item: "crimson_planks",       count: 4)),
-        (from: (item: "warped_stem"),       to: (item: "warped_planks",        count: 4)),
+        // logs -> planks
+        (from: (item: "oak_log"),      to: (item: "oak_planks", count: 4)),
+        (from: (item: "bamboo_block"), to: (item: "bamboo_planks", count: 2)),
+        (from: (item: "bamboo", count: 9), to: (item: "bamboo_block")),
 
         // planks -> the two things every build needs next
         (from: (item: "oak_planks", count: 2), to: (item: "stick", count: 4)),
         (from: (item: "oak_planks", count: 6), to: (item: "oak_slab", count: 6)),
 
         // stone family
-        (from: (item: "cobblestone"),       to: (item: "stone")),                   // smelted
-        (from: (item: "stone"),             to: (item: "stone_bricks")),
-        (from: (item: "cobbled_deepslate"), to: (item: "deepslate")),
-        (from: (item: "sand"),              to: (item: "glass")),                   // smelted
+        (from: (item: "cobblestone"),         to: (item: "stone")),          // smelted
+        (from: (item: "stone"),               to: (item: "stone_bricks")),
+        (from: (item: "sand"),                to: (item: "glass")),          // smelted
         (from: (item: "clay_ball", count: 4), to: (item: "clay")),
-        (from: (item: "gravel"),            to: (item: "flint")),
+        (from: (item: "gravel"),              to: (item: "flint")),
 
         // ore -> ingot, smelted
-        (from: (item: "raw_iron"),          to: (item: "iron_ingot")),
-        (from: (item: "raw_copper"),        to: (item: "copper_ingot")),
-        (from: (item: "raw_gold"),          to: (item: "gold_ingot")),
+        (from: (item: "raw_iron"),               to: (item: "iron_ingot")),
+        (from: (item: "raw_copper"),             to: (item: "copper_ingot")),
+        (from: (item: "raw_gold"),               to: (item: "gold_ingot")),
         (from: (item: "copper_ingot", count: 9), to: (item: "copper_block")),
         (from: (item: "iron_ingot", count: 9),   to: (item: "iron_block")),
     ],

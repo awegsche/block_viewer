@@ -1254,3 +1254,12 @@ Y=0 in the world and won't be cleaned up by this fix — see the ticket.
   5. **A broken table is visible, not fatal** — typo `economy.ron`, relaunch,
      and confirm the game starts with no grant and no conversions and the
      "Definition Errors" window lists it under "Economy".
+
+- [ ] **075 interchangeable materials.** `cargo run --bin citybuilder`. Hand-
+  edit `citybuilder/stock.ron` to hold only `minecraft:birch_log` (say 40)
+  and nothing else, then relaunch. The build menu's House row should read
+  affordable with an orange "Converts: 10x birch_log" line under its cost;
+  placing should eat the birch and leave the spare oak planks in the pile
+  (the stock keeps saying `birch_log` for what you cut — only the payment is
+  type-blind). Worth a second pass with `stripped_spruce_log` and
+  `cherry_wood`, which route through the same group.

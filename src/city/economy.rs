@@ -39,6 +39,25 @@
 //!   `from.item == to.item` is refused at load time as the degenerate case
 //!   of the same thing.
 //!
+//! ## Groups: the same material under a different name (ticket 075)
+//!
+//! `birch_log` and `oak_log` are not a ratio, they're a synonym — and
+//! spelling twelve plank types as mutually convertible would be 132 ordered
+//! pairs in a hand-edited file. So a second list sits next to `conversions`:
+//! [`EconomyConfig::groups`], where **every member converts to every other
+//! 1:1**. Ratios stay in `conversions`; a ratio means the two aren't the
+//! same material after all.
+//!
+//! Groups are expanded at *lookup* ([`routes_to`]), not at load. A
+//! forty-eight-member group of every log, bark block and stripped variant
+//! would otherwise become 2,256 `Conversion` structs, and `build_menu`
+//! prices every visible row every frame.
+//!
+//! This is what keeps the drop table honest: the pile goes on saying
+//! `birch_log`, because that's what the world gave, and only the *payment*
+//! stops caring. Collapsing wood to one id in `drops.ron` would have made a
+//! building that genuinely wants birch impossible to express.
+//!
 //! ## One planner, two callers
 //!
 //! `city::ui::build_menu` prices a row with [`plan_payment`] and
@@ -97,6 +116,10 @@ struct EconomyFile {
     start_stock: HashMap<String, u64>,
     #[serde(default)]
     conversions: Vec<Conversion>,
+    /// Ticket 075 — each inner list is a set of materials that are the same
+    /// material under different names.
+    #[serde(default)]
+    interchangeable: Vec<Vec<String>>,
 }
 
 /// The loaded economy knobs. [`Default`] is the "no `economy.ron`" config:
@@ -109,6 +132,10 @@ pub struct EconomyConfig {
     /// that can produce a short item wins, so a table listing a cheap route
     /// before an expensive one gets the cheap one.
     pub conversions: Vec<Conversion>,
+    /// Sets of materials that convert to each other 1:1 (ticket 075) — see
+    /// the module docs. Tried *after* [`Self::conversions`], so an explicit
+    /// ratio always wins over a synonym.
+    pub groups: Vec<Vec<String>>,
 }
 
 /// Why `economy.ron` didn't load. A missing file is **not** one of these —
@@ -126,6 +153,13 @@ pub enum EconomyError {
     /// A conversion from a material to itself. Harmless-looking, and the
     /// degenerate cycle: it can only ever be a mistake in the file.
     SelfConversion(String),
+    /// An `interchangeable` group with fewer than two members — it says
+    /// nothing, so it's a half-finished edit rather than a valid choice.
+    GroupTooSmall(usize),
+    /// A material listed twice in one group, or in two groups at once. The
+    /// second is the real hazard: "which group wins" is not a question this
+    /// file should be able to ask.
+    DuplicateGroupMember(String),
 }
 
 impl std::fmt::Display for EconomyError {
@@ -136,6 +170,12 @@ impl std::fmt::Display for EconomyError {
             EconomyError::ZeroCount(what) => write!(f, "conversion {what} has a count of 0"),
             EconomyError::EmptyItem(what) => write!(f, "conversion {what} has a blank item name"),
             EconomyError::SelfConversion(item) => write!(f, "{item} is listed as converting to itself"),
+            EconomyError::GroupTooSmall(index) => {
+                write!(f, "interchangeable group {index} has fewer than two materials in it")
+            }
+            EconomyError::DuplicateGroupMember(item) => {
+                write!(f, "{item} appears more than once across the interchangeable groups")
+            }
         }
     }
 }
@@ -195,7 +235,30 @@ pub fn load_economy(path: &Path) -> Result<EconomyConfig, EconomyError> {
         });
     }
 
-    Ok(EconomyConfig { start_stock, conversions })
+    let mut groups: Vec<Vec<String>> = Vec::with_capacity(file.interchangeable.len());
+    let mut seen: HashMap<String, ()> = HashMap::new();
+    for (index, group) in file.interchangeable.into_iter().enumerate() {
+        let mut members = Vec::with_capacity(group.len());
+        for member in group {
+            if member.trim().is_empty() {
+                return Err(EconomyError::EmptyItem(format!("interchangeable group {index}")));
+            }
+            let member = namespaced(&member);
+            // Across groups as well as within one: two groups sharing a
+            // member would make "what is this the same as" depend on which
+            // group `routes_to` happened to look at first.
+            if seen.insert(member.clone(), ()).is_some() {
+                return Err(EconomyError::DuplicateGroupMember(member));
+            }
+            members.push(member);
+        }
+        if members.len() < 2 {
+            return Err(EconomyError::GroupTooSmall(index));
+        }
+        groups.push(members);
+    }
+
+    Ok(EconomyConfig { start_stock, conversions, groups })
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -264,15 +327,56 @@ impl<'a> Ledger<'a> {
     }
 }
 
-/// Prices `costs` against `stock`, converting through `conversions` wherever
-/// the stock is short — see the module docs for what "converting" is allowed
-/// to mean here.
+/// One way to make more of some material: `count` of `from` becomes
+/// `produces` of it.
+///
+/// The two sources of supply — an explicit [`Conversion`] and a 1:1
+/// group-mate (ticket 075) — flattened into one shape, so [`cover`] has a
+/// single list to walk rather than two loops that have to agree with each
+/// other about ordering and cycle rules.
+struct Route<'a> {
+    from: &'a str,
+    count: u32,
+    produces: u32,
+}
+
+/// Every route that ends in `item`: the explicit conversions first (a stated
+/// ratio beats a synonym), then the item's group-mates at 1:1.
+///
+/// Built per call rather than cached: it's a filter over two small lists, it
+/// happens once per short material rather than once per block, and a cached
+/// index would be one more thing to keep in step with a hot-reloaded config.
+fn routes_to<'a>(item: &str, economy: &'a EconomyConfig) -> Vec<Route<'a>> {
+    let mut routes: Vec<Route<'a>> = economy
+        .conversions
+        .iter()
+        .filter(|conversion| conversion.to.item == item)
+        .map(|conversion| Route { from: &conversion.from.item, count: conversion.from.count, produces: conversion.to.count })
+        .collect();
+
+    // At most one group can hold `item` — `load_economy` refuses a name that
+    // appears in two.
+    if let Some(group) = economy.groups.iter().find(|group| group.iter().any(|member| member == item)) {
+        routes.extend(
+            group
+                .iter()
+                .filter(|member| member.as_str() != item)
+                .map(|member| Route { from: member.as_str(), count: 1, produces: 1 }),
+        );
+    }
+
+    routes
+}
+
+/// Prices `costs` against `stock`, converting through `economy`'s table and
+/// groups wherever the stock is short — see the module docs for what
+/// "converting" is allowed to mean here.
 ///
 /// Pure: nothing is mutated, and the returned [`ConversionPlan`] is what the
 /// caller should apply if it decides to go ahead. That's what lets the build
 /// menu ask the same question the commit answers without either of them
 /// touching the stock.
-pub fn plan_payment(stock: &Stock, costs: &[Cost], conversions: &[Conversion]) -> Payment {
+pub fn plan_payment(stock: &Stock, costs: &[Cost], economy: &EconomyConfig) -> Payment {
     let wanted = Parcel::from_costs(costs);
     let mut ledger = Ledger::new(stock);
     let mut plan = ConversionPlan::default();
@@ -286,7 +390,7 @@ pub fn plan_payment(stock: &Stock, costs: &[Cost], conversions: &[Conversion]) -
         }
 
         let mut covering = Vec::new();
-        cover(item, needed - held, conversions, &mut ledger, &mut plan, &mut covering, 0);
+        cover(item, needed - held, economy, &mut ledger, &mut plan, &mut covering, 0);
 
         // Whatever the conversions managed, the cost itself is charged
         // against what's now there; anything still missing is reported.
@@ -313,7 +417,7 @@ pub fn plan_payment(stock: &Stock, costs: &[Cost], conversions: &[Conversion]) -
 fn cover(
     item: &str,
     amount: u64,
-    conversions: &[Conversion],
+    economy: &EconomyConfig,
     ledger: &mut Ledger,
     plan: &mut ConversionPlan,
     covering: &mut Vec<String>,
@@ -325,41 +429,33 @@ fn cover(
     covering.push(item.to_string());
 
     let mut still_needed = amount;
-    for conversion in conversions.iter().filter(|c| c.to.item == item) {
+    for route in routes_to(item, economy) {
         if still_needed == 0 {
             break;
         }
 
-        // A run produces `to.count`; round up, since half a run isn't a
-        // thing — converting one log for two planks leaves two planks over.
-        let runs_wanted = still_needed.div_ceil(u64::from(conversion.to.count));
+        // A run produces `route.produces`; round up, since half a run isn't
+        // a thing — converting one log for two planks leaves two planks over.
+        let runs_wanted = still_needed.div_ceil(u64::from(route.produces));
 
         // The input may itself be short — chase it one level further before
         // giving up on this route.
-        let input_wanted = runs_wanted.saturating_mul(u64::from(conversion.from.count));
-        let input_held = ledger.available(&conversion.from.item);
+        let input_wanted = runs_wanted.saturating_mul(u64::from(route.count));
+        let input_held = ledger.available(route.from);
         if input_held < input_wanted {
-            cover(
-                &conversion.from.item,
-                input_wanted - input_held,
-                conversions,
-                ledger,
-                plan,
-                covering,
-                depth + 1,
-            );
+            cover(route.from, input_wanted - input_held, economy, ledger, plan, covering, depth + 1);
         }
 
-        let runs = runs_wanted.min(ledger.available(&conversion.from.item) / u64::from(conversion.from.count));
+        let runs = runs_wanted.min(ledger.available(route.from) / u64::from(route.count));
         if runs == 0 {
             continue;
         }
 
-        let consumed = runs * u64::from(conversion.from.count);
-        let produced = runs * u64::from(conversion.to.count);
-        ledger.take(&conversion.from.item, consumed);
+        let consumed = runs * u64::from(route.count);
+        let produced = runs * u64::from(route.produces);
+        ledger.take(route.from, consumed);
         ledger.give(item, produced);
-        plan.consumed.add(&conversion.from.item, consumed);
+        plan.consumed.add(route.from, consumed);
         plan.produced.add(item, produced);
         still_needed = still_needed.saturating_sub(produced);
     }
@@ -390,8 +486,14 @@ mod tests {
         }
     }
 
-    fn logs_to_planks() -> Vec<Conversion> {
-        vec![conversion(("minecraft:oak_log", 1), ("minecraft:oak_planks", 4))]
+    /// A config with a conversion table and no groups — what every ticket
+    /// 074 test was written against.
+    fn table(conversions: Vec<Conversion>) -> EconomyConfig {
+        EconomyConfig { start_stock: Parcel::default(), conversions, groups: Vec::new() }
+    }
+
+    fn logs_to_planks() -> EconomyConfig {
+        table(vec![conversion(("minecraft:oak_log", 1), ("minecraft:oak_planks", 4))])
     }
 
     // --- pricing without conversions ---------------------------------------
@@ -407,7 +509,7 @@ mod tests {
 
     #[test]
     fn a_free_cost_is_always_affordable() {
-        let payment = plan_payment(&Stock::default(), &[], &[]);
+        let payment = plan_payment(&Stock::default(), &[], &table(vec![]));
         assert!(payment.affordable());
         assert!(payment.conversion.is_empty());
     }
@@ -415,7 +517,7 @@ mod tests {
     #[test]
     fn with_no_conversions_a_shortfall_is_just_a_shortfall() {
         let stock = stock_with(&[("minecraft:oak_log", 40)]);
-        let payment = plan_payment(&stock, &[cost("minecraft:oak_planks", 40)], &[]);
+        let payment = plan_payment(&stock, &[cost("minecraft:oak_planks", 40)], &table(vec![]));
 
         assert!(!payment.affordable());
         assert_eq!(payment.shortfall.missing.get("minecraft:oak_planks"), 40);
@@ -477,13 +579,13 @@ mod tests {
     #[test]
     fn a_chain_is_followed_through() {
         // sticks <- planks <- logs, with only logs in the pile.
-        let table = vec![
+        let chain = table(vec![
             conversion(("minecraft:oak_log", 1), ("minecraft:oak_planks", 4)),
             conversion(("minecraft:oak_planks", 2), ("minecraft:stick", 4)),
-        ];
+        ]);
         let stock = stock_with(&[("minecraft:oak_log", 4)]);
 
-        let payment = plan_payment(&stock, &[cost("minecraft:stick", 8)], &table);
+        let payment = plan_payment(&stock, &[cost("minecraft:stick", 8)], &chain);
 
         assert!(payment.affordable(), "{:?}", payment.shortfall.missing);
         assert_eq!(payment.conversion.produced.get("minecraft:stick"), 8);
@@ -495,11 +597,11 @@ mod tests {
     fn a_cycle_gives_up_instead_of_hanging() {
         // The pathological table the depth cap and the `covering` set exist
         // for. If this test hangs, they don't work.
-        let table = vec![
+        let cyclic = table(vec![
             conversion(("minecraft:a", 1), ("minecraft:b", 1)),
             conversion(("minecraft:b", 1), ("minecraft:a", 1)),
-        ];
-        let payment = plan_payment(&Stock::default(), &[cost("minecraft:a", 5)], &table);
+        ]);
+        let payment = plan_payment(&Stock::default(), &[cost("minecraft:a", 5)], &cyclic);
 
         assert!(!payment.affordable());
         assert_eq!(payment.shortfall.missing.get("minecraft:a"), 5);
@@ -509,16 +611,85 @@ mod tests {
     fn two_costs_cannot_both_spend_the_same_log() {
         // The whole reason the planner works against a running ledger rather
         // than pricing each item independently.
-        let table = vec![
+        let two_uses = table(vec![
             conversion(("minecraft:oak_log", 1), ("minecraft:oak_planks", 4)),
             conversion(("minecraft:oak_log", 1), ("minecraft:stick", 4)),
-        ];
+        ]);
         let stock = stock_with(&[("minecraft:oak_log", 1)]);
 
-        let payment = plan_payment(&stock, &[cost("minecraft:oak_planks", 4), cost("minecraft:stick", 4)], &table);
+        let payment = plan_payment(&stock, &[cost("minecraft:oak_planks", 4), cost("minecraft:stick", 4)], &two_uses);
 
         assert!(!payment.affordable(), "one log can't pay for both");
         assert_eq!(payment.conversion.consumed.get("minecraft:oak_log"), 1);
+    }
+
+    // --- groups (ticket 075) ------------------------------------------------
+
+    /// The shipped shape: logs convert to their own planks at 4:1, and every
+    /// plank type is the same plank.
+    fn wood_economy() -> EconomyConfig {
+        EconomyConfig {
+            start_stock: Parcel::default(),
+            conversions: vec![
+                conversion(("minecraft:oak_log", 1), ("minecraft:oak_planks", 4)),
+                conversion(("minecraft:birch_log", 1), ("minecraft:birch_planks", 4)),
+            ],
+            groups: vec![vec!["minecraft:oak_planks".to_string(), "minecraft:birch_planks".to_string()]],
+        }
+    }
+
+    #[test]
+    fn a_group_mate_pays_a_cost_one_for_one() {
+        let stock = stock_with(&[("minecraft:birch_planks", 40)]);
+        let payment = plan_payment(&stock, &[cost("minecraft:oak_planks", 40)], &wood_economy());
+
+        assert!(payment.affordable());
+        assert_eq!(payment.conversion.consumed.get("minecraft:birch_planks"), 40);
+        assert_eq!(payment.conversion.produced.get("minecraft:oak_planks"), 40);
+    }
+
+    /// The user's actual question, end to end: a city that has only ever cut
+    /// birch trees can build a house priced in oak planks.
+    #[test]
+    fn a_birch_forest_can_pay_for_an_oak_house() {
+        let stock = stock_with(&[("minecraft:birch_log", 10)]);
+        let payment = plan_payment(&stock, &[cost("minecraft:oak_planks", 40)], &wood_economy());
+
+        assert!(payment.affordable(), "{:?}", payment.shortfall.missing);
+        assert_eq!(payment.conversion.consumed.get("minecraft:birch_log"), 10, "through birch planks");
+        assert_eq!(payment.conversion.produced.get("minecraft:oak_planks"), 40);
+    }
+
+    #[test]
+    fn what_the_stock_already_holds_beats_a_group_mate() {
+        let stock = stock_with(&[("minecraft:oak_planks", 40), ("minecraft:birch_planks", 40)]);
+        let payment = plan_payment(&stock, &[cost("minecraft:oak_planks", 40)], &wood_economy());
+
+        assert!(payment.affordable());
+        assert!(payment.conversion.is_empty(), "no reason to touch the birch");
+    }
+
+    #[test]
+    fn a_group_is_not_an_infinite_source() {
+        // oak <-> birch is a cycle by construction; the visited set has to
+        // stop it being a way to make planks out of nothing.
+        let payment = plan_payment(&Stock::default(), &[cost("minecraft:oak_planks", 40)], &wood_economy());
+
+        assert!(!payment.affordable());
+        assert_eq!(payment.shortfall.missing.get("minecraft:oak_planks"), 40);
+        assert!(payment.conversion.is_empty());
+    }
+
+    #[test]
+    fn an_explicit_ratio_is_tried_before_a_group_mate() {
+        // Both routes are open; the stated 1-log-makes-4 wins over trading
+        // planks one for one, because it's the cheaper answer and the file
+        // said so explicitly.
+        let stock = stock_with(&[("minecraft:oak_log", 10), ("minecraft:birch_planks", 40)]);
+        let payment = plan_payment(&stock, &[cost("minecraft:oak_planks", 40)], &wood_economy());
+
+        assert_eq!(payment.conversion.consumed.get("minecraft:oak_log"), 10);
+        assert_eq!(payment.conversion.consumed.get("minecraft:birch_planks"), 0);
     }
 
     // --- loading -----------------------------------------------------------
@@ -576,6 +747,35 @@ mod tests {
     }
 
     #[test]
+    fn a_group_loads_namespaced() {
+        let config = config_from(r#"(interchangeable: [["oak_planks", "minecraft:birch_planks"]])"#).expect("loads");
+        assert_eq!(config.groups, vec![vec!["minecraft:oak_planks".to_string(), "minecraft:birch_planks".to_string()]]);
+    }
+
+    #[test]
+    fn a_one_member_group_is_refused() {
+        let err = config_from(r#"(interchangeable: [["oak_planks"]])"#).expect_err("says nothing");
+        assert!(matches!(err, EconomyError::GroupTooSmall(0)), "{err}");
+    }
+
+    #[test]
+    fn a_material_in_two_groups_is_refused() {
+        // "Which group wins" is not a question the file should be able to
+        // ask — `routes_to` takes the first match.
+        let err = config_from(
+            r#"(interchangeable: [["oak_planks", "birch_planks"], ["oak_planks", "spruce_planks"]])"#,
+        )
+        .expect_err("ambiguous");
+        assert!(matches!(err, EconomyError::DuplicateGroupMember(_)), "{err}");
+    }
+
+    #[test]
+    fn a_material_listed_twice_in_one_group_is_refused() {
+        let err = config_from(r#"(interchangeable: [["oak_planks", "minecraft:oak_planks"]])"#).expect_err("duplicate");
+        assert!(matches!(err, EconomyError::DuplicateGroupMember(_)), "{err}");
+    }
+
+    #[test]
     fn nonsense_is_a_parse_error_not_a_panic() {
         let err = config_from("not ron at all").expect_err("parse");
         assert!(matches!(err, EconomyError::Parse(_)), "{err}");
@@ -589,7 +789,15 @@ mod tests {
         assert!(!config.start_stock.is_empty(), "a new city is founded with something");
 
         let stock = stock_with(&[("minecraft:oak_log", 10)]);
-        let payment = plan_payment(&stock, &[cost("minecraft:oak_planks", 40)], &config.conversions);
+        let payment = plan_payment(&stock, &[cost("minecraft:oak_planks", 40)], &config);
         assert!(payment.affordable(), "the shipped table should turn logs into planks");
+
+        // Ticket 075, against the real file: the wood the map actually gave
+        // you pays for a cost priced in oak.
+        for wood in ["minecraft:birch_log", "minecraft:spruce_log", "minecraft:stripped_dark_oak_log", "minecraft:cherry_wood"] {
+            let stock = stock_with(&[(wood, 10)]);
+            let payment = plan_payment(&stock, &[cost("minecraft:oak_planks", 40)], &config);
+            assert!(payment.affordable(), "{wood} should pay for an oak-planks cost: {:?}", payment.shortfall.missing);
+        }
     }
 }

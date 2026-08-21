@@ -166,7 +166,7 @@ fn entry_row(
     // succeeds. A row the player can only afford *by* converting says so —
     // materials disappearing out of the pile is worth a word of warning.
     let cost_text = format!("  Cost: {}", cost_line(&entry.building.cost));
-    let payment = economy::plan_payment(stock, &entry.building.cost, &economy.conversions);
+    let payment = economy::plan_payment(stock, &entry.building.cost, economy);
     if !payment.affordable() {
         ui.colored_label(egui::Color32::RED, format!("{cost_text}  (short {})", payment.shortfall));
     } else if payment.conversion.consumed.is_empty() {
