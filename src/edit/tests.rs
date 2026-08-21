@@ -141,15 +141,17 @@ fn a_half_generated_chunk_is_refused() {
 }
 
 #[test]
-fn a_data_version_mismatch_is_refused_and_can_be_overridden() {
+fn an_incompatible_data_version_is_refused_and_can_be_overridden() {
     let nbt = chunk_root(Some("minecraft:full"), Some(FIXTURE_DATA_VERSION));
 
+    // 2860 is 1.18; the fixture is 1.21-era. Block migrations sit in between,
+    // so this edit's blocks are not the ones the chunk speaks.
     assert_eq!(
-        check_chunk_nbt((0, 0), &nbt, &EditPolicy::default(), Some(3953)).unwrap_err(),
+        check_chunk_nbt((0, 0), &nbt, &EditPolicy::default(), Some(2860)).unwrap_err(),
         EditRefusal::DataVersionMismatch {
             chunk: (0, 0),
             save: FIXTURE_DATA_VERSION,
-            edit: 3953
+            edit: 2860
         }
     );
 
@@ -173,7 +175,51 @@ fn a_data_version_mismatch_is_refused_and_can_be_overridden() {
         enforce_data_version: false,
         ..EditPolicy::default()
     };
-    assert!(check_chunk_nbt((0, 0), &nbt, &lenient, Some(3953)).is_ok());
+    assert!(check_chunk_nbt((0, 0), &nbt, &lenient, Some(2860)).is_ok());
+}
+
+/// Ticket 069's actual bug: the shipped `.nbt` assets are 4903 and half the
+/// real save's chunks are 4438, so exact equality refused every road cell
+/// landing on the older half. Nothing was renamed between the two.
+#[test]
+fn a_newer_edit_writes_into_an_older_chunk_of_the_same_band() {
+    let nbt = chunk_root(Some("minecraft:full"), Some(4438));
+    assert!(check_chunk_nbt((0, 0), &nbt, &EditPolicy::default(), Some(4903)).is_ok());
+
+    // And the other way round — a save can be newer than the blueprint too.
+    let nbt = chunk_root(Some("minecraft:full"), Some(4903));
+    assert!(check_chunk_nbt((0, 0), &nbt, &EditPolicy::default(), Some(4438)).is_ok());
+}
+
+#[test]
+fn compatibility_is_reflexive_symmetric_and_bounded_by_a_migration() {
+    // Within a band, in both directions.
+    assert!(data_versions_compatible(4438, 4903));
+    assert!(data_versions_compatible(4903, 4438));
+    assert!(data_versions_compatible(3953, 3953));
+
+    // Across one, in both directions.
+    assert!(!data_versions_compatible(3953, 3463));
+    assert!(!data_versions_compatible(3463, 3953));
+
+    // A pre-Flattening world is compatible with nothing after it.
+    assert!(!data_versions_compatible(1343, 4903));
+    assert!(data_versions_compatible(1343, 1518));
+
+    // Every version is compatible with itself, including ones the table has
+    // never heard of.
+    for version in [0, 1, 1519, 2860, 3953, 4903, i32::MAX] {
+        assert!(data_versions_compatible(version, version), "{version}");
+    }
+}
+
+#[test]
+fn a_version_on_a_boundary_belongs_to_the_newer_band() {
+    // 3953 is 1.21's first version: it speaks the new spelling, so it sits
+    // with what follows it and not with 1.20.
+    assert!(data_versions_compatible(3953, 4903));
+    assert!(!data_versions_compatible(3953, 3952));
+    assert!(data_versions_compatible(3952, 3463));
 }
 
 // -------------------------------------------------------------------------------------------------

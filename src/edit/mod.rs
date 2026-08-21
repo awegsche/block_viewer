@@ -86,6 +86,70 @@ const STATUS_FULL: &str = "minecraft:full";
 const DATA_VERSION: &str = "DataVersion";
 
 // -------------------------------------------------------------------------------------------------
+// ---- data version compatibility -----------------------------------------------------------------
+// -------------------------------------------------------------------------------------------------
+
+/// The `DataVersion`s at which block names or properties migrated, sorted
+/// ascending. Each entry opens a new *compatibility band*: block states
+/// written at or after it may not mean the same thing as block states written
+/// before it.
+///
+/// ## Why a table and not `edit == save`
+///
+/// Both versions in the comparison are outside the user's control. A
+/// blueprint carries whatever version the Minecraft that exported it wrote,
+/// and a save is a *patchwork* — a world only rewrites the chunks it actually
+/// loads, so one played across a few updates holds chunks at several versions
+/// side by side. Ticket 069 measured a real save at 9327 chunks on 4438 and
+/// 9215 on 4903, interleaved region by region. Exact equality refused roughly
+/// half of it, in patches, and bought nothing: 4438 and 4903 are both 1.21-era
+/// and rename no blocks. What the check is actually defending against is a
+/// *migration* between the two versions, which is what this table names.
+///
+/// ## What goes in it
+///
+/// The first `DataVersion` of each Minecraft release that renamed or
+/// restructured blocks — release granularity rather than snapshot, which is
+/// coarser (it refuses some pairs that would in fact have been fine) and
+/// therefore errs toward refusing rather than corrupting.
+///
+/// Versions above the last entry are all one band. **When a new Minecraft
+/// release renames blocks, add its first `DataVersion` here** — until then a
+/// post-1.21 chunk and a 1.21 blueprint are treated as compatible, which is
+/// the permissive direction, and the reason this table has to be maintained
+/// rather than inferred.
+const BLOCK_FORMAT_BOUNDARIES: &[i32] = &[
+    1519, // 1.13, The Flattening: numeric ids and metadata become names and properties.
+    1952, // 1.14: `sign` -> `oak_sign`, `wall_sign` -> `oak_wall_sign`, and friends.
+    2566, // 1.16: the nether rewrite's block set.
+    2724, // 1.17: `grass_path` -> `dirt_path`, `cauldron` splits by contents.
+    2860, // 1.18: the world height change moves every section index.
+    3105, // 1.19: the deep dark's block set.
+    3463, // 1.20, and 3698 within it renamed `grass` -> `short_grass`.
+    3953, // 1.21.
+];
+
+/// Which band of [`BLOCK_FORMAT_BOUNDARIES`] a version sits in — the count of
+/// boundaries at or below it. A version exactly *on* a boundary belongs to the
+/// newer band: the boundary is the first version that speaks the new spelling.
+fn data_version_band(version: i32) -> usize {
+    BLOCK_FORMAT_BOUNDARIES
+        .iter()
+        .filter(|&&boundary| version >= boundary)
+        .count()
+}
+
+/// Whether block states spelled for one `DataVersion` can be written into a
+/// chunk at another: true when no block migration ([`BLOCK_FORMAT_BOUNDARIES`])
+/// lies between them.
+///
+/// Symmetric, and reflexive — equal versions are always compatible, whatever
+/// the table says.
+pub fn data_versions_compatible(a: i32, b: i32) -> bool {
+    data_version_band(a) == data_version_band(b)
+}
+
+// -------------------------------------------------------------------------------------------------
 // ---- the edit -----------------------------------------------------------------------------------
 // -------------------------------------------------------------------------------------------------
 
@@ -222,9 +286,10 @@ pub struct EditPolicy {
     /// writing into a partially generated chunk invites the generator to
     /// overwrite it later.
     pub require_full_status: bool,
-    /// Refuse when the edit's `DataVersion` and the chunk's disagree. On by
-    /// default; the override exists so a UI can offer "do it anyway" rather
-    /// than leaving the user stuck.
+    /// Refuse when the edit's `DataVersion` and the chunk's are *incompatible*
+    /// — a block migration lies between them ([`data_versions_compatible`]).
+    /// On by default; the override exists so a UI can offer "do it anyway"
+    /// rather than leaving the user stuck.
     pub enforce_data_version: bool,
     /// Record what each written position held *before* the edit.
     ///
@@ -298,9 +363,15 @@ pub enum EditRefusal {
     ChunkNotGenerated { chunk: (i32, i32) },
     /// The chunk exists but isn't finished generating.
     StatusNotFull { chunk: (i32, i32), status: String },
-    /// The edit's blocks were written for a different Minecraft version than
-    /// the save's. Block names and properties migrate between versions, so
-    /// this is a refusal by default rather than a warning.
+    /// The edit's blocks were written for a Minecraft version that spells
+    /// blocks differently than the chunk's does — a block migration
+    /// ([`BLOCK_FORMAT_BOUNDARIES`]) sits between the two. A refusal by
+    /// default rather than a warning: writing a name the target version has
+    /// never heard of leaves the save holding blocks Minecraft will not load.
+    ///
+    /// Merely *different* versions are not this. Ticket 069: a save played
+    /// across updates is a patchwork of versions, and only the ones a
+    /// migration separates are a problem.
     DataVersionMismatch {
         chunk: (i32, i32),
         save: i32,
@@ -358,7 +429,7 @@ impl std::fmt::Display for EditRefusal {
             ),
             EditRefusal::DataVersionMismatch { chunk, save, edit } => write!(
                 f,
-                "chunk ({}, {}) is DataVersion {save}, the edit is {edit}",
+                "chunk ({}, {}) is DataVersion {save}, the edit is {edit}, and blocks were renamed in between",
                 chunk.0, chunk.1
             ),
             EditRefusal::SectionMissing { chunk, section_y } => write!(
@@ -556,8 +627,13 @@ fn check_chunk_nbt(
         // An edit that makes no version claim, or a chunk that carries none,
         // is not a mismatch — there's nothing to compare, and refusing on a
         // missing tag would block every edit built from block names in code.
+        //
+        // Ticket 069: *incompatible*, not merely different. Two versions with
+        // no block migration between them spell blocks the same way, and a
+        // save played across updates holds several versions at once — see
+        // `BLOCK_FORMAT_BOUNDARIES`.
         match (edit_version, nbt.get_int(DATA_VERSION)) {
-            (Some(edit), Some(save)) if edit != save => {
+            (Some(edit), Some(save)) if !data_versions_compatible(edit, save) => {
                 return Err(EditRefusal::DataVersionMismatch { chunk, save, edit });
             }
             _ => {}

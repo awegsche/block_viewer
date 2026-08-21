@@ -2,7 +2,7 @@
 
 Not a work item: the design document for the citybuilder game and the shared
 world-edit infrastructure it uses. High-level tasks here get split into
-numbered tickets in this directory when picked up (**next free number: 069**).
+numbered tickets in this directory when picked up (**next free number: 070**).
 Companion to `ROADMAP.md`, which covers the viewer 001–029.
 
 ## The goal
@@ -104,8 +104,10 @@ writes to an explicit Save.
   heightmap invalidation, the last once per chunk at the **end of the
   transaction**, not per `set_blocks` call. Block-entity cleanup and
   `isLightOn` clearing are folded into `ranvil`'s `set_blocks`. `Status` gate:
-  only `minecraft:full` chunks are edited. A `DataVersion` mismatch between
-  blueprint and save refuses/warns loudly.
+  only `minecraft:full` chunks are edited. A `DataVersion` *incompatibility*
+  between blueprint and save refuses loudly — compared by band, not by
+  equality (ticket 069): a save played across updates is a patchwork of
+  versions, and only the ones a block migration separates are a problem.
 - **Routing** (`edit::route`): block coordinate → `(region, chunk, section,
   local index)`, batched by region file (a 20×20 building can straddle 4
   chunks or 4 region files). **Plans every region before applying any** —

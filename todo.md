@@ -1122,3 +1122,24 @@ Y=0 in the world and won't be cleaned up by this fix — see the ticket.
      `<save>/citybuilder/city.ron` is version 4 and will be *refused* on load
      (`city save is version 4, this build reads version 5`) — delete it to
      clear the message; the buildings and roads it recorded go with it.
+
+- [ ] **069 road placement over older chunks writes instead of refusing.**
+  `cargo run --bin citybuilder nbt_test` — that save is a real patchwork:
+  9327 overworld chunks at `DataVersion` 4438, 12 at 4440, 9215 at 4903,
+  mixed region by region (`r.-2.-1.mca` is 1024/1024 on 4438;
+  `r.0.-2.mca` is 874/874 on 4903; `r.0.0.mca` is 479 against 383). The
+  shipped road pieces are all 4903, and before this ticket every cell
+  landing on a 4438 chunk refused the drag with `chunk (x, z) is
+  DataVersion 4438, the edit is 4903` and placed nothing. Confirm:
+  1. **Build a road over the old half** — head west/south-west (negative
+     X, around chunk X -64 and below, region `r.-2.-1`/`r.-2.-2`) and drag
+     a road. It should place, and the console should report blocks
+     written, with no `DataVersion` line at all.
+  2. **Build a road straddling the seam** — `r.0.0` and `r.1.-1` hold both
+     versions. A drag crossing from 4903 chunks onto 4438 ones should
+     commit as one transaction, not fail partway.
+  3. **Save, then open the world in Minecraft.** The point of the change:
+     blocks written into the 4438 chunks have to load and look right after
+     the game's own datafixers run over them. Walk the road built in step
+     1 — dirt path, stairs and all — and confirm nothing came back as
+     `air`, a missing block, or the wrong stair facing.
