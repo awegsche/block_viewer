@@ -1232,3 +1232,25 @@ Y=0 in the world and won't be cleaned up by this fix — see the ticket.
   5. **Demolish is not a farm** — place a building, demolish it, and confirm
      the restored terrain was charged back (the dirt you gained on placing
      it goes away again). Repeating place/demolish should not grow the pile.
+
+- [ ] **074 founding stock and conversions.** `cargo run --bin citybuilder`.
+  1. **A new city is founded with materials** — on a save with no
+     `citybuilder/stock.ron`, the console should list the grant and the City
+     window's "Stock" section should show 512 dirt, 256 cobblestone, 128
+     oak_planks, 64 oak_log (`assets/city/economy.ron`). Place a House and
+     confirm the planks and cobblestone leave the pile.
+  2. **An emptied city is not refilled** — spend or hand-edit the stock down
+     to `(version: 1, items: {})`, relaunch, and confirm the stock stays
+     empty. The grant is for a save with *no* stock file, not an empty one.
+  3. **Logs pay for planks** — hand-edit `stock.ron` to hold only
+     `minecraft:oak_log` (say 40) and nothing else. The build menu's House
+     row should be affordable, with an orange "Converts: 10x oak_log" line
+     under its cost; placing should eat the logs and leave the spare planks
+     in the pile (40 planks made, 40 spent — so with 10 logs exactly, none
+     spare; try 41 planks' worth to see the remainder).
+  4. **Undo returns the logs** — note the stock, place that House, undo it
+     from the City panel, and confirm the *logs* come back rather than
+     planks.
+  5. **A broken table is visible, not fatal** — typo `economy.ron`, relaunch,
+     and confirm the game starts with no grant and no conversions and the
+     "Definition Errors" window lists it under "Economy".

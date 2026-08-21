@@ -99,6 +99,20 @@
 //! reverse this placement's own numbers rather than recomputing a cost that
 //! may since have been edited under it.
 //!
+//! ## Converting on the way (ticket 074)
+//!
+//! A cost is priced through [`economy::plan_payment`], which covers whatever
+//! the stock is short of by running `assets/city/economy.ron`'s conversion
+//! table — a city holding logs can pay a cost in planks. The conversion is
+//! applied at the same instant the cost is spent, and both halves of it join
+//! the same ledger: what it consumed is `debited` alongside the cost, what it
+//! produced is `credited` alongside the terrain drops. So undo hands the
+//! *logs* back rather than the planks they became, and a failed apply
+//! reverses it the same way ([`PendingCommit::gained`]).
+//!
+//! This is the only place conversions run. A demolition's backfill and a
+//! terraform's fill *debit*, and debits clamp — see `city::demolish`.
+//!
 //! ## Which definition's cost, though
 //!
 //! [`PlacementSelection`] names a *catalogue* id (the `.nbt` stem); `cost`
@@ -122,6 +136,7 @@ use crate::DecodedWorld;
 
 use super::definition::BuildingDefinitions;
 use super::drops::DropTable;
+use super::economy::{self, EconomyConfig};
 use super::inventory::{Parcel, Stock};
 use super::journal::{self, Journal, Ledger};
 use super::picking::{HoveredBlock, PickingSet};
@@ -143,6 +158,11 @@ struct PendingCommit {
     /// [`Ledger::debited`] if it succeeds. Kept here rather than looked up
     /// again later: the definition it came from can be hot-reloaded mid-write.
     spent: Parcel,
+    /// What ticket 074's conversions *produced* on the way to paying —
+    /// materials the placement put into the stock, which a failed apply has
+    /// to take back out again or the rollback would leave the player with
+    /// planks they never had and a log they no longer do.
+    gained: Parcel,
     task: Task<Result<EditReport, EditRefusal>>,
 }
 
@@ -165,6 +185,7 @@ impl Plugin for CommitPlugin {
             .init_resource::<Stock>()
             .init_resource::<DropTable>()
             .init_resource::<BuildingDefinitions>()
+            .init_resource::<EconomyConfig>()
             // `city::demolish::DemolishPlugin`/`city::undo::UndoPlugin`
             // initialize the same resource — `init_resource` only inserts a
             // default when one isn't already present, so it doesn't matter
@@ -241,6 +262,7 @@ fn try_commit_placement(
     definitions: Res<BuildingDefinitions>,
     mut stock: ResMut<Stock>,
     mut write_status: ResMut<WriteStatus>,
+    economy: Res<EconomyConfig>,
 ) {
     // Ticket 055, roadmap F2: a left click while the road tool is active is
     // `city::road_build`'s to react to, not this. `Option` and a default of
@@ -307,11 +329,14 @@ fn try_commit_placement(
         .map(|definition| definition.building.cost.clone())
         .unwrap_or_default();
 
-    // Checked before the tile is claimed, so a refusal leaves nothing behind
-    // to roll back; the `spend` below can't then fail, since nothing between
-    // the two touches the stock.
-    if !stock.can_afford(&costs) {
-        let shortfall = stock.shortfall(&costs);
+    // Priced before the tile is claimed, so a refusal leaves nothing behind
+    // to roll back; the conversion and the `spend` below then can't fail,
+    // since nothing between here and there touches the stock. Ticket 074:
+    // the shortfall reported is the one that survives conversions, so the
+    // message never asks for planks a log in the pile would have covered.
+    let payment = economy::plan_payment(&stock, &costs, &economy.conversions);
+    if !payment.affordable() {
+        let shortfall = &payment.shortfall;
         println!("block_viewer: can't afford {id}: needs {shortfall}");
         write_status.record_failure(WriteKind::Placed, id, format!("can't afford it — needs {shortfall}"));
         return;
@@ -324,7 +349,14 @@ fn try_commit_placement(
             return;
         }
     };
-    let spent = stock.spend(&costs).expect("can_afford said so, and nothing since has touched the stock");
+    // The conversion first, then the cost out of what it made — one
+    // transaction as far as the stock is concerned, recorded as one ledger.
+    let economy::ConversionPlan { consumed, produced } = payment.conversion;
+    stock.remove_parcel(&consumed);
+    stock.add_parcel(&produced);
+    let mut spent = stock.spend(&costs).expect("plan_payment said this was affordable, and nothing since has touched the stock");
+    spent.add_all(&consumed);
+    let gained = produced;
     let placed = PlacedBuilding { definition: id, origin, rotation: selection.rotation, footprint: entry.footprint };
 
     let cache: Arc<Mutex<RegionCache>> = region_cache.0.clone();
@@ -336,7 +368,7 @@ fn try_commit_placement(
         apply_building_edit(&mut cache, &task_edit, &policy)
     });
 
-    commit.pending = Some(PendingCommit { building, placement: placed, edit, spent, task });
+    commit.pending = Some(PendingCommit { building, placement: placed, edit, spent, gained, task });
 }
 
 /// Single non-blocking poll of the in-flight commit, the same
@@ -360,7 +392,8 @@ fn poll_commit(
         };
         result
     };
-    let PendingCommit { building, placement, edit, spent, .. } = commit.pending.take().expect("just matched Some above");
+    let PendingCommit { building, placement, edit, spent, gained, .. } =
+        commit.pending.take().expect("just matched Some above");
 
     match result {
         Ok(report) => {
@@ -379,8 +412,12 @@ fn poll_commit(
                 // out of the very record roadmap I1 already keeps. `previous`
                 // is what each written position held before — air included,
                 // which the drop table drops on the floor.
-                let credited = drops.parcel_for(baseline.previous.iter().map(|(_, state)| state));
+                let mut credited = drops.parcel_for(baseline.previous.iter().map(|(_, state)| state));
                 stock.add_parcel(&credited);
+                // Ticket 074's conversions are part of the same action: what
+                // they made is already in the stock, and belongs on the
+                // ledger so undo takes it back out with everything else.
+                credited.add_all(&gained);
                 if !credited.is_empty() || !spent.is_empty() {
                     println!(
                         "block_viewer:   paid {} unit(s), recovered {} unit(s) of material",
@@ -396,8 +433,10 @@ fn poll_commit(
         Err(err) => {
             city.remove_building(building);
             // The cost was taken the instant the tile was claimed; both halves
-            // of that claim come back together.
+            // of that claim come back together, conversions included — the
+            // logs return and the planks they became do not.
             stock.add_parcel(&spent);
+            stock.remove_parcel(&gained);
             println!("block_viewer: placement of {} failed, rolled back: {err}", placement.definition);
             write_status.record_failure(WriteKind::Placed, placement.definition, err.to_string());
         }
@@ -664,7 +703,7 @@ mod tests {
         let task = pool().spawn(async move { Ok(report) });
 
         app.world_mut().resource_mut::<CommitState>().pending =
-            Some(PendingCommit { building, placement: a_placement(), edit: task_edit, spent: Parcel::default(), task });
+            Some(PendingCommit { building, placement: a_placement(), edit: task_edit, spent: Parcel::default(), gained: Parcel::default(), task });
 
         run_until_settled(&mut app);
 
@@ -693,7 +732,7 @@ mod tests {
 
         let task = pool().spawn(async { Err(EditRefusal::Empty) });
         app.world_mut().resource_mut::<CommitState>().pending =
-            Some(PendingCommit { building, placement: a_placement(), edit: WorldEdit::new(), spent: Parcel::default(), task });
+            Some(PendingCommit { building, placement: a_placement(), edit: WorldEdit::new(), spent: Parcel::default(), gained: Parcel::default(), task });
 
         run_until_settled(&mut app);
 
@@ -729,7 +768,7 @@ mod tests {
             edit.set(*at, state_named("minecraft:oak_planks"));
         }
         let task = pool().spawn(async move { result });
-        PendingCommit { building, placement: a_placement(), edit, spent, task }
+        PendingCommit { building, placement: a_placement(), edit, spent, gained: Parcel::default(), task }
     }
 
     #[test]
@@ -767,6 +806,93 @@ mod tests {
         let ledger = journal.entries().last().unwrap().ledger();
         assert_eq!(ledger.credited, a_parcel(&[("minecraft:stone", 2)]));
         assert_eq!(ledger.debited, a_parcel(&[("minecraft:oak_planks", 40)]), "the ledger records what was actually paid");
+    }
+
+    /// Ticket 074, end to end on the ledger: a placement paid for by
+    /// converting logs into planks has to undo back to *logs*. The
+    /// placement's own numbers are simulated here the way
+    /// `try_commit_placement` computes them (`economy::plan_payment` has its
+    /// own tests for that); what this pins down is that reversing the ledger
+    /// `poll_commit` writes puts the stock back exactly as it was.
+    #[test]
+    fn a_placement_paid_for_by_converting_undoes_back_to_what_was_converted() {
+        let mut app = commit_test_app();
+        let before = {
+            let mut stock = Stock::default();
+            stock.add("minecraft:oak_log", 20);
+            stock
+        };
+
+        // Ten logs became forty planks, and the forty planks were spent.
+        *app.world_mut().resource_mut::<Stock>() = {
+            let mut stock = before.clone();
+            stock.remove("minecraft:oak_log", 10);
+            stock
+        };
+        let mut spent = a_parcel(&[("minecraft:oak_log", 10), ("minecraft:oak_planks", 40)]);
+        let gained = a_parcel(&[("minecraft:oak_planks", 40)]);
+
+        let building = app
+            .world_mut()
+            .resource_mut::<state::City>()
+            .place_building("house01", IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::new(2, 2))
+            .unwrap();
+        let replaced = vec![(IVec3::new(0, 64, 0), state_named("minecraft:dirt"))];
+        let report = EditReport {
+            blocks_written: 1,
+            chunks: vec![(0, 0)],
+            regions: vec![(0, 0)],
+            replaced: Some(replaced.clone()),
+        };
+        let mut pending = pending_that_replaced(building, replaced, Parcel::default(), Ok(report));
+        std::mem::swap(&mut pending.spent, &mut spent);
+        pending.gained = gained;
+        app.world_mut().resource_mut::<CommitState>().pending = Some(pending);
+
+        run_until_settled(&mut app);
+
+        let ledger = app.world().resource::<Journal>().entries().last().unwrap().ledger().clone();
+        assert_eq!(ledger.credited.get("minecraft:oak_planks"), 40, "what the conversion made is credited");
+        assert_eq!(ledger.credited.get("minecraft:dirt"), 1, "alongside the terrain the placement cleared");
+        assert_eq!(ledger.debited.get("minecraft:oak_log"), 10, "and what it consumed is debited");
+
+        // Undo's own settlement (`city::undo::settle_reverse`), applied here
+        // to the ledger this commit actually wrote.
+        let mut stock = app.world().resource::<Stock>().clone();
+        stock.add_parcel(&ledger.debited);
+        stock.remove_parcel(&ledger.credited);
+
+        assert_eq!(stock, before, "undoing gives the logs back, not the planks they became");
+    }
+
+    #[test]
+    fn a_failed_placement_undoes_its_conversion_too() {
+        let mut app = commit_test_app();
+        // Mid-placement: ten logs are already gone and the planks they made
+        // have already been spent on the cost.
+        app.world_mut().resource_mut::<Stock>().add("minecraft:oak_log", 10);
+        let before = app.world().resource::<Stock>().clone();
+
+        let building = app
+            .world_mut()
+            .resource_mut::<state::City>()
+            .place_building("house01", IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::new(2, 2))
+            .unwrap();
+        let mut pending = pending_that_replaced(
+            building,
+            vec![(IVec3::new(0, 64, 0), state_named("minecraft:stone"))],
+            a_parcel(&[("minecraft:oak_log", 10), ("minecraft:oak_planks", 40)]),
+            Err(EditRefusal::Empty),
+        );
+        pending.gained = a_parcel(&[("minecraft:oak_planks", 40)]);
+        app.world_mut().resource_mut::<CommitState>().pending = Some(pending);
+
+        run_until_settled(&mut app);
+
+        let stock = app.world().resource::<Stock>();
+        assert_eq!(stock.count("minecraft:oak_log"), 20, "the logs come back");
+        assert_eq!(stock.count("minecraft:oak_planks"), 0, "and the planks they became do not stay");
+        assert_ne!(*stock, before, "…which is the pile as it stood before the conversion, not mid-payment");
     }
 
     #[test]

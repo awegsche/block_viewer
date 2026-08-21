@@ -2,7 +2,7 @@
 
 Not a work item: the design document for the citybuilder game and the shared
 world-edit infrastructure it uses. High-level tasks here get split into
-numbered tickets in this directory when picked up (**next free number: 074**).
+numbered tickets in this directory when picked up (**next free number: 075**).
 Companion to `ROADMAP.md`, which covers the viewer 001–029.
 
 ## The goal
@@ -577,12 +577,36 @@ world is made of are the economy's own units.
     while the two stems coincide). Production is the first mechanic that
     needs it per-instance, and it's a `city.ron` version bump — it belongs to
     that ticket.
-  - **No bootstrap yet.** Nothing grants a founding stock, and the only
-    materials a new city can earn are what terraforming digs up — so the
-    shipped `house01` (40 planks, 20 cobblestone) can't be built on a fresh
-    save. A starting grant, cheaper tier-1 costs, or wood as a dig yield are
-    all one-line answers; picking one is a balance decision, not a
-    mechanical one.
+- **`city::economy` (ticket 074, done)** — `assets/city/economy.ron`, the
+  economy's two tunable tables in one hand-editable file (`drops.ron` stays
+  separate: hundreds of *block* names is a different kind of thing from a
+  dozen knobs).
+  - **The founding grant** closes 073's bootstrap gap: `start_stock` is
+    handed out when a save has **no** `stock.ron` — not when it has one that
+    happens to be empty, because a player who spent everything hasn't founded
+    a new city. `inventory::load_stock` returns `Option<Stock>` precisely to
+    keep those apart, and a stock file that fails to *load* isn't granted
+    either (a corrupt file must not become free materials). Ships 512 dirt,
+    256 cobblestone, 128 oak planks, 64 oak logs.
+  - **Trivially transformable materials** — `1 oak_log -> 4 oak_planks` and
+    friends, applied automatically when a placement is paid for, and only
+    then: a demolition's backfill and a terraform's fill *debit*, and
+    converting a player's logs to satisfy a clamped debit would be the game
+    spending their materials to fill a hole. Conversions cover a shortfall
+    rather than running over the pile, in whole runs (needing 2 planks with
+    one log converts the log and leaves 2 planks behind). Chains work
+    (logs -> planks -> sticks) via a recursion with a depth cap and a
+    visited set, so a hand-written `A -> B, B -> A` gives up instead of
+    hanging the frame; `from == to` is refused at load.
+  - **One planner, two callers** — `economy::plan_payment` prices a cost
+    against a stock and answers with *both* the conversions needed and the
+    shortfall that survives them. `city::ui::build_menu` shows it (a row
+    that can only be afforded by converting says what it will eat) and
+    `city::commit` pays with it, so the menu can't read red above a click
+    that succeeds.
+  - **The conversion is part of the placement's ledger** — consumed joins
+    `debited`, produced joins `credited`, so undo hands back the logs rather
+    than the planks they became, and a failed apply reverses it the same way.
 - **Still open**: production, warehouses, and haulage along roads —
   a producer's output has to reach a warehouse, and how long that takes comes
   from the road distance and each road type's `travel_speed` (loaded and

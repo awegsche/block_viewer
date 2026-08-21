@@ -268,6 +268,7 @@ mod commit;
 mod definition;
 mod demolish;
 mod drops;
+mod economy;
 mod grid;
 mod hot_reload;
 mod inventory;
@@ -325,6 +326,11 @@ const ROAD_TYPES_DIR: &str = "assets/city/road_types";
 /// names rather than a set of ids; see [`drops`]' own module docs.
 const DROPS_FILE: &str = "assets/city/drops.ron";
 
+/// Where [`run`] looks for the economy's tunable numbers (ticket 074) — the
+/// founding grant and the conversion table, one file for both; see
+/// [`economy`]'s own module docs.
+const ECONOMY_FILE: &str = "assets/city/economy.ron";
+
 /// Where [`save_city`](persistence::save_city)/[`load_city`](persistence::load_city)
 /// look, relative to a save's root — `None` when [`world_app`]'s
 /// [`LoadedSave`] is ticket 008's placeholder (`empty_save`, `meta.path`
@@ -340,6 +346,7 @@ pub fn run() {
     let road_catalogue = load_road_catalogue();
     let (road_types, road_type_errors) = load_road_types(&road_catalogue);
     let (drop_table, drop_errors) = load_drop_table();
+    let (economy_config, economy_errors) = load_economy();
 
     // Ticket 061, roadmap C4: seed the hot-reload snapshots from the same
     // scan the load above already did, and the error panel from that load's
@@ -351,13 +358,14 @@ pub fn run() {
         buildings: building_errors.into_iter().map(|(path, err)| (path, err.to_string())).collect(),
         road_types: road_type_errors.into_iter().map(|(path, err)| (path, err.to_string())).collect(),
         drops: drop_errors,
+        economy: economy_errors,
     };
 
     let mut app = world_app();
     let save_root = app.world().resource::<LoadedSave>().0.meta.path.clone();
     let city = load_city(&save_root);
     let journal = load_journal(&save_root);
-    let stock = load_stock(&save_root);
+    let stock = load_stock(&save_root, &economy_config);
 
     app.insert_resource(RenderFloor(FloorPolicy::BelowSurface { margin: 16 }))
         // Ticket 070: further than the viewer's default 10. The RTS camera
@@ -379,6 +387,7 @@ pub fn run() {
         .insert_resource(city)
         .insert_resource(journal)
         .insert_resource(drop_table)
+        .insert_resource(economy_config)
         .insert_resource(stock)
         .insert_resource(CitySavePath(if save_root.as_os_str().is_empty() { None } else { Some(save_root) }))
         // Ticket 061, roadmap C4: hot reload, seeded above so the first
@@ -542,13 +551,16 @@ fn save_journal_on_exit(
 /// [`load_journal`] — a missing file or no save at all both start from an
 /// empty stockpile, which for this file is the literal truth rather than a
 /// default (see [`inventory`]' module docs).
-fn load_stock(save_root: &Path) -> inventory::Stock {
+fn load_stock(save_root: &Path, economy: &economy::EconomyConfig) -> inventory::Stock {
+    // No save at all (ticket 008's `empty_save`): nothing to read, nothing
+    // to write — but a founding grant is still the right starting state, so
+    // the placeholder behaves like the new city it is.
     if save_root.as_os_str().is_empty() {
-        return inventory::Stock::default();
+        return founding_stock(economy);
     }
 
     match inventory::load_stock(save_root) {
-        Ok(loaded) => {
+        Ok(Some(loaded)) => {
             if !loaded.is_empty() {
                 println!(
                     "block_viewer: loaded {} material{} from {}",
@@ -559,9 +571,55 @@ fn load_stock(save_root: &Path) -> inventory::Stock {
             }
             loaded
         }
+        // Ticket 074: no stock file means a city that has never had one — a
+        // new city, which is founded with the grant. A file that exists and
+        // happens to be empty is a player who spent everything, and is not
+        // topped up; `inventory::load_stock` returns `Option` to keep those
+        // two apart.
+        Ok(None) => founding_stock(economy),
         Err(err) => {
+            // Deliberately *not* granted: there was a stock here, and a
+            // corrupt or future-versioned file must not become free
+            // materials.
             println!("block_viewer: could not load stock, starting empty: {err}");
             inventory::Stock::default()
+        }
+    }
+}
+
+/// The founding grant as a [`Stock`](inventory::Stock) — `assets/city/economy.ron`'s
+/// `start_stock`, logged so it's obvious where a brand-new city's materials
+/// came from.
+fn founding_stock(economy: &economy::EconomyConfig) -> inventory::Stock {
+    let mut stock = inventory::Stock::default();
+    stock.add_parcel(&economy.start_stock);
+    if stock.is_empty() {
+        println!("block_viewer: new city, and {ECONOMY_FILE} grants nothing to start with");
+    } else {
+        println!("block_viewer: new city founded with {} unit(s) of material:", economy.start_stock.total());
+        for (item, count) in stock.iter() {
+            println!("block_viewer:   {count}x {}", inventory::short_name(item));
+        }
+    }
+    stock
+}
+
+/// Loads and logs the economy config (ticket 074), same shape as
+/// [`load_drop_table`] — one file, no per-entry recovery, and a missing file
+/// is an empty config rather than an error.
+fn load_economy() -> (economy::EconomyConfig, Vec<(PathBuf, String)>) {
+    match economy::load_economy(Path::new(ECONOMY_FILE)) {
+        Ok(config) => {
+            println!(
+                "block_viewer: loaded {} conversion(s) and a {} founding grant from {ECONOMY_FILE}",
+                config.conversions.len(),
+                if config.start_stock.is_empty() { "empty" } else { "non-empty" },
+            );
+            (config, Vec::new())
+        }
+        Err(err) => {
+            println!("block_viewer: could not load {ECONOMY_FILE}, no grant and no conversions: {err}");
+            (economy::EconomyConfig::default(), vec![(PathBuf::from(ECONOMY_FILE), err.to_string())])
         }
     }
 }

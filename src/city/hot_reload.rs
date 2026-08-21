@@ -106,11 +106,14 @@ pub struct DefinitionErrors {
     /// watches directories, and a one-file watcher is a ticket of its own if
     /// it turns out to be wanted.
     pub drops: Vec<(PathBuf, String)>,
+    /// `assets/city/economy.ron` (ticket 074) — same shape and same
+    /// not-hot-reloaded caveat as [`Self::drops`].
+    pub economy: Vec<(PathBuf, String)>,
 }
 
 impl DefinitionErrors {
     pub fn is_empty(&self) -> bool {
-        self.buildings.is_empty() && self.road_types.is_empty() && self.drops.is_empty()
+        self.buildings.is_empty() && self.road_types.is_empty() && self.drops.is_empty() && self.economy.is_empty()
     }
 }
 

@@ -42,6 +42,7 @@ use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts};
 
 use super::super::definition::{Building, BuildingDefinitions, Cost, LoadedBuilding, Production};
+use super::super::economy::{self, EconomyConfig};
 use super::super::inventory::Stock;
 use super::super::placement::{rotation_degrees, PlacementSelection};
 use super::super::state;
@@ -80,6 +81,13 @@ fn production_line(production: &Production) -> Option<String> {
 /// docs' "Unlocking, defined for the first time here". A plain function, not
 /// a system, so it's testable directly against a bare [`state::City`] the
 /// same way [`crate::city::placement::resolve_placement`] is.
+/// `"10x oak_log"` — what a row's cost will eat out of the stock through
+/// ticket 074's conversion table. Same `count`/short-name shape
+/// [`cost_line`] uses, because it's read in the same glance.
+fn conversion_line(consumed: &super::super::inventory::Parcel) -> String {
+    consumed.iter().map(|(item, count)| format!("{count}x {}", short_name(item))).collect::<Vec<_>>().join(", ")
+}
+
 fn missing_requirements(building: &Building, city: &state::City) -> Vec<String> {
     building
         .requires
@@ -128,6 +136,7 @@ fn entry_row(
     selection: &mut PlacementSelection,
     city: &state::City,
     stock: &Stock,
+    economy: &EconomyConfig,
 ) {
     let missing = missing_requirements(&entry.building, city);
     let unlocked = missing.is_empty();
@@ -151,11 +160,23 @@ fn entry_row(
     // Ticket 073: the cost line turns red the moment the stockpile can't
     // cover it, and says what's short — a placement click would otherwise be
     // refused with the reason only in the city panel's last-edit line.
+    //
+    // Ticket 074: priced through the same `plan_payment` the commit pays
+    // with, conversions included, so a row can't read red above a click that
+    // succeeds. A row the player can only afford *by* converting says so —
+    // materials disappearing out of the pile is worth a word of warning.
     let cost_text = format!("  Cost: {}", cost_line(&entry.building.cost));
-    if stock.can_afford(&entry.building.cost) {
+    let payment = economy::plan_payment(stock, &entry.building.cost, &economy.conversions);
+    if !payment.affordable() {
+        ui.colored_label(egui::Color32::RED, format!("{cost_text}  (short {})", payment.shortfall));
+    } else if payment.conversion.consumed.is_empty() {
         ui.label(cost_text);
     } else {
-        ui.colored_label(egui::Color32::RED, format!("{cost_text}  (short {})", stock.shortfall(&entry.building.cost)));
+        ui.label(cost_text);
+        ui.colored_label(
+            egui::Color32::from_rgb(220, 160, 90),
+            format!("  Converts: {}", conversion_line(&payment.conversion.consumed)),
+        );
     }
     if let Some(production) = &entry.building.production {
         if let Some(line) = production_line(production) {
@@ -234,6 +255,7 @@ pub(super) fn build_menu_panel(
     definitions: Option<Res<BuildingDefinitions>>,
     city: Res<state::City>,
     stock: Res<Stock>,
+    economy: Res<EconomyConfig>,
     mut selection: ResMut<PlacementSelection>,
 ) {
     egui::Window::new("Build").show(contexts.ctx_mut(), |ui| {
@@ -261,7 +283,7 @@ pub(super) fn build_menu_panel(
                 current_tier = Some(entry.building.tier);
                 ui.heading(format!("Tier {}", entry.building.tier));
             }
-            entry_row(ui, entry, &definitions, &mut selection, &city, &stock);
+            entry_row(ui, entry, &definitions, &mut selection, &city, &stock, &economy);
             ui.separator();
         }
 
@@ -351,6 +373,13 @@ mod tests {
     fn a_cost_is_formatted_count_and_short_name() {
         let cost = [Cost { block: "minecraft:oak_planks".to_string(), count: 40 }];
         assert_eq!(cost_line(&cost), "40x oak_planks");
+    }
+
+    #[test]
+    fn a_conversion_line_reads_as_what_leaves_the_stock() {
+        let mut consumed = super::super::super::inventory::Parcel::default();
+        consumed.add("minecraft:oak_log", 10);
+        assert_eq!(conversion_line(&consumed), "10x oak_log");
     }
 
     #[test]

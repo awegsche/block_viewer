@@ -1,0 +1,66 @@
+// The economy's tunable numbers (ticket 074). See `src/city/economy.rs`.
+//
+// Two knobs:
+//
+//   start_stock  what a city with NO `citybuilder/stock.ron` is founded
+//                with. A save that already has a stock file is never
+//                topped up, however empty it is.
+//   conversions  trivially transformable materials, applied automatically
+//                when a placement is paid for and ONLY then — never on a
+//                demolition's backfill or a terraform's fill, and never to
+//                the pile at large. A conversion runs whole: needing 2
+//                planks with one log in stock converts the log and leaves
+//                the other 2 planks behind.
+//
+// Bare names are read as `minecraft:<name>`. An input `count` left out is 1.
+// Chains work (logs -> planks -> sticks); a cycle is caught and refused
+// rather than followed.
+(
+    // ---- the founding grant ---------------------------------------------
+    // Enough to lay out a first street without terraforming for it: the
+    // shipped House costs 40 oak_planks + 20 cobblestone, so this is about
+    // three houses in planks with another sixteen in logs behind them.
+    start_stock: {
+        "dirt": 512,
+        "cobblestone": 256,
+        "oak_planks": 128,
+        "oak_log": 64,
+    },
+
+    // ---- trivially transformable ----------------------------------------
+    // Vanilla recipes with no ambiguity about the result. Nothing here
+    // models a workbench, a furnace or fuel — the point is only that a city
+    // holding logs shouldn't be unable to build with planks.
+    conversions: [
+        // logs -> planks, one per wood type
+        (from: (item: "oak_log"),           to: (item: "oak_planks",           count: 4)),
+        (from: (item: "spruce_log"),        to: (item: "spruce_planks",        count: 4)),
+        (from: (item: "birch_log"),         to: (item: "birch_planks",         count: 4)),
+        (from: (item: "jungle_log"),        to: (item: "jungle_planks",        count: 4)),
+        (from: (item: "acacia_log"),        to: (item: "acacia_planks",        count: 4)),
+        (from: (item: "dark_oak_log"),      to: (item: "dark_oak_planks",      count: 4)),
+        (from: (item: "mangrove_log"),      to: (item: "mangrove_planks",      count: 4)),
+        (from: (item: "cherry_log"),        to: (item: "cherry_planks",        count: 4)),
+        (from: (item: "crimson_stem"),      to: (item: "crimson_planks",       count: 4)),
+        (from: (item: "warped_stem"),       to: (item: "warped_planks",        count: 4)),
+
+        // planks -> the two things every build needs next
+        (from: (item: "oak_planks", count: 2), to: (item: "stick", count: 4)),
+        (from: (item: "oak_planks", count: 6), to: (item: "oak_slab", count: 6)),
+
+        // stone family
+        (from: (item: "cobblestone"),       to: (item: "stone")),                   // smelted
+        (from: (item: "stone"),             to: (item: "stone_bricks")),
+        (from: (item: "cobbled_deepslate"), to: (item: "deepslate")),
+        (from: (item: "sand"),              to: (item: "glass")),                   // smelted
+        (from: (item: "clay_ball", count: 4), to: (item: "clay")),
+        (from: (item: "gravel"),            to: (item: "flint")),
+
+        // ore -> ingot, smelted
+        (from: (item: "raw_iron"),          to: (item: "iron_ingot")),
+        (from: (item: "raw_copper"),        to: (item: "copper_ingot")),
+        (from: (item: "raw_gold"),          to: (item: "gold_ingot")),
+        (from: (item: "copper_ingot", count: 9), to: (item: "copper_block")),
+        (from: (item: "iron_ingot", count: 9),   to: (item: "iron_block")),
+    ],
+)

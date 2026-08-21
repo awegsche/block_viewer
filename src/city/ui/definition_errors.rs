@@ -50,7 +50,7 @@ pub(super) fn definition_errors_panel(mut contexts: EguiContexts, errors: Res<De
         }
         ui.label(format!(
             "{} problem(s)",
-            errors.buildings.len() + errors.road_types.len() + errors.drops.len()
+            errors.buildings.len() + errors.road_types.len() + errors.drops.len() + errors.economy.len()
         ));
         error_list(ui, "Buildings (assets/city/buildings)", &errors.buildings);
         if !errors.buildings.is_empty() && !errors.road_types.is_empty() {
@@ -63,5 +63,6 @@ pub(super) fn definition_errors_panel(mut contexts: EguiContexts, errors: Res<De
         // Ticket 072: one file, so at most one line — and the one that says
         // the whole drop table fell back to "everything drops itself".
         error_list(ui, "Drops (assets/city/drops.ron)", &errors.drops);
+        error_list(ui, "Economy (assets/city/economy.ron)", &errors.economy);
     });
 }

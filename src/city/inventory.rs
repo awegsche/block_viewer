@@ -123,6 +123,15 @@ impl Parcel {
         self.items.values().fold(0u64, |sum, &count| sum.saturating_add(count))
     }
 
+    /// Folds `other` into this parcel — used where one action's materials
+    /// arrive in two pieces (ticket 074: a placement's cost *plus* what its
+    /// conversions consumed both count as debited).
+    pub fn add_all(&mut self, other: &Parcel) {
+        for (item, count) in other.iter() {
+            self.add(item, count);
+        }
+    }
+
     /// A cost list as a parcel — the same summing an all-or-nothing
     /// [`Stock::spend`] has to do anyway, so a definition that lists the
     /// same block twice (`20 planks` and `20 planks` rather than `40`) costs
@@ -234,8 +243,14 @@ impl Stock {
         taken
     }
 
-    /// Whether [`spend`](Self::spend) would succeed, without spending —
-    /// what a build menu greys a row out on.
+    /// Whether [`spend`](Self::spend) would succeed, without spending.
+    ///
+    /// The conversion-blind question: since ticket 074 both real pricing
+    /// callers go through [`super::economy::plan_payment`] instead, which
+    /// answers the same question *after* converting what the table allows.
+    /// This stays as the primitive underneath it — and as the one to ask
+    /// when there is no table in hand.
+    #[allow(dead_code)]
     pub fn can_afford(&self, costs: &[Cost]) -> bool {
         self.shortfall(costs).missing.is_empty()
     }
@@ -350,19 +365,21 @@ pub fn save_stock(stock: &Stock, save_root: &Path) -> Result<(), StockError> {
     fs::write(&path, text).map_err(StockError::Io)
 }
 
-/// Reads `<save_root>/citybuilder/stock.ron` into a fresh [`Stock`]. A
-/// missing file is `Ok(Stock::default())` — a save that predates the economy
-/// has an empty stock, which is the truth rather than a default.
+/// Reads `<save_root>/citybuilder/stock.ron`. **`Ok(None)` when there is no
+/// such file** — not an empty [`Stock`], because ticket 074's founding grant
+/// turns on exactly that distinction: a save that has never had a stock is a
+/// new city and gets the grant, while one whose player spent everything has
+/// an empty stock file and must not be refilled.
 ///
 /// Zero counts in the file are dropped rather than loaded: nothing this
 /// module writes can produce one, so a `0` is a hand edit, and carrying it
 /// into memory would break the "no entry is ever stored at zero" invariant
 /// the rest of the type relies on.
-pub fn load_stock(save_root: &Path) -> Result<Stock, StockError> {
+pub fn load_stock(save_root: &Path) -> Result<Option<Stock>, StockError> {
     let path = stock_file_path(save_root);
     let text = match fs::read_to_string(&path) {
         Ok(text) => text,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Stock::default()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(StockError::Io(err)),
     };
 
@@ -375,7 +392,7 @@ pub fn load_stock(save_root: &Path) -> Result<Stock, StockError> {
     for (item, count) in save.items {
         stock.add(&item, count);
     }
-    Ok(stock)
+    Ok(Some(stock))
 }
 
 #[cfg(test)]
@@ -530,10 +547,21 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_file_loads_an_empty_stock() {
+    fn a_missing_file_is_none_rather_than_an_empty_stock() {
+        // The distinction ticket 074's founding grant turns on.
         let dir = temp_dir("missing");
-        let stock = load_stock(&dir).expect("a missing file is not an error");
-        assert!(stock.is_empty());
+        assert!(load_stock(&dir).expect("a missing file is not an error").is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_empty_saved_stock_loads_as_an_empty_stock_not_as_absent() {
+        let dir = temp_dir("empty");
+        save_stock(&Stock::default(), &dir).expect("save");
+
+        let loaded = load_stock(&dir).expect("load").expect("the file is there, however empty");
+
+        assert!(loaded.is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -543,7 +571,7 @@ mod tests {
         let stock = stock_with(&[("minecraft:oak_planks", 40), ("minecraft:dirt", 7)]);
 
         save_stock(&stock, &dir).expect("save");
-        let loaded = load_stock(&dir).expect("load");
+        let loaded = load_stock(&dir).expect("load").expect("the file was just written");
 
         assert_eq!(loaded, stock);
         let _ = fs::remove_dir_all(&dir);
@@ -568,7 +596,7 @@ mod tests {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, format!("(version: {CURRENT_VERSION}, items: {{\"minecraft:dirt\": 0}})")).unwrap();
 
-        let stock = load_stock(&dir).expect("load");
+        let stock = load_stock(&dir).expect("load").expect("the file is there");
         assert!(stock.is_empty(), "a zero count is not an entry");
         let _ = fs::remove_dir_all(&dir);
     }
