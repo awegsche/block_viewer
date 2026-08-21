@@ -1,0 +1,85 @@
+// What a block gives the city when a placement, a demolition or a terraform
+// drag clears it away (ticket 072, roadmap H2). See `src/city/drops.rs` for
+// the rules; the short version:
+//
+//   1. air drops nothing (hardcoded — deliberately not listed here)
+//   2. a name under `nothing` drops nothing
+//   3. a name under `replaced` drops what it says (`count` defaults to 1)
+//   4. anything else drops ITSELF, one for one
+//
+// So this file only has to describe the exceptions. Bare names are read as
+// `minecraft:<name>`. Properties are ignored — a slab is a slab.
+(
+    // ---- drops nothing -------------------------------------------------
+    // Fluids, plant life, and the handful of blocks vanilla gives you
+    // nothing for without silk touch. Terrain is full of these and none of
+    // them are building material.
+    nothing: [
+        // fluids
+        "water", "lava", "bubble_column",
+        // ground cover and small plants
+        "short_grass", "tall_grass", "fern", "large_fern", "dead_bush",
+        "seagrass", "tall_seagrass", "kelp", "kelp_plant", "sea_pickle",
+        "vine", "glow_lichen", "hanging_roots", "moss_carpet",
+        "sculk", "sculk_vein", "sculk_catalyst", "sculk_shrieker", "sculk_sensor",
+        // leaves — a forest is not a lumber yard
+        "oak_leaves", "spruce_leaves", "birch_leaves", "jungle_leaves",
+        "acacia_leaves", "dark_oak_leaves", "mangrove_leaves", "cherry_leaves",
+        "azalea_leaves", "flowering_azalea_leaves", "pale_oak_leaves",
+        // crops mid-growth
+        "wheat", "carrots", "potatoes", "beetroots", "torchflower_crop",
+        "pitcher_crop", "sweet_berry_bush", "cocoa", "nether_wart",
+        // silk-touch-only
+        "glass", "glass_pane", "ice", "packed_ice", "blue_ice", "frosted_ice",
+        "spawner", "budding_amethyst", "turtle_egg",
+        // never yours in the first place
+        "bedrock", "fire", "soul_fire", "snow", "end_portal_frame",
+    ],
+
+    // ---- drops something else -------------------------------------------
+    replaced: {
+        // stone family — mining it gives the cobbled form
+        "stone": (item: "cobblestone"),
+        "deepslate": (item: "cobbled_deepslate"),
+        "infested_stone": (item: "cobblestone"),
+        "infested_deepslate": (item: "cobbled_deepslate"),
+
+        // the soil family all comes up as plain dirt
+        "grass_block": (item: "dirt"),
+        "podzol": (item: "dirt"),
+        "mycelium": (item: "dirt"),
+        "dirt_path": (item: "dirt"),
+        "farmland": (item: "dirt"),
+
+        // ores — the counts follow vanilla's midpoints, not its ranges;
+        // there is no randomness anywhere in this game's economy.
+        "coal_ore": (item: "coal"),
+        "deepslate_coal_ore": (item: "coal"),
+        "iron_ore": (item: "raw_iron"),
+        "deepslate_iron_ore": (item: "raw_iron"),
+        "copper_ore": (item: "raw_copper", count: 3),
+        "deepslate_copper_ore": (item: "raw_copper", count: 3),
+        "gold_ore": (item: "raw_gold"),
+        "deepslate_gold_ore": (item: "raw_gold"),
+        "diamond_ore": (item: "diamond"),
+        "deepslate_diamond_ore": (item: "diamond"),
+        "emerald_ore": (item: "emerald"),
+        "deepslate_emerald_ore": (item: "emerald"),
+        "lapis_ore": (item: "lapis_lazuli", count: 6),
+        "deepslate_lapis_ore": (item: "lapis_lazuli", count: 6),
+        "redstone_ore": (item: "redstone", count: 4),
+        "deepslate_redstone_ore": (item: "redstone", count: 4),
+        "nether_gold_ore": (item: "gold_nugget", count: 4),
+        "nether_quartz_ore": (item: "quartz"),
+
+        // odds and ends that break into something smaller
+        "clay": (item: "clay_ball", count: 4),
+        "snow_block": (item: "snowball", count: 4),
+        "glowstone": (item: "glowstone_dust", count: 4),
+        "sea_lantern": (item: "prismarine_crystals", count: 3),
+        "bookshelf": (item: "book", count: 3),
+        "cobweb": (item: "string"),
+        "melon": (item: "melon_slice", count: 5),
+        "gilded_blackstone": (item: "gold_nugget", count: 4),
+    },
+)

@@ -1194,3 +1194,18 @@ Y=0 in the world and won't be cleaned up by this fix — see the ticket.
   4. **Old saves are refused, not misplaced** — a `citybuilder/city.ron`
      written before this change is version 5; loading it should print the
      version-mismatch line rather than silently loading roads.
+
+- [ ] **072 material stock.** `cargo run --bin citybuilder`. Nothing charges
+  or credits the stock yet (that's 073) — this check is that the plumbing is
+  visible and survives a restart.
+  1. **The panel says so** — the City window has a "Stock" section reading
+     `(nothing stockpiled)` on a fresh save, below "Roads".
+  2. **A bad table is visible, not fatal** — put a deliberate typo in
+     `assets/city/drops.ron` (e.g. delete a closing brace) and relaunch. The
+     game should still start, the console should say every block will drop
+     itself, and the "Definition Errors" window should list the file under a
+     "Drops" heading. Undo the typo afterwards.
+  3. **It round-trips** — hand-write
+     `<save>/citybuilder/stock.ron` as `(version: 1, items: {"minecraft:dirt": 12})`,
+     relaunch, and confirm the panel shows `12x dirt`; close the game and
+     confirm the file is still there and still says 12.

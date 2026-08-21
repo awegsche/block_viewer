@@ -2,7 +2,7 @@
 
 Not a work item: the design document for the citybuilder game and the shared
 world-edit infrastructure it uses. High-level tasks here get split into
-numbered tickets in this directory when picked up (**next free number: 072**).
+numbered tickets in this directory when picked up (**next free number: 074**).
 Companion to `ROADMAP.md`, which covers the viewer 001–029.
 
 ## The goal
@@ -516,13 +516,41 @@ emitted into `PendingChunkWork::to_unload` (nothing drains that list).
 
 # Remaining plan
 
-## H2 — Yields (open)
+## H2 — Materials, yields and cost (iteration 2, in progress)
 
-Dug blocks become resource counts in city state. Inert in iteration 1, like
-the production fields. `city::terraform`'s dig currently records nothing
-anywhere production could later read. Likely shares plumbing with the noted-
-but-unscheduled idea of **charging build cost/time for blocks a placement
-clears** (instead of the old refusal); worth picking up together.
+**Materials are Minecraft item ids** — the stock is keyed by
+`minecraft:oak_planks`, not by an invented `"wood"`, so a building's existing
+`cost` field became spendable without a schema change and the blocks the
+world is made of are the economy's own units.
+
+- **`city::inventory` (ticket 072, done)** — `Stock`, one global pile, `u64`
+  counts (fractions belong to a producer's own accumulator, not to the
+  ledger), and `Parcel`, the "some quantity of some materials" bundle that a
+  spend, a yield, a journal delta and later a shipment all are. `spend` is
+  all-or-nothing (a half-paid building must not exist); `remove` clamps at
+  zero (a debit settles a world change that has already happened, and a
+  negative stock is a debt no mechanic can discharge). Persisted to its own
+  `<save>/citybuilder/stock.ron` rather than a `city.ron` field — that file's
+  loader refuses any version but its own, so folding the stock in would have
+  discarded every existing city to add an empty ledger to it.
+- **`city::drops` (ticket 072, done)** — `assets/city/drops.ron`, a *table*
+  rather than a one-file-per-id catalogue, because drops are a mapping over
+  block names rather than a set of entities. Four rules in order: air drops
+  nothing (hardcoded — a blueprint is mostly air and no asset file should be
+  able to get that wrong), `nothing` drops nothing, `replaced` drops what it
+  says, and **anything else drops itself**, so a missing table is a crude
+  economy rather than a dead one. Keyed on `BlockState::name` alone;
+  properties, tools and randomness are all deliberately out of scope.
+- **Charging and crediting (ticket 073)** — one rule: *a write that removes
+  blocks credits their drops; a write that restores blocks debits them; a
+  building's own blocks are what `cost` buys.* See that ticket for the four
+  write paths it applies to, and for why demolition charges for its own
+  backfill (without it, `place -> demolish -> place` is a stone farm).
+- **Still open**: production, warehouses, and haulage along roads —
+  a producer's output has to reach a warehouse, and how long that takes comes
+  from the road distance and each road type's `travel_speed` (loaded and
+  inert since ticket 060). **Decided**: the economy runs on a game clock with
+  pause and speed controls, not on raw wall-clock time.
 
 ## I — Damage: the world diffing back (iteration 2, except I1)
 

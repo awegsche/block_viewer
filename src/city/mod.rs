@@ -267,8 +267,10 @@ use std::path::{Path, PathBuf};
 mod commit;
 mod definition;
 mod demolish;
+mod drops;
 mod grid;
 mod hot_reload;
+mod inventory;
 mod journal;
 mod persistence;
 mod picking;
@@ -318,6 +320,11 @@ const ROAD_CATALOGUE_DIR: &str = "assets/city/roads";
 /// `CATALOGUE_DIR`.
 const ROAD_TYPES_DIR: &str = "assets/city/road_types";
 
+/// Where [`run`] looks for the block drop table (ticket 072, roadmap H2) —
+/// one file rather than a directory, because drops are a mapping over block
+/// names rather than a set of ids; see [`drops`]' own module docs.
+const DROPS_FILE: &str = "assets/city/drops.ron";
+
 /// Where [`save_city`](persistence::save_city)/[`load_city`](persistence::load_city)
 /// look, relative to a save's root — `None` when [`world_app`]'s
 /// [`LoadedSave`] is ticket 008's placeholder (`empty_save`, `meta.path`
@@ -332,6 +339,7 @@ pub fn run() {
     let (definitions, building_errors) = load_building_definitions(&catalogue);
     let road_catalogue = load_road_catalogue();
     let (road_types, road_type_errors) = load_road_types(&road_catalogue);
+    let (drop_table, drop_errors) = load_drop_table();
 
     // Ticket 061, roadmap C4: seed the hot-reload snapshots from the same
     // scan the load above already did, and the error panel from that load's
@@ -342,12 +350,14 @@ pub fn run() {
     let definition_errors = hot_reload::DefinitionErrors {
         buildings: building_errors.into_iter().map(|(path, err)| (path, err.to_string())).collect(),
         road_types: road_type_errors.into_iter().map(|(path, err)| (path, err.to_string())).collect(),
+        drops: drop_errors,
     };
 
     let mut app = world_app();
     let save_root = app.world().resource::<LoadedSave>().0.meta.path.clone();
     let city = load_city(&save_root);
     let journal = load_journal(&save_root);
+    let stock = load_stock(&save_root);
 
     app.insert_resource(RenderFloor(FloorPolicy::BelowSurface { margin: 16 }))
         // Ticket 070: further than the viewer's default 10. The RTS camera
@@ -368,6 +378,8 @@ pub fn run() {
         .insert_resource(road_types)
         .insert_resource(city)
         .insert_resource(journal)
+        .insert_resource(drop_table)
+        .insert_resource(stock)
         .insert_resource(CitySavePath(if save_root.as_os_str().is_empty() { None } else { Some(save_root) }))
         // Ticket 061, roadmap C4: hot reload, seeded above so the first
         // `Update` tick doesn't immediately redo the load just above.
@@ -394,7 +406,7 @@ pub fn run() {
         // `flush_world_on_exit` first: `city.ron`/`journal.ron` describe
         // buildings whose blocks need to have actually reached disk by the
         // time they're written — see the module docs' "Save world".
-        .add_systems(Last, (flush_world_on_exit, save_city_on_exit, save_journal_on_exit).chain())
+        .add_systems(Last, (flush_world_on_exit, save_city_on_exit, save_journal_on_exit, save_stock_on_exit).chain())
         .run();
 }
 
@@ -523,6 +535,71 @@ fn save_journal_on_exit(
 
     if let Err(err) = journal::save_journal(&journal, save_root) {
         println!("block_viewer: could not save journal: {err}");
+    }
+}
+
+/// Loads [`inventory::Stock`] from `save_root`, same shape as
+/// [`load_journal`] — a missing file or no save at all both start from an
+/// empty stockpile, which for this file is the literal truth rather than a
+/// default (see [`inventory`]' module docs).
+fn load_stock(save_root: &Path) -> inventory::Stock {
+    if save_root.as_os_str().is_empty() {
+        return inventory::Stock::default();
+    }
+
+    match inventory::load_stock(save_root) {
+        Ok(loaded) => {
+            if !loaded.is_empty() {
+                println!(
+                    "block_viewer: loaded {} material{} from {}",
+                    loaded.distinct(),
+                    if loaded.distinct() == 1 { "" } else { "s" },
+                    inventory::stock_file_path_for_log(save_root).display(),
+                );
+            }
+            loaded
+        }
+        Err(err) => {
+            println!("block_viewer: could not load stock, starting empty: {err}");
+            inventory::Stock::default()
+        }
+    }
+}
+
+/// Saves [`inventory::Stock`] to [`CitySavePath`] on every [`AppExit`], the
+/// same trigger and the same no-op-when-`None` contract
+/// [`save_city_on_exit`]/[`save_journal_on_exit`] use.
+fn save_stock_on_exit(
+    mut exit_events: EventReader<AppExit>,
+    stock: Res<inventory::Stock>,
+    save_path: Res<CitySavePath>,
+) {
+    if exit_events.read().count() == 0 {
+        return;
+    }
+    let Some(save_root) = &save_path.0 else { return };
+
+    if let Err(err) = inventory::save_stock(&stock, save_root) {
+        println!("block_viewer: could not save stock: {err}");
+    }
+}
+
+/// Loads and logs the block drop table (ticket 072, roadmap H2). Unlike the
+/// four loaders below it there is no per-entry recovery — a `drops.ron` that
+/// doesn't parse gives the default table (every non-air block drops itself)
+/// and one entry in the errors panel, rather than a table half of whose
+/// rules apply. The returned list is that panel's seed, in the same
+/// `(path, message)` shape the definition loaders hand back.
+fn load_drop_table() -> (drops::DropTable, Vec<(PathBuf, String)>) {
+    match drops::load_drop_table(Path::new(DROPS_FILE)) {
+        Ok(table) => {
+            println!("block_viewer: loaded {} drop rule(s) from {DROPS_FILE}", table.len());
+            (table, Vec::new())
+        }
+        Err(err) => {
+            println!("block_viewer: could not load {DROPS_FILE}, every block will drop itself: {err}");
+            (drops::DropTable::default(), vec![(PathBuf::from(DROPS_FILE), err.to_string())])
+        }
     }
 }
 

@@ -99,11 +99,18 @@ pub struct DefinitionErrors {
     /// otherwise unrelated types, and nothing here needs to match on them.
     pub buildings: Vec<(PathBuf, String)>,
     pub road_types: Vec<(PathBuf, String)>,
+    /// `assets/city/drops.ron` (ticket 072) — at most one entry, since the
+    /// drop table is a single file with no per-entry recovery. Seeded by
+    /// [`super::run`] and never touched again: unlike the two directories
+    /// above, the table is **not** hot-reloaded. The snapshot machinery
+    /// watches directories, and a one-file watcher is a ticket of its own if
+    /// it turns out to be wanted.
+    pub drops: Vec<(PathBuf, String)>,
 }
 
 impl DefinitionErrors {
     pub fn is_empty(&self) -> bool {
-        self.buildings.is_empty() && self.road_types.is_empty()
+        self.buildings.is_empty() && self.road_types.is_empty() && self.drops.is_empty()
     }
 }
 

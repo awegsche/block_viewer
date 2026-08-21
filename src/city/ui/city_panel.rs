@@ -36,11 +36,24 @@ use bevy_egui::{egui, EguiContexts};
 use crate::chunk_pipeline::SharedRegionCache;
 use crate::{LoadedSave, StartupIssue};
 
+use super::super::inventory::{short_name, Stock};
 use super::super::journal::Journal;
 use super::super::save::{SaveCommand, SaveState};
 use super::super::state;
 use super::super::undo::{UndoCommand, UndoState};
 use super::super::write_status::{LastSave, LastWrite, WriteKind, WriteStatus};
+
+/// Every held material as `count x short_name`, in the order
+/// [`Stock::iter`] gives (ascending by item id). A plain function like
+/// [`building_counts`], for the same reason: testable without an
+/// `egui::Context`.
+///
+/// Short names (`oak_planks`, not `minecraft:oak_planks`) because the build
+/// menu's own cost lines already read that way — a player comparing "Cost:
+/// 40x oak_planks" against the stockpile shouldn't have to translate.
+fn stock_lines(stock: &Stock) -> Vec<String> {
+    stock.iter().map(|(item, count)| format!("  {count}x {}", short_name(item))).collect()
+}
 
 /// A written file's status line is green rather than the default text
 /// colour — the same call `viewer::ui::selection_panel`'s own `WROTE_COLOR`
@@ -211,6 +224,7 @@ fn world_section(ui: &mut egui::Ui, save: &LoadedSave, issue: &StartupIssue) {
 pub(super) fn city_panel(
     mut contexts: EguiContexts,
     city: Res<state::City>,
+    stock: Res<Stock>,
     journal: Res<Journal>,
     write_status: Res<WriteStatus>,
     region_cache: Option<Res<SharedRegionCache>>,
@@ -237,6 +251,16 @@ pub(super) fn city_panel(
         ui.separator();
         ui.heading("Roads");
         ui.label(format!("{} cell(s)", city.road_cells().count()));
+
+        ui.separator();
+        ui.heading("Stock");
+        if stock.is_empty() {
+            ui.label("(nothing stockpiled)");
+        } else {
+            for line in stock_lines(&stock) {
+                ui.label(line);
+            }
+        }
 
         ui.separator();
         ui.heading("Last edit");
@@ -273,6 +297,20 @@ mod tests {
 
         let counts = building_counts(&city);
         assert_eq!(counts, vec![("carpenter".to_string(), 1), ("house01".to_string(), 2)]);
+    }
+
+    #[test]
+    fn an_empty_stock_has_no_lines() {
+        assert!(stock_lines(&Stock::default()).is_empty());
+    }
+
+    #[test]
+    fn stock_lines_are_counted_short_names_in_id_order() {
+        let mut stock = Stock::default();
+        stock.add("minecraft:oak_planks", 40);
+        stock.add("minecraft:cobblestone", 20);
+
+        assert_eq!(stock_lines(&stock), vec!["  20x cobblestone".to_string(), "  40x oak_planks".to_string()]);
     }
 
     #[test]
