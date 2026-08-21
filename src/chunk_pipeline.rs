@@ -382,10 +382,22 @@ fn owned_neighbors_of(
 /// already in flight — re-requesting a coordinate that's already loading
 /// never spawns a duplicate task.
 ///
+/// Drains `pending.to_load` as it goes (mirroring [`start_chunk_remeshes`]/
+/// [`start_chunk_reloads`]) rather than leaving dispatched coordinates
+/// sitting in it: every entry here gets *some* resolution in this same pass
+/// (a task spawned into `in_flight`, or dropped as already-loaded/already-
+/// in-flight), so nothing is left to re-check next frame. Previously this
+/// read `&pending.to_load` without consuming it, so a coordinate stayed in
+/// the list forever after being dispatched — `status_panel`'s "Queued
+/// chunks" (`pending.to_load.len() + in_flight_loads.len()`) would then
+/// double-count in-flight work and never count down as loads actually
+/// completed, making a large render distance's worth of streaming look
+/// stalled even while it was progressing normally in the background.
+///
 /// `pub(crate)` so [`crate::unload`] (005-d) can order its own systems
 /// `.before()` this one.
 pub(crate) fn start_chunk_loads(
-    pending: Res<PendingChunkWork>,
+    mut pending: ResMut<PendingChunkWork>,
     mut in_flight: ResMut<InFlightChunkLoads>,
     decoded_world: Res<DecodedWorld>,
     region_cache: Option<Res<SharedRegionCache>>,
@@ -395,7 +407,8 @@ pub(crate) fn start_chunk_loads(
 ) {
     // All three are inserted by `lib.rs::setup_world` once the real save/atlas/
     // colormaps exist; before that (Startup hasn't finished) there's nothing
-    // to load with.
+    // to load with — leave `pending.to_load` untouched so it's still there
+    // to drain once setup finishes.
     let (Some(region_cache), Some(atlas), Some(color_maps)) = (region_cache, atlas, color_maps)
     else {
         return;
@@ -403,7 +416,7 @@ pub(crate) fn start_chunk_loads(
     let floor_policy = render_floor.0;
 
     let pool = AsyncComputeTaskPool::get();
-    for &coord in &pending.to_load {
+    for coord in std::mem::take(&mut pending.to_load) {
         if in_flight.0.contains_key(&coord) || decoded_world.columns.contains_key(&coord) {
             continue;
         }

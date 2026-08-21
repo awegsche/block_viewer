@@ -968,3 +968,30 @@ these itself (see CLAUDE.md's "Manual/visual verification").
   changes in `assets/city/buildings`/`assets/city/road_types` should
   trigger anything.
 
+- [ ] **062 fix stale "queued chunks" count: the counter actually counts
+  down, and a fresh large-render-distance load actually finishes.** The
+  reported symptom: loading a new world showed "Queued chunks: 850" and the
+  world only displayed some chunks. Root cause was `start_chunk_loads`
+  never draining `PendingChunkWork::to_load` as it dispatched tasks, so the
+  status panel's counter stayed pinned at the initial render-distance count
+  forever (until the next chunk-boundary crossing), even while loading was
+  progressing normally in the background — see
+  `finished_tickets/062-fix-stale-queued-chunks-count.md` for the full
+  diagnosis.
+
+  `cargo run --bin block_viewer` against the real save, ideally with the
+  render distance slider pushed up toward 14-20 before switching to a save
+  (or right after opening) so there's a large backlog to watch. Confirm:
+  (1) "Queued chunks" visibly counts *down* over the following seconds
+  rather than sitting fixed at one number; (2) it eventually reaches 0 (or
+  close to it — chunks at the edge of explored terrain that aren't fully
+  generated yet correctly never enter the count, that's expected) while
+  "Loaded chunks" climbs to fill the render-distance square; (3) all of the
+  visible terrain in view actually renders in — no permanently-missing
+  patch inside the render distance once the counter settles at/near 0. If
+  the counter still gets stuck non-zero with terrain visibly missing, the
+  bottleneck is elsewhere in the pipeline (the shared
+  `Mutex<BlockRegistry>`/`Mutex<BiomeRegistry>` serializing every chunk's
+  decode+mesh — see `chunk_pipeline`'s module docs) rather than this fix,
+  and is worth its own ticket.
+
