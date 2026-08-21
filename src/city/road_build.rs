@@ -112,6 +112,37 @@
 //! recorded height wins over the terrain, so a new drag joins an old road
 //! flush instead of at whatever the ground under it happens to be.
 //!
+//! ## Tunnels: when the terrain closes over the road (ticket 071)
+//!
+//! Height planning above is about a road running *over* terrain. It says
+//! nothing about terrain running over the *road* — drag across the foot of a
+//! hill and the profile happily puts the surface course several blocks under
+//! the hillside, and the piece's own three layers of clearance mow exactly
+//! three layers of it before the player walks into a wall.
+//!
+//! The rule for spotting that is a single reading, taken at the first Y the
+//! cell's piece does not occupy: **if more than half of the 36 columns over
+//! the cell are not air, the cell is a tunnel** ([`cover_at`],
+//! [`ROAD_TUNNEL_COVER_MAJORITY`]). It resolves to a
+//! [`RoadPieceVariant::Tunnel`] piece — `<kind>-tunnel.nbt`, the same kind
+//! and the same rotation, a different `.nbt` — so nothing in
+//! [`road::select_piece`] or the connection logic changes.
+//!
+//! [`plan_tunnels`] is that pass, run over [`plan_drag`]'s output rather
+//! than inside it, because it needs both the heights that pass resolves and
+//! the catalogue that pass deliberately doesn't see. Two things gate it, and
+//! the second is the same shape [`stair_available`] gives ramps: a cell is
+//! only recorded as a tunnel if the catalogue really holds the piece, so a
+//! style with no `-tunnel` exports keeps building exactly what it built
+//! before rather than leaving unresolvable cells as holes.
+//!
+//! And, like the heights, the variant is decided **once** and remembered on
+//! [`super::state::RoadCell::variant`]. Here that isn't the subtle drift
+//! 065 fixed but a straight contradiction: writing the tunnel piece *carves
+//! away the cover that chose it*, so a cell re-measured after its own write
+//! reads as open sky and the next re-tile would fill the bore back in with
+//! hillside.
+//!
 //! ## Terrain fit, reusing E2 rather than reinventing it for cells
 //!
 //! A road cell is exactly a [`super::state::ROAD_CELL_SIZE`]-square footprint
@@ -172,7 +203,7 @@ use crate::DecodedWorld;
 use super::commit::blueprint_edit;
 use super::grid::{self, FootprintFit};
 use super::picking::{HoveredBlock, PickingSet};
-use super::road::{self, RoadConnections, RoadPieceKind};
+use super::road::{self, RoadConnections, RoadPieceKind, RoadPieceVariant};
 use super::road_catalogue::RoadCatalogue;
 use super::state::{self, City, ROAD_CELL_SIZE};
 use super::tool::ActiveTool;
@@ -261,7 +292,7 @@ struct RoadPreviewState {
     entities: Vec<Entity>,
     quad_mesh: Option<Handle<Mesh>>,
     materials: Option<PreviewMaterials>,
-    piece_meshes: HashMap<(String, RoadPieceKind, Rotation), Option<Handle<Mesh>>>,
+    piece_meshes: HashMap<(String, RoadPieceKind, RoadPieceVariant, Rotation), Option<Handle<Mesh>>>,
 }
 
 /// The two translucent preview materials — a separate pair from
@@ -454,6 +485,11 @@ pub(super) struct CellPlan {
     /// `None` for a flat cell, else the direction this cell climbs — see
     /// [`state::RoadCell::ascent`].
     pub(super) ascent: Option<road::Direction>,
+    /// Surface or tunnel (ticket 071) — decided by [`plan_tunnels`] in a
+    /// second pass over [`plan_drag`]'s output, because it depends on the
+    /// heights that pass resolves *and* on the catalogue, which `plan_drag`
+    /// deliberately doesn't see.
+    pub(super) variant: RoadPieceVariant,
 }
 
 /// Why a drag has no contiguous height profile, and so can't be built at all.
@@ -604,7 +640,13 @@ fn plan_drag(
     let leaving = path.get(1).and_then(|&next| step_direction(first, next));
     let start_y = anchor_level(first, leaving, world, city).ok_or(PlanRefusal::NoGround(first))?;
 
-    let flat = |level: i32| path.iter().map(|&cell| CellPlan { cell, base_y: level, ascent: None }).collect::<Vec<_>>();
+    // Every cell starts `Surface`; `plan_tunnels` is what turns any of them
+    // over, once these heights exist for it to measure the cover above.
+    let flat = |level: i32| {
+        path.iter()
+            .map(|&cell| CellPlan { cell, base_y: level, ascent: None, variant: RoadPieceVariant::Surface })
+            .collect::<Vec<_>>()
+    };
     if path.len() < 2 || !stair_available {
         return Ok(flat(start_y));
     }
@@ -635,7 +677,7 @@ fn plan_drag(
     let mut level = start_y;
     for (index, &cell) in path.iter().enumerate() {
         if !stairs.contains(&index) {
-            plan.push(CellPlan { cell, base_y: level, ascent: None });
+            plan.push(CellPlan { cell, base_y: level, ascent: None, variant: RoadPieceVariant::Surface });
             continue;
         }
         // `stair_eligible` already established this cell has a next one and
@@ -643,12 +685,17 @@ fn plan_drag(
         let travel = step_direction(cell, path[index + 1]).expect("a stair-eligible cell has a cardinal successor");
         if steps > 0 {
             // Climbing: this cell's low end meets the flat run behind it.
-            plan.push(CellPlan { cell, base_y: level, ascent: Some(travel) });
+            plan.push(CellPlan { cell, base_y: level, ascent: Some(travel), variant: RoadPieceVariant::Surface });
             level += ROAD_STAIR_RISE;
         } else {
             // Descending: the *high* end meets the run behind it, so the
             // recorded low end is a step down and the ascent points back.
-            plan.push(CellPlan { cell, base_y: level - ROAD_STAIR_RISE, ascent: Some(travel.opposite()) });
+            plan.push(CellPlan {
+                cell,
+                base_y: level - ROAD_STAIR_RISE,
+                ascent: Some(travel.opposite()),
+                variant: RoadPieceVariant::Surface,
+            });
             level -= ROAD_STAIR_RISE;
         }
     }
@@ -659,8 +706,120 @@ fn plan_drag(
 /// needs to know about the catalogue. `false` (every cell flat) when there's
 /// no catalogue, no selected style, or no `stairs.nbt` for it, which is the
 /// state a style is in until a `stairs.nbt` is exported for it.
+///
+/// The **surface** stair specifically (ticket 071), not "either variant": a
+/// style that somehow shipped only `stairs-tunnel.nbt` could plan a ramp it
+/// then couldn't write on any cell the terrain didn't happen to close over,
+/// which is a hole in a road rather than a flat one.
 fn stair_available(catalogue: Option<&RoadCatalogue>, style: Option<&str>) -> bool {
-    matches!((catalogue, style), (Some(catalogue), Some(style)) if catalogue.get(style, RoadPieceKind::Stair).is_some())
+    matches!(
+        (catalogue, style),
+        (Some(catalogue), Some(style))
+            if catalogue.get(style, RoadPieceKind::Stair, RoadPieceVariant::Surface).is_some()
+    )
+}
+
+// -----------------------------------------------------------------------------------------------
+// ---- tunnels: the pieces for a cell the terrain closes over (ticket 071) -----------------------
+// -----------------------------------------------------------------------------------------------
+
+/// How many of a road cell's 36 columns have to be roofed over before the
+/// cell needs a [`RoadPieceVariant::Tunnel`] piece — a strict majority, so
+/// the test is `cover > ROAD_TUNNEL_COVER_MAJORITY`.
+///
+/// Derived from [`ROAD_CELL_SIZE`] rather than written as `18`: 36 is the
+/// cell's own footprint, and the rule is "is the majority of this cell
+/// roofed", not a magic count that would quietly become a minority if a cell
+/// ever stopped being 6x6.
+pub(super) const ROAD_TUNNEL_COVER_MAJORITY: usize = (ROAD_CELL_SIZE * ROAD_CELL_SIZE / 2) as usize;
+
+/// How many of `cell`'s 36 columns hold something other than air at exactly
+/// world Y `y`.
+///
+/// **One layer, and literally not-air.** Not [`grid::ground_height_at`]'s
+/// top-down scan — that answers "where does the ground stop", which a cell
+/// buried in a hillside answers from somewhere far above the road — and not
+/// its clutter-skipping notion of ground either: a cell roofed by 36 leaves
+/// is exactly as unwalkable as one roofed by 36 stone, and a road that
+/// tunnels under a tree is no worse for it.
+///
+/// A column whose chunk isn't decoded counts as *not* covered. Every cell
+/// this is asked about has already passed [`cell_fit`], which refuses
+/// outright on an undecoded column, so that case is unreachable in practice
+/// — and "don't carve a tunnel through terrain you can't see" is the right
+/// way for it to fail if it ever isn't.
+fn cover_at(cell: IVec2, y: i32, world: &DecodedWorld) -> usize {
+    state::road_cell_tiles(cell)
+        .filter(|tile| {
+            grid::block_at(IVec3::new(tile.x, y, tile.y), world)
+                .is_some_and(|id| id != world::BlockRegistry::AIR)
+        })
+        .count()
+}
+
+/// The first world Y a cell's piece does **not** occupy — where
+/// [`cover_at`] takes its reading.
+///
+/// Read off the *surface* piece's own blueprint rather than a constant,
+/// because the pieces aren't all the same height: the shipped flat `dirt`
+/// pieces are `6x5x6` and `stairs.nbt` is `6x8x6`, so a hardcoded envelope
+/// would sample four blocks inside the stair on one hand or four blocks of
+/// sky above a straight on the other. `None` when the style has no piece for
+/// this kind at all — there is nothing to measure the top of, and nothing
+/// that would be written there either.
+fn piece_top_y(
+    cell: IVec2,
+    base_y: i32,
+    style: &str,
+    kind: RoadPieceKind,
+    catalogue: &RoadCatalogue,
+) -> Option<i32> {
+    let piece = catalogue.get(style, kind, RoadPieceVariant::Surface)?;
+    Some(cell_write_origin(cell, base_y).y + piece.size.y)
+}
+
+/// Fills in every [`CellPlan::variant`] in `plan`, the second pass over
+/// [`plan_drag`]'s output — see the module docs' "Tunnels".
+///
+/// A cell that is **already** road keeps its own recorded variant, exactly
+/// as `City::add_road_cell` will: re-measuring a written tunnel reads the
+/// air the tunnel piece itself carved, which is the whole reason
+/// [`state::RoadCell::variant`] is stored rather than derived.
+///
+/// A cell new to this drag is a tunnel when both of these hold:
+///
+/// - a strict majority of the 36 columns just above its piece are not air
+///   ([`cover_at`], [`ROAD_TUNNEL_COVER_MAJORITY`]);
+/// - the catalogue actually has the `-tunnel` piece for its `(style, kind)`.
+///
+/// The second condition is the same shape [`stair_available`] gives ramps: a
+/// style with no tunnel exports keeps building the surface pieces it has,
+/// rather than recording cells whose blueprint can't be resolved and leaving
+/// holes in the road where they were.
+fn plan_tunnels(
+    plan: &mut [CellPlan],
+    path: &[IVec2],
+    world: &DecodedWorld,
+    city: &City,
+    catalogue: Option<&RoadCatalogue>,
+    selected_style: Option<&str>,
+) {
+    for entry in plan.iter_mut() {
+        if let Some(existing) = city.road_cell_at(entry.cell) {
+            entry.variant = existing.variant;
+            continue;
+        }
+        let Some(catalogue) = catalogue else { continue };
+        let Some(style) = style_for_cell(entry.cell, city, selected_style) else { continue };
+        let (kind, _) = piece_for(connections_with_path(city, path, entry.cell), entry.ascent);
+        if catalogue.get(style, kind, RoadPieceVariant::Tunnel).is_none() {
+            continue;
+        }
+        let Some(top) = piece_top_y(entry.cell, entry.base_y, style, kind, catalogue) else { continue };
+        if cover_at(entry.cell, top, world) > ROAD_TUNNEL_COVER_MAJORITY {
+            entry.variant = RoadPieceVariant::Tunnel;
+        }
+    }
 }
 
 /// The piece kind and rotation a cell calls for: a stair if it has an
@@ -787,7 +946,8 @@ fn plains_biome_colors(world: &DecodedWorld, maps: &world::ColorMaps) -> BiomeCo
     table.get(world::BiomeRegistry::PLAINS.0 as usize).copied().unwrap_or_else(white_biome)
 }
 
-/// Resolves (and caches) the preview mesh for `(style, kind, rotation)`: the
+/// Resolves (and caches) the preview mesh for `(style, kind, variant,
+/// rotation)`: the
 /// real piece from `catalogue`, meshed via B2/B3's own path, if one has
 /// loaded — [`quad_mesh`] otherwise (including when `style` is `None`: a
 /// cell new to this drag with nothing selected yet still needs *some*
@@ -802,6 +962,7 @@ fn preview_mesh(
     preview: &mut RoadPreviewState,
     style: Option<&str>,
     kind: RoadPieceKind,
+    variant: RoadPieceVariant,
     rotation: Rotation,
     catalogue: Option<&RoadCatalogue>,
     atlas: &world::AtlasUvIndex,
@@ -812,11 +973,11 @@ fn preview_mesh(
     let Some(style) = style else {
         return (preview.quad_mesh.get_or_insert_with(|| meshes.add(quad_mesh())).clone(), PreviewAnchor::Quad);
     };
-    let Some(piece) = catalogue.and_then(|c| c.get(style, kind)) else {
+    let Some(piece) = catalogue.and_then(|c| c.get(style, kind, variant)) else {
         return (preview.quad_mesh.get_or_insert_with(|| meshes.add(quad_mesh())).clone(), PreviewAnchor::Quad);
     };
 
-    let key = (style.to_string(), kind, rotation);
+    let key = (style.to_string(), kind, variant, rotation);
     if let Some(cached) = preview.piece_meshes.get(&key) {
         if let Some(handle) = cached {
             return (handle.clone(), PreviewAnchor::Piece);
@@ -836,7 +997,7 @@ fn preview_mesh(
                 &rotated
             }
             Err(err) => {
-                println!("block_viewer: road preview: {style}/{kind:?} can't rotate to {rotation:?}: {err}");
+                println!("block_viewer: road preview: {style}/{kind:?}/{variant:?} can't rotate to {rotation:?}: {err}");
                 preview.piece_meshes.insert(key, None);
                 return (preview.quad_mesh.get_or_insert_with(|| meshes.add(quad_mesh())).clone(), PreviewAnchor::Quad);
             }
@@ -959,12 +1120,17 @@ fn update_drag_preview(
     let stairs = stair_available(catalogue.as_deref(), selected_style);
     let plan = plan_drag(&path, &world, &city, stairs);
     let refused = plan.is_err();
-    let plan = plan.unwrap_or_else(|_| {
+    let mut plan = plan.unwrap_or_else(|_| {
         plan_drag(&path, &world, &city, false).unwrap_or_default()
     });
+    // Ticket 071: the ghost shows the *tunnel* piece where one is going to be
+    // written, for the same reason it stands on the plan's heights — the
+    // preview and the commit share one answer so the player can't be shown
+    // paving and given a bore.
+    plan_tunnels(&mut plan, &path, &world, &city, catalogue.as_deref(), selected_style);
 
     for (index, planned) in plan.iter().enumerate() {
-        let CellPlan { cell, base_y, ascent } = *planned;
+        let CellPlan { cell, base_y, ascent, variant } = *planned;
         let valid = !refused && cell_valid(cell, &world, &city);
         let style = style_for_cell(cell, &city, selected_style);
         let (kind, rotation) = piece_for(connections_with_path(&city, &path, cell), ascent);
@@ -972,6 +1138,7 @@ fn update_drag_preview(
             &mut preview,
             style,
             kind,
+            variant,
             rotation,
             catalogue.as_deref(),
             &atlas.0,
@@ -1028,7 +1195,9 @@ fn road_write_edit(affected: &[IVec2], catalogue: &RoadCatalogue, city: &City) -
         // Ticket 067: a cell recorded with an ascent is a stair, whatever its
         // connections look like — see `piece_for`.
         let (kind, rotation) = piece_for(road::connections_at(city, cell), road.ascent);
-        let Some(piece) = catalogue.get(&road.style, kind) else { continue };
+        // Ticket 071: and the *variant* the cell was recorded with, never a
+        // fresh reading of what's above it — see `state::RoadCell::variant`.
+        let Some(piece) = catalogue.get(&road.style, kind, road.variant) else { continue };
 
         let rotated;
         let blueprint: &Blueprint = if rotation == Rotation::Deg0 {
@@ -1040,7 +1209,10 @@ fn road_write_edit(affected: &[IVec2], catalogue: &RoadCatalogue, city: &City) -
                     &rotated
                 }
                 Err(err) => {
-                    println!("block_viewer: road build: {}/{kind:?} can't rotate to {rotation:?}, skipping cell: {err}", road.style);
+                    println!(
+                        "block_viewer: road build: {}/{kind:?}/{:?} can't rotate to {rotation:?}, skipping cell: {err}",
+                        road.style, road.variant
+                    );
                     continue;
                 }
             }
@@ -1111,21 +1283,25 @@ fn try_commit_drag(
     // the *placement*, not per cell, or the road comes out as a run of
     // one-block cliffs.
     let stairs = stair_available(catalogue.as_deref(), Some(build_style.as_str()));
-    let plan = match plan_drag(&path, &world, &city, stairs) {
+    let mut plan = match plan_drag(&path, &world, &city, stairs) {
         Ok(plan) => plan,
         Err(refusal) => {
             println!("block_viewer: road drag refused: {refusal}");
             return;
         }
     };
+    // Ticket 071: which cells the terrain closes over, measured off the
+    // heights above and *before* anything is written — once the tunnel
+    // pieces are in the world the cover they were chosen for is gone.
+    plan_tunnels(&mut plan, &path, &world, &city, catalogue.as_deref(), Some(build_style.as_str()));
 
     let newly_added: Vec<IVec2> = path.iter().copied().filter(|&cell| !city.is_road_cell(cell)).collect();
-    for &CellPlan { cell, base_y, ascent } in &plan {
+    for &CellPlan { cell, base_y, ascent, variant } in &plan {
         // Already validated above; `add_road_cell` only fails on occupancy,
         // which `cell_valid` just confirmed clear (or already-road, which is
         // idempotent — and keeps its own recorded style, height and ascent) —
         // see the module docs' "Committing".
-        if let Err(err) = city.add_road_cell(cell, build_style.clone(), base_y, ascent) {
+        if let Err(err) = city.add_road_cell(cell, build_style.clone(), base_y, ascent, variant) {
             println!("block_viewer: road drag refused partway through (a race with another edit?): {err}");
             for cell in &newly_added {
                 city.remove_road_cell(*cell);
@@ -1272,7 +1448,7 @@ mod tests {
     fn cell_occupancy_ok_is_true_for_free_or_already_road_ground() {
         let mut city = City::default();
         assert!(cell_occupancy_ok(IVec2::new(0, 0), &city));
-        city.add_road_cell(IVec2::new(0, 0), "dirt", 64, None).unwrap();
+        city.add_road_cell(IVec2::new(0, 0), "dirt", 64, None, RoadPieceVariant::Surface).unwrap();
         assert!(cell_occupancy_ok(IVec2::new(0, 0), &city), "already-road counts as ok, not blocked");
     }
 
@@ -1286,8 +1462,8 @@ mod tests {
     #[test]
     fn affected_cells_includes_the_path_and_its_already_road_neighbours() {
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(-1, 0), "dirt", 64, None).unwrap(); // west neighbour of (0, 0)
-        city.add_road_cell(IVec2::new(5, 5), "dirt", 64, None).unwrap(); // unrelated, far away
+        city.add_road_cell(IVec2::new(-1, 0), "dirt", 64, None, RoadPieceVariant::Surface).unwrap(); // west neighbour of (0, 0)
+        city.add_road_cell(IVec2::new(5, 5), "dirt", 64, None, RoadPieceVariant::Surface).unwrap(); // unrelated, far away
 
         let affected = affected_cells(&[IVec2::new(0, 0)], &city);
         assert!(affected.contains(&IVec2::new(0, 0)));
@@ -1299,7 +1475,7 @@ mod tests {
     #[test]
     fn affected_cells_does_not_duplicate_a_neighbour_shared_by_two_path_cells() {
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(1, 1), "dirt", 64, None).unwrap();
+        city.add_road_cell(IVec2::new(1, 1), "dirt", 64, None, RoadPieceVariant::Surface).unwrap();
 
         // Both (0, 1) and (2, 1) border (1, 1); (1, 0)/(1, 2) also border it.
         let affected = affected_cells(&[IVec2::new(0, 1), IVec2::new(2, 1)], &city);
@@ -1322,7 +1498,7 @@ mod tests {
     #[test]
     fn connections_with_path_still_sees_real_city_roads() {
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(0, -1), "dirt", 64, None).unwrap(); // north of (0, 0)
+        city.add_road_cell(IVec2::new(0, -1), "dirt", 64, None, RoadPieceVariant::Surface).unwrap(); // north of (0, 0)
         let connections = connections_with_path(&city, &[IVec2::new(0, 0)], IVec2::new(0, 0));
         assert!(connections.north);
     }
@@ -1370,12 +1546,24 @@ mod tests {
         dir
     }
 
-    /// Writes `blueprint` at `piece_path(dir, style, kind)`, creating the
-    /// style subdirectory first — same reason
+    /// Writes `blueprint` at `piece_path(dir, style, kind, Surface)`,
+    /// creating the style subdirectory first — same reason
     /// `road_catalogue::tests::write_piece` needs to.
     fn write_piece(dir: &std::path::Path, style: &str, kind: RoadPieceKind, blueprint: &Blueprint) {
+        write_variant_piece(dir, style, kind, RoadPieceVariant::Surface, blueprint);
+    }
+
+    /// [`write_piece`], for a named variant — ticket 071's tests need to put
+    /// a `-tunnel` file beside a surface one.
+    fn write_variant_piece(
+        dir: &std::path::Path,
+        style: &str,
+        kind: RoadPieceKind,
+        variant: RoadPieceVariant,
+        blueprint: &Blueprint,
+    ) {
         std::fs::create_dir_all(dir.join(style)).expect("should create style dir");
-        write_structure_file(&piece_path(dir, style, kind), blueprint).unwrap();
+        write_structure_file(&piece_path(dir, style, kind, variant), blueprint).unwrap();
     }
 
     /// A catalogue with only [`RoadPieceKind::Isolated`] loaded, under style
@@ -1402,7 +1590,7 @@ mod tests {
         let dir = temp_dir("write_edit_isolated");
         let catalogue = catalogue_with_isolated(&dir);
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(0, 0), "dirt", 64, None).unwrap();
+        city.add_road_cell(IVec2::new(0, 0), "dirt", 64, None, RoadPieceVariant::Surface).unwrap();
 
         let edit = road_write_edit(&[IVec2::new(0, 0)], &catalogue, &city);
         assert_eq!(edit.len(), (ROAD_CELL_SIZE * ROAD_CELL_SIZE) as usize, "every block in the one cell's piece");
@@ -1418,7 +1606,7 @@ mod tests {
         let dir = temp_dir("write_edit_unknown_style");
         let catalogue = catalogue_with_isolated(&dir); // only "dirt" is loaded
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(0, 0), "paved", 64, None).unwrap();
+        city.add_road_cell(IVec2::new(0, 0), "paved", 64, None, RoadPieceVariant::Surface).unwrap();
 
         let edit = road_write_edit(&[IVec2::new(0, 0)], &catalogue, &city);
         assert!(edit.is_empty());
@@ -1433,7 +1621,7 @@ mod tests {
         write_piece(&dir, "dirt", RoadPieceKind::Straight, &one_stone_piece());
         let (catalogue, _skipped) = load_road_catalogue_dir(&dir);
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(0, 0), "dirt", 64, None).unwrap();
+        city.add_road_cell(IVec2::new(0, 0), "dirt", 64, None, RoadPieceVariant::Surface).unwrap();
 
         let edit = road_write_edit(&[IVec2::new(0, 0)], &catalogue, &city);
         assert!(edit.is_empty());
@@ -1445,8 +1633,8 @@ mod tests {
         let dir = temp_dir("write_edit_offset");
         let catalogue = catalogue_with_isolated(&dir);
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(0, 0), "dirt", 64, None).unwrap();
-        city.add_road_cell(IVec2::new(2, 0), "dirt", 64, None).unwrap();
+        city.add_road_cell(IVec2::new(0, 0), "dirt", 64, None, RoadPieceVariant::Surface).unwrap();
+        city.add_road_cell(IVec2::new(2, 0), "dirt", 64, None, RoadPieceVariant::Surface).unwrap();
 
         let edit = road_write_edit(&[IVec2::new(0, 0), IVec2::new(2, 0)], &catalogue, &city);
         let positions: std::collections::HashSet<IVec3> = edit.edits().iter().map(|e| e.at).collect();
@@ -1470,7 +1658,7 @@ mod tests {
         let dir = temp_dir("write_edit_base_y");
         let catalogue = catalogue_with_isolated(&dir);
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(0, 0), "dirt", 71, None).unwrap();
+        city.add_road_cell(IVec2::new(0, 0), "dirt", 71, None, RoadPieceVariant::Surface).unwrap();
 
         let edit = road_write_edit(&[IVec2::new(0, 0)], &catalogue, &city);
         assert!(!edit.is_empty());
@@ -1501,8 +1689,8 @@ mod tests {
         let dir = temp_dir("write_edit_two_heights");
         let catalogue = catalogue_with_isolated(&dir);
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(0, 0), "dirt", 64, None).unwrap();
-        city.add_road_cell(IVec2::new(2, 0), "dirt", 70, None).unwrap();
+        city.add_road_cell(IVec2::new(0, 0), "dirt", 64, None, RoadPieceVariant::Surface).unwrap();
+        city.add_road_cell(IVec2::new(2, 0), "dirt", 70, None, RoadPieceVariant::Surface).unwrap();
 
         let edit = road_write_edit(&[IVec2::new(0, 0), IVec2::new(2, 0)], &catalogue, &city);
         let positions: std::collections::HashSet<IVec3> = edit.edits().iter().map(|e| e.at).collect();
@@ -1536,9 +1724,9 @@ mod tests {
         // A straight run of three cells: the middle one sees a north *and*
         // a south neighbour, resolving to Straight — the two ends resolve
         // to DeadEnd, which this catalogue has no piece for.
-        city.add_road_cell(IVec2::new(0, -1), "dirt", 64, None).unwrap();
-        city.add_road_cell(IVec2::new(0, 0), "dirt", 64, None).unwrap();
-        city.add_road_cell(IVec2::new(0, 1), "dirt", 64, None).unwrap();
+        city.add_road_cell(IVec2::new(0, -1), "dirt", 64, None, RoadPieceVariant::Surface).unwrap();
+        city.add_road_cell(IVec2::new(0, 0), "dirt", 64, None, RoadPieceVariant::Surface).unwrap();
+        city.add_road_cell(IVec2::new(0, 1), "dirt", 64, None, RoadPieceVariant::Surface).unwrap();
 
         let edit = road_write_edit(&[IVec2::new(0, -1), IVec2::new(0, 0), IVec2::new(0, 1)], &catalogue, &city);
         assert_eq!(
@@ -1560,8 +1748,8 @@ mod tests {
         let (catalogue, _skipped) = load_road_catalogue_dir(&dir);
 
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(0, 0), "dirt", 64, None).unwrap();
-        city.add_road_cell(IVec2::new(100, 100), "paved", 64, None).unwrap();
+        city.add_road_cell(IVec2::new(0, 0), "dirt", 64, None, RoadPieceVariant::Surface).unwrap();
+        city.add_road_cell(IVec2::new(100, 100), "paved", 64, None, RoadPieceVariant::Surface).unwrap();
 
         let edit = road_write_edit(&[IVec2::new(0, 0), IVec2::new(100, 100)], &catalogue, &city);
         assert_eq!(
@@ -1607,7 +1795,7 @@ mod tests {
     #[test]
     fn poll_road_build_success_fires_chunks_edited_and_records_the_write() {
         let mut app = road_build_test_app();
-        app.world_mut().resource_mut::<City>().add_road_cell(IVec2::new(0, 0), "dirt", 64, None).unwrap();
+        app.world_mut().resource_mut::<City>().add_road_cell(IVec2::new(0, 0), "dirt", 64, None, RoadPieceVariant::Surface).unwrap();
 
         let report = EditReport { blocks_written: 36, chunks: vec![(0, 0)], regions: vec![(0, 0)], replaced: None };
         let task = pool().spawn(async move { Ok(report) });
@@ -1629,8 +1817,8 @@ mod tests {
         let mut app = road_build_test_app();
         {
             let mut city = app.world_mut().resource_mut::<City>();
-            city.add_road_cell(IVec2::new(0, 0), "dirt", 64, None).unwrap(); // pre-existing neighbour, not newly added
-            city.add_road_cell(IVec2::new(1, 0), "dirt", 64, None).unwrap(); // this drag's own new cell
+            city.add_road_cell(IVec2::new(0, 0), "dirt", 64, None, RoadPieceVariant::Surface).unwrap(); // pre-existing neighbour, not newly added
+            city.add_road_cell(IVec2::new(1, 0), "dirt", 64, None, RoadPieceVariant::Surface).unwrap(); // this drag's own new cell
         }
 
         let task = pool().spawn(async { Err(EditRefusal::Empty) });
@@ -1652,7 +1840,7 @@ mod tests {
     #[test]
     fn style_for_cell_prefers_a_cells_own_recorded_style_over_the_selection() {
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(0, 0), "dirt", 64, None).unwrap();
+        city.add_road_cell(IVec2::new(0, 0), "dirt", 64, None, RoadPieceVariant::Surface).unwrap();
         assert_eq!(style_for_cell(IVec2::new(0, 0), &city, Some("paved")), Some("dirt"));
     }
 
@@ -1961,7 +2149,7 @@ mod tests {
     #[test]
     fn a_drag_starting_on_an_existing_road_cell_continues_at_its_recorded_level() {
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(0, 0), "dirt", 80, None).unwrap();
+        city.add_road_cell(IVec2::new(0, 0), "dirt", 80, None, RoadPieceVariant::Surface).unwrap();
 
         let path: Vec<IVec2> = (0..4).map(|x| IVec2::new(x, 0)).collect();
         let world = world_with_cell_ground(&path.iter().map(|&c| (c, 64)).collect::<Vec<_>>());
@@ -1975,7 +2163,7 @@ mod tests {
     #[test]
     fn a_drag_starting_beside_an_existing_road_cell_meets_it_flush() {
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(-1, 0), "dirt", 80, None).unwrap();
+        city.add_road_cell(IVec2::new(-1, 0), "dirt", 80, None, RoadPieceVariant::Surface).unwrap();
 
         let path: Vec<IVec2> = (0..4).map(|x| IVec2::new(x, 0)).collect();
         let world = world_with_cell_ground(&path.iter().map(|&c| (c, 64)).collect::<Vec<_>>());
@@ -1992,7 +2180,7 @@ mod tests {
         let mut city = City::default();
         // A stair at (-1, 0) climbing east — so its east edge (facing the
         // drag below) is four blocks above its recorded base.
-        city.add_road_cell(IVec2::new(-1, 0), "dirt", 80, Some(Direction::East)).unwrap();
+        city.add_road_cell(IVec2::new(-1, 0), "dirt", 80, Some(Direction::East), RoadPieceVariant::Surface).unwrap();
 
         let path: Vec<IVec2> = (0..4).map(|x| IVec2::new(x, 0)).collect();
         let world = world_with_cell_ground(&path.iter().map(|&c| (c, 64)).collect::<Vec<_>>());
@@ -2003,7 +2191,7 @@ mod tests {
         // being joined is its low end, and the new road runs at the recorded
         // base instead of four blocks up.
         let mut low_side = City::default();
-        low_side.add_road_cell(IVec2::new(-1, 0), "dirt", 80, Some(Direction::West)).unwrap();
+        low_side.add_road_cell(IVec2::new(-1, 0), "dirt", 80, Some(Direction::West), RoadPieceVariant::Surface).unwrap();
         let plan = plan_drag(&path, &world, &low_side, false).unwrap();
         assert_eq!(levels(&plan), vec![80; 4]);
     }
@@ -2057,9 +2245,9 @@ mod tests {
         let (catalogue, _) = super::super::road_catalogue::load_road_catalogue_dir(&dir);
 
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(0, -1), "dirt", 64, None).unwrap();
-        city.add_road_cell(IVec2::new(0, 0), "dirt", 64, Some(road::Direction::North)).unwrap();
-        city.add_road_cell(IVec2::new(0, 1), "dirt", 64, None).unwrap();
+        city.add_road_cell(IVec2::new(0, -1), "dirt", 64, None, RoadPieceVariant::Surface).unwrap();
+        city.add_road_cell(IVec2::new(0, 0), "dirt", 64, Some(road::Direction::North), RoadPieceVariant::Surface).unwrap();
+        city.add_road_cell(IVec2::new(0, 1), "dirt", 64, None, RoadPieceVariant::Surface).unwrap();
 
         let edit = road_write_edit(&[IVec2::new(0, 0)], &catalogue, &city);
         let solid: std::collections::HashSet<&str> =
@@ -2071,5 +2259,208 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // -- tunnels (ticket 071) -----------------------------------------------
+
+    /// [`one_stone_piece`], `height` blocks tall — the tunnel tests care
+    /// about a piece's *height*, because that's what decides which layer
+    /// [`cover_at`] reads (see [`piece_top_y`]), and the shipped flat pieces
+    /// are five tall where `one_stone_piece` is one.
+    fn piece_of_height(height: i32) -> Blueprint {
+        let size = IVec3::new(ROAD_CELL_SIZE, height, ROAD_CELL_SIZE);
+        let volume = (size.x * size.y * size.z) as usize;
+        let mut blocks = vec![1u16; volume];
+        blocks[0] = 0; // (0,0,0) stays air, so both palette entries are in use.
+        Blueprint {
+            size,
+            origin: IVec3::ZERO,
+            palette: vec![BlockState::air(), state_named("minecraft:stone")],
+            blocks,
+            data_version: 4438,
+            failed_columns: 0,
+        }
+    }
+
+    /// Puts a solid block over `count` of `cell`'s 36 columns at world Y `y`
+    /// — the hillside a tunnel is cut out of. Columns are roofed in
+    /// [`state::road_cell_tiles`]' own order, which is arbitrary but stable;
+    /// nothing about the rule cares *which* columns are covered, only how
+    /// many.
+    fn roof_cell(world: &mut DecodedWorld, cell: IVec2, y: i32, count: usize) {
+        use crate::world::{BiomeRegistry, BlockRegistry, ChunkColumn, ChunkSection};
+
+        let stone = world.registry.lock().unwrap().intern("minecraft:stone");
+        let size = world::SECTION_SIZE as i32;
+        for tile in state::road_cell_tiles(cell).take(count) {
+            let chunk = (tile.x.div_euclid(size), tile.y.div_euclid(size));
+            let column = world.columns.entry(chunk).or_insert_with(|| ChunkColumn {
+                x: chunk.0,
+                z: chunk.1,
+                sections: Vec::new(),
+                floor_y: world::WORLD_MIN_Y,
+            });
+            let section_y = y.div_euclid(size) as i8;
+            let index = match column.sections.iter().position(|s| s.y == section_y) {
+                Some(index) => index,
+                None => {
+                    column.sections.push(ChunkSection {
+                        y: section_y,
+                        blocks: Box::new([BlockRegistry::AIR; world::SECTION_VOLUME]),
+                        biomes: Box::new([BiomeRegistry::PLAINS; world::BIOME_GRID_VOLUME]),
+                    });
+                    column.sections.len() - 1
+                }
+            };
+            let (local_x, local_y, local_z) =
+                (tile.x.rem_euclid(size) as usize, y.rem_euclid(size) as usize, tile.y.rem_euclid(size) as usize);
+            column.sections[index].blocks[ChunkSection::index(local_x, local_y, local_z)] = stone;
+        }
+    }
+
+    /// A `"dirt"` catalogue holding a five-tall straight and, if
+    /// `with_tunnel`, a five-tall `straight-tunnel` beside it — paved in
+    /// cobblestone so a write can be told apart from the surface piece's
+    /// stone.
+    fn tunnel_catalogue(dir: &std::path::Path, with_tunnel: bool) -> RoadCatalogue {
+        write_variant_piece(dir, "dirt", RoadPieceKind::Straight, RoadPieceVariant::Surface, &piece_of_height(5));
+        if with_tunnel {
+            let mut tunnel = piece_of_height(5);
+            tunnel.palette[1] = state_named("minecraft:cobblestone");
+            write_variant_piece(dir, "dirt", RoadPieceKind::Straight, RoadPieceVariant::Tunnel, &tunnel);
+        }
+        let (catalogue, _skipped) = super::super::road_catalogue::load_road_catalogue_dir(dir);
+        catalogue
+    }
+
+    /// A three-cell straight run at Y 64 with `cover` of the middle cell's
+    /// 36 columns roofed over at the first Y its piece doesn't occupy, run
+    /// through [`plan_drag`] and then [`plan_tunnels`]. Answers with the
+    /// middle cell's planned variant.
+    fn middle_variant(dir: &std::path::Path, cover: usize, with_tunnel: bool) -> RoadPieceVariant {
+        let path: Vec<IVec2> = (0..3).map(|x| IVec2::new(x, 0)).collect();
+        let mut world = world_with_cell_ground(&path.iter().map(|&c| (c, 64)).collect::<Vec<_>>());
+        // A five-tall piece written from `64 - 1 - ROAD_PIECE_SUBGRADE_DEPTH`
+        // tops out at 66, so 67 is the layer the rule reads.
+        roof_cell(&mut world, path[1], 67, cover);
+
+        let catalogue = tunnel_catalogue(dir, with_tunnel);
+        let city = City::default();
+        let mut plan = plan_drag(&path, &world, &city, false).unwrap();
+        plan_tunnels(&mut plan, &path, &world, &city, Some(&catalogue), Some("dirt"));
+        plan[1].variant
+    }
+
+    /// The layer the rule reads is the first one the *piece* doesn't occupy
+    /// — pinned here rather than left implicit, because it's the one number
+    /// that decides whether the whole feature looks at hillside or at sky.
+    #[test]
+    fn the_cover_reading_is_taken_directly_above_the_piece() {
+        let dir = temp_dir("tunnel_top_y");
+        let catalogue = tunnel_catalogue(&dir, true);
+        // Origin is `64 - 1 - 1 = 62`; a five-tall piece occupies 62..=66.
+        assert_eq!(cell_write_origin(IVec2::ZERO, 64).y, 62);
+        assert_eq!(piece_top_y(IVec2::ZERO, 64, "dirt", RoadPieceKind::Straight, &catalogue), Some(67));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The user's rule, at its two neighbouring values: 18 of 36 is not a
+    /// tunnel, 19 is. A strict majority, not "at least half" — the
+    /// difference between a road that dips into a bank and one that goes
+    /// under a hill.
+    #[test]
+    fn a_strict_majority_of_the_36_columns_being_covered_makes_a_tunnel() {
+        assert_eq!(ROAD_TUNNEL_COVER_MAJORITY, 18);
+
+        let dir = temp_dir("tunnel_threshold_18");
+        assert_eq!(middle_variant(&dir, 18, true), RoadPieceVariant::Surface, "exactly half is not a majority");
+        std::fs::remove_dir_all(&dir).ok();
+
+        let dir = temp_dir("tunnel_threshold_19");
+        assert_eq!(middle_variant(&dir, 19, true), RoadPieceVariant::Tunnel);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_uncovered_cell_is_never_a_tunnel() {
+        let dir = temp_dir("tunnel_open_sky");
+        assert_eq!(middle_variant(&dir, 0, true), RoadPieceVariant::Surface);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The [`stair_available`] rule, for tunnels: a style with no `-tunnel`
+    /// export keeps building its surface pieces rather than recording cells
+    /// whose blueprint can't be resolved — which [`road_write_edit`] would
+    /// skip, leaving a hole in the road.
+    #[test]
+    fn a_style_with_no_tunnel_piece_never_records_a_tunnel_cell() {
+        let dir = temp_dir("tunnel_missing_piece");
+        assert_eq!(
+            middle_variant(&dir, 36, false),
+            RoadPieceVariant::Surface,
+            "fully buried, but nothing to build it with"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The regression this ticket's design exists for. A tunnel piece carves
+    /// away the cover that chose it, so a cell re-planned after its own write
+    /// sees open sky. If the variant were re-derived, the next re-tile (a
+    /// neighbour growing a connection) would write the surface piece back
+    /// into the hillside and fill the bore in around the player.
+    #[test]
+    fn an_existing_tunnel_cell_keeps_its_variant_when_a_later_drag_recrosses_it() {
+        let dir = temp_dir("tunnel_recross");
+        let catalogue = tunnel_catalogue(&dir, true);
+
+        let path: Vec<IVec2> = (0..3).map(|x| IVec2::new(x, 0)).collect();
+        // No roof at all — this is the world *after* the tunnel was cut.
+        let world = world_with_cell_ground(&path.iter().map(|&c| (c, 64)).collect::<Vec<_>>());
+
+        let mut city = City::default();
+        city.add_road_cell(path[1], "dirt", 64, None, RoadPieceVariant::Tunnel).unwrap();
+
+        let mut plan = plan_drag(&path, &world, &city, false).unwrap();
+        plan_tunnels(&mut plan, &path, &world, &city, Some(&catalogue), Some("dirt"));
+        assert_eq!(plan[1].variant, RoadPieceVariant::Tunnel, "the recorded variant wins over a fresh reading");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The write-path half: a cell recorded as a tunnel resolves to the
+    /// `-tunnel` blueprint, not to its kind's surface one.
+    #[test]
+    fn road_write_edit_writes_the_tunnel_piece_for_a_tunnel_cell() {
+        let dir = temp_dir("write_tunnel");
+        let catalogue = tunnel_catalogue(&dir, true);
+
+        let mut city = City::default();
+        city.add_road_cell(IVec2::new(0, -1), "dirt", 64, None, RoadPieceVariant::Surface).unwrap();
+        city.add_road_cell(IVec2::new(0, 0), "dirt", 64, None, RoadPieceVariant::Tunnel).unwrap();
+        city.add_road_cell(IVec2::new(0, 1), "dirt", 64, None, RoadPieceVariant::Surface).unwrap();
+
+        let edit = road_write_edit(&[IVec2::new(0, 0)], &catalogue, &city);
+        let solid: std::collections::HashSet<&str> =
+            edit.edits().iter().map(|e| e.state.name.as_str()).filter(|name| *name != "minecraft:air").collect();
+        assert_eq!(solid, std::collections::HashSet::from(["minecraft:cobblestone"]));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// [`cover_at`] counts one layer, and calls anything that isn't air
+    /// cover — deliberately not `city::grid`'s clutter-skipping notion of
+    /// ground, and deliberately not the terrain above or below that one
+    /// layer.
+    #[test]
+    fn cover_at_counts_one_layer_of_not_air_and_nothing_else() {
+        let cell = IVec2::new(0, 0);
+        let mut world = world_with_cell_ground(&[(cell, 64)]);
+        assert_eq!(cover_at(cell, 67, &world), 0);
+        // The ground itself is at 63 and doesn't leak upward into the reading.
+        assert_eq!(cover_at(cell, 63, &world), 36);
+
+        roof_cell(&mut world, cell, 67, 7);
+        assert_eq!(cover_at(cell, 67, &world), 7);
+        assert_eq!(cover_at(cell, 68, &world), 0, "one layer up is its own question");
     }
 }

@@ -1169,3 +1169,28 @@ Y=0 in the world and won't be cleaned up by this fix — see the ticket.
      direction for several minutes without stopping. `M lingering` should
      plateau at 256 (the cap shedding the farthest ones early) rather than
      growing with the length of the flight, and RSS should plateau with it.
+
+- [ ] **071 road tunnel tiles.** Needs the `-tunnel.nbt` exports first — the
+  code path is complete but inert until at least
+  `assets/city/roads/dirt/straight-tunnel.nbt` exists (see that directory's
+  `README.md` for what a tunnel piece has to keep identical to its surface
+  twin). Once one is in, `cargo run --bin citybuilder` and:
+  1. **It triggers where it should** — drag a road straight into the side of
+     a hill. The cells that end up buried should preview as the *tunnel*
+     piece (the ghost and the written blocks share `plan_tunnels`, so a
+     mismatch here is a real bug), and the cells out in the open should not.
+     The boundary is "more than 18 of the 36 columns just above the piece are
+     not air", so a road grazing a low bank should stay a surface road.
+  2. **It's walkable** — save, open the world in Minecraft, and walk the
+     road through the hill end to end. No suffocation, no stone left hanging
+     where the bore should be, and the portal at each end shouldn't step up
+     or down (the tunnel piece's subgrade/surface layers have to sit where
+     the surface piece's do).
+  3. **The tunnel survives a re-tile** — this is the regression the whole
+     "store the variant" design exists for. Build a second road that
+     branches off a cell *next to* the tunnel, so the tunnel's neighbour is
+     re-tiled and the tunnel itself is rewritten. The bore must still be
+     there afterwards, not filled back in with hillside.
+  4. **Old saves are refused, not misplaced** — a `citybuilder/city.ron`
+     written before this change is version 5; loading it should print the
+     version-mismatch line rather than silently loading roads.

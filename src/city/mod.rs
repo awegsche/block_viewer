@@ -600,8 +600,8 @@ fn load_road_catalogue() -> road_catalogue::RoadCatalogue {
         catalogue.len(),
         if catalogue.len() == 1 { "" } else { "s" }
     );
-    for (style, kind, err) in &skipped {
-        println!("block_viewer:   skipped {style}/{kind:?}: {err}");
+    for (style, kind, variant, err) in &skipped {
+        println!("block_viewer:   skipped {style}/{kind:?}/{variant:?}: {err}");
     }
 
     catalogue

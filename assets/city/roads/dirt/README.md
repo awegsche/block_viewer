@@ -23,6 +23,9 @@ The rule, in one line: **every piece opens to the south.** Per file:
 | `cross.nbt`    | all four               |
 | `stairs.nbt`   | north + south, ascending toward **north** (tickets 067/068) |
 
+Every row above ships **twice** (ticket 071): `<name>.nbt` and
+`<name>-tunnel.nbt`. See "Tunnel pieces", below.
+
 `city::road_catalogue`'s
 `the_shipped_dirt_pieces_are_authored_at_the_canonical_orientations` reads
 these files and checks exactly that, so a re-export at a different
@@ -60,6 +63,39 @@ cell on the high side records `base_y + 4` — see `city::road_build`'s
 a re-export with a different rise leaves a lip at every ramp.
 `city::road_catalogue`'s `the_shipped_stair_climbs_north_by_exactly_one_stair_rise`
 checks all three of those properties against the real file.
+
+## Tunnel pieces: `<name>-tunnel.nbt` (ticket 071)
+
+A road cell whose terrain closes over it needs a piece with a **bore** rather
+than open sky above the paving. `city::road_build` measures that as: more than
+half of the cell's 36 columns are not air, in the single layer directly above
+the piece that would otherwise be written. When that holds, the cell resolves
+to `<kind>-tunnel.nbt` instead of `<kind>.nbt`.
+
+What a tunnel piece has to keep identical to its surface twin:
+
+- **the same `6` x/z footprint** — the loader enforces it either way;
+- **the same canonical orientation**, per the table above. It is the same
+  `RoadPieceKind`; `select_piece` picks the shape and rotation without ever
+  knowing which variant will be used, and
+  `the_shipped_dirt_pieces_are_authored_at_the_canonical_orientations`
+  checks the tunnel files against exactly the same rule;
+- **the same subgrade and surface layers** (`y=0`, `y=1`) — the write origin
+  is computed from `ROAD_PIECE_SUBGRADE_DEPTH` for both, so a tunnel whose
+  paving sat on a different layer would step down at every portal;
+- for `stairs-tunnel.nbt`, **the same `ROAD_STAIR_RISE = 4`** between its low
+  and high surface, for the same reason.
+
+What it should differ in: everything above the surface course. A tunnel piece
+is expected to be *taller* than its five-block twin — the clearance layers
+become a walled and roofed bore, and whatever is written there is what
+replaces the hillside. The blocks it does *not* write are left as they were,
+so a tunnel piece that stops short leaves stone hanging.
+
+A missing `-tunnel.nbt` is not an error: `RoadCatalogue::get` never falls back
+from one variant to the other, and `city::road_build` asks the catalogue
+*before* recording a cell as a tunnel, so a style with none simply keeps
+building its surface pieces the way it did before this existed.
 
 ## Game data
 

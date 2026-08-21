@@ -8,8 +8,9 @@
 //! [`blueprint::load_catalogue_dir`](crate::blueprint::load_catalogue_dir)
 //! (ticket 039) indexes *whatever* `.nbt` files it finds, keyed by filename.
 //! A road piece isn't an open-ended catalogue that way — there are exactly
-//! kinds ([`RoadPieceKind::ALL`](super::road::RoadPieceKind::ALL)) per
-//! style, each with one canonical filename. What *is* open-ended (ticket
+//! kinds ([`RoadPieceKind::ALL`](super::road::RoadPieceKind::ALL)) times
+//! variants ([`RoadPieceVariant::ALL`](super::road::RoadPieceVariant::ALL),
+//! ticket 071) per style, each with one canonical filename. What *is* open-ended (ticket
 //! 059) is the set of styles: `assets/city/roads/<style>/*.nbt`, one
 //! subdirectory per style, the subdirectory's own name serving as the style
 //! id — the same "the filename is the id" call
@@ -31,6 +32,21 @@
 //! [`STRUCTURE_BLOCK_MAX_SIZE`], and a palette with more than just air —
 //! the same "not actually empty" rule 039 already applies. Unchanged from
 //! 054; styles don't loosen or tighten it.
+//!
+//! ## Surface and tunnel: a second key, not a second catalogue (ticket 071)
+//!
+//! Each kind ships **twice** — `<kind>.nbt` and `<kind>-tunnel.nbt` — for a
+//! cell the terrain closes over. The pair is the same shape at the same
+//! canonical orientation; only the roof differs, so it's a
+//! [`RoadPieceVariant`](super::road::RoadPieceVariant) alongside the kind
+//! rather than a kind of its own, and [`RoadCatalogue`] is keyed on the
+//! `(kind, variant)` pair. A style with no `-tunnel` exports yet is simply a
+//! style whose tunnel half is all [`RoadCatalogueError::Missing`] — the same
+//! per-file tolerance a missing corner already gets, and
+//! `city::road_build` asks the catalogue before ever *recording* a cell as
+//! a tunnel, so a half-populated style never leaves an unresolvable cell
+//! behind. [`RoadCatalogue::get`] deliberately does not fall back from one
+//! variant to the other.
 //!
 //! ## Style is a lookup key, not a shape rule
 //!
@@ -61,7 +77,7 @@ use bevy::prelude::Resource;
 
 use crate::blueprint::{read_structure_file, Blueprint, StructureReadError, STRUCTURE_BLOCK_MAX_SIZE};
 
-use super::road::RoadPieceKind;
+use super::road::{RoadPieceKind, RoadPieceVariant};
 use super::state::ROAD_CELL_SIZE;
 
 /// Why a road piece file didn't become a catalogue entry.
@@ -98,7 +114,7 @@ impl std::error::Error for RoadCatalogueError {}
 /// The filename stem (without `.nbt`) each [`RoadPieceKind`] loads from,
 /// inside a style's own subdirectory — the fixed names
 /// `assets/city/roads/<style>` is expected to contain one of each of.
-fn filename_for(kind: RoadPieceKind) -> &'static str {
+fn kind_stem(kind: RoadPieceKind) -> &'static str {
     match kind {
         RoadPieceKind::Isolated => "isolated",
         RoadPieceKind::DeadEnd => "dead_end",
@@ -113,6 +129,23 @@ fn filename_for(kind: RoadPieceKind) -> &'static str {
     }
 }
 
+/// The filename stem one `(kind, variant)` pair loads from — [`kind_stem`]
+/// for [`RoadPieceVariant::Surface`], and that same stem plus `-tunnel` for
+/// [`RoadPieceVariant::Tunnel`] (ticket 071).
+///
+/// A **suffix on the kind's own name**, not a `tunnel/` subdirectory: a
+/// style directory is already the unit the loader treats as "one full set",
+/// and burying half a set one level deeper would make `style_dirs` have to
+/// tell a variant folder apart from a style folder. The suffixed name also
+/// keeps the two files for one kind adjacent in a directory listing, which
+/// is where an asset author compares them.
+fn filename_for(kind: RoadPieceKind, variant: RoadPieceVariant) -> String {
+    match variant {
+        RoadPieceVariant::Surface => kind_stem(kind).to_string(),
+        RoadPieceVariant::Tunnel => format!("{}-tunnel", kind_stem(kind)),
+    }
+}
+
 /// Every loaded road piece, keyed by style and then kind —
 /// [`super::state::City::road_style_at`] plus [`super::road::select_piece`]'s
 /// own output is exactly this catalogue's key pair. A nested map, not a flat
@@ -124,12 +157,21 @@ fn filename_for(kind: RoadPieceKind) -> &'static str {
 /// `Option<Res<RoadCatalogue>>`.
 #[derive(Resource, Default)]
 pub struct RoadCatalogue {
-    styles: HashMap<String, HashMap<RoadPieceKind, Blueprint>>,
+    styles: HashMap<String, HashMap<(RoadPieceKind, RoadPieceVariant), Blueprint>>,
 }
 
 impl RoadCatalogue {
-    pub fn get(&self, style: &str, kind: RoadPieceKind) -> Option<&Blueprint> {
-        self.styles.get(style)?.get(&kind)
+    /// The blueprint for one exact `(style, kind, variant)`, or `None` if
+    /// that file didn't load.
+    ///
+    /// **Exact — there is no fallback from [`RoadPieceVariant::Tunnel`] to
+    /// [`RoadPieceVariant::Surface`]** (ticket 071). A missing tunnel piece
+    /// must not quietly write the open-sky piece into a hillside; instead
+    /// `city::road_build` asks this *before* deciding a cell is a tunnel at
+    /// all (the same shape `stair_available` already has), so a style with
+    /// no tunnel exports simply never records a tunnel cell.
+    pub fn get(&self, style: &str, kind: RoadPieceKind, variant: RoadPieceVariant) -> Option<&Blueprint> {
+        self.styles.get(style)?.get(&(kind, variant))
     }
 
     /// Every style id with at least one piece loaded, sorted — the order
@@ -169,8 +211,8 @@ fn validate(blueprint: &Blueprint) -> Result<(), RoadCatalogueError> {
 /// missing file is [`RoadCatalogueError::Missing`], not a panic and not
 /// treated any differently from a malformed one by [`load_road_catalogue_dir`]
 /// — both just mean this kind has no piece to select for this style.
-fn load_piece(style_dir: &Path, kind: RoadPieceKind) -> Result<Blueprint, RoadCatalogueError> {
-    let path = style_dir.join(format!("{}.nbt", filename_for(kind)));
+fn load_piece(style_dir: &Path, kind: RoadPieceKind, variant: RoadPieceVariant) -> Result<Blueprint, RoadCatalogueError> {
+    let path = style_dir.join(format!("{}.nbt", filename_for(kind, variant)));
     if !path.is_file() {
         return Err(RoadCatalogueError::Missing);
     }
@@ -199,7 +241,9 @@ fn style_dirs(dir: &Path) -> Vec<PathBuf> {
 /// (or every style) absent or incomplete in the returned catalogue, reported
 /// in the second return value — the same per-file tolerance
 /// [`crate::blueprint::load_catalogue_dir`] gives buildings.
-pub fn load_road_catalogue_dir(dir: &Path) -> (RoadCatalogue, Vec<(String, RoadPieceKind, RoadCatalogueError)>) {
+pub fn load_road_catalogue_dir(
+    dir: &Path,
+) -> (RoadCatalogue, Vec<(String, RoadPieceKind, RoadPieceVariant, RoadCatalogueError)>) {
     let mut styles = HashMap::new();
     let mut skipped = Vec::new();
 
@@ -209,11 +253,13 @@ pub fn load_road_catalogue_dir(dir: &Path) -> (RoadCatalogue, Vec<(String, RoadP
 
         let mut pieces = HashMap::new();
         for kind in RoadPieceKind::ALL {
-            match load_piece(&style_dir, kind) {
-                Ok(blueprint) => {
-                    pieces.insert(kind, blueprint);
+            for variant in RoadPieceVariant::ALL {
+                match load_piece(&style_dir, kind, variant) {
+                    Ok(blueprint) => {
+                        pieces.insert((kind, variant), blueprint);
+                    }
+                    Err(err) => skipped.push((style.clone(), kind, variant, err)),
                 }
-                Err(err) => skipped.push((style.clone(), kind, err)),
             }
         }
         if !pieces.is_empty() {
@@ -224,11 +270,11 @@ pub fn load_road_catalogue_dir(dir: &Path) -> (RoadCatalogue, Vec<(String, RoadP
     (RoadCatalogue { styles }, skipped)
 }
 
-/// `<dir>/<style>/<kind's filename>.nbt`, exposed for callers (and tests)
+/// `<dir>/<style>/<piece's filename>.nbt`, exposed for callers (and tests)
 /// that want to name the path a piece would load from without loading it.
 #[allow(dead_code)] // no non-test caller yet
-pub fn piece_path(dir: &Path, style: &str, kind: RoadPieceKind) -> PathBuf {
-    dir.join(style).join(format!("{}.nbt", filename_for(kind)))
+pub fn piece_path(dir: &Path, style: &str, kind: RoadPieceKind, variant: RoadPieceVariant) -> PathBuf {
+    dir.join(style).join(format!("{}.nbt", filename_for(kind, variant)))
 }
 
 #[cfg(test)]
@@ -265,10 +311,15 @@ mod tests {
     /// Writes `blueprint` at `piece_path(dir, style, kind)`, creating the
     /// style subdirectory first — `write_structure_file` doesn't create
     /// parent directories itself, and `temp_dir` only creates `dir` proper.
-    fn write_piece(dir: &Path, style: &str, kind: RoadPieceKind, blueprint: &Blueprint) {
+    fn write_piece(dir: &Path, style: &str, kind: RoadPieceKind, variant: RoadPieceVariant, blueprint: &Blueprint) {
         fs::create_dir_all(dir.join(style)).expect("should create style dir");
-        write_structure_file(&piece_path(dir, style, kind), blueprint).unwrap();
+        write_structure_file(&piece_path(dir, style, kind, variant), blueprint).unwrap();
     }
+
+    /// How many files a complete style directory holds — one per
+    /// `(kind, variant)` pair (ticket 071), which is what every "how many
+    /// were skipped" count below is measured against.
+    const PIECES_PER_STYLE: usize = RoadPieceKind::ALL.len() * RoadPieceVariant::ALL.len();
 
     #[test]
     fn a_missing_directory_is_an_empty_catalogue_with_nothing_skipped() {
@@ -294,13 +345,13 @@ mod tests {
     #[test]
     fn a_correctly_sized_piece_loads_under_its_style_and_kind() {
         let dir = temp_dir("straight");
-        write_piece(&dir, "dirt", RoadPieceKind::Straight, &one_stone(IVec3::new(6, 3, 6)));
+        write_piece(&dir, "dirt", RoadPieceKind::Straight, RoadPieceVariant::Surface, &one_stone(IVec3::new(6, 3, 6)));
 
         let (catalogue, skipped) = load_road_catalogue_dir(&dir);
         assert_eq!(catalogue.len(), 1);
-        assert!(catalogue.get("dirt", RoadPieceKind::Straight).is_some());
+        assert!(catalogue.get("dirt", RoadPieceKind::Straight, RoadPieceVariant::Surface).is_some());
         assert_eq!(catalogue.styles(), vec!["dirt"]);
-        assert_eq!(skipped.len(), RoadPieceKind::ALL.len() - 1, "every other kind of this one style still has no file");
+        assert_eq!(skipped.len(), PIECES_PER_STYLE - 1, "every other piece of this one style still has no file");
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -309,11 +360,14 @@ mod tests {
     fn a_wrong_footprint_is_skipped_as_invalid_size() {
         let dir = temp_dir("wrong_size");
         // 5x*x6 instead of 6x*x6 — footprint doesn't match ROAD_CELL_SIZE.
-        write_piece(&dir, "dirt", RoadPieceKind::Cross, &one_stone(IVec3::new(5, 3, 6)));
+        write_piece(&dir, "dirt", RoadPieceKind::Cross, RoadPieceVariant::Surface, &one_stone(IVec3::new(5, 3, 6)));
 
         let (catalogue, skipped) = load_road_catalogue_dir(&dir);
-        assert!(catalogue.get("dirt", RoadPieceKind::Cross).is_none());
-        let (style, _, err) = skipped.iter().find(|(_, kind, _)| *kind == RoadPieceKind::Cross).unwrap();
+        assert!(catalogue.get("dirt", RoadPieceKind::Cross, RoadPieceVariant::Surface).is_none());
+        let (style, _, _, err) = skipped
+            .iter()
+            .find(|(_, kind, variant, _)| *kind == RoadPieceKind::Cross && *variant == RoadPieceVariant::Surface)
+            .unwrap();
         assert_eq!(style, "dirt");
         assert!(matches!(err, RoadCatalogueError::InvalidSize(_)));
 
@@ -324,14 +378,18 @@ mod tests {
     fn every_kind_loads_independently_for_one_style() {
         let dir = temp_dir("all_kinds");
         for kind in RoadPieceKind::ALL {
-            write_piece(&dir, "dirt", kind, &one_stone(IVec3::new(6, 2, 6)));
+            for variant in RoadPieceVariant::ALL {
+                write_piece(&dir, "dirt", kind, variant, &one_stone(IVec3::new(6, 2, 6)));
+            }
         }
 
         let (catalogue, skipped) = load_road_catalogue_dir(&dir);
         assert!(skipped.is_empty(), "{skipped:?}");
-        assert_eq!(catalogue.len(), RoadPieceKind::ALL.len());
+        assert_eq!(catalogue.len(), PIECES_PER_STYLE);
         for kind in RoadPieceKind::ALL {
-            assert!(catalogue.get("dirt", kind).is_some());
+            for variant in RoadPieceVariant::ALL {
+                assert!(catalogue.get("dirt", kind, variant).is_some(), "{kind:?}/{variant:?}");
+            }
         }
 
         fs::remove_dir_all(&dir).ok();
@@ -344,22 +402,24 @@ mod tests {
         let dir = temp_dir("two_styles");
         for style in ["dirt", "paved"] {
             for kind in RoadPieceKind::ALL {
-                write_piece(&dir, style, kind, &one_stone(IVec3::new(6, 2, 6)));
+                for variant in RoadPieceVariant::ALL {
+                    write_piece(&dir, style, kind, variant, &one_stone(IVec3::new(6, 2, 6)));
+                }
             }
         }
 
         let (catalogue, skipped) = load_road_catalogue_dir(&dir);
         assert!(skipped.is_empty(), "{skipped:?}");
-        assert_eq!(catalogue.len(), RoadPieceKind::ALL.len() * 2);
+        assert_eq!(catalogue.len(), PIECES_PER_STYLE * 2);
         assert_eq!(catalogue.styles(), vec!["dirt", "paved"]);
         for style in ["dirt", "paved"] {
             for kind in RoadPieceKind::ALL {
-                assert!(catalogue.get(style, kind).is_some(), "{style}/{kind:?}");
+                assert!(catalogue.get(style, kind, RoadPieceVariant::Surface).is_some(), "{style}/{kind:?}");
             }
         }
         // A lookup under a style that was never loaded finds nothing, not a
         // panic, and doesn't fall back to some other style's piece.
-        assert!(catalogue.get("gravel", RoadPieceKind::Straight).is_none());
+        assert!(catalogue.get("gravel", RoadPieceKind::Straight, RoadPieceVariant::Surface).is_none());
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -367,12 +427,12 @@ mod tests {
     #[test]
     fn a_style_missing_some_pieces_still_loads_the_rest() {
         let dir = temp_dir("partial_style");
-        write_piece(&dir, "dirt", RoadPieceKind::Straight, &one_stone(IVec3::new(6, 3, 6)));
+        write_piece(&dir, "dirt", RoadPieceKind::Straight, RoadPieceVariant::Surface, &one_stone(IVec3::new(6, 3, 6)));
 
         let (catalogue, skipped) = load_road_catalogue_dir(&dir);
-        assert!(catalogue.get("dirt", RoadPieceKind::Straight).is_some());
-        assert_eq!(skipped.len(), RoadPieceKind::ALL.len() - 1, "every other kind of this style");
-        for (style, _, err) in &skipped {
+        assert!(catalogue.get("dirt", RoadPieceKind::Straight, RoadPieceVariant::Surface).is_some());
+        assert_eq!(skipped.len(), PIECES_PER_STYLE - 1, "every other piece of this style");
+        for (style, _, _, err) in &skipped {
             assert_eq!(style, "dirt");
             assert!(matches!(err, RoadCatalogueError::Missing));
         }
@@ -420,8 +480,11 @@ mod tests {
     #[test]
     fn the_shipped_stair_climbs_north_by_exactly_one_stair_rise() {
         let (catalogue, _skipped) = load_road_catalogue_dir(Path::new("assets/city/roads"));
-        let Some(piece) = catalogue.get("dirt", RoadPieceKind::Stair) else {
-            panic!("assets/city/roads/dirt/{}.nbt should be checked in", filename_for(RoadPieceKind::Stair));
+        let Some(piece) = catalogue.get("dirt", RoadPieceKind::Stair, RoadPieceVariant::Surface) else {
+            panic!(
+                "assets/city/roads/dirt/{}.nbt should be checked in",
+                filename_for(RoadPieceKind::Stair, RoadPieceVariant::Surface)
+            );
         };
 
         let (sx, sz) = (piece.size.x as usize, piece.size.z as usize);
@@ -461,13 +524,20 @@ mod tests {
         let (catalogue, _skipped) = load_road_catalogue_dir(Path::new("assets/city/roads"));
         for style in catalogue.styles() {
             for kind in RoadPieceKind::ALL {
-                let Some(piece) = catalogue.get(&style, kind) else { continue };
-                for rotation in [Rotation::Deg0, Rotation::Deg90, Rotation::Deg180, Rotation::Deg270] {
-                    let rotated = rotate_blueprint(piece, rotation)
-                        .unwrap_or_else(|err| panic!("{style}/{}.nbt at {rotation:?}: {err}", filename_for(kind)));
-                    // A quarter turn swaps x and z; a road piece is square, so
-                    // every rotation of one has to come back the same size.
-                    assert_eq!(rotated.size, piece.size, "{style}/{}.nbt at {rotation:?}", filename_for(kind));
+                // Ticket 071: the tunnel variants are covered too, the moment
+                // they are checked in — a `-tunnel` piece is rotated by
+                // exactly the same code path and skipped on failure the same
+                // invisible way.
+                for variant in RoadPieceVariant::ALL {
+                    let Some(piece) = catalogue.get(style, kind, variant) else { continue };
+                    let name = filename_for(kind, variant);
+                    for rotation in [Rotation::Deg0, Rotation::Deg90, Rotation::Deg180, Rotation::Deg270] {
+                        let rotated = rotate_blueprint(piece, rotation)
+                            .unwrap_or_else(|err| panic!("{style}/{name}.nbt at {rotation:?}: {err}"));
+                        // A quarter turn swaps x and z; a road piece is square, so
+                        // every rotation of one has to come back the same size.
+                        assert_eq!(rotated.size, piece.size, "{style}/{name}.nbt at {rotation:?}");
+                    }
                 }
             }
         }
@@ -500,21 +570,62 @@ mod tests {
     #[test]
     fn the_shipped_dirt_pieces_are_authored_at_the_canonical_orientations() {
         let (catalogue, _skipped) = load_road_catalogue_dir(Path::new("assets/city/roads"));
-        assert!(catalogue.get("dirt", RoadPieceKind::Straight).is_some(), "the dirt style should be checked in");
+        assert!(
+            catalogue.get("dirt", RoadPieceKind::Straight, RoadPieceVariant::Surface).is_some(),
+            "the dirt style should be checked in"
+        );
 
         for kind in RoadPieceKind::ALL {
             if matches!(kind, RoadPieceKind::Isolated | RoadPieceKind::Stair) {
                 continue; // see the doc comment
             }
-            let Some(piece) = catalogue.get("dirt", kind) else {
-                continue; // a kind with no shipped asset yet — tolerated, same as the loader does
-            };
-            assert_eq!(
-                open_edges(piece),
-                super::super::road::canonical_pattern(kind),
-                "assets/city/roads/dirt/{}.nbt is exported at a different orientation than city::road::canonical_pattern                  claims — fix whichever is wrong, and keep road.rs's module docs and the style's README with it",
-                filename_for(kind),
-            );
+            // Ticket 071: a `-tunnel` piece is the same shape at the same
+            // canonical orientation — only its roof differs — so it is held
+            // to exactly the same rule, and checked the moment it is
+            // checked in.
+            for variant in RoadPieceVariant::ALL {
+                let Some(piece) = catalogue.get("dirt", kind, variant) else {
+                    continue; // a piece with no shipped asset yet — tolerated, same as the loader does
+                };
+                assert_eq!(
+                    open_edges(piece),
+                    super::super::road::canonical_pattern(kind),
+                    "assets/city/roads/dirt/{}.nbt is exported at a different orientation than city::road::canonical_pattern                  claims — fix whichever is wrong, and keep road.rs's module docs and the style's README with it",
+                    filename_for(kind, variant),
+                );
+            }
         }
+    }
+
+    /// Ticket 071's own loader case: a style that ships tunnel pieces
+    /// alongside its surface ones resolves both independently, and asking
+    /// for a tunnel piece that isn't there does **not** fall back to the
+    /// surface one — see [`RoadCatalogue::get`] for why that fallback would
+    /// be the wrong kindness.
+    #[test]
+    fn tunnel_variants_load_beside_their_surface_pieces_and_never_stand_in_for_each_other() {
+        let dir = temp_dir("tunnel_variants");
+        write_piece(&dir, "dirt", RoadPieceKind::Straight, RoadPieceVariant::Surface, &one_stone(IVec3::new(6, 5, 6)));
+        write_piece(&dir, "dirt", RoadPieceKind::Straight, RoadPieceVariant::Tunnel, &one_stone(IVec3::new(6, 7, 6)));
+        write_piece(&dir, "dirt", RoadPieceKind::Corner, RoadPieceVariant::Surface, &one_stone(IVec3::new(6, 5, 6)));
+
+        let (catalogue, _skipped) = load_road_catalogue_dir(&dir);
+        assert_eq!(catalogue.len(), 3);
+        // The two straights are separate entries, not one overwriting the other.
+        assert_eq!(catalogue.get("dirt", RoadPieceKind::Straight, RoadPieceVariant::Surface).unwrap().size.y, 5);
+        assert_eq!(catalogue.get("dirt", RoadPieceKind::Straight, RoadPieceVariant::Tunnel).unwrap().size.y, 7);
+        // A corner with no tunnel export stays absent rather than resolving
+        // to its own surface piece.
+        assert!(catalogue.get("dirt", RoadPieceKind::Corner, RoadPieceVariant::Tunnel).is_none());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_tunnel_piece_is_named_after_its_kind_with_a_tunnel_suffix() {
+        assert_eq!(filename_for(RoadPieceKind::Straight, RoadPieceVariant::Surface), "straight");
+        assert_eq!(filename_for(RoadPieceKind::Straight, RoadPieceVariant::Tunnel), "straight-tunnel");
+        assert_eq!(filename_for(RoadPieceKind::DeadEnd, RoadPieceVariant::Tunnel), "dead_end-tunnel");
+        assert_eq!(filename_for(RoadPieceKind::Stair, RoadPieceVariant::Tunnel), "stairs-tunnel");
     }
 }

@@ -2,7 +2,7 @@
 
 Not a work item: the design document for the citybuilder game and the shared
 world-edit infrastructure it uses. High-level tasks here get split into
-numbered tickets in this directory when picked up (**next free number: 071**).
+numbered tickets in this directory when picked up (**next free number: 072**).
 Companion to `ROADMAP.md`, which covers the viewer 001–029.
 
 ## The goal
@@ -239,12 +239,13 @@ Building(
   load rebuilds it through `City::insert_loaded`/`add_road_cell`, so a corrupt
   or overlapping file fails with `PersistenceError::Corrupt` rather than
   producing an inconsistent `City`. `next_id` is persisted verbatim (never
-  recomputed) so a removed id is never reissued. **Save version 5**
+  recomputed) so a removed id is never reissued. **Save version 6**
   (1→2 when roads became cells, 2→3 when cells gained a `style`, 3→4 a `y`,
-  4→5 a stair's `ascent`); an old save is refused rather than misplaced —
-  including at 4→5, where defaulting the new field to "flat" *would* have been
-  safe, because one quietly-defaulted field is the precedent the next unsafe
-  one argues from. `city::run()` skips persistence for ticket
+  4→5 a stair's `ascent`, 5→6 a cell's tunnel `variant`); an old save is
+  refused rather than misplaced — including at 4→5, where defaulting the new
+  field to "flat" *would* have been safe, because one quietly-defaulted field
+  is the precedent the next unsafe one argues from, and 5→6 is exactly the
+  case it was kept for: defaulting a cut tunnel to `Surface` re-fills it. `city::run()` skips persistence for ticket
   008's `empty_save` placeholder, otherwise loads synchronously before
   `App::run()` and saves on `AppExit`.
 - **`journal::{Baseline, JournalEntry, Journal, reconcile, repair_edit}`** —
@@ -346,7 +347,8 @@ Building(
 - **Styles** — `assets/city/roads` is a directory *of styles*:
   `assets/city/roads/<style>/{isolated,dead_end,straight,corner,t,cross,stairs}.nbt`,
   each piece required to be exactly `ROAD_CELL_SIZE` on x/z; the subdirectory
-  name is the style id. `RoadCatalogue` is keyed by `(style, RoadPieceKind)`;
+  name is the style id. `RoadCatalogue` is keyed by
+  `(style, RoadPieceKind, RoadPieceVariant)`;
   a missing piece is skipped, not fatal, and `RoadCatalogue::styles()` only
   counts a style once it has at least one piece **loaded**, not once its
   directory exists. Connectivity and shape selection are entirely
@@ -369,10 +371,12 @@ Building(
   the fixed filenames, the orientation convention and the cross-section the
   loader and the write path expect. `stairs.nbt` landed with ticket 068 —
   `6x8x6`, ascending north, rising exactly `ROAD_STAIR_RISE` = 4, which is
-  what makes 067's stair planning do anything. One gap remains:
-  `isolated.nbt` is a byte-identical copy of `dead_end.nbt`, so a lone road
-  cell renders as a south-pointing stub rather than an island. That needs
-  Minecraft, not code.
+  what makes 067's stair planning do anything. Two gaps remain, both needing
+  Minecraft rather than code: `isolated.nbt` is a byte-identical copy of
+  `dead_end.nbt`, so a lone road cell renders as a south-pointing stub rather
+  than an island; and **no `-tunnel.nbt` piece is checked in yet** (ticket
+  071's code is complete and inert until one is, exactly the state 067's stair
+  planning sat in until 068).
 - **`road_build`** — drag-to-build, gated by `city::tool::ActiveTool`
   (`Building | Road | Terraform`, `T` cycles; placement/commit no-op unless
   `Building`). A drag is an **L-shaped `drag_path`** (row then column) so every
@@ -403,6 +407,29 @@ Building(
   *edge* being joined, since its two ends are four blocks apart. Preview and
   write share `plan_drag` and `cell_write_origin` so the ghost cannot stand
   anywhere the blocks won't land.
+- **Tunnels are a variant, not a kind** (ticket 071). A road that has to run
+  *under* terrain needs a bore, and 065/067's height planning has nothing to
+  say about it: the profile happily puts the surface course under a hillside
+  and the piece's three clearance layers mow three layers of it. The rule, the
+  user's own: **more than 18 of the 36 columns in the single layer directly
+  above a cell's piece are not air** -> that cell is a tunnel
+  (`road_build::cover_at`/`ROAD_TUNNEL_COVER_MAJORITY`, the layer located by
+  `piece_top_y` off the *surface* piece's own height, because a stair is
+  `6x8x6` where the flat pieces are `6x5x6`). It resolves to
+  `<kind>-tunnel.nbt` — the same kind, the same rotation, the same canonical
+  orientation, a different `.nbt` — so `select_piece` and everything
+  connectivity-shaped is untouched. `plan_tunnels` runs as a second pass over
+  `plan_drag`'s output (it needs that pass's heights *and* the catalogue that
+  pass deliberately doesn't see), shared by preview and commit like
+  everything else here. Two gates: the cover majority, and the catalogue
+  actually holding the piece — the same shape `stair_available` gives ramps,
+  so a style with no `-tunnel` exports builds exactly what it built before
+  rather than leaving unresolvable cells as holes. And, like `base_y` and
+  `ascent`, the variant is **decided once and stored**
+  (`state::RoadCell::variant`, `city.ron` version 6): here that isn't 065's
+  subtle drift but a straight contradiction, since writing the tunnel carves
+  away the very cover that chose it, and a re-tiled neighbour would fill the
+  bore back in with hillside.
 - **Connectivity queries** — four functions built entirely on
   `reachable_from`/`is_connected` (no second BFS).
   `touching_road_cells(city, building)` bridges a footprint to adjacent road

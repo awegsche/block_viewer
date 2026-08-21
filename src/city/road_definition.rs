@@ -237,7 +237,7 @@ mod tests {
     use super::*;
     use crate::blueprint::{write_structure_file, BlockState, Blueprint};
     use bevy::math::IVec3;
-    use super::super::road::RoadPieceKind;
+    use super::super::road::{RoadPieceKind, RoadPieceVariant};
     use super::super::road_catalogue::{load_road_catalogue_dir, piece_path};
     use super::super::state::ROAD_CELL_SIZE;
 
@@ -276,10 +276,18 @@ mod tests {
         let dir = temp_dir("catalogue_fixture");
         fs::create_dir_all(dir.join("dirt")).expect("should create style dir");
         for kind in RoadPieceKind::ALL {
-            write_structure_file(&piece_path(&dir, "dirt", kind), &one_stone_piece()).unwrap();
+            write_structure_file(&piece_path(&dir, "dirt", kind, RoadPieceVariant::Surface), &one_stone_piece())
+                .unwrap();
         }
         let (catalogue, skipped) = load_road_catalogue_dir(&dir);
-        assert!(skipped.is_empty(), "{skipped:?}");
+        // Only the surface pieces are written here — this fixture exists to
+        // give a *style* some geometry to be validated against, not to
+        // exercise ticket 071's variants, so every `-tunnel` file is
+        // legitimately missing.
+        assert!(
+            skipped.iter().all(|(_, _, variant, _)| *variant == RoadPieceVariant::Tunnel),
+            "{skipped:?}"
+        );
         catalogue
     }
 

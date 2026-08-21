@@ -240,6 +240,29 @@ pub fn ground_height_at(tile: IVec2, world: &DecodedWorld) -> Option<i32> {
         .map(|(y, _id)| y + 1)
 }
 
+/// The block at Minecraft coordinates `block`, or `None` if its chunk column
+/// isn't decoded at all — the deliberate distinction
+/// [`ground_height_at`] already draws between "nothing there" and "not
+/// loaded". An absent *section* inside a decoded column is uniform air (see
+/// [`world::ChunkColumn::sections`]), so it reads back as
+/// [`world::BlockRegistry::AIR`] rather than `None`.
+///
+/// Ticket 071 is the caller: `city::road_build` counts how many of a road
+/// cell's 36 columns are roofed over at one exact Y, which is a question
+/// [`ground_height_at`]'s top-down scan can't answer. `camera` has a private
+/// near-twin of this for its own ray-marching, which reads an unloaded
+/// column as air; that suits a mesher's neighbour lookups and doesn't suit a
+/// decision about whether to carve a tunnel, so this one keeps the `Option`.
+pub fn block_at(block: IVec3, world: &DecodedWorld) -> Option<world::BlockId> {
+    let size = world::SECTION_SIZE as i32;
+    let column = world.columns.get(&(block.x.div_euclid(size), block.z.div_euclid(size)))?;
+    let section_y = block.y.div_euclid(size) as i8;
+    let Some(section) = column.sections.iter().find(|s| s.y == section_y) else {
+        return Some(world::BlockRegistry::AIR);
+    };
+    Some(section.get(block.x.rem_euclid(size) as usize, block.y.rem_euclid(size) as usize, block.z.rem_euclid(size) as usize))
+}
+
 /// Samples every tile [`footprint_tiles`] covers for `footprint` placed at
 /// `origin`/`rotation`, and decides whether it's buildable — see the module
 /// docs for the height read and the "No auto-level, and no slope refusal
@@ -578,5 +601,45 @@ mod tests {
             matches!(fit, FootprintFit::Refused(FitError::NotLoaded { .. })),
             "no ground anywhere in a decoded column should refuse, not fit at a nonsensical height"
         );
+    }
+
+    // -- block_at (ticket 071) ------------------------------------------------
+
+    /// The three answers [`block_at`] draws apart, and the one that isn't
+    /// obvious: an *absent section* inside a decoded column is uniform air,
+    /// so it reads back as air rather than as "not loaded". Only the column
+    /// being missing entirely is `None`.
+    #[test]
+    fn block_at_tells_air_apart_from_an_undecoded_column() {
+        let mut world = flat_chunk(64);
+        let air = world::BlockRegistry::AIR;
+
+        // The ground block itself — `flat_chunk` puts one stone block *at*
+        // the y it is given, which is why `ground_height_at` answers 65 here.
+        assert_ne!(block_at(IVec3::new(3, 64, 3), &world), Some(air));
+        // Air directly above it, in a section that exists.
+        assert_eq!(block_at(IVec3::new(3, 65, 3), &world), Some(air));
+        // Air far above it, in a section that does not exist at all.
+        assert_eq!(block_at(IVec3::new(3, 200, 3), &world), Some(air));
+        // A column that was never decoded is the one case that isn't an answer.
+        assert_eq!(block_at(IVec3::new(500, 64, 500), &world), None);
+
+        add_block(&mut world, IVec2::new(3, 3), 70, "minecraft:oak_leaves");
+        let leaves = block_at(IVec3::new(3, 70, 3), &world).expect("the column is decoded");
+        assert_eq!(world.registry.lock().unwrap().name(leaves), "minecraft:oak_leaves");
+    }
+
+    /// [`block_at`] reads *exactly* the Y it is asked for — it is not
+    /// [`ground_height_at`]'s top-down scan, which is the whole reason
+    /// `city::road_build` needs it to count what roofs a road cell.
+    #[test]
+    fn block_at_reads_one_exact_y_not_the_topmost_block() {
+        let mut world = empty_chunk();
+        add_block(&mut world, IVec2::new(0, 0), 100, "minecraft:stone");
+
+        let air = world::BlockRegistry::AIR;
+        assert_eq!(block_at(IVec3::new(0, 99, 0), &world), Some(air));
+        assert_ne!(block_at(IVec3::new(0, 100, 0), &world), Some(air));
+        assert_eq!(block_at(IVec3::new(0, 101, 0), &world), Some(air));
     }
 }

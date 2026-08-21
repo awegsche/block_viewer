@@ -60,6 +60,14 @@
 //! safe to default has to argue its case against a precedent. A migration
 //! function is the answer when one is worth writing, not a per-field
 //! exception here.
+//!
+//! Bumped again to `6` by ticket 071: a road cell also remembers whether it
+//! was built as a surface or a *tunnel* piece
+//! ([`super::state::RoadCell::variant`]). Defaulting a version-5 file's
+//! cells to `Surface` would be wrong in the one case that matters — a road
+//! already cut through a hill would re-tile itself back into solid
+//! hillside — and this is the field the "no quiet defaults" precedent above
+//! was being kept for. Refused, same as the four bumps before it.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -67,13 +75,13 @@ use std::path::{Path, PathBuf};
 use bevy::math::{IVec2, IVec3};
 use serde::{Deserialize, Serialize};
 
-use super::road::Direction;
+use super::road::{Direction, RoadPieceVariant};
 use super::state::{BuildingId, City, PlacedBuilding, PlacementError};
 use crate::blueprint::Rotation;
 
 /// The `CitySave` schema version this build writes and reads. Bumped only
 /// alongside a migration path — see the module docs.
-pub const CURRENT_VERSION: u32 = 5;
+pub const CURRENT_VERSION: u32 = 6;
 
 /// Where [`save_city`]/[`load_city`] look, relative to a save's root
 /// (`SaveMeta::path`) — the roadmap's own `<save>/citybuilder/city.ron`.
@@ -108,8 +116,8 @@ struct SavedBuilding {
 
 /// One saved road cell — cell coordinates plus the style
 /// (`super::road_catalogue::RoadCatalogue`'s key) it was built as, the world
-/// Y its piece sits at (ticket 065) and, for a stair, which way it climbs
-/// (ticket 067).
+/// Y its piece sits at (ticket 065), for a stair which way it climbs
+/// (ticket 067), and whether it is a tunnel (ticket 071).
 #[derive(Debug, Serialize, Deserialize)]
 struct SavedRoadCell {
     x: i32,
@@ -122,6 +130,9 @@ struct SavedRoadCell {
     /// [`super::road::Direction`] itself, not a mirror enum — see that
     /// type's own docs.
     ascent: Option<Direction>,
+    /// Surface or tunnel — [`super::road::RoadPieceVariant`] itself, not a
+    /// mirror enum, for the same reason `ascent` carries `Direction`.
+    variant: RoadPieceVariant,
 }
 
 /// Why [`save_city`] or [`load_city`] failed.
@@ -190,6 +201,7 @@ pub fn save_city(city: &City, save_root: &Path) -> Result<(), PersistenceError> 
             y: road.base_y,
             style: road.style.clone(),
             ascent: road.ascent,
+            variant: road.variant,
         })
         .collect();
     road_cells.sort_by_key(|cell| (cell.x, cell.z));
@@ -238,7 +250,7 @@ pub fn load_city(save_root: &Path) -> Result<City, PersistenceError> {
     let mut road_cells = save.road_cells;
     road_cells.sort_by_key(|cell| (cell.x, cell.z));
     for cell in road_cells {
-        city.add_road_cell(IVec2::new(cell.x, cell.z), cell.style, cell.y, cell.ascent)
+        city.add_road_cell(IVec2::new(cell.x, cell.z), cell.style, cell.y, cell.ascent, cell.variant)
             .map_err(PersistenceError::Corrupt)?;
     }
 
@@ -298,11 +310,13 @@ mod tests {
         let b = city
             .place_building("house01", IVec3::new(0, 70, 0), Rotation::Deg90, IVec2::new(3, 5))
             .unwrap();
-        city.add_road_cell(IVec2::new(50, 50), "dirt", 64, None).unwrap();
-        city.add_road_cell(IVec2::new(50, 51), "paved", 71, None).unwrap();
+        city.add_road_cell(IVec2::new(50, 50), "dirt", 64, None, RoadPieceVariant::Surface).unwrap();
+        city.add_road_cell(IVec2::new(50, 51), "paved", 71, None, RoadPieceVariant::Surface).unwrap();
         // Ticket 067: a stair cell, so the ascent field is exercised by the
         // round trip rather than only by its own dedicated test.
-        city.add_road_cell(IVec2::new(50, 52), "dirt", 71, Some(Direction::East)).unwrap();
+        city.add_road_cell(IVec2::new(50, 52), "dirt", 71, Some(Direction::East), RoadPieceVariant::Surface).unwrap();
+        // Ticket 071: and a tunnel cell, for the same reason.
+        city.add_road_cell(IVec2::new(50, 53), "dirt", 71, None, RoadPieceVariant::Tunnel).unwrap();
 
         save_city(&city, &dir).unwrap();
         let loaded = load_city(&dir).unwrap();
@@ -319,7 +333,7 @@ mod tests {
         // The rotated occupancy rectangle should have round-tripped too.
         assert_eq!(loaded.occupant_at(IVec2::new(4, 2)), Some(crate::city::state::Occupant::Building(b)));
 
-        assert_eq!(loaded.road_cells().count(), 3);
+        assert_eq!(loaded.road_cells().count(), 4);
         assert!(loaded.is_road_cell(IVec2::new(50, 50)));
         // Ticket 059: each cell's own style round-trips too, not just its
         // coordinate.
@@ -333,6 +347,16 @@ mod tests {
         // climbing the way it was built, not merely "some stair".
         assert_eq!(loaded.road_cell_at(IVec2::new(50, 50)).and_then(|road| road.ascent), None);
         assert_eq!(loaded.road_cell_at(IVec2::new(50, 52)).and_then(|road| road.ascent), Some(Direction::East));
+        // Ticket 071: a tunnel comes back a tunnel, and a surface cell isn't
+        // quietly promoted into one.
+        assert_eq!(
+            loaded.road_cell_at(IVec2::new(50, 53)).map(|road| road.variant),
+            Some(RoadPieceVariant::Tunnel)
+        );
+        assert_eq!(
+            loaded.road_cell_at(IVec2::new(50, 50)).map(|road| road.variant),
+            Some(RoadPieceVariant::Surface)
+        );
     }
 
     /// The scenario the module docs call out: the *highest*-id building is
@@ -432,6 +456,25 @@ mod tests {
         assert!(matches!(err, PersistenceError::Parse(_) | PersistenceError::UnsupportedVersion(4)), "{err:?}");
     }
 
+    /// Ticket 071: a version-5 file's `road_cells` have no `variant`, so
+    /// every road in one would default to `Surface` — and for a road already
+    /// cut through a hill that default is actively wrong: the first re-tile
+    /// would write the open-sky piece back into the hillside and fill the
+    /// tunnel in. Refused, like every bump before it.
+    #[test]
+    fn an_old_variantless_road_cell_save_is_refused_not_silently_defaulted() {
+        let dir = temp_dir("old_road_cell_variant");
+        fs::create_dir_all(dir.join("citybuilder")).unwrap();
+        fs::write(
+            dir.join("citybuilder/city.ron"),
+            r#"(version: 5, next_id: 0, buildings: [], road_cells: [(x: 5, z: 5, y: 64, style: "dirt", ascent: None)])"#,
+        )
+        .unwrap();
+
+        let err = load_city(&dir).unwrap_err();
+        assert!(matches!(err, PersistenceError::Parse(_) | PersistenceError::UnsupportedVersion(5)), "{err:?}");
+    }
+
     /// Ticket 065: a version-3 file's `road_cells` had no `y` — every road
     /// in it was written at the hardcoded Y=0 that ticket fixed, so there is
     /// no height to recover and nothing sensible to default to. Refused, the
@@ -505,7 +548,7 @@ mod tests {
                 buildings: [
                     (id: 0, definition: "house01", origin: (0, 64, 0), rotation: Deg0, footprint: (2, 2)),
                 ],
-                road_cells: [(x: 0, z: 0, y: 64, style: "dirt", ascent: None)],
+                road_cells: [(x: 0, z: 0, y: 64, style: "dirt", ascent: None, variant: Surface)],
             )"#
             ),
         )
