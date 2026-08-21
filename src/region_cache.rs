@@ -11,12 +11,26 @@
 //! decode) — [`crate::chunk_pipeline`] (005-c) is what puts calls to it on
 //! a background task, sharing one instance across every task via
 //! `Arc<Mutex<RegionCache>>` rather than giving each task its own.
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use mc_anvil::chunkregion::ChunkRegion;
 use mc_anvil::region::{Region, REGION_WIDTH_IN_CHUNKS};
 use mc_anvil::{MCLoadError, SaveMeta};
+
+/// How long a region that failed to load stays remembered as failed before
+/// [`RegionCache::load_if_absent`] will try it again (ticket 062 follow-up).
+/// A region's own file can fail transiently — Windows Explorer or an
+/// antivirus scanner briefly holding a `.mca` file open, a sharing
+/// violation while another process touches the save — and without a
+/// cooldown that one bad moment permanently blacklisted every chunk in the
+/// region for the rest of the session, no matter how long the user waited
+/// or how many times the streaming diff re-ran. A save that genuinely
+/// doesn't have the region at all (`SaveMeta::has_region` false) is a
+/// different, permanent case and never touches `failed` at all — see
+/// [`RegionCache::load_if_absent`].
+const FAILED_RETRY_COOLDOWN: Duration = Duration::from_secs(10);
 
 /// Converts a chunk coordinate into the coordinate of the region that
 /// contains it. Anvil regions are 32x32 chunks; `div_euclid` floors toward
@@ -60,13 +74,14 @@ pub struct RegionCache {
     /// remove+push on every access is cheap — not worth a real intrusive
     /// LRU list at this size.
     order: Vec<(i32, i32)>,
-    /// Regions whose `load_chunks` has already failed once (truncated or
-    /// otherwise corrupt `.mca`, ticket 008) — remembered so a bad region is
-    /// only attempted, and logged, once; every later request for the same
-    /// coordinate fails fast without re-touching disk or logging again.
-    /// Deliberately separate from `entries`, which only ever holds
+    /// Regions whose `load_chunks` has failed, keyed to when the failure
+    /// happened (truncated or otherwise corrupt `.mca`, ticket 008; or a
+    /// transient I/O failure, ticket 062 follow-up) — remembered so a bad
+    /// region fails fast, without re-touching disk or re-logging, for
+    /// [`FAILED_RETRY_COOLDOWN`] after the failure, then gets one more
+    /// attempt. Deliberately separate from `entries`, which only ever holds
     /// successfully loaded regions.
-    failed: HashSet<(i32, i32)>,
+    failed: HashMap<(i32, i32), Instant>,
 }
 
 impl RegionCache {
@@ -78,7 +93,7 @@ impl RegionCache {
             capacity: capacity.max(1),
             entries: HashMap::new(),
             order: Vec::new(),
-            failed: HashSet::new(),
+            failed: HashMap::new(),
         }
     }
 
@@ -103,10 +118,12 @@ impl RegionCache {
     /// `capacity`.
     ///
     /// Errors if the save has no region at `region_coord`, or if loading it
-    /// fails (missing/corrupt file, unsupported compression, ...) — the
-    /// latter is remembered in `failed` (ticket 008) so a permanently broken
-    /// region only gets logged, and its file re-read, once rather than on
-    /// every chunk that lands inside it.
+    /// fails (missing/corrupt file, unsupported compression, a transient I/O
+    /// error, ...) — the latter is remembered in `failed` (ticket 008) for
+    /// [`FAILED_RETRY_COOLDOWN`] so a bad region only gets logged, and its
+    /// file re-read, once per cooldown window rather than on every chunk
+    /// that lands inside it, but a region that failed only transiently
+    /// (ticket 062 follow-up) isn't blacklisted for the rest of the session.
     pub fn get_or_load(&mut self, region_coord: (i32, i32)) -> Result<&ChunkRegion, MCLoadError> {
         self.load_if_absent(region_coord)?;
         Ok(self
@@ -139,8 +156,12 @@ impl RegionCache {
     /// [`get_or_load_mut`](Self::get_or_load_mut) so there's one copy of the
     /// load path rather than two that can drift.
     fn load_if_absent(&mut self, region_coord: (i32, i32)) -> Result<(), MCLoadError> {
-        if self.failed.contains(&region_coord) {
-            return Err(MCLoadError::PathNotFoundError);
+        if let Some(&failed_at) = self.failed.get(&region_coord) {
+            if failed_at.elapsed() < FAILED_RETRY_COOLDOWN {
+                return Err(MCLoadError::PathNotFoundError);
+            }
+            // Cooldown elapsed — worth one more attempt below rather than
+            // staying blacklisted forever over what may have been transient.
         }
 
         if !self.entries.contains_key(&region_coord) {
@@ -157,12 +178,17 @@ impl RegionCache {
             let path_display = path.display().to_string();
             let mut region: ChunkRegion = Region::new(rx, rz, path).into();
             if let Err(err) = region.load_chunks() {
-                self.failed.insert(region_coord);
+                self.failed.insert(region_coord, Instant::now());
                 println!(
                     "block_viewer: skipping region ({rx}, {rz}) — failed to load {path_display}: {err}"
                 );
                 return Err(err);
             }
+            // A cooldown-expired retry that succeeds clears the old failure
+            // record — otherwise a region that failed once and then loaded
+            // fine would still short-circuit-fail again the moment the next
+            // cooldown window happened to be checked mid-eviction.
+            self.failed.remove(&region_coord);
             self.entries.insert(region_coord, region);
         }
 
@@ -247,12 +273,22 @@ impl RegionCache {
         let coord = self.order.remove(index);
         self.entries.remove(&coord);
     }
+
+    /// Test-only: back-dates `region_coord`'s failure record to just past
+    /// [`FAILED_RETRY_COOLDOWN`], so a cooldown-expiry test doesn't need to
+    /// actually sleep for it. No-op if `region_coord` isn't currently
+    /// recorded as failed.
+    #[cfg(test)]
+    fn force_failed_stale(&mut self, region_coord: (i32, i32)) {
+        if let Some(at) = self.failed.get_mut(&region_coord) {
+            *at = Instant::now() - FAILED_RETRY_COOLDOWN - Duration::from_secs(1);
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Instant;
 
     /// This repo assumes a real Minecraft saves directory is reachable on
     /// the dev machine (see `lib.rs::load_real_save`); these tests follow
@@ -314,11 +350,11 @@ mod tests {
     /// Ticket 008: unlike a region the save's metadata never listed (above),
     /// this simulates a region the save *claims* to have but whose `.mca`
     /// file is missing/corrupt on disk — `get_or_load` should fail cleanly
-    /// (not panic), and a repeat request for the same coordinate should keep
-    /// failing cleanly too rather than somehow succeeding once the failure
-    /// is remembered in `failed`.
+    /// (not panic), and a repeat request for the same coordinate within the
+    /// cooldown window should keep failing cleanly too rather than somehow
+    /// succeeding once the failure is remembered in `failed`.
     #[test]
-    fn get_or_load_remembers_a_load_failure_instead_of_retrying_forever() {
+    fn get_or_load_remembers_a_load_failure_within_the_cooldown_window() {
         let meta = SaveMeta {
             name: "broken".to_string(),
             path: std::path::PathBuf::from("does-not-exist-on-disk"),
@@ -330,6 +366,42 @@ mod tests {
         assert!(cache.get_or_load((0, 0)).is_err());
         assert!(cache.get_or_load((0, 0)).is_err());
         assert_eq!(cache.len(), 0, "a failed region must never end up cached as loaded");
+    }
+
+    /// Ticket 062 follow-up: a region that failed only transiently (a
+    /// sharing violation, an antivirus scan mid-read, ...) must not stay
+    /// blacklisted for the rest of the session — once [`FAILED_RETRY_COOLDOWN`]
+    /// has passed, the next request gets a real retry, not just the
+    /// remembered failure replayed. Backdates the failure timestamp with the
+    /// test-only [`RegionCache::force_failed_stale`] rather than actually
+    /// sleeping for the cooldown.
+    #[test]
+    fn a_failure_older_than_the_cooldown_gets_retried() {
+        let meta = SaveMeta {
+            name: "broken".to_string(),
+            path: std::path::PathBuf::from("does-not-exist-on-disk"),
+            region_dir: std::path::PathBuf::from("does-not-exist-on-disk/region"),
+            regions: vec![(0, 0)],
+        };
+        let mut cache = RegionCache::new(meta, 4);
+
+        assert!(cache.get_or_load((0, 0)).is_err());
+        let first_failure_at = *cache.failed.get(&(0, 0)).expect("recorded as failed");
+
+        cache.force_failed_stale((0, 0));
+        let staled_at = *cache.failed.get(&(0, 0)).expect("still recorded as failed");
+        assert!(staled_at < first_failure_at, "test setup should have backdated the failure");
+
+        // The file still doesn't exist, so this still errors — the point is
+        // *whether* a fresh attempt happened, not whether it succeeds: a
+        // fresh attempt refreshes the failure timestamp, a short-circuit on
+        // the old blacklist entry wouldn't touch it at all.
+        assert!(cache.get_or_load((0, 0)).is_err());
+        let second_failure_at = *cache.failed.get(&(0, 0)).expect("recorded as failed again");
+        assert!(
+            second_failure_at > staled_at,
+            "a cooldown-expired failure should be retried, not just replayed from the old record"
+        );
     }
 
     #[test]

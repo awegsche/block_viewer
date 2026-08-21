@@ -17,6 +17,7 @@
 
 use bevy::prelude::*;
 use std::collections::HashSet;
+use std::time::Duration;
 
 use crate::{camera, world, DecodedWorld};
 
@@ -108,26 +109,53 @@ pub(crate) fn camera_chunk_coord(translation: Vec3) -> (i32, i32) {
     ((mc_x / size).floor() as i32, (mc_z / size).floor() as i32)
 }
 
+/// How often [`update_pending_chunk_work`] force-recomputes the load/unload
+/// diff even when the camera hasn't crossed a chunk boundary (ticket 062
+/// follow-up). The chunk-crossing/render-distance-change triggers below
+/// assume every coordinate that ever lands in [`PendingChunkWork::to_load`]
+/// eventually makes it into [`DecodedWorld`] on its own — true for ordinary
+/// streaming, but not for a coordinate whose only region failed to load (see
+/// [`crate::region_cache::RegionCache`]'s retry cooldown) or any other way a
+/// load could silently drop a coordinate without ever loading it, with
+/// nothing left to notice and retry it. Re-running the same diff on a timer
+/// regardless of camera movement re-queues anything still desired but
+/// missing from [`DecodedWorld`] — cheap (the same O(desired) `HashSet` diff
+/// `unload`'s own cancel system already redoes every frame), and
+/// self-healing rather than depending on the camera happening to cross
+/// another chunk boundary to notice.
+const FORCE_RECOMPUTE_INTERVAL: Duration = Duration::from_secs(2);
+
 /// Recomputes [`PendingChunkWork`] whenever the camera's chunk coordinate
-/// changes, or whenever [`RenderDistance`] itself changes (ticket 007's
+/// changes, whenever [`RenderDistance`] itself changes (ticket 007's
 /// status-panel slider) — the camera can sit in the same chunk while the
 /// desired radius around it grows or shrinks, and that needs the same
-/// re-diff a chunk crossing does. Otherwise does not act on the delta —
-/// loading/spawning/unloading is 005-b onward.
+/// re-diff a chunk crossing does — or every [`FORCE_RECOMPUTE_INTERVAL`]
+/// regardless of either, as a self-healing retry (see that constant's
+/// docs). Otherwise does not act on the delta — loading/spawning/unloading
+/// is 005-b onward.
 fn update_pending_chunk_work(
     camera: Query<&Transform, With<camera::CameraRig>>,
     render_distance: Res<RenderDistance>,
     decoded_world: Res<DecodedWorld>,
     mut last_chunk: ResMut<LastCameraChunk>,
     mut pending: ResMut<PendingChunkWork>,
+    time: Res<Time>,
+    mut since_last_recompute: Local<Duration>,
 ) {
     let Ok(transform) = camera.get_single() else {
         return;
     };
 
     let center = camera_chunk_coord(transform.translation);
-    if last_chunk.0 == Some(center) && !render_distance.is_changed() {
-        return; // Same chunk, same render distance; the delta hasn't changed.
+
+    *since_last_recompute += time.delta();
+    let force_recompute = *since_last_recompute >= FORCE_RECOMPUTE_INTERVAL;
+    if force_recompute {
+        *since_last_recompute = Duration::ZERO;
+    }
+
+    if last_chunk.0 == Some(center) && !render_distance.is_changed() && !force_recompute {
+        return; // Same chunk, same render distance, not due for a retry yet.
     }
     last_chunk.0 = Some(center);
 
@@ -135,12 +163,18 @@ fn update_pending_chunk_work(
     let loaded: HashSet<(i32, i32)> = decoded_world.columns.keys().copied().collect();
     let (to_load, to_unload) = diff_chunks(&desired, &loaded);
 
-    println!(
-        "Chunk streaming: camera entered chunk {:?} ({} to load, {} to unload)",
-        center,
-        to_load.len(),
-        to_unload.len()
-    );
+    // Worth a console line only when there's an actual delta — the periodic
+    // retry runs whether or not anything changed, and logging an empty diff
+    // every couple of seconds would just be noise once streaming has caught
+    // up (which is the common, steady-state case this runs in).
+    if !to_load.is_empty() || !to_unload.is_empty() {
+        println!(
+            "Chunk streaming: camera entered chunk {:?} ({} to load, {} to unload)",
+            center,
+            to_load.len(),
+            to_unload.len()
+        );
+    }
 
     pending.to_load = to_load;
     pending.to_unload = to_unload;
