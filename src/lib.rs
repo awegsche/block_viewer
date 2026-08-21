@@ -127,6 +127,35 @@ pub(crate) struct DecodedWorld {
 #[derive(Component)]
 pub(crate) struct BlockMesh;
 
+/// Which save the process was told to open, parsed from the CLI
+/// (ticket 064). Both halves are optional and independent: the directory to
+/// scan, and the save to pick out of it.
+struct SaveSelection {
+    /// Where to look for saves — see [`saves_directory_from`].
+    directory: PathBuf,
+    /// Which save under `directory` to open, or `None` for "the first one
+    /// found", which is all this ever did before ticket 064.
+    wanted: Option<String>,
+}
+
+/// The two positional CLI arguments, as [`SaveSelection`] — `argv[1]` the
+/// saves directory (ticket 008), `argv[2]` the save within it (ticket 064).
+/// Reads the real process args; [`save_selection_from`] is the testable half.
+fn save_selection() -> SaveSelection {
+    let mut args = std::env::args().skip(1);
+    save_selection_from(args.next(), args.next())
+}
+
+/// The actual logic behind [`save_selection`], taking the CLI args as plain
+/// `Option<String>`s rather than reading `std::env::args()` directly — real
+/// process args can't be overridden per-test, so tests exercise this instead.
+fn save_selection_from(dir_arg: Option<String>, name_arg: Option<String>) -> SaveSelection {
+    SaveSelection {
+        directory: saves_directory_from(dir_arg),
+        wanted: name_arg.filter(|name| !name.trim().is_empty()),
+    }
+}
+
 /// Directory to scan for Minecraft saves: the first CLI argument if one was
 /// given (ticket 008 — pointing at a CurseForge/MultiMC instance elsewhere
 /// on disk, since those don't live under the default directory), else
@@ -135,15 +164,20 @@ pub(crate) struct BlockMesh;
 /// startup ([`try_load_real_save`]) and the UI's save picker
 /// (`viewer::ui::scan_saves`) so both agree on where "the saves directory" is.
 pub(crate) fn saves_directory() -> PathBuf {
-    saves_directory_from(std::env::args().nth(1))
+    save_selection().directory
 }
 
 /// The actual logic behind [`saves_directory`], taking the CLI arg (if any)
 /// as a plain `Option<String>` rather than reading `std::env::args()`
 /// directly — real process args can't be overridden per-test, so tests
 /// exercise this instead.
+///
+/// An **empty or whitespace-only** argument counts as absent (ticket 064), so
+/// `citybuilder -- "" MyWorld` can name a save in `argv[2]` while keeping the
+/// default `.minecraft/saves` directory — an empty `PathBuf` would otherwise
+/// be a saves directory that can never list anything.
 fn saves_directory_from(cli_arg: Option<String>) -> PathBuf {
-    if let Some(dir) = cli_arg {
+    if let Some(dir) = cli_arg.filter(|dir| !dir.trim().is_empty()) {
         return PathBuf::from(dir);
     }
     dirs::config_dir()
@@ -151,35 +185,81 @@ fn saves_directory_from(cli_arg: Option<String>) -> PathBuf {
         .join(".minecraft/saves")
 }
 
-/// Picks the first save found under `dir`. Metadata only
-/// (`get_saves_from_instance`/`SaveMeta` -> `Save`) — cheap and synchronous,
-/// unlike chunk data, which streams in after `App::run()` via the async
-/// pipeline (ticket 005-c) instead of being loaded here (ticket 005-e
-/// removed the old eager pre-`App::run()` region load).
+/// Picks a save under `dir` — the one `wanted` names (ticket 064), or the
+/// first one found when it's `None`, which is all this did before. Metadata
+/// only (`get_saves_from_instance`/`SaveMeta` -> `Save`) — cheap and
+/// synchronous, unlike chunk data, which streams in after `App::run()` via
+/// the async pipeline (ticket 005-c) instead of being loaded here (ticket
+/// 005-e removed the old eager pre-`App::run()` region load).
+///
+/// A `wanted` that names an **existing directory** is taken as the save
+/// itself and read straight through `SaveMeta::from_path`, so a world living
+/// nowhere near any `saves/` folder can be opened without also pointing
+/// `argv[1]` at its parent.
 ///
 /// `Err` covers every unhappy path ticket 008 calls out — no `.minecraft`
 /// directory, an empty `saves/` folder, or any other I/O failure listing
-/// it — as a message for [`load_real_save`] to log and show in the UI,
-/// rather than a panic that kills the process before the window opens.
+/// it — plus ticket 064's "no save by that name", as a message for
+/// [`load_real_save`] to log and show in the UI, rather than a panic that
+/// kills the process before the window opens.
 /// Takes `dir` as a parameter (rather than calling [`saves_directory`]
 /// itself) purely so tests can point it at a fixture directory.
-fn try_load_save_from(dir: &Path) -> Result<Save, String> {
+fn try_load_save_from(dir: &Path, wanted: Option<&str>) -> Result<Save, String> {
+    if let Some(path) = wanted.map(Path::new).filter(|path| path.is_dir()) {
+        let meta = SaveMeta::from_path(path)
+            .map_err(|e| format!("could not read the save at {}: {e}", path.display()))?;
+        println!("Loading save {}", meta.get_grid_view());
+        return Ok(meta.into());
+    }
+
     let saves = get_saves_from_instance(dir)
         .map_err(|e| format!("could not read saves directory {}: {e}", dir.display()))?;
-    let meta = saves
-        .into_iter()
-        .next()
-        .ok_or_else(|| format!("no Minecraft saves found under {}", dir.display()))?;
+    let meta = match wanted {
+        Some(name) => pick_named_save(&saves, name, dir)?,
+        None => saves
+            .into_iter()
+            .next()
+            .ok_or_else(|| format!("no Minecraft saves found under {}", dir.display()))?,
+    };
 
     println!("Loading save {}", meta.get_grid_view());
 
     Ok(meta.into())
 }
 
-/// [`try_load_save_from`] against [`saves_directory`] — the real entry point
+/// The save called `wanted` out of `saves` — exact name first, then
+/// case-insensitively, since a world's folder name is what the player typed
+/// into Minecraft and re-typing its capitalisation on a command line is a
+/// pointless way to fail (ticket 064).
+///
+/// The `Err` lists the names that *are* there: a typo'd name would otherwise
+/// fall back to [`empty_save`] and look exactly like a world that hasn't
+/// generated any terrain yet.
+fn pick_named_save(saves: &[SaveMeta], wanted: &str, dir: &Path) -> Result<SaveMeta, String> {
+    if let Some(meta) = saves
+        .iter()
+        .find(|meta| meta.name == wanted)
+        .or_else(|| saves.iter().find(|meta| meta.name.eq_ignore_ascii_case(wanted)))
+    {
+        return Ok(meta.clone());
+    }
+
+    let available = if saves.is_empty() {
+        "(none)".to_string()
+    } else {
+        saves.iter().map(|meta| meta.name.as_str()).collect::<Vec<_>>().join(", ")
+    };
+    Err(format!(
+        "no save named \"{wanted}\" under {} — available: {available}",
+        dir.display()
+    ))
+}
+
+/// [`try_load_save_from`] against [`save_selection`] — the real entry point
 /// [`load_real_save`] uses at startup.
 fn try_load_real_save() -> Result<Save, String> {
-    try_load_save_from(&saves_directory())
+    let selection = save_selection();
+    try_load_save_from(&selection.directory, selection.wanted.as_deref())
 }
 
 /// Always returns a usable [`Save`] — [`empty_save`] plus a logged reason
@@ -411,6 +491,83 @@ mod tests {
         assert_eq!(dir, Path::new("some/other/instance"));
     }
 
+    /// Ticket 064: `citybuilder -- "" MyWorld` keeps the default directory,
+    /// so the second argument can name a save without also spelling out
+    /// where `.minecraft` lives.
+    #[test]
+    fn saves_directory_from_treats_an_empty_arg_as_unset() {
+        let dir = saves_directory_from(Some("   ".to_string()));
+        assert!(
+            dir.ends_with(Path::new(".minecraft/saves")),
+            "expected the default directory, got {}",
+            dir.display()
+        );
+    }
+
+    #[test]
+    fn save_selection_from_takes_the_second_arg_as_the_save_name() {
+        let selection = save_selection_from(Some("D:/instance/saves".to_string()), Some("MyCityWorld".to_string()));
+        assert_eq!(selection.directory, Path::new("D:/instance/saves"));
+        assert_eq!(selection.wanted.as_deref(), Some("MyCityWorld"));
+    }
+
+    /// No second argument (and an empty one) means "the first save found" —
+    /// exactly what every run did before ticket 064.
+    #[test]
+    fn save_selection_from_wants_no_particular_save_without_a_second_arg() {
+        assert!(save_selection_from(None, None).wanted.is_none());
+        assert!(save_selection_from(None, Some(String::new())).wanted.is_none());
+    }
+
+    fn meta_named(name: &str) -> SaveMeta {
+        SaveMeta {
+            name: name.to_string(),
+            path: PathBuf::from(name),
+            region_dir: PathBuf::new(),
+            regions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn pick_named_save_matches_a_saves_name_exactly() {
+        let saves = [meta_named("Flat"), meta_named("MyCityWorld")];
+        let picked = pick_named_save(&saves, "MyCityWorld", Path::new("saves")).unwrap();
+        assert_eq!(picked.name, "MyCityWorld");
+    }
+
+    #[test]
+    fn pick_named_save_falls_back_to_a_case_insensitive_match() {
+        let saves = [meta_named("MyCityWorld")];
+        let picked = pick_named_save(&saves, "mycityworld", Path::new("saves")).unwrap();
+        assert_eq!(picked.name, "MyCityWorld");
+    }
+
+    /// An exact match wins even when a differently-cased name comes first in
+    /// the listing.
+    #[test]
+    fn pick_named_save_prefers_the_exact_match_over_a_cased_one() {
+        let saves = [meta_named("MYCITYWORLD"), meta_named("MyCityWorld")];
+        let picked = pick_named_save(&saves, "MyCityWorld", Path::new("saves")).unwrap();
+        assert_eq!(picked.name, "MyCityWorld");
+    }
+
+    /// Ticket 064: a typo'd name must say so *and* list what's there —
+    /// silently falling back to the first save (or an empty world) is how a
+    /// typo turns into "the citybuilder lost my city".
+    #[test]
+    fn pick_named_save_errors_with_the_available_names() {
+        let saves = [meta_named("Flat"), meta_named("MyCityWorld")];
+        let err = pick_named_save(&saves, "Typo", Path::new("saves")).unwrap_err();
+        assert!(err.contains("Typo"), "{err}");
+        assert!(err.contains("Flat") && err.contains("MyCityWorld"), "{err}");
+    }
+
+    #[test]
+    fn pick_named_save_errors_when_there_are_no_saves_at_all() {
+        let err = pick_named_save(&[], "MyCityWorld", Path::new("saves")).unwrap_err();
+        assert!(err.contains("(none)"), "{err}");
+    }
+
     #[test]
     fn saves_directory_from_falls_back_to_the_default_minecraft_layout() {
         let dir = saves_directory_from(None);
@@ -425,9 +582,10 @@ mod tests {
     /// case) should come back as an `Err` with a message, never panic.
     #[test]
     fn try_load_save_from_errors_cleanly_when_the_directory_does_not_exist() {
-        let err = try_load_save_from(Path::new(
-            "definitely-does-not-exist-anywhere/.minecraft/saves",
-        ))
+        let err = try_load_save_from(
+            Path::new("definitely-does-not-exist-anywhere/.minecraft/saves"),
+            None,
+        )
         .unwrap_err();
         assert!(!err.is_empty());
     }
@@ -443,7 +601,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&empty_dir).expect("should be able to create a temp dir");
 
-        let err = try_load_save_from(&empty_dir).unwrap_err();
+        let err = try_load_save_from(&empty_dir, None).unwrap_err();
         assert!(err.contains("no Minecraft saves found"));
 
         std::fs::remove_dir_all(&empty_dir).ok();

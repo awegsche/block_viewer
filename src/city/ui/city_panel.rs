@@ -19,6 +19,14 @@
 //! commit/demolish/undo/save is mid-apply; a UI count one frame stale from a
 //! contended lock is harmless, so this skips the count that frame rather
 //! than blocking on it).
+//!
+//! Ticket 064 added [`world_section`] at the top: which save the citybuilder
+//! actually opened. The viewer says this in its own save picker
+//! (`viewer::ui::save_picker`); the citybuilder has no picker to say it in,
+//! and since a save is now something the command line *chooses* (`argv[2]`),
+//! a mistyped name would otherwise be indistinguishable from a world with no
+//! terrain generated yet — hence [`crate::StartupIssue`] in red right here
+//! rather than only on stdout.
 
 use std::collections::HashMap;
 
@@ -26,6 +34,7 @@ use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts};
 
 use crate::chunk_pipeline::SharedRegionCache;
+use crate::{LoadedSave, StartupIssue};
 
 use super::super::journal::Journal;
 use super::super::save::{SaveCommand, SaveState};
@@ -184,18 +193,37 @@ fn undo_section(ui: &mut egui::Ui, journal: &Journal, undo: &mut UndoCommand) {
     }
 }
 
-/// Egui window: buildings, roads, write status, world save, undo. See the
-/// module docs.
+/// The "World" section (ticket 064): the save this run opened, and why it
+/// couldn't open one if [`crate::StartupIssue`] says so. The region count is
+/// the same "is there anything here at all" signal the viewer's save picker
+/// shows — a real save that reads as `0 regions` is a different problem from
+/// no save at all, and both look identical out of the window.
+fn world_section(ui: &mut egui::Ui, save: &LoadedSave, issue: &StartupIssue) {
+    ui.label(format!("{} ({} regions)", save.0.meta.name, save.0.meta.regions.len()));
+    if let Some(reason) = &issue.0 {
+        ui.colored_label(egui::Color32::RED, reason);
+        ui.label("Pass a saves directory and save name: citybuilder -- <saves dir> <save name>");
+    }
+}
+
+/// Egui window: the save, buildings, roads, write status, world save, undo.
+/// See the module docs.
 pub(super) fn city_panel(
     mut contexts: EguiContexts,
     city: Res<state::City>,
     journal: Res<Journal>,
     write_status: Res<WriteStatus>,
     region_cache: Option<Res<SharedRegionCache>>,
+    loaded_save: Res<LoadedSave>,
+    startup_issue: Res<StartupIssue>,
     mut save: ResMut<SaveCommand>,
     mut undo: ResMut<UndoCommand>,
 ) {
     egui::Window::new("City").show(contexts.ctx_mut(), |ui| {
+        ui.heading("World");
+        world_section(ui, &loaded_save, &startup_issue);
+
+        ui.separator();
         ui.heading("Buildings");
         if city.is_empty() {
             ui.label("(nothing built yet)");

@@ -1008,3 +1008,32 @@ these itself (see CLAUDE.md's "Manual/visual verification").
   docs — needs longer than expected, or a per-frame dispatch budget, for a
   backlog this size).
 
+
+## 064 — save selection on the citybuilder command line
+
+Claude can't run the app; this needs a human at the window.
+
+Run each of these and check the **City** panel's new "World" section at the
+top of the window says what you asked for (name plus region count):
+
+1. `cargo run --bin citybuilder` — unchanged behaviour, the first save found
+   under `%AppData%\.minecraft\saves`.
+2. `cargo run --bin citybuilder -- "" <a save name>` — that save loads, the
+   default saves directory is still used, and the terrain around the camera
+   is that world's, not the first one's.
+3. `cargo run --bin citybuilder -- "" <a save name with the wrong case>` —
+   should load the same world (case-insensitive fallback).
+4. `cargo run --bin citybuilder -- "" NoSuchWorld` — the World section shows
+   a **red** message naming `NoSuchWorld` and listing the saves that do
+   exist, plus the usage line, and the window sits on an empty world rather
+   than silently opening some other save.
+5. `cargo run --bin citybuilder -- "" <full path to a save folder>` — loads
+   that save directly, including one that lives outside any `saves/` folder.
+6. `cargo run --bin block_viewer -- "" <a save name>` — the viewer honours
+   the same argument as its *startup* save, and its own Save picker window
+   still lists and switches saves as before.
+
+Also worth confirming once: place a building in a save picked by name, hit
+"Save world", quit, and reopen that same save by name — the city comes back
+(`city.ron`/`journal.ron` are read from the *selected* save's root, not the
+first save's).

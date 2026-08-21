@@ -227,6 +227,30 @@
 //! own startup load, then kept current by the same plugin) is what a bad
 //! `.ron` file shows up in now, in place of a console line that only 040's
 //! own `../todo.md` check was ever going to read.
+//!
+//! ## Which save it plays on (ticket 064)
+//!
+//! Two positional CLI arguments, parsed by [`crate::saves_directory`]'s own
+//! neighbours in the crate root rather than here, so `block_viewer` honours
+//! them identically as its startup default:
+//!
+//! ```text
+//! citybuilder                                  # the first save found (unchanged)
+//! citybuilder -- "" MyCityWorld                # default saves dir, named save
+//! citybuilder -- D:/instance/saves MyCityWorld # both
+//! citybuilder -- "" D:/worlds/MyCityWorld      # a path straight to a save
+//! ```
+//!
+//! `argv[1]` keeps its ticket 008 meaning (which saves *directory* to scan,
+//! for CurseForge/MultiMC instances); an empty one now means "unset", so a
+//! save name can be given without also spelling out where `.minecraft` is.
+//! Everything per-save that [`run`] loads below — [`state::City`],
+//! [`journal::Journal`], [`CitySavePath`] — hangs off whichever save this
+//! resolves to, which is exactly why the citybuilder has no *runtime* save
+//! picker the way `block_viewer` does: switching live would have to save and
+//! swap all three, and flush the deferred world writes (E) to the save being
+//! left. `ui::city_panel`'s "World" section names the resolved save so a
+//! mistyped name doesn't just look like an ungenerated world.
 
 use std::path::{Path, PathBuf};
 

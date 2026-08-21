@@ -959,8 +959,16 @@ mod tests {
         }
     }
 
+    /// A fixture directory of this test's own. The pid alone isn't unique
+    /// enough: `cycle_test_app` hands every one of its four callers the same
+    /// `name`, and `cargo test` runs them in parallel — so one test's
+    /// `remove_dir_all` below would delete a fixture another was still
+    /// reading, or write a *different* set of styles into it. The counter
+    /// makes each call its own directory regardless of what it's called.
     fn temp_dir(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("block_viewer_test_road_build_{name}_{}", std::process::id()));
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("block_viewer_test_road_build_{name}_{}_{seq}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("should create temp dir");
         dir

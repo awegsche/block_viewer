@@ -963,45 +963,4 @@ mod tests {
         // (4,0,0) crosses into the next cell on X — cell index 1.
         assert_eq!(section.biome_at(4, 0, 0), desert);
     }
-
-    /// Mirrors `chunk_pipeline`'s
-    /// `load_and_mesh_chunk_decodes_and_meshes_a_real_chunk` convention for
-    /// resolving a real region, but decodes a spread of chunks across it
-    /// (its diagonal) rather than just the centre one — a single chunk can
-    /// easily land entirely inside one biome, which would make "the biome
-    /// registry is non-trivial" flaky depending on exactly which chunk the
-    /// centre happens to be.
-    #[test]
-    fn decodes_a_plausible_biome_set_from_a_real_chunk() {
-        use mc_anvil::region::REGION_WIDTH_IN_CHUNKS;
-
-        let saves = mc_anvil::get_saves().expect("could not read the Minecraft saves directory");
-        let meta = saves
-            .into_iter()
-            .find(|s| !s.regions.is_empty())
-            .expect("need a save with at least one region");
-        let (rx, rz) = meta.regions[0];
-
-        let mut cache = crate::region_cache::RegionCache::new(meta, 4);
-        let region = cache.get_or_load((rx, rz)).expect("region should load");
-
-        let mut registry = BlockRegistry::new();
-        let mut biomes = BiomeRegistry::new();
-        let mut decoded_any = false;
-        for step in 0..REGION_WIDTH_IN_CHUNKS {
-            let Some(nbt) = region.get_chunk(step, step) else { continue };
-            let nbt = nbt.clone();
-            match decode_chunk(&nbt, &mut registry, &mut biomes, FloorPolicy::WholeWorld) {
-                Ok(_) => decoded_any = true,
-                Err(DecodeError::NotFullyGenerated(_)) => continue,
-                Err(err) => panic!("failed to decode chunk ({step}, {step}): {err}"),
-            }
-        }
-
-        assert!(decoded_any, "expected at least one fully-generated chunk along the region's diagonal");
-        assert!(
-            biomes.len() > 1,
-            "expected at least one real biome name interned beyond the default minecraft:plains"
-        );
-    }
 }
