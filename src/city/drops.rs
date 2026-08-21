@@ -54,7 +54,6 @@ use super::inventory::Parcel;
 /// The three names that are air. `BlockState::AIR` covers the first; the
 /// other two only ever appear in generated terrain, which is exactly what a
 /// placement clears.
-#[allow(dead_code)] // read by `drop_for` — see `impl DropTable`
 const AIR_NAMES: [&str; 3] = [BlockState::AIR, "minecraft:cave_air", "minecraft:void_air"];
 
 /// One entry of the file's `replaced` map: what a block gives instead of
@@ -95,11 +94,6 @@ pub struct DropTable {
     replaced: HashMap<String, Drop>,
 }
 
-// Ticket 073 is what wires the table to the write paths (placement credits
-// what it cleared, terraform credits what it dug); until that commit lands
-// only the tests below call these, the same "no caller yet" mark
-// `city::road`'s F4 queries carry.
-#[allow(dead_code)]
 impl DropTable {
     /// What clearing `block` yields: the item id and how many, or `None` for
     /// air and for anything the table says gives nothing.

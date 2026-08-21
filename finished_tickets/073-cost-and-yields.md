@@ -95,6 +95,22 @@ in `todo.md` and the roadmap rather than smuggled in here.
 7. Roadmap H2 rewritten as done, with the salvage/definition-id follow-ups
    named; `todo.md` gets the visual checks.
 
+## What shipped that the plan above didn't say
+
+- `city::undo::settle_reverse` is a plain function rather than two lines
+  inside `start_undo`, so "undo is the exact inverse" is testable without a
+  loaded save — `start_undo` refuses before it reaches the settlement
+  without one.
+- Terraform reuses `journal::Baseline::capture` purely as the "what was
+  written where, and what was there before" pairing, so dig and level settle
+  through one code path instead of two. Nothing is journaled: the stock is
+  the only record a drag leaves, exactly like the terrain itself.
+- **No bootstrap.** Nothing grants a founding stock, so on a fresh save the
+  only earnable materials are what terraforming digs up, and the shipped
+  `house01` (40 planks, 20 cobblestone) can't be built. Named in the roadmap
+  and in `todo.md`'s manual check; picking the answer (a starting grant,
+  cheaper tier-1 costs, or wood as a dig yield) is a balance decision.
+
 ## Done when
 
 - `cargo check` and `cargo test` pass.

@@ -541,11 +541,48 @@ world is made of are the economy's own units.
   says, and **anything else drops itself**, so a missing table is a crude
   economy rather than a dead one. Keyed on `BlockState::name` alone;
   properties, tools and randomness are all deliberately out of scope.
-- **Charging and crediting (ticket 073)** — one rule: *a write that removes
-  blocks credits their drops; a write that restores blocks debits them; a
-  building's own blocks are what `cost` buys.* See that ticket for the four
-  write paths it applies to, and for why demolition charges for its own
-  backfill (without it, `place -> demolish -> place` is a stone farm).
+- **Charging and crediting (ticket 073, done)** — one rule: *a write that
+  removes blocks credits their drops; a write that restores blocks debits
+  them; a building's own blocks are what `cost` buys.* Applied to all four
+  write paths: a placement spends its definition's `cost` the instant
+  `place_building` claims the tiles (refused before anything is claimed if
+  it can't be paid, refunded verbatim if the apply fails) and credits the
+  drops of `baseline.previous` on success; a terraform drag credits what it
+  replaced and debits what it wrote (dig and level are the same rule, not
+  two modes); a **demolition pays for its own backfill** and salvages
+  nothing, which is what stops `place -> demolish -> place` from being a
+  stone farm; undo settles the entry's own recorded numbers in reverse.
+  - **The ledger is recorded, not recomputed** — `journal::Ledger` on every
+    entry, `journal.ron` version **2**, read as a band `1..=2` (ticket 069's
+    precedent, and the one place in this crate where a band beats
+    `persistence`'s equality check: refusing a version-1 journal would
+    discard every as-built baseline in it — roadmap I1, unrecoverable after
+    the fact — to avoid defaulting a field whose correct value for those
+    entries is provably empty). Recomputing a cost at undo time would refund
+    a number nobody paid, since definitions hot-reload.
+  - **Debits clamp, costs don't.** `Stock::remove_parcel` takes what's there:
+    a demolition or an undo settles a world change that has already landed,
+    and blocking one for want of dirt would leave city state and the world
+    unable to agree. `Stock::spend` is the opposite — all-or-nothing, because
+    a half-paid building must not exist.
+  - **`PlacementSelection::definition_id`** — the build menu now names the
+    *definition* alongside the catalogue id, because `cost` lives on the
+    `.ron` and the two stems are free to differ. A selection made through
+    `city::placement`'s keyboard stand-in has no definition behind it and is
+    placed **free**, the same hole that already leaves it with no
+    requirements and no production.
+  - **Known gap, deliberately not smuggled in**: `PlacedBuilding::definition`
+    is a *catalogue* id, so a **placed** building still can't find its own
+    definition (this also means `build_menu`'s requirement check only works
+    while the two stems coincide). Production is the first mechanic that
+    needs it per-instance, and it's a `city.ron` version bump — it belongs to
+    that ticket.
+  - **No bootstrap yet.** Nothing grants a founding stock, and the only
+    materials a new city can earn are what terraforming digs up — so the
+    shipped `house01` (40 planks, 20 cobblestone) can't be built on a fresh
+    save. A starting grant, cheaper tier-1 costs, or wood as a dig yield are
+    all one-line answers; picking one is a balance decision, not a
+    mechanical one.
 - **Still open**: production, warehouses, and haulage along roads —
   a producer's output has to reach a warehouse, and how long that takes comes
   from the road distance and each road type's `travel_speed` (loaded and
@@ -656,8 +693,9 @@ reusing `selection::gizmo`) beats making the player click to find out.
   the entities are dropped with a warning. Removing *existing* ones we
   overwrite is in scope — corruption avoidance, not a feature.
 - **Entities and mobs.** Structure files can carry them. Ignored.
-- **Production simulation, resources, spending.** The definition fields, H2
-  and I4's malus carry the data; nothing consumes it.
+- **Production simulation.** Resources and spending landed in iteration 2
+  (H2, tickets 072/073); production itself, warehouses and haulage have not,
+  and I4's malus still has nothing to multiply.
 - **Damage detection (I2–I7).** Iteration 2 — but I1's baseline belongs to
   iteration 1, since it can't be added retroactively.
 - **Obstruction as a distinct mechanic** (blocks placed in a building's

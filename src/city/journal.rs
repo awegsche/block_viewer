@@ -53,6 +53,7 @@ use crate::blueprint::{BlockState, Rotation};
 use crate::edit::route::refusal_for;
 use crate::edit::{BlockEdit, EditReport, RegionSource, WorldEdit};
 
+use super::inventory::Parcel;
 use super::state::{BuildingId, City, PlacedBuilding, PlacementError};
 
 // -------------------------------------------------------------------------------------------------
@@ -129,6 +130,51 @@ impl Baseline {
 }
 
 // -------------------------------------------------------------------------------------------------
+// ---- the stock delta (ticket 073) -----------------------------------------------------------------
+// -------------------------------------------------------------------------------------------------
+
+/// What one journaled action moved in and out of [`super::inventory::Stock`]
+/// — the materials half of the same record the [`Baseline`] is the blocks
+/// half of.
+///
+/// Recorded rather than recomputed, and that is the whole point: undo settles
+/// **exactly what was settled**, so a definition whose `cost` was edited
+/// between the placement and the undo (hot reload makes that a normal
+/// Tuesday) can't refund a number nobody ever paid. The same argument the
+/// baseline makes for recording what a placement *wrote* instead of
+/// re-deriving it from the blueprint.
+///
+/// `debited` is what was actually taken, not what was asked for —
+/// [`super::inventory::Stock::remove_parcel`] clamps at zero, and undoing a
+/// clamped debit must not hand back materials that were never removed.
+///
+/// Serde-derived directly rather than through a mirror type, the same call
+/// [`crate::blueprint::Rotation`] and [`BlockState`] already got here: both
+/// halves are plain maps, with none of the `IVec3` awkwardness
+/// [`SavedBaseline`] exists for.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Ledger {
+    /// Materials the action added to the stock — the drops of the blocks it
+    /// cleared out of the world.
+    #[serde(default)]
+    pub credited: Parcel,
+    /// Materials the action took out of the stock — a placement's `cost`, or
+    /// the drops of the blocks it put *back* into the world.
+    #[serde(default)]
+    pub debited: Parcel,
+}
+
+impl Ledger {
+    /// A ledger that moved nothing: what every entry written before ticket
+    /// 073 gets on load, and what a free building placed through the
+    /// keyboard stand-in records.
+    #[allow(dead_code)] // read by this module's tests and by anything displaying an entry
+    pub fn is_empty(&self) -> bool {
+        self.credited.is_empty() && self.debited.is_empty()
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
 // ---- the journal entry ---------------------------------------------------------------------------
 // -------------------------------------------------------------------------------------------------
 
@@ -142,21 +188,30 @@ impl Baseline {
 #[derive(Debug, Clone)]
 pub enum JournalEntry {
     /// `baseline.written` is the building's own blocks; `baseline.previous`
-    /// is the terrain that stood there before it was placed.
+    /// is the terrain that stood there before it was placed. `ledger.debited`
+    /// is what the definition's `cost` actually took; `ledger.credited` is
+    /// the drops of that cleared terrain.
     Placed {
         building: BuildingId,
         placement: PlacedBuilding,
         baseline: Baseline,
+        ledger: Ledger,
     },
     /// `baseline.written` is the terrain restored in the building's place;
     /// `baseline.previous` is the building's own blocks, read off the world
     /// at demolition time — not re-derived from the blueprint, so a building
     /// damaged before it was demolished demolishes (and undoes) as what it
     /// actually was, not as though it had never been touched.
+    /// `ledger.debited` is the drops of that restored terrain — a
+    /// demolition pays for its own backfill, which is what stops
+    /// `place -> demolish -> place` from being a way to make stone. Nothing
+    /// is credited: a demolished building's own blocks are lost, not
+    /// salvaged (see `city::demolish`).
     Demolished {
         building: BuildingId,
         placement: PlacedBuilding,
         baseline: Baseline,
+        ledger: Ledger,
     },
 }
 
@@ -174,6 +229,16 @@ impl JournalEntry {
     pub fn baseline(&self) -> &Baseline {
         match self {
             JournalEntry::Placed { baseline, .. } | JournalEntry::Demolished { baseline, .. } => baseline,
+        }
+    }
+
+    /// What this entry moved in and out of the stock (ticket 073) — read by
+    /// [`Journal::undo_last`] to settle it in reverse, and by anything that
+    /// wants to show what an action cost.
+    #[allow(dead_code)] // `undo_last` matches the variants directly; this is for readers
+    pub fn ledger(&self) -> &Ledger {
+        match self {
+            JournalEntry::Placed { ledger, .. } | JournalEntry::Demolished { ledger, .. } => ledger,
         }
     }
 
@@ -207,8 +272,8 @@ impl Journal {
     ///
     /// Called by `city::commit::poll_commit` (ticket 048, roadmap E4) once a
     /// placement's write has actually succeeded.
-    pub fn record_placement(&mut self, building: BuildingId, placement: PlacedBuilding, baseline: Baseline) {
-        self.entries.push(JournalEntry::Placed { building, placement, baseline });
+    pub fn record_placement(&mut self, building: BuildingId, placement: PlacedBuilding, baseline: Baseline, ledger: Ledger) {
+        self.entries.push(JournalEntry::Placed { building, placement, baseline, ledger });
     }
 
     /// Appends a demolition entry. `placement` is what [`City::remove_building`]
@@ -219,8 +284,8 @@ impl Journal {
     /// once a demolition's restoring write has actually succeeded — the same
     /// "record only after the write lands" ordering [`record_placement`](Self::record_placement)
     /// already uses.
-    pub fn record_demolition(&mut self, building: BuildingId, placement: PlacedBuilding, baseline: Baseline) {
-        self.entries.push(JournalEntry::Demolished { building, placement, baseline });
+    pub fn record_demolition(&mut self, building: BuildingId, placement: PlacedBuilding, baseline: Baseline, ledger: Ledger) {
+        self.entries.push(JournalEntry::Demolished { building, placement, baseline, ledger });
     }
 
     /// `city::undo` (ticket 050) reads the last entry off this before
@@ -276,6 +341,7 @@ impl Journal {
     pub fn undo_last(&mut self, city: &mut City) -> Result<UndoStep, UndoError> {
         let entry = self.entries.last().ok_or(UndoError::Empty)?;
         let edit = entry.baseline().restore_edit();
+        let ledger = entry.ledger().clone();
 
         let building = match entry {
             JournalEntry::Placed { building, .. } => {
@@ -295,7 +361,7 @@ impl Journal {
         };
 
         self.entries.pop();
-        Ok(UndoStep { building, edit })
+        Ok(UndoStep { building, edit, ledger })
     }
 }
 
@@ -306,6 +372,12 @@ impl Journal {
 pub struct UndoStep {
     pub building: BuildingId,
     pub edit: WorldEdit,
+    /// What the undone entry moved in and out of the stock — the caller
+    /// settles it in reverse (add back what was debited, take back what was
+    /// credited). Handed over rather than settled here for the same reason
+    /// `edit` is: this module knows nothing about resources, only about the
+    /// record.
+    pub ledger: Ledger,
 }
 
 /// Why [`Journal::undo_last`] couldn't undo.
@@ -460,10 +532,30 @@ pub fn repair_edit(report: &ReconcileReport) -> Option<WorldEdit> {
 // block in every building's baseline would be a lot of copying for no
 // benefit.
 
-/// The journal file's schema version. Bumped only alongside a migration
-/// path — no migration exists yet, so a mismatch is refused rather than
-/// guessed at, the same call ticket 043 made for [`super::persistence`].
-pub const CURRENT_VERSION: u32 = 1;
+/// The journal file's schema version. Version 2 (ticket 073) added each
+/// entry's [`Ledger`].
+pub const CURRENT_VERSION: u32 = 2;
+
+/// The oldest version [`load_journal`] will read — a **band**, not
+/// [`super::persistence`]'s equality check, and ticket 069's precedent for
+/// preferring one where it's warranted.
+///
+/// It is warranted here and nowhere else in this crate's save files. A
+/// version-1 journal has no [`Ledger`] on its entries, and the correct value
+/// for those entries is provably *empty*: they were written before the
+/// economy existed, so they moved no materials, and undoing one should
+/// settle nothing. That is a fact about the old file, not a default standing
+/// in for an unknown — which is exactly the distinction `persistence`'s
+/// "no quiet defaults" note draws.
+///
+/// The cost of getting it wrong is also asymmetric. Refusing a version-1
+/// journal would discard every **as-built baseline** in it — roadmap I1's
+/// whole point, the one record that "cannot be added retroactively" — to
+/// avoid defaulting a field whose value isn't in doubt. `city.ron` is
+/// refused instead because a mis-defaulted road cell silently builds the
+/// wrong world; a mis-defaulted ledger, if it were even possible here, would
+/// cost the player some dirt.
+pub const MIN_READABLE_VERSION: u32 = 1;
 
 const JOURNAL_FILE: &str = "citybuilder/journal.ron";
 
@@ -485,8 +577,23 @@ struct SavedJournal {
 
 #[derive(Debug, Serialize, Deserialize)]
 enum SavedEntry {
-    Placed { building: u64, placement: SavedPlacement, baseline: SavedBaseline },
-    Demolished { building: u64, placement: SavedPlacement, baseline: SavedBaseline },
+    // `ledger` is `#[serde(default)]` so a version-1 entry reads back with an
+    // empty one — see [`MIN_READABLE_VERSION`] for why that particular
+    // default is a fact rather than a guess.
+    Placed {
+        building: u64,
+        placement: SavedPlacement,
+        baseline: SavedBaseline,
+        #[serde(default)]
+        ledger: Ledger,
+    },
+    Demolished {
+        building: u64,
+        placement: SavedPlacement,
+        baseline: SavedBaseline,
+        #[serde(default)]
+        ledger: Ledger,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -557,7 +664,10 @@ impl std::fmt::Display for JournalError {
             JournalError::Io(err) => write!(f, "{err}"),
             JournalError::Parse(msg) => write!(f, "{msg}"),
             JournalError::UnsupportedVersion(version) => {
-                write!(f, "journal is version {version}, this build reads version {CURRENT_VERSION}")
+                write!(
+                    f,
+                    "journal is version {version}, this build reads versions {MIN_READABLE_VERSION}-{CURRENT_VERSION}"
+                )
             }
         }
     }
@@ -579,15 +689,17 @@ pub fn save_journal(journal: &Journal, save_root: &Path) -> Result<(), JournalEr
         .entries
         .iter()
         .map(|entry| match entry {
-            JournalEntry::Placed { building, placement, baseline } => SavedEntry::Placed {
+            JournalEntry::Placed { building, placement, baseline, ledger } => SavedEntry::Placed {
                 building: building.as_u64(),
                 placement: saved_placement(placement),
                 baseline: saved_baseline(baseline),
+                ledger: ledger.clone(),
             },
-            JournalEntry::Demolished { building, placement, baseline } => SavedEntry::Demolished {
+            JournalEntry::Demolished { building, placement, baseline, ledger } => SavedEntry::Demolished {
                 building: building.as_u64(),
                 placement: saved_placement(placement),
                 baseline: saved_baseline(baseline),
+                ledger: ledger.clone(),
             },
         })
         .collect();
@@ -611,7 +723,7 @@ pub fn load_journal(save_root: &Path) -> Result<Journal, JournalError> {
     };
 
     let save: SavedJournal = ron::de::from_str(&text).map_err(|err| JournalError::Parse(err.to_string()))?;
-    if save.version != CURRENT_VERSION {
+    if !(MIN_READABLE_VERSION..=CURRENT_VERSION).contains(&save.version) {
         return Err(JournalError::UnsupportedVersion(save.version));
     }
 
@@ -619,15 +731,17 @@ pub fn load_journal(save_root: &Path) -> Result<Journal, JournalError> {
         .entries
         .into_iter()
         .map(|entry| match entry {
-            SavedEntry::Placed { building, placement, baseline } => JournalEntry::Placed {
+            SavedEntry::Placed { building, placement, baseline, ledger } => JournalEntry::Placed {
                 building: BuildingId::from_u64(building),
                 placement: placement_from_saved(placement),
                 baseline: baseline_from_saved(baseline),
+                ledger,
             },
-            SavedEntry::Demolished { building, placement, baseline } => JournalEntry::Demolished {
+            SavedEntry::Demolished { building, placement, baseline, ledger } => JournalEntry::Demolished {
                 building: BuildingId::from_u64(building),
                 placement: placement_from_saved(placement),
                 baseline: baseline_from_saved(baseline),
+                ledger,
             },
         })
         .collect();

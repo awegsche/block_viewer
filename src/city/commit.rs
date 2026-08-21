@@ -76,6 +76,38 @@
 //! `Arc<Mutex<RegionCache>>` still serializes concurrent applies correctly
 //! on its own, and `WriteGate` was removed.
 
+//! ## Paying for it, and being paid for the hole (ticket 073)
+//!
+//! A placement is the first half of iteration 2's rule — *a write that
+//! removes blocks credits their drops; a write that restores blocks debits
+//! them; a building's own blocks are what `cost` buys*:
+//!
+//! - The definition's `cost` is spent the instant
+//!   [`state::City::place_building`] claims the tiles, in the same
+//!   synchronous step and for the same reason: two clicks in flight must not
+//!   both be able to afford the last forty planks. Unaffordable is a refusal
+//!   before anything is claimed at all, reported through [`WriteStatus`] so
+//!   the city panel says why nothing happened.
+//! - The terrain the placement cleared is credited on success, out of the
+//!   baseline's `previous` (what the write overwrote) through
+//!   [`super::drops::DropTable`] — the same record roadmap I1 already
+//!   captures, read a second way.
+//! - A failed apply refunds exactly what was spent, beside the
+//!   [`state::City::remove_building`] rollback that was already there.
+//!
+//! Both halves land on the journal entry's [`journal::Ledger`], so undo can
+//! reverse this placement's own numbers rather than recomputing a cost that
+//! may since have been edited under it.
+//!
+//! ## Which definition's cost, though
+//!
+//! [`PlacementSelection`] names a *catalogue* id (the `.nbt` stem); `cost`
+//! lives on a *definition* (the `.ron`), and the two are allowed to differ.
+//! [`PlacementSelection::definition_id`] is the bridge the build menu fills
+//! in; a selection made through `city::placement`'s keyboard stand-in has no
+//! definition behind it and is therefore **free**, the same hole that
+//! already leaves such a placement with no requirements and no production.
+
 use std::sync::{Arc, Mutex};
 
 use bevy::prelude::*;
@@ -88,7 +120,10 @@ use crate::edit::{EditPolicy, EditRefusal, EditReport, WorldEdit};
 use crate::region_cache::RegionCache;
 use crate::DecodedWorld;
 
-use super::journal::{self, Journal};
+use super::definition::BuildingDefinitions;
+use super::drops::DropTable;
+use super::inventory::{Parcel, Stock};
+use super::journal::{self, Journal, Ledger};
 use super::picking::{HoveredBlock, PickingSet};
 use super::placement::{self, GhostPlacement, PlacementSelection};
 use super::state::{self, BuildingId, PlacedBuilding};
@@ -103,6 +138,11 @@ struct PendingCommit {
     /// ([`journal::Baseline::capture`] needs the edit *and* the report it
     /// produced) without recomputing it from the blueprint a second time.
     edit: WorldEdit,
+    /// What [`Stock::spend`] actually took for this placement — refunded
+    /// verbatim if the apply fails, journaled as the entry's
+    /// [`Ledger::debited`] if it succeeds. Kept here rather than looked up
+    /// again later: the definition it came from can be hot-reloaded mid-write.
+    spent: Parcel,
     task: Task<Result<EditReport, EditRefusal>>,
 }
 
@@ -117,6 +157,14 @@ pub struct CommitPlugin;
 impl Plugin for CommitPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<CommitState>()
+            // Ticket 073's three, all `init_resource` for the same reason
+            // `WriteStatus` below is: `city::run` inserts the real ones
+            // before adding any plugin, and a bare test `App` gets empty
+            // defaults (no definitions -> free, no drop table -> every block
+            // drops itself) instead of a missing-resource panic.
+            .init_resource::<Stock>()
+            .init_resource::<DropTable>()
+            .init_resource::<BuildingDefinitions>()
             // `city::demolish::DemolishPlugin`/`city::undo::UndoPlugin`
             // initialize the same resource — `init_resource` only inserts a
             // default when one isn't already present, so it doesn't matter
@@ -190,6 +238,9 @@ fn try_commit_placement(
     mut commit: ResMut<CommitState>,
     region_cache: Option<Res<SharedRegionCache>>,
     tool: Option<Res<ActiveTool>>,
+    definitions: Res<BuildingDefinitions>,
+    mut stock: ResMut<Stock>,
+    mut write_status: ResMut<WriteStatus>,
 ) {
     // Ticket 055, roadmap F2: a left click while the road tool is active is
     // `city::road_build`'s to react to, not this. `Option` and a default of
@@ -247,6 +298,25 @@ fn try_commit_placement(
         return;
     }
 
+    // Ticket 073: what this placement costs, if a definition was selected at
+    // all — see the module docs' "Which definition's cost, though".
+    let costs = selection
+        .definition_id
+        .as_deref()
+        .and_then(|definition| definitions.get(definition))
+        .map(|definition| definition.building.cost.clone())
+        .unwrap_or_default();
+
+    // Checked before the tile is claimed, so a refusal leaves nothing behind
+    // to roll back; the `spend` below can't then fail, since nothing between
+    // the two touches the stock.
+    if !stock.can_afford(&costs) {
+        let shortfall = stock.shortfall(&costs);
+        println!("block_viewer: can't afford {id}: needs {shortfall}");
+        write_status.record_failure(WriteKind::Placed, id, format!("can't afford it — needs {shortfall}"));
+        return;
+    }
+
     let building = match city.place_building(id.clone(), origin, selection.rotation, entry.footprint) {
         Ok(building) => building,
         Err(err) => {
@@ -254,6 +324,7 @@ fn try_commit_placement(
             return;
         }
     };
+    let spent = stock.spend(&costs).expect("can_afford said so, and nothing since has touched the stock");
     let placed = PlacedBuilding { definition: id, origin, rotation: selection.rotation, footprint: entry.footprint };
 
     let cache: Arc<Mutex<RegionCache>> = region_cache.0.clone();
@@ -265,7 +336,7 @@ fn try_commit_placement(
         apply_building_edit(&mut cache, &task_edit, &policy)
     });
 
-    commit.pending = Some(PendingCommit { building, placement: placed, edit, task });
+    commit.pending = Some(PendingCommit { building, placement: placed, edit, spent, task });
 }
 
 /// Single non-blocking poll of the in-flight commit, the same
@@ -279,6 +350,8 @@ fn poll_commit(
     mut journal: ResMut<Journal>,
     mut write_status: ResMut<WriteStatus>,
     mut edited: EventWriter<ChunksEdited>,
+    mut stock: ResMut<Stock>,
+    drops: Res<DropTable>,
 ) {
     let result = {
         let Some(pending) = &mut commit.pending else { return };
@@ -287,7 +360,7 @@ fn poll_commit(
         };
         result
     };
-    let PendingCommit { building, placement, edit, .. } = commit.pending.take().expect("just matched Some above");
+    let PendingCommit { building, placement, edit, spent, .. } = commit.pending.take().expect("just matched Some above");
 
     match result {
         Ok(report) => {
@@ -302,13 +375,29 @@ fn poll_commit(
             // defensive shape `Baseline::capture`'s own doc comment expects
             // of a caller, not a case this path expects to actually miss.
             if let Some(baseline) = journal::Baseline::capture(&edit, &report) {
-                journal.record_placement(building, placement.clone(), baseline);
+                // Ticket 073: the terrain this placement cleared, credited
+                // out of the very record roadmap I1 already keeps. `previous`
+                // is what each written position held before — air included,
+                // which the drop table drops on the floor.
+                let credited = drops.parcel_for(baseline.previous.iter().map(|(_, state)| state));
+                stock.add_parcel(&credited);
+                if !credited.is_empty() || !spent.is_empty() {
+                    println!(
+                        "block_viewer:   paid {} unit(s), recovered {} unit(s) of material",
+                        spent.total(),
+                        credited.total()
+                    );
+                }
+                journal.record_placement(building, placement.clone(), baseline, Ledger { credited, debited: spent });
             }
             write_status.record_success(WriteKind::Placed, placement.definition, &report);
             edited.send(ChunksEdited(report.chunks));
         }
         Err(err) => {
             city.remove_building(building);
+            // The cost was taken the instant the tile was claimed; both halves
+            // of that claim come back together.
+            stock.add_parcel(&spent);
             println!("block_viewer: placement of {} failed, rolled back: {err}", placement.definition);
             write_status.record_failure(WriteKind::Placed, placement.definition, err.to_string());
         }
@@ -575,7 +664,7 @@ mod tests {
         let task = pool().spawn(async move { Ok(report) });
 
         app.world_mut().resource_mut::<CommitState>().pending =
-            Some(PendingCommit { building, placement: a_placement(), edit: task_edit, task });
+            Some(PendingCommit { building, placement: a_placement(), edit: task_edit, spent: Parcel::default(), task });
 
         run_until_settled(&mut app);
 
@@ -604,7 +693,7 @@ mod tests {
 
         let task = pool().spawn(async { Err(EditRefusal::Empty) });
         app.world_mut().resource_mut::<CommitState>().pending =
-            Some(PendingCommit { building, placement: a_placement(), edit: WorldEdit::new(), task });
+            Some(PendingCommit { building, placement: a_placement(), edit: WorldEdit::new(), spent: Parcel::default(), task });
 
         run_until_settled(&mut app);
 
@@ -615,5 +704,92 @@ mod tests {
 
         let fired = app.world_mut().resource_mut::<Events<ChunksEdited>>().drain().count();
         assert_eq!(fired, 0, "nothing changed in the world, so nothing needs re-meshing");
+    }
+
+    // --- ticket 073: the ledger ---------------------------------------------
+
+    fn a_parcel(items: &[(&str, u64)]) -> Parcel {
+        let mut parcel = Parcel::default();
+        for &(item, count) in items {
+            parcel.add(item, count);
+        }
+        parcel
+    }
+
+    /// A pending commit that cleared `replaced` out of the world and paid
+    /// `spent` for the privilege.
+    fn pending_that_replaced(
+        building: BuildingId,
+        replaced: Vec<(IVec3, BlockState)>,
+        spent: Parcel,
+        result: Result<EditReport, EditRefusal>,
+    ) -> PendingCommit {
+        let mut edit = WorldEdit::new();
+        for (at, _) in &replaced {
+            edit.set(*at, state_named("minecraft:oak_planks"));
+        }
+        let task = pool().spawn(async move { result });
+        PendingCommit { building, placement: a_placement(), edit, spent, task }
+    }
+
+    #[test]
+    fn a_successful_placement_credits_the_terrain_it_cleared() {
+        let mut app = commit_test_app();
+        let building = app
+            .world_mut()
+            .resource_mut::<state::City>()
+            .place_building("house01", IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::new(2, 2))
+            .unwrap();
+
+        // Two stone, one air: with the default (empty) drop table stone
+        // drops itself, and air is never a drop at all.
+        let replaced = vec![
+            (IVec3::new(0, 64, 0), state_named("minecraft:stone")),
+            (IVec3::new(1, 64, 0), state_named("minecraft:stone")),
+            (IVec3::new(2, 64, 0), BlockState::air()),
+        ];
+        let report = EditReport {
+            blocks_written: 3,
+            chunks: vec![(0, 0)],
+            regions: vec![(0, 0)],
+            replaced: Some(replaced.clone()),
+        };
+        app.world_mut().resource_mut::<CommitState>().pending =
+            Some(pending_that_replaced(building, replaced, a_parcel(&[("minecraft:oak_planks", 40)]), Ok(report)));
+
+        run_until_settled(&mut app);
+
+        let stock = app.world().resource::<Stock>();
+        assert_eq!(stock.count("minecraft:stone"), 2);
+        assert_eq!(stock.count(BlockState::AIR), 0, "air is not a material");
+
+        let journal = app.world().resource::<Journal>();
+        let ledger = journal.entries().last().unwrap().ledger();
+        assert_eq!(ledger.credited, a_parcel(&[("minecraft:stone", 2)]));
+        assert_eq!(ledger.debited, a_parcel(&[("minecraft:oak_planks", 40)]), "the ledger records what was actually paid");
+    }
+
+    #[test]
+    fn a_failed_placement_refunds_exactly_what_it_spent() {
+        let mut app = commit_test_app();
+        app.world_mut().resource_mut::<Stock>().add("minecraft:oak_planks", 10);
+        let building = app
+            .world_mut()
+            .resource_mut::<state::City>()
+            .place_building("house01", IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::new(2, 2))
+            .unwrap();
+
+        app.world_mut().resource_mut::<CommitState>().pending = Some(pending_that_replaced(
+            building,
+            vec![(IVec3::new(0, 64, 0), state_named("minecraft:stone"))],
+            a_parcel(&[("minecraft:oak_planks", 40)]),
+            Err(EditRefusal::Empty),
+        ));
+
+        run_until_settled(&mut app);
+
+        let stock = app.world().resource::<Stock>();
+        assert_eq!(stock.count("minecraft:oak_planks"), 50, "the cost comes back with the rolled-back city entry");
+        assert_eq!(stock.count("minecraft:stone"), 0, "and a write that never landed cleared nothing to credit");
     }
 }

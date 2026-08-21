@@ -86,6 +86,17 @@ use super::tool::ActiveTool;
 #[derive(Resource, Debug, Default, Clone, PartialEq, Eq)]
 pub struct PlacementSelection {
     pub catalogue_id: Option<String>,
+    /// Which *definition* (`assets/city/buildings/<id>.ron`) the selection
+    /// came from, when it came from one at all — the build menu sets it,
+    /// [`cycle_selection`]'s keyboard stand-in leaves it `None`.
+    ///
+    /// [`catalogue_id`](Self::catalogue_id) alone can't stand in for it: a
+    /// `.ron` names the `.nbt` it uses, and the two stems are free to
+    /// differ, so a blueprint doesn't identify the game data placed with it.
+    /// Ticket 073 needs the definition to charge the placement's `cost`; a
+    /// selection with no definition behind it has no cost, no requirements
+    /// and no production, and is placed free.
+    pub definition_id: Option<String>,
     pub rotation: Rotation,
     /// Added to whichever Y [`resolve_placement`] would otherwise have used
     /// — [`grid::fit_footprint`]'s `base_y` on a fit, the hovered block's
@@ -206,6 +217,7 @@ fn cycle_selection(
 
     if keys.just_pressed(KeyCode::Escape) {
         selection.catalogue_id = None;
+        selection.definition_id = None;
         selection.y_offset = 0;
     }
     if keys.just_pressed(KeyCode::KeyR) {
@@ -230,6 +242,9 @@ fn cycle_selection(
         if keys.just_pressed(*key) {
             if let Some(&id) = ids.get(index) {
                 selection.catalogue_id = Some(id.to_string());
+                // A catalogue entry picked straight off the keyboard has no
+                // definition behind it — see `definition_id`'s own docs.
+                selection.definition_id = None;
                 selection.y_offset = 0;
             }
         }
@@ -763,7 +778,7 @@ mod tests {
     #[test]
     fn resolve_ghost_is_hidden_with_no_hovered_block() {
         let mut ghost = GhostState::default();
-        let selection = PlacementSelection { catalogue_id: Some("house01".to_string()), rotation: Rotation::Deg0, y_offset: 0 };
+        let selection = PlacementSelection { catalogue_id: Some("house01".to_string()), definition_id: None, rotation: Rotation::Deg0, y_offset: 0 };
         let dir = temp_dir("hidden_no_hover");
         let catalogue = catalogue_with(&dir, &[("house01", IVec3::new(2, 2, 2))]);
         let world = flat_world(63);
@@ -786,7 +801,7 @@ mod tests {
         // Ticket 055, roadmap F2/F3: the two tools' previews must never both
         // draw at once — `city::road_build` owns the preview here.
         let mut ghost = GhostState::default();
-        let selection = PlacementSelection { catalogue_id: Some("house01".to_string()), rotation: Rotation::Deg0, y_offset: 0 };
+        let selection = PlacementSelection { catalogue_id: Some("house01".to_string()), definition_id: None, rotation: Rotation::Deg0, y_offset: 0 };
         let dir = temp_dir("hidden_road_tool");
         let catalogue = catalogue_with(&dir, &[("house01", IVec3::new(2, 2, 2))]);
         let world = flat_world(63);
@@ -817,7 +832,7 @@ mod tests {
     #[test]
     fn resolve_ghost_shows_the_valid_material_on_buildable_free_ground() {
         let mut ghost = GhostState::default();
-        let selection = PlacementSelection { catalogue_id: Some("house01".to_string()), rotation: Rotation::Deg0, y_offset: 0 };
+        let selection = PlacementSelection { catalogue_id: Some("house01".to_string()), definition_id: None, rotation: Rotation::Deg0, y_offset: 0 };
         let dir = temp_dir("shown_valid");
         let catalogue = catalogue_with(&dir, &[("house01", IVec3::new(2, 2, 2))]);
         let world = flat_world(63);
@@ -848,7 +863,7 @@ mod tests {
     #[test]
     fn resolve_ghost_shows_the_invalid_material_when_occupied() {
         let mut ghost = GhostState::default();
-        let selection = PlacementSelection { catalogue_id: Some("house01".to_string()), rotation: Rotation::Deg0, y_offset: 0 };
+        let selection = PlacementSelection { catalogue_id: Some("house01".to_string()), definition_id: None, rotation: Rotation::Deg0, y_offset: 0 };
         let dir = temp_dir("shown_invalid");
         let catalogue = catalogue_with(&dir, &[("house01", IVec3::new(2, 2, 2))]);
         let world = flat_world(63);

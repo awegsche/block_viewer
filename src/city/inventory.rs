@@ -74,17 +74,15 @@ use super::definition::Cost;
 ///
 /// `BTreeMap`, not `HashMap`: every consumer either displays this or writes
 /// it to a RON file, and both want a stable order.
+/// `#[serde(transparent)]`: a parcel is written as the bare map it is
+/// (`{"minecraft:dirt": 12}`) rather than nested under a field name nobody
+/// reading `journal.ron` by hand wants to see.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct Parcel {
     items: BTreeMap<String, u64>,
 }
 
-// Ticket 073 is the wiring — a placement charges its cost, a cleared block
-// credits its drop, an undo settles the difference — and it makes real
-// callers of everything in this file. Until then only the city panel's stock
-// list and the tests below read it; marked rather than left warning, the
-// same "no caller yet" note `city::road`'s F4 queries carry.
-#[allow(dead_code)]
 impl Parcel {
     /// Adds `amount` of `item`, saturating rather than wrapping — a count
     /// that has reached `u64::MAX` is already meaningless, and wrapping to
@@ -97,6 +95,9 @@ impl Parcel {
         *entry = entry.saturating_add(amount);
     }
 
+    /// Read by tests and by ticket 074's shipments; the panels and the write
+    /// paths all go through [`iter`](Self::iter) or [`total`](Self::total).
+    #[allow(dead_code)]
     pub fn get(&self, item: &str) -> u64 {
         self.items.get(item).copied().unwrap_or(0)
     }
@@ -111,6 +112,7 @@ impl Parcel {
 
     /// How many *distinct* materials — not how many units; see
     /// [`total`](Self::total) for that.
+    #[allow(dead_code)] // same "tests and 074" note `get` above carries
     pub fn distinct(&self) -> usize {
         self.items.len()
     }
@@ -138,7 +140,6 @@ impl Parcel {
 /// requested ones, so a message can read "needs 12 more oak_planks" without
 /// the caller re-deriving the difference.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // ticket 073's refusal message — see `impl Parcel` above
 pub struct Shortfall {
     pub missing: Parcel,
 }
@@ -187,7 +188,6 @@ pub struct Stock {
     items: BTreeMap<String, u64>,
 }
 
-#[allow(dead_code)] // see `impl Parcel` above
 impl Stock {
     pub fn count(&self, item: &str) -> u64 {
         self.items.get(item).copied().unwrap_or(0)

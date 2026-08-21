@@ -42,6 +42,7 @@ use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts};
 
 use super::super::definition::{Building, BuildingDefinitions, Cost, LoadedBuilding, Production};
+use super::super::inventory::Stock;
 use super::super::placement::{rotation_degrees, PlacementSelection};
 use super::super::state;
 
@@ -120,7 +121,14 @@ fn requirement_label(id: &str, definitions: &BuildingDefinitions) -> String {
 
 /// One row: name, footprint, cost, production, and either a click target (if
 /// unlocked) or a disabled row naming what's missing (if not).
-fn entry_row(ui: &mut egui::Ui, entry: &LoadedBuilding, definitions: &BuildingDefinitions, selection: &mut PlacementSelection, city: &state::City) {
+fn entry_row(
+    ui: &mut egui::Ui,
+    entry: &LoadedBuilding,
+    definitions: &BuildingDefinitions,
+    selection: &mut PlacementSelection,
+    city: &state::City,
+    stock: &Stock,
+) {
     let missing = missing_requirements(&entry.building, city);
     let unlocked = missing.is_empty();
     let missing_names = || -> String { missing.iter().map(|id| requirement_label(id, definitions)).collect::<Vec<_>>().join(", ") };
@@ -130,13 +138,25 @@ fn entry_row(ui: &mut egui::Ui, entry: &LoadedBuilding, definitions: &BuildingDe
     let response = ui.add_enabled(unlocked, egui::SelectableLabel::new(selected, label));
     if response.clicked() {
         selection.catalogue_id = Some(entry.catalogue_id.clone());
+        // Ticket 073: the *definition*, so `city::commit` can find the cost
+        // this row is displaying. The catalogue id above can't stand in for
+        // it — see `PlacementSelection::definition_id`.
+        selection.definition_id = Some(entry.id.clone());
         selection.y_offset = 0;
     }
     if !unlocked {
         response.on_disabled_hover_text(format!("Requires: {}", missing_names()));
     }
 
-    ui.label(format!("  Cost: {}", cost_line(&entry.building.cost)));
+    // Ticket 073: the cost line turns red the moment the stockpile can't
+    // cover it, and says what's short — a placement click would otherwise be
+    // refused with the reason only in the city panel's last-edit line.
+    let cost_text = format!("  Cost: {}", cost_line(&entry.building.cost));
+    if stock.can_afford(&entry.building.cost) {
+        ui.label(cost_text);
+    } else {
+        ui.colored_label(egui::Color32::RED, format!("{cost_text}  (short {})", stock.shortfall(&entry.building.cost)));
+    }
     if let Some(production) = &entry.building.production {
         if let Some(line) = production_line(production) {
             ui.label(format!("  Produces: {line}"));
@@ -213,6 +233,7 @@ pub(super) fn build_menu_panel(
     mut contexts: EguiContexts,
     definitions: Option<Res<BuildingDefinitions>>,
     city: Res<state::City>,
+    stock: Res<Stock>,
     mut selection: ResMut<PlacementSelection>,
 ) {
     egui::Window::new("Build").show(contexts.ctx_mut(), |ui| {
@@ -228,6 +249,7 @@ pub(super) fn build_menu_panel(
         selected_line(ui, &selection, &definitions);
         if ui.button("Clear selection").clicked() {
             selection.catalogue_id = None;
+            selection.definition_id = None;
             selection.y_offset = 0;
         }
         ui.separator();
@@ -239,7 +261,7 @@ pub(super) fn build_menu_panel(
                 current_tier = Some(entry.building.tier);
                 ui.heading(format!("Tier {}", entry.building.tier));
             }
-            entry_row(ui, entry, &definitions, &mut selection, &city);
+            entry_row(ui, entry, &definitions, &mut selection, &city, &stock);
             ui.separator();
         }
 

@@ -43,7 +43,8 @@ use crate::edit::{EditPolicy, EditRefusal, EditReport};
 use crate::region_cache::RegionCache;
 
 use super::commit::apply_building_edit;
-use super::journal::{Journal, JournalEntry};
+use super::inventory::Stock;
+use super::journal::{Journal, JournalEntry, Ledger};
 use super::state::{BuildingId, City};
 use super::write_status::{WriteKind, WriteStatus};
 
@@ -122,12 +123,34 @@ pub struct UndoPlugin;
 impl Plugin for UndoPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<UndoCommand>()
+            // Ticket 073 — same `init_resource` reasoning `WriteStatus`
+            // below carries.
+            .init_resource::<Stock>()
             // Idempotent-either-order, the same shape `WriteStatus` already
             // uses across `city::commit`/`city::demolish`.
             .init_resource::<WriteStatus>()
             .add_event::<ChunksEdited>()
             .add_systems(Update, (start_undo, poll_undo).chain());
     }
+}
+
+/// Puts a journal entry's [`Ledger`] back: adds what it took, takes back what
+/// it gave. The materials half of "undo reverses the entry", the same shape
+/// [`journal::Journal::undo_last`] gives the world and city halves.
+///
+/// The entry's **recorded** numbers, not a fresh look at the definition's
+/// `cost` — a definition can be edited (hot reload) between a placement and
+/// its undo, and refunding a price nobody paid is exactly the bug ticket 073
+/// added the ledger to avoid.
+///
+/// Taking back a credit is clamped by [`Stock::remove_parcel`], so undoing a
+/// placement whose yield has since been spent leaves the stock at zero
+/// rather than in debt. A plain function rather than two lines inside
+/// [`start_undo`] so it's testable without a loaded save — `start_undo`
+/// refuses before it ever reaches this without one.
+fn settle_reverse(stock: &mut Stock, ledger: &Ledger) {
+    stock.add_parcel(&ledger.debited);
+    stock.remove_parcel(&ledger.credited);
 }
 
 /// Dispatches a requested undo: synchronously reverses the journal's most
@@ -139,6 +162,7 @@ fn start_undo(
     mut journal: ResMut<Journal>,
     mut city: ResMut<City>,
     region_cache: Option<Res<SharedRegionCache>>,
+    mut stock: ResMut<Stock>,
 ) {
     if !std::mem::take(&mut undo.requested) {
         return;
@@ -171,6 +195,18 @@ fn start_undo(
             return;
         }
     };
+
+    // Ticket 073: settle the entry's own ledger in reverse — put back what
+    // it took, take back what it gave. The entry's recorded numbers, not a
+    // fresh look at the definition's `cost`, which may have been edited (hot
+    // reload) since the placement was paid for.
+    //
+    // Settled here, at the same point of no return the `City` mutation above
+    // happens at, and outside the same guarantee: if the apply below fails,
+    // the world is behind city state *and* the ledger. That gap is the one
+    // the module docs already name; this ticket puts a third thing on the
+    // near side of it rather than opening a new one.
+    settle_reverse(&mut stock, &step.ledger);
 
     let cache: Arc<Mutex<RegionCache>> = region_cache.0.clone();
     let policy = EditPolicy { allow_dirty_regions: true, ..EditPolicy::default() };
@@ -257,6 +293,58 @@ mod tests {
         assert!(app.world().resource::<City>().is_empty());
     }
 
+    fn parcel(items: &[(&str, u64)]) -> super::super::inventory::Parcel {
+        let mut parcel = super::super::inventory::Parcel::default();
+        for &(item, count) in items {
+            parcel.add(item, count);
+        }
+        parcel
+    }
+
+    // --- ticket 073: settling the ledger in reverse -------------------------
+
+    #[test]
+    fn undoing_a_placement_returns_the_stock_to_exactly_where_it_stood() {
+        // What a placement did: paid 40 planks, cleared 12 dirt out of the
+        // ground. Undoing it has to be the exact inverse of that, whichever
+        // order the two happened in.
+        let mut stock = Stock::default();
+        stock.add("minecraft:oak_planks", 60);
+        let before = stock.clone();
+
+        stock.remove("minecraft:oak_planks", 40);
+        stock.add("minecraft:dirt", 12);
+        settle_reverse(&mut stock, &Ledger { credited: parcel(&[("minecraft:dirt", 12)]), debited: parcel(&[("minecraft:oak_planks", 40)]) });
+
+        assert_eq!(stock, before);
+    }
+
+    #[test]
+    fn undoing_a_credit_that_has_since_been_spent_clamps_at_zero() {
+        // The dirt a placement yielded was spent on something else before
+        // the undo. Taking it back can't put the stock into debt — see
+        // `settle_reverse`.
+        let mut stock = Stock::default();
+        stock.add("minecraft:dirt", 3);
+
+        settle_reverse(&mut stock, &Ledger { credited: parcel(&[("minecraft:dirt", 12)]), debited: parcel(&[]) });
+
+        assert_eq!(stock.count("minecraft:dirt"), 0);
+    }
+
+    #[test]
+    fn undoing_an_entry_that_moved_nothing_moves_nothing() {
+        // A version-1 journal entry, or a building placed free through the
+        // keyboard stand-in.
+        let mut stock = Stock::default();
+        stock.add("minecraft:dirt", 3);
+        let before = stock.clone();
+
+        settle_reverse(&mut stock, &Ledger::default());
+
+        assert_eq!(stock, before);
+    }
+
     #[test]
     fn a_request_is_refused_while_another_is_pending() {
         let mut undo = UndoCommand::default();
@@ -289,7 +377,7 @@ mod tests {
             previous: vec![(IVec3::new(0, 64, 0), BlockState::air())],
             data_version: None,
         };
-        app.world_mut().resource_mut::<Journal>().record_placement(building, placement, baseline);
+        app.world_mut().resource_mut::<Journal>().record_placement(building, placement, baseline, Ledger::default());
 
         app.world_mut().resource_mut::<UndoCommand>().request();
         run_until_settled(&mut app);

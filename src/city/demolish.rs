@@ -71,7 +71,9 @@ use crate::edit::{EditPolicy, EditRefusal, EditReport, WorldEdit};
 use crate::region_cache::RegionCache;
 
 use super::commit::apply_building_edit;
-use super::journal::{Baseline, Journal};
+use super::drops::DropTable;
+use super::inventory::Stock;
+use super::journal::{Baseline, Journal, Ledger};
 use super::picking::{HoveredBlock, PickingSet};
 use super::state::{BuildingId, City, Occupant, PlacedBuilding};
 use super::write_status::{WriteKind, WriteStatus};
@@ -101,6 +103,10 @@ pub struct DemolishPlugin;
 impl Plugin for DemolishPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<DemolishState>()
+            // Ticket 073 — same `init_resource` reasoning `city::commit`'s
+            // own three carry.
+            .init_resource::<Stock>()
+            .init_resource::<DropTable>()
             // `city::commit::CommitPlugin`/`city::undo::UndoPlugin`
             // initialize the same resource — `init_resource` only inserts a
             // default when one isn't already present. See `write_status`'s
@@ -220,6 +226,8 @@ fn poll_demolish(
     mut journal: ResMut<Journal>,
     mut write_status: ResMut<WriteStatus>,
     mut edited: EventWriter<ChunksEdited>,
+    mut stock: ResMut<Stock>,
+    drops: Res<DropTable>,
 ) {
     let result = {
         let Some(pending) = &mut demolish.pending else { return };
@@ -245,7 +253,26 @@ fn poll_demolish(
             // `Some` here — see the module docs on what each half of this
             // particular baseline means for a demolition.
             if let Some(baseline) = Baseline::capture(&edit, &report) {
-                journal.record_demolition(building, placement.clone(), baseline);
+                // Ticket 073: the terrain this demolition put back is paid
+                // for out of the stock. Without that, `place -> demolish ->
+                // place` clears the same hillside over and over and hands
+                // back its stone every time. Nothing is credited in return —
+                // the building's own blocks are lost, not salvaged; salvage
+                // is a mechanic (a fraction, a rubble state), not a rounding
+                // decision, and belongs to a ticket that designs it.
+                //
+                // Clamped, not refused: `remove_parcel` takes what's there
+                // and reports it, because a demolition is a world-state
+                // change that has already landed, and blocking one for want
+                // of dirt would leave city state and world unable to agree.
+                let wanted = drops.parcel_for(baseline.written.iter().map(|(_, state)| state));
+                let debited = stock.remove_parcel(&wanted);
+                journal.record_demolition(
+                    building,
+                    placement.clone(),
+                    baseline,
+                    Ledger { credited: Default::default(), debited },
+                );
             }
             write_status.record_success(WriteKind::Demolished, placement.definition, &report);
             edited.send(ChunksEdited(report.chunks));
@@ -318,7 +345,7 @@ mod tests {
         let mut city = City::default();
         let id = city.place_building("house01", IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::new(1, 1)).unwrap();
         let mut journal = Journal::default();
-        journal.record_placement(id, a_placement(), a_baseline());
+        journal.record_placement(id, a_placement(), a_baseline(), Ledger::default());
 
         let result = resolve_demolition_target(IVec3::new(0, 64, 0), &city, &journal);
         let DemolitionTarget::Found { building, placement, baseline } = result else { panic!("expected Found") };
@@ -401,6 +428,84 @@ mod tests {
         let fired: Vec<_> = app.world_mut().resource_mut::<Events<ChunksEdited>>().drain().collect();
         assert_eq!(fired.len(), 1);
         assert_eq!(fired[0].0, vec![(0, 0)]);
+    }
+
+    // --- ticket 073: a demolition pays for its own backfill -----------------
+
+    #[test]
+    fn a_demolition_charges_for_the_terrain_it_puts_back() {
+        // The loop this closes: placing cleared this dirt and credited it,
+        // so restoring it has to take it back — otherwise `place ->
+        // demolish -> place` clears the same ground over and over and pays
+        // out every time.
+        let mut app = demolish_test_app();
+        app.world_mut().resource_mut::<Stock>().add("minecraft:dirt", 1);
+        let stock_before = app.world().resource::<Stock>().clone();
+
+        let building = app
+            .world_mut()
+            .resource_mut::<City>()
+            .place_building("house01", IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::new(1, 1))
+            .unwrap();
+
+        // The restoring edit writes the dirt back; `replaced` is the
+        // building's own block, which is lost rather than salvaged.
+        let mut edit = WorldEdit::new();
+        edit.set(IVec3::new(0, 64, 0), state_named("minecraft:dirt"));
+        let report = EditReport {
+            blocks_written: 1,
+            chunks: vec![(0, 0)],
+            regions: vec![(0, 0)],
+            replaced: Some(vec![(IVec3::new(0, 64, 0), state_named("minecraft:oak_planks"))]),
+        };
+        let task_edit = edit.clone();
+        let task = pool().spawn(async move { Ok(report) });
+        app.world_mut().resource_mut::<DemolishState>().pending =
+            Some(PendingDemolition { building, placement: a_placement(), edit: task_edit, task });
+
+        run_until_settled(&mut app);
+
+        let stock = app.world().resource::<Stock>();
+        assert_eq!(stock.count("minecraft:dirt"), 0, "the restored terrain is paid for");
+        assert_eq!(stock.count("minecraft:oak_planks"), 0, "and the building's own blocks are not salvaged");
+        assert!(stock.is_empty(), "back exactly where the placement found it");
+        assert_ne!(*stock, stock_before);
+
+        let journal = app.world().resource::<Journal>();
+        let ledger = journal.entries().last().unwrap().ledger();
+        assert!(ledger.credited.is_empty());
+        assert_eq!(ledger.debited.get("minecraft:dirt"), 1);
+    }
+
+    #[test]
+    fn a_backfill_the_stock_cannot_cover_is_clamped_rather_than_refused() {
+        // Demolishing is a world-state change; being short of dirt must not
+        // be able to block it — see `poll_demolish`'s own comment.
+        let mut app = demolish_test_app();
+        let building = app
+            .world_mut()
+            .resource_mut::<City>()
+            .place_building("house01", IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::new(1, 1))
+            .unwrap();
+
+        let mut edit = WorldEdit::new();
+        edit.set(IVec3::new(0, 64, 0), state_named("minecraft:dirt"));
+        let report = EditReport {
+            blocks_written: 1,
+            chunks: vec![(0, 0)],
+            regions: vec![(0, 0)],
+            replaced: Some(vec![(IVec3::new(0, 64, 0), state_named("minecraft:oak_planks"))]),
+        };
+        let task_edit = edit.clone();
+        let task = pool().spawn(async move { Ok(report) });
+        app.world_mut().resource_mut::<DemolishState>().pending =
+            Some(PendingDemolition { building, placement: a_placement(), edit: task_edit, task });
+
+        run_until_settled(&mut app);
+
+        assert!(app.world().resource::<City>().is_empty(), "the demolition still went through");
+        let ledger = app.world().resource::<Journal>().entries().last().unwrap().ledger().clone();
+        assert!(ledger.debited.is_empty(), "the ledger records what was actually taken, which was nothing");
     }
 
     #[test]

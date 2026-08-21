@@ -76,6 +76,9 @@ use crate::region_cache::RegionCache;
 use crate::world;
 use crate::DecodedWorld;
 
+use super::drops::DropTable;
+use super::inventory::Stock;
+use super::journal::Baseline;
 use super::picking::{HoveredBlock, PickingSet};
 use super::tool::ActiveTool;
 use super::write_status::{WriteKind, WriteStatus};
@@ -129,6 +132,11 @@ struct TerraformDragState {
 /// finish or roll back, so nothing else needs to survive to [`poll_terraform`].
 struct PendingTerraform {
     tiles: usize,
+    /// Kept for ticket 073's settlement: what the drag wrote is what it has
+    /// to pay for (level's fill), and [`Baseline::capture`] needs the edit
+    /// alongside the report to line that up with what it dug out. The same
+    /// reason `city::commit::PendingCommit` holds its own edit.
+    edit: WorldEdit,
     task: Task<Result<EditReport, EditRefusal>>,
 }
 
@@ -147,6 +155,10 @@ impl Plugin for TerraformPlugin {
         app.init_resource::<TerraformMode>()
             .init_resource::<TerraformDragState>()
             .init_resource::<TerraformBuildState>()
+            // Ticket 073 — same `init_resource` reasoning `WriteStatus`
+            // below carries.
+            .init_resource::<Stock>()
+            .init_resource::<DropTable>()
             // Idempotent-either-order shape `city::commit`/`city::road_build`
             // already document for this resource.
             .init_resource::<WriteStatus>()
@@ -323,22 +335,31 @@ fn try_commit_terraform(
 
     let tiles = rect.len();
     let cache: Arc<Mutex<RegionCache>> = region_cache.0.clone();
-    let policy = EditPolicy { allow_dirty_regions: true, ..EditPolicy::default() };
-    let task_edit = edit;
+    // `capture_replaced` (ticket 073): what a drag dug out is what it pays
+    // the player, and the report is the only record of it — a terraform is
+    // not journaled, so unlike a placement there is no second chance to ask.
+    let policy = EditPolicy { capture_replaced: true, allow_dirty_regions: true, ..EditPolicy::default() };
+    let task_edit = edit.clone();
 
     let task = AsyncComputeTaskPool::get().spawn(async move {
         let mut cache = cache.lock().expect("region cache mutex poisoned");
         super::commit::apply_building_edit(&mut cache, &task_edit, &policy)
     });
 
-    build.pending = Some(PendingTerraform { tiles, task });
+    build.pending = Some(PendingTerraform { tiles, edit, task });
 }
 
 /// Single non-blocking poll of the in-flight write, the same
 /// `block_on(poll_once(..))` pattern `city::commit::poll_commit`/
 /// `city::road_build::poll_road_build` use. There's no `City` entry to
 /// finish or roll back either way — see the module docs.
-fn poll_terraform(mut build: ResMut<TerraformBuildState>, mut write_status: ResMut<WriteStatus>, mut edited: EventWriter<ChunksEdited>) {
+fn poll_terraform(
+    mut build: ResMut<TerraformBuildState>,
+    mut write_status: ResMut<WriteStatus>,
+    mut edited: EventWriter<ChunksEdited>,
+    mut stock: ResMut<Stock>,
+    drops: Res<DropTable>,
+) {
     let result = {
         let Some(pending) = &mut build.pending else { return };
         let Some(result) = block_on(poll_once(&mut pending.task)) else {
@@ -346,7 +367,7 @@ fn poll_terraform(mut build: ResMut<TerraformBuildState>, mut write_status: ResM
         };
         result
     };
-    let PendingTerraform { tiles, .. } = build.pending.take().expect("just matched Some above");
+    let PendingTerraform { tiles, edit, .. } = build.pending.take().expect("just matched Some above");
 
     match result {
         Ok(report) => {
@@ -355,6 +376,20 @@ fn poll_terraform(mut build: ResMut<TerraformBuildState>, mut write_status: ResM
                 report.blocks_written,
                 report.chunks.len()
             );
+            // Ticket 073, both halves of the same rule in one place: a dig
+            // writes air over stone (credit, nothing to debit), a level
+            // writes dirt over air (debit, nothing to credit), and a level
+            // that cuts one tile to fill another does both. `Baseline` is
+            // reused purely as the "what was written where, and what was
+            // there before" pairing — nothing here is journaled, the stock
+            // is the only record a terraform leaves, exactly like the
+            // terrain itself.
+            if let Some(baseline) = Baseline::capture(&edit, &report) {
+                let credited = drops.parcel_for(baseline.previous.iter().map(|(_, state)| state));
+                let wanted = drops.parcel_for(baseline.written.iter().map(|(_, state)| state));
+                stock.add_parcel(&credited);
+                stock.remove_parcel(&wanted);
+            }
             write_status.record_success(WriteKind::Terraform, format!("{tiles} tile(s)"), &report);
             edited.send(ChunksEdited(report.chunks));
         }
@@ -564,7 +599,7 @@ mod tests {
         let mut app = terraform_test_app();
         let report = EditReport { blocks_written: 4, chunks: vec![(0, 0)], regions: vec![(0, 0)], replaced: None };
         let task = pool().spawn(async move { Ok(report) });
-        app.world_mut().resource_mut::<TerraformBuildState>().pending = Some(PendingTerraform { tiles: 4, task });
+        app.world_mut().resource_mut::<TerraformBuildState>().pending = Some(PendingTerraform { tiles: 4, edit: WorldEdit::new(), task });
 
         run_until_settled(&mut app);
 
@@ -577,11 +612,75 @@ mod tests {
         assert!(matches!(write_status.last(), Some(super::super::write_status::LastWrite::Success(_))));
     }
 
+    // --- ticket 073: a drag is paid for and paid out ------------------------
+
+    /// A settled drag: `written` is what the edit put down, `replaced` what
+    /// it took away, exactly as the write path reports them.
+    fn run_terraform(app: &mut App, written: &[(IVec3, &str)], replaced: &[(IVec3, &str)]) {
+        let mut edit = WorldEdit::new();
+        for (at, name) in written {
+            edit.set(*at, name.parse().unwrap());
+        }
+        let report = EditReport {
+            blocks_written: written.len(),
+            chunks: vec![(0, 0)],
+            regions: vec![(0, 0)],
+            replaced: Some(replaced.iter().map(|(at, name)| (*at, name.parse().unwrap())).collect()),
+        };
+        let task = pool().spawn(async move { Ok(report) });
+        app.world_mut().resource_mut::<TerraformBuildState>().pending =
+            Some(PendingTerraform { tiles: written.len(), edit, task });
+        run_until_settled(app);
+    }
+
+    #[test]
+    fn digging_credits_what_it_dug_out() {
+        let mut app = terraform_test_app();
+        run_terraform(
+            &mut app,
+            &[(IVec3::new(0, 64, 0), "minecraft:air"), (IVec3::new(1, 64, 0), "minecraft:air")],
+            &[(IVec3::new(0, 64, 0), "minecraft:dirt"), (IVec3::new(1, 64, 0), "minecraft:dirt")],
+        );
+
+        let stock = app.world().resource::<Stock>();
+        assert_eq!(stock.count("minecraft:dirt"), 2);
+        assert_eq!(stock.count("minecraft:air"), 0, "writing air costs nothing — air is not a material");
+    }
+
+    #[test]
+    fn levelling_pays_for_the_dirt_it_fills_with() {
+        let mut app = terraform_test_app();
+        app.world_mut().resource_mut::<Stock>().add("minecraft:dirt", 5);
+
+        // One tile cut down to the anchor, one filled up to it — the two
+        // halves of a level drag, and the two halves of the rule.
+        run_terraform(
+            &mut app,
+            &[(IVec3::new(0, 64, 0), "minecraft:air"), (IVec3::new(1, 63, 0), "minecraft:dirt")],
+            &[(IVec3::new(0, 64, 0), "minecraft:stone"), (IVec3::new(1, 63, 0), "minecraft:air")],
+        );
+
+        let stock = app.world().resource::<Stock>();
+        assert_eq!(stock.count("minecraft:dirt"), 4, "one dirt went into the ground");
+        assert_eq!(stock.count("minecraft:stone"), 1, "and one stone came out of it");
+    }
+
+    #[test]
+    fn a_fill_the_stock_cannot_cover_is_clamped_rather_than_refused() {
+        // Same call `city::demolish` makes: the blocks are already in the
+        // world by the time this settles, so the ledger follows the world
+        // rather than the other way round.
+        let mut app = terraform_test_app();
+        run_terraform(&mut app, &[(IVec3::new(0, 64, 0), "minecraft:dirt")], &[(IVec3::new(0, 64, 0), "minecraft:air")]);
+
+        assert!(app.world().resource::<Stock>().is_empty());
+    }
+
     #[test]
     fn poll_terraform_failure_records_a_failure_and_fires_nothing() {
         let mut app = terraform_test_app();
         let task = pool().spawn(async { Err(EditRefusal::Empty) });
-        app.world_mut().resource_mut::<TerraformBuildState>().pending = Some(PendingTerraform { tiles: 2, task });
+        app.world_mut().resource_mut::<TerraformBuildState>().pending = Some(PendingTerraform { tiles: 2, edit: WorldEdit::new(), task });
 
         run_until_settled(&mut app);
 

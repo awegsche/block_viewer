@@ -1209,3 +1209,26 @@ Y=0 in the world and won't be cleaned up by this fix — see the ticket.
      `<save>/citybuilder/stock.ron` as `(version: 1, items: {"minecraft:dirt": 12})`,
      relaunch, and confirm the panel shows `12x dirt`; close the game and
      confirm the file is still there and still says 12.
+
+- [ ] **073 cost and yields.** `cargo run --bin citybuilder`. Note the
+  bootstrap gap first: a fresh save has an empty stock and the shipped
+  `house01` costs 40 oak_planks + 20 cobblestone, so **start by
+  terraforming** (`T` to the terraform tool, drag to dig) — dug blocks are
+  what pays for everything else until there's a starting grant.
+  1. **Digging pays** — dig a patch of grassy hillside and watch the City
+     window's "Stock" section fill with dirt and cobblestone (grass_block
+     gives dirt, stone gives cobblestone — `assets/city/drops.ron`).
+     Levelling *up* should take dirt back out again.
+  2. **A cost you can't meet refuses before anything happens** — with an
+     empty stock, the build menu's cost line for House should be red and
+     read "(short 40 more oak_planks, ...)"; clicking to place should place
+     nothing, and the City window's "Last edit" should say why.
+  3. **A placement pays and is paid** — hand-edit `stock.ron` to give
+     yourself the planks and cobblestone (or dig first), place a House on a
+     slope, and confirm the cost leaves the stock while the terrain it
+     displaced arrives in it.
+  4. **Undo is exact** — note the stock, place a building, undo it from the
+     City panel, and confirm the stock is back to the same numbers.
+  5. **Demolish is not a farm** — place a building, demolish it, and confirm
+     the restored terrain was charged back (the dirt you gained on placing
+     it goes away again). Repeating place/demolish should not grow the pile.

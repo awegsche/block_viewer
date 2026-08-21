@@ -87,7 +87,7 @@ fn recording_and_undoing_a_placement_removes_the_building_and_restores_the_previ
     let snapshot = city.building(id).unwrap().clone();
 
     let mut journal = Journal::default();
-    journal.record_placement(id, snapshot, sample_baseline());
+    journal.record_placement(id, snapshot, sample_baseline(), Ledger::default());
     assert_eq!(journal.len(), 1);
 
     let step = journal.undo_last(&mut city).expect("a placement can be undone");
@@ -118,7 +118,7 @@ fn recording_and_undoing_a_demolition_reinserts_the_building_under_its_original_
     let snapshot = city.remove_building(id).unwrap();
 
     let mut journal = Journal::default();
-    journal.record_demolition(id, snapshot, sample_baseline());
+    journal.record_demolition(id, snapshot, sample_baseline(), Ledger::default());
 
     let step = journal.undo_last(&mut city).expect("a demolition can be undone");
     assert_eq!(step.building, id);
@@ -143,7 +143,7 @@ fn undoing_a_demolition_is_refused_when_the_tile_is_occupied_now() {
     let snapshot = city.remove_building(id).unwrap();
 
     let mut journal = Journal::default();
-    journal.record_demolition(id, snapshot, sample_baseline());
+    journal.record_demolition(id, snapshot, sample_baseline(), Ledger::default());
 
     // Something else claims the freed tile before the undo runs.
     city.place_building("house01", IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::new(1, 1))
@@ -163,12 +163,12 @@ fn placement_baseline_returns_the_most_recent_record_for_a_building() {
     let first = Baseline { written: vec![(IVec3::ZERO, stone())], previous: vec![(IVec3::ZERO, dirt())], data_version: None };
     let second = sample_baseline();
 
-    journal.record_placement(id, placed("house01", IVec3::ZERO, IVec2::ONE), first);
+    journal.record_placement(id, placed("house01", IVec3::ZERO, IVec2::ONE), first, Ledger::default());
     assert_eq!(journal.placement_baseline(id).unwrap().written[0].1, stone());
 
     // A later Placed record for the same id (a fresh placement after a
     // demolition, say) supersedes the earlier one.
-    journal.record_placement(id, placed("house01", IVec3::ZERO, IVec2::ONE), second.clone());
+    journal.record_placement(id, placed("house01", IVec3::ZERO, IVec2::ONE), second.clone(), Ledger::default());
     assert_eq!(journal.placement_baseline(id).unwrap().written, second.written);
 
     assert!(journal.placement_baseline(BuildingId::from_u64(99)).is_none());
@@ -277,6 +277,7 @@ fn city_and_journal_with_one_building(id_seed: IVec3, at: IVec3, expected: Block
         id,
         building,
         Baseline { written: vec![(at, expected)], previous: vec![(at, BlockState::air())], data_version: None },
+        Ledger::default(),
     );
     (city, journal)
 }
@@ -411,6 +412,7 @@ fn placements_and_demolitions_round_trip_exactly() {
         placed_id,
         placed("house01", IVec3::new(10, 64, 20), IVec2::new(3, 2)),
         sample_baseline(),
+        Ledger::default(),
     );
     journal.record_demolition(
         demolished_id,
@@ -420,6 +422,7 @@ fn placements_and_demolitions_round_trip_exactly() {
             previous: vec![(IVec3::new(0, 70, 0), stone())],
             data_version: Some(3953),
         },
+        Ledger::default(),
     );
 
     save_journal(&journal, &dir).unwrap();
@@ -427,7 +430,7 @@ fn placements_and_demolitions_round_trip_exactly() {
 
     assert_eq!(loaded.len(), 2);
     match &loaded.entries()[0] {
-        JournalEntry::Placed { building, placement, baseline } => {
+        JournalEntry::Placed { building, placement, baseline, .. } => {
             assert_eq!(*building, placed_id);
             assert_eq!(placement.origin, IVec3::new(10, 64, 20));
             assert_eq!(*baseline, sample_baseline());
@@ -435,7 +438,7 @@ fn placements_and_demolitions_round_trip_exactly() {
         other => panic!("expected a Placed entry, got {other:?}"),
     }
     match &loaded.entries()[1] {
-        JournalEntry::Demolished { building, placement, baseline } => {
+        JournalEntry::Demolished { building, placement, baseline, .. } => {
             assert_eq!(*building, demolished_id);
             assert_eq!(placement.footprint, IVec2::new(3, 5));
             assert_eq!(baseline.data_version, Some(3953));
@@ -451,6 +454,87 @@ fn a_version_mismatch_is_refused() {
     fs::write(dir.join("citybuilder/journal.ron"), "(version: 999, entries: [])").unwrap();
 
     assert!(matches!(load_journal(&dir).unwrap_err(), JournalError::UnsupportedVersion(999)));
+}
+
+// -------------------------------------------------------------------------------------------------
+// ---- the ledger (ticket 073) ------------------------------------------------------------------------
+// -------------------------------------------------------------------------------------------------
+
+fn parcel(items: &[(&str, u64)]) -> super::super::inventory::Parcel {
+    let mut parcel = super::super::inventory::Parcel::default();
+    for &(item, count) in items {
+        parcel.add(item, count);
+    }
+    parcel
+}
+
+#[test]
+fn a_ledger_round_trips_through_disk() {
+    let dir = temp_dir("ledger");
+    let mut journal = Journal::default();
+    let ledger = Ledger {
+        credited: parcel(&[("minecraft:dirt", 12), ("minecraft:cobblestone", 3)]),
+        debited: parcel(&[("minecraft:oak_planks", 40)]),
+    };
+    journal.record_placement(BuildingId::from_u64(0), placed("house01", IVec3::ZERO, IVec2::ONE), sample_baseline(), ledger.clone());
+
+    save_journal(&journal, &dir).unwrap();
+    let loaded = load_journal(&dir).unwrap();
+
+    assert_eq!(*loaded.entries()[0].ledger(), ledger);
+}
+
+/// The reason [`MIN_READABLE_VERSION`] is a band rather than an equality
+/// check: a version-1 journal's as-built baselines are unrecoverable if this
+/// file is refused, and the ledger those entries lack is provably empty —
+/// they were written before anything could be charged.
+#[test]
+fn a_version_1_journal_still_loads_with_empty_ledgers() {
+    let dir = temp_dir("v1");
+    fs::create_dir_all(dir.join("citybuilder")).unwrap();
+    fs::write(
+        dir.join("citybuilder/journal.ron"),
+        r#"(
+            version: 1,
+            entries: [
+                Placed(
+                    building: 7,
+                    placement: (definition: "house01", origin: (1, 64, 2), rotation: Deg0, footprint: (3, 3)),
+                    baseline: (
+                        written: [((1, 64, 2), (name: "minecraft:stone", properties: []))],
+                        previous: [((1, 64, 2), (name: "minecraft:dirt", properties: []))],
+                        data_version: Some(3953),
+                    ),
+                ),
+            ],
+        )"#,
+    )
+    .unwrap();
+
+    let loaded = load_journal(&dir).expect("a version-1 journal is still readable");
+
+    assert_eq!(loaded.len(), 1, "the entry — and its baseline — survives");
+    let entry = &loaded.entries()[0];
+    assert_eq!(entry.building(), BuildingId::from_u64(7));
+    assert_eq!(entry.baseline().previous[0].1, dirt());
+    assert!(entry.ledger().is_empty(), "an entry from before the economy moved no materials");
+}
+
+#[test]
+fn undo_last_hands_back_the_entrys_own_ledger() {
+    // Undo settles what was settled — not a fresh reading of a definition
+    // that may have been edited since.
+    let mut city = City::default();
+    let id = city.place_building("house01", IVec3::ZERO, Rotation::Deg0, IVec2::ONE).unwrap();
+    let building = city.building(id).unwrap().clone();
+    let ledger = Ledger { credited: parcel(&[("minecraft:dirt", 9)]), debited: parcel(&[("minecraft:oak_planks", 40)]) };
+
+    let mut journal = Journal::default();
+    journal.record_placement(id, building, sample_baseline(), ledger.clone());
+
+    let step = journal.undo_last(&mut city).expect("undoes");
+
+    assert_eq!(step.ledger, ledger);
 }
 
 #[test]
