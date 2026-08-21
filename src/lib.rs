@@ -127,62 +127,114 @@ pub(crate) struct DecodedWorld {
 #[derive(Component)]
 pub(crate) struct BlockMesh;
 
-/// Which save the process was told to open, parsed from the CLI
-/// (ticket 064). Both halves are optional and independent: the directory to
-/// scan, and the save to pick out of it.
+/// The two positional CLI arguments, with blank ones dropped — see
+/// [`save_args_from`]. What each one *means* is deliberately not decided
+/// here: [`resolve_selection_in`] does that, because it depends on what's
+/// actually on disk.
+struct SaveArgs {
+    first: Option<String>,
+    second: Option<String>,
+}
+
+/// [`SaveArgs`] from the real process args; [`save_args_from`] is the
+/// testable half — real process args can't be overridden per-test.
+fn save_args() -> SaveArgs {
+    let mut args = std::env::args().skip(1);
+    save_args_from(args.next(), args.next())
+}
+
+/// The actual logic behind [`save_args`]: an argument that's empty, all
+/// whitespace, or nothing but quote characters counts as **not given**.
+///
+/// The quote case is Windows PowerShell 5.1, which doesn't pass an empty
+/// `""` argument through to a native executable intact — it arrives either
+/// dropped entirely or as two literal quote characters. Both are why
+/// [`resolve_selection_in`] below makes a *single* argument work on its own
+/// rather than needing an empty one in front of a save name.
+fn save_args_from(first: Option<String>, second: Option<String>) -> SaveArgs {
+    fn given(arg: String) -> Option<String> {
+        let trimmed = arg.trim().trim_matches(QUOTES).trim().to_string();
+        (!trimmed.is_empty()).then_some(trimmed)
+    }
+    SaveArgs { first: first.and_then(given), second: second.and_then(given) }
+}
+
+/// The quote characters [`save_args_from`] strips off an argument. A real
+/// path never starts or ends with one, so this can't eat a meaningful part
+/// of a directory name.
+const QUOTES: [char; 2] = ['"', '\''];
+
+/// What the CLI arguments resolved to (ticket 064): the directory to scan,
+/// and which save in it to open (`None` = the first one found, which is all
+/// this ever did before).
 struct SaveSelection {
-    /// Where to look for saves — see [`saves_directory_from`].
     directory: PathBuf,
-    /// Which save under `directory` to open, or `None` for "the first one
-    /// found", which is all this ever did before ticket 064.
     wanted: Option<String>,
 }
 
-/// The two positional CLI arguments, as [`SaveSelection`] — `argv[1]` the
-/// saves directory (ticket 008), `argv[2]` the save within it (ticket 064).
-/// Reads the real process args; [`save_selection_from`] is the testable half.
-fn save_selection() -> SaveSelection {
-    let mut args = std::env::args().skip(1);
-    save_selection_from(args.next(), args.next())
-}
-
-/// The actual logic behind [`save_selection`], taking the CLI args as plain
-/// `Option<String>`s rather than reading `std::env::args()` directly — real
-/// process args can't be overridden per-test, so tests exercise this instead.
-fn save_selection_from(dir_arg: Option<String>, name_arg: Option<String>) -> SaveSelection {
-    SaveSelection {
-        directory: saves_directory_from(dir_arg),
-        wanted: name_arg.filter(|name| !name.trim().is_empty()),
-    }
-}
-
-/// Directory to scan for Minecraft saves: the first CLI argument if one was
-/// given (ticket 008 — pointing at a CurseForge/MultiMC instance elsewhere
-/// on disk, since those don't live under the default directory), else
 /// `dirs::config_dir()/.minecraft/saves`
-/// (`C:\Users\<user>\AppData\Roaming\.minecraft\saves` on Windows). Shared by
-/// startup ([`try_load_real_save`]) and the UI's save picker
-/// (`viewer::ui::scan_saves`) so both agree on where "the saves directory" is.
-pub(crate) fn saves_directory() -> PathBuf {
-    save_selection().directory
+/// (`C:\Users\<user>\AppData\Roaming\.minecraft\saves` on Windows) — where
+/// saves live when no CLI argument says otherwise.
+fn default_saves_directory() -> PathBuf {
+    dirs::config_dir().unwrap_or_default().join(".minecraft/saves")
 }
 
-/// The actual logic behind [`saves_directory`], taking the CLI arg (if any)
-/// as a plain `Option<String>` rather than reading `std::env::args()`
-/// directly — real process args can't be overridden per-test, so tests
-/// exercise this instead.
+/// Decides what each argument meant, against what's on disk.
 ///
-/// An **empty or whitespace-only** argument counts as absent (ticket 064), so
-/// `citybuilder -- "" MyWorld` can name a save in `argv[2]` while keeping the
-/// default `.minecraft/saves` directory — an empty `PathBuf` would otherwise
-/// be a saves directory that can never list anything.
-fn saves_directory_from(cli_arg: Option<String>) -> PathBuf {
-    if let Some(dir) = cli_arg.filter(|dir| !dir.trim().is_empty()) {
-        return PathBuf::from(dir);
+/// Two arguments are unambiguous: directory, then save. **One** is the
+/// interesting case, and it resolves by what the argument actually is:
+///
+/// - a directory that lists at least one save is ticket 008's saves/instance
+///   directory (`citybuilder D:/curseforge/instance/saves`), unchanged;
+/// - anything else is ticket 064's save — a name under
+///   [`default_saves_directory`], or a path straight to one save
+///   (`citybuilder nbt_test`, `citybuilder D:/worlds/nbt_test`).
+///
+/// Naming the save is by far the commoner thing to want, and this is what
+/// lets it be typed on its own. It originally required an empty first
+/// argument (`-- "" nbt_test`) to keep `argv[1]`'s ticket 008 meaning
+/// unambiguous — which turned out not to survive Windows PowerShell 5.1's
+/// native-argument handling at all (see [`save_args_from`]), and was awkward
+/// to type even where it did. The empty-first-argument form still works.
+///
+/// Takes the default directory as a parameter (rather than calling
+/// [`default_saves_directory`] itself) purely so tests can point it at a
+/// fixture directory.
+fn resolve_selection_in(args: &SaveArgs, default_dir: &Path) -> SaveSelection {
+    match (args.first.as_deref(), args.second.as_deref()) {
+        (None, None) => SaveSelection { directory: default_dir.to_path_buf(), wanted: None },
+        (Some(dir), Some(name)) => {
+            SaveSelection { directory: PathBuf::from(dir), wanted: Some(name.to_string()) }
+        }
+        (None, Some(name)) => {
+            SaveSelection { directory: default_dir.to_path_buf(), wanted: Some(name.to_string()) }
+        }
+        (Some(only), None) if lists_saves(Path::new(only)) => {
+            SaveSelection { directory: PathBuf::from(only), wanted: None }
+        }
+        (Some(only), None) => {
+            SaveSelection { directory: default_dir.to_path_buf(), wanted: Some(only.to_string()) }
+        }
     }
-    dirs::config_dir()
-        .unwrap_or_default()
-        .join(".minecraft/saves")
+}
+
+/// Whether `dir` reads as a saves *directory* — i.e. it lists at least one
+/// save. Deliberately "at least one" rather than "is readable": a path
+/// straight to a single save is readable too, but its `data`/`datapacks`/
+/// `dimensions` subdirectories are not themselves saves, so it lists none
+/// and resolves as a save instead. See [`resolve_selection_in`].
+fn lists_saves(dir: &Path) -> bool {
+    get_saves_from_instance(dir).is_ok_and(|saves| !saves.is_empty())
+}
+
+/// Directory to scan for Minecraft saves — [`resolve_selection_in`]'s half of
+/// the answer. Shared by startup ([`try_load_real_save`]) and the UI's save
+/// picker (`viewer::ui::scan_saves`) so both agree on where "the saves
+/// directory" is, including when a single CLI argument named a save rather
+/// than a directory (the picker then lists the default directory, which is
+/// where that save was found).
+pub(crate) fn saves_directory() -> PathBuf {
+    resolve_selection_in(&save_args(), &default_saves_directory()).directory
 }
 
 /// Picks a save under `dir` — the one `wanted` names (ticket 064), or the
@@ -194,8 +246,7 @@ fn saves_directory_from(cli_arg: Option<String>) -> PathBuf {
 ///
 /// A `wanted` that names an **existing directory** is taken as the save
 /// itself and read straight through `SaveMeta::from_path`, so a world living
-/// nowhere near any `saves/` folder can be opened without also pointing
-/// `argv[1]` at its parent.
+/// nowhere near any `saves/` folder can be opened.
 ///
 /// `Err` covers every unhappy path ticket 008 calls out — no `.minecraft`
 /// directory, an empty `saves/` folder, or any other I/O failure listing
@@ -206,8 +257,9 @@ fn saves_directory_from(cli_arg: Option<String>) -> PathBuf {
 /// itself) purely so tests can point it at a fixture directory.
 fn try_load_save_from(dir: &Path, wanted: Option<&str>) -> Result<Save, String> {
     if let Some(path) = wanted.map(Path::new).filter(|path| path.is_dir()) {
-        let meta = SaveMeta::from_path(path)
-            .map_err(|e| format!("could not read the save at {}: {e}", path.display()))?;
+        let meta = SaveMeta::from_path(path).map_err(|e| {
+            format!("{} is not a Minecraft save (no readable region directory): {e}", path.display())
+        })?;
         println!("Loading save {}", meta.get_grid_view());
         return Ok(meta.into());
     }
@@ -255,10 +307,10 @@ fn pick_named_save(saves: &[SaveMeta], wanted: &str, dir: &Path) -> Result<SaveM
     ))
 }
 
-/// [`try_load_save_from`] against [`save_selection`] — the real entry point
-/// [`load_real_save`] uses at startup.
+/// [`try_load_save_from`] against [`resolve_selection_in`] — the real entry
+/// point [`load_real_save`] uses at startup.
 fn try_load_real_save() -> Result<Save, String> {
-    let selection = save_selection();
+    let selection = resolve_selection_in(&save_args(), &default_saves_directory());
     try_load_save_from(&selection.directory, selection.wanted.as_deref())
 }
 
@@ -485,38 +537,94 @@ fn region_centroid(regions: &[(i32, i32)]) -> Option<(i32, i32)> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn saves_directory_from_prefers_the_cli_arg_over_the_default() {
-        let dir = saves_directory_from(Some("some/other/instance".to_string()));
-        assert_eq!(dir, Path::new("some/other/instance"));
+    /// A fixture saves directory holding `names`, each a save with an empty
+    /// (but present, so `SaveMeta::from_path` can read it) region directory.
+    fn saves_fixture(tag: &str, names: &[&str]) -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir()
+            .join(format!("block_viewer_test_saves_{tag}_{}_{seq}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for name in names {
+            std::fs::create_dir_all(dir.join(name).join("region")).expect("should create fixture");
+        }
+        std::fs::create_dir_all(&dir).expect("should create fixture");
+        dir
     }
 
-    /// Ticket 064: `citybuilder -- "" MyWorld` keeps the default directory,
-    /// so the second argument can name a save without also spelling out
-    /// where `.minecraft` lives.
+    fn args(first: Option<&str>, second: Option<&str>) -> SaveArgs {
+        save_args_from(first.map(str::to_string), second.map(str::to_string))
+    }
+
+    /// Ticket 008's argument, unchanged: a directory that lists saves is the
+    /// saves directory even when it's the only argument given.
     #[test]
-    fn saves_directory_from_treats_an_empty_arg_as_unset() {
-        let dir = saves_directory_from(Some("   ".to_string()));
-        assert!(
-            dir.ends_with(Path::new(".minecraft/saves")),
-            "expected the default directory, got {}",
-            dir.display()
-        );
+    fn a_lone_saves_directory_argument_is_still_the_directory() {
+        let fixture = saves_fixture("instance", &["Flat", "MyCityWorld"]);
+        let selection =
+            resolve_selection_in(&args(Some(fixture.to_str().unwrap()), None), Path::new("default"));
+        assert_eq!(selection.directory, fixture);
+        assert!(selection.wanted.is_none(), "a directory names no save in particular");
+        std::fs::remove_dir_all(&fixture).ok();
+    }
+
+    /// Ticket 064's whole point after the `-- "" name` form turned out not to
+    /// survive Windows PowerShell 5.1: a lone argument that isn't a saves
+    /// directory is a save *name*, looked for under the default directory.
+    #[test]
+    fn a_lone_non_directory_argument_is_a_save_name() {
+        let selection = resolve_selection_in(&args(Some("nbt_test"), None), Path::new("default"));
+        assert_eq!(selection.directory, Path::new("default"));
+        assert_eq!(selection.wanted.as_deref(), Some("nbt_test"));
+    }
+
+    /// A path straight to one save isn't a saves directory either — its own
+    /// `region`/`data`/`datapacks` subdirectories aren't saves, so it lists
+    /// none and resolves as the save to open.
+    #[test]
+    fn a_lone_path_to_a_single_save_is_a_save_not_a_directory() {
+        let fixture = saves_fixture("single", &["MyCityWorld"]);
+        let save_path = fixture.join("MyCityWorld");
+        let selection =
+            resolve_selection_in(&args(Some(save_path.to_str().unwrap()), None), Path::new("default"));
+        assert_eq!(selection.wanted.as_deref(), Some(save_path.to_str().unwrap()));
+        std::fs::remove_dir_all(&fixture).ok();
     }
 
     #[test]
-    fn save_selection_from_takes_the_second_arg_as_the_save_name() {
-        let selection = save_selection_from(Some("D:/instance/saves".to_string()), Some("MyCityWorld".to_string()));
+    fn two_arguments_are_the_directory_then_the_save() {
+        let selection =
+            resolve_selection_in(&args(Some("D:/instance/saves"), Some("MyCityWorld")), Path::new("default"));
         assert_eq!(selection.directory, Path::new("D:/instance/saves"));
         assert_eq!(selection.wanted.as_deref(), Some("MyCityWorld"));
     }
 
-    /// No second argument (and an empty one) means "the first save found" —
-    /// exactly what every run did before ticket 064.
+    /// No arguments means "the first save found under the default
+    /// directory" — exactly what every run did before ticket 064.
     #[test]
-    fn save_selection_from_wants_no_particular_save_without_a_second_arg() {
-        assert!(save_selection_from(None, None).wanted.is_none());
-        assert!(save_selection_from(None, Some(String::new())).wanted.is_none());
+    fn no_arguments_leaves_the_save_unchosen() {
+        let selection = resolve_selection_in(&args(None, None), Path::new("default"));
+        assert_eq!(selection.directory, Path::new("default"));
+        assert!(selection.wanted.is_none());
+    }
+
+    /// The original `-- "" MyWorld` form still resolves the same way, for
+    /// whoever's shell does pass an empty argument through.
+    #[test]
+    fn an_empty_first_argument_still_means_the_default_directory() {
+        let selection = resolve_selection_in(&args(Some("  "), Some("MyCityWorld")), Path::new("default"));
+        assert_eq!(selection.directory, Path::new("default"));
+        assert_eq!(selection.wanted.as_deref(), Some("MyCityWorld"));
+    }
+
+    /// Windows PowerShell 5.1 can deliver an "empty" argument as two literal
+    /// quote characters rather than dropping it — which would otherwise be a
+    /// saves directory called `""`.
+    #[test]
+    fn an_argument_of_nothing_but_quotes_counts_as_not_given() {
+        let parsed = args(Some("\"\""), Some("'MyCityWorld'"));
+        assert!(parsed.first.is_none());
+        assert_eq!(parsed.second.as_deref(), Some("MyCityWorld"));
     }
 
     fn meta_named(name: &str) -> SaveMeta {
@@ -569,8 +677,8 @@ mod tests {
     }
 
     #[test]
-    fn saves_directory_from_falls_back_to_the_default_minecraft_layout() {
-        let dir = saves_directory_from(None);
+    fn the_default_saves_directory_follows_the_minecraft_layout() {
+        let dir = default_saves_directory();
         assert!(
             dir.ends_with(Path::new(".minecraft/saves")),
             "expected a `.minecraft/saves` suffix, got {}",

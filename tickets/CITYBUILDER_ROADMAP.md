@@ -381,14 +381,19 @@ this game doesn't use `crate::selection`-based panels. Three windows:
   `city::undo` (`Journal::undo_last`'s caller).
 - **Definition errors** — see C above.
 
-**Which save it opens** (ticket 064): two positional CLI arguments, parsed in
-the crate root (`saves_directory_from`/`pick_named_save`) so `block_viewer`
-honours them as its startup default too. `argv[1]` keeps ticket 008's meaning
-(which saves *directory* to scan) but now treats an empty value as unset;
-`argv[2]` picks a save within it by name (exact, then case-insensitive), or
-is taken as the save directory itself when it names an existing one. An
-unmatched name is a ticket-008-style startup issue listing the names that do
-exist, not a silent fall back to the first save. The city panel's **World**
+**Which save it opens** (ticket 064): up to two positional CLI arguments,
+parsed in the crate root (`resolve_selection_in`/`pick_named_save`) so
+`block_viewer` honours them as its startup default too. A **single** argument
+is classified against the filesystem — a directory that lists saves is ticket
+008's saves directory, unchanged; anything else is the save, by name under
+`.minecraft/saves` or by path (`citybuilder nbt_test`). Two arguments are
+directory then save. Name matching is exact first, then case-insensitive, and
+an unmatched name is a ticket-008-style startup issue listing the names that
+do exist, not a silent fall back to the first save. The empty-first-argument
+form this shipped with (`-- "" nbt_test`) is still accepted but is no longer
+required: Windows PowerShell 5.1 doesn't pass an empty argument to a native
+executable intact, so requiring one made the feature unusable on the shell
+this repo is developed on. The city panel's **World**
 section shows the resolved save, its region count, and that issue in red —
 the citybuilder's stand-in for the viewer's save picker, which it can't
 reuse; see "Deliberately not in this iteration".

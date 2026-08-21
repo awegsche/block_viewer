@@ -230,21 +230,31 @@
 //!
 //! ## Which save it plays on (ticket 064)
 //!
-//! Two positional CLI arguments, parsed by [`crate::saves_directory`]'s own
-//! neighbours in the crate root rather than here, so `block_viewer` honours
-//! them identically as its startup default:
+//! Up to two positional CLI arguments, parsed by [`crate::saves_directory`]'s
+//! own neighbours in the crate root rather than here, so `block_viewer`
+//! honours them identically as its startup default:
 //!
 //! ```text
-//! citybuilder                                  # the first save found (unchanged)
-//! citybuilder -- "" MyCityWorld                # default saves dir, named save
-//! citybuilder -- D:/instance/saves MyCityWorld # both
-//! citybuilder -- "" D:/worlds/MyCityWorld      # a path straight to a save
+//! cargo run --bin citybuilder                                     # first save found (unchanged)
+//! cargo run --bin citybuilder -- MyCityWorld                      # a save by name
+//! cargo run --bin citybuilder -- D:/worlds/MyCityWorld            # a path straight to a save
+//! cargo run --bin citybuilder -- D:/instance/saves                # ticket 008: a saves directory
+//! cargo run --bin citybuilder -- D:/instance/saves MyCityWorld    # both
 //! ```
 //!
-//! `argv[1]` keeps its ticket 008 meaning (which saves *directory* to scan,
-//! for CurseForge/MultiMC instances); an empty one now means "unset", so a
-//! save name can be given without also spelling out where `.minecraft` is.
-//! Everything per-save that [`run`] loads below — [`state::City`],
+//! A **single** argument is classified against what's on disk: a directory
+//! that lists saves is ticket 008's saves directory (for CurseForge/MultiMC
+//! instances), anything else is the save — by name under the default
+//! `.minecraft/saves`, or by path. Two arguments are directory then save.
+//! Name matching is case-insensitive, and an unmatched one lists the names
+//! that do exist rather than falling back to some other save.
+//!
+//! This deliberately does *not* require the empty first argument
+//! (`-- "" MyCityWorld`) it was first built with: Windows PowerShell 5.1
+//! doesn't pass an empty argument to a native executable intact, so that form
+//! failed outright on the shell this repo is developed on. It still works
+//! where a shell does pass it through. Everything per-save that [`run`] loads
+//! below — [`state::City`],
 //! [`journal::Journal`], [`CitySavePath`] — hangs off whichever save this
 //! resolves to, which is exactly why the citybuilder has no *runtime* save
 //! picker the way `block_viewer` does: switching live would have to save and

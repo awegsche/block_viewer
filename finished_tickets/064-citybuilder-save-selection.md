@@ -62,3 +62,29 @@ equivalent).
 - `saves_directory_from` / the new selection parsing and name matching are
   unit-tested, including the empty-string directory arg and the unknown-name
   error.
+
+## Follow-up: the empty first argument didn't survive the shell
+
+Shipped requiring `-- "" <save name>` to keep `argv[1]`'s ticket 008 meaning
+unambiguous. That doesn't work: **Windows PowerShell 5.1 does not pass an
+empty argument to a native executable intact** — it arrives either dropped
+(so the save name lands in `argv[1]` and is read as a saves directory, which
+fails with an I/O error naming a path that doesn't exist) or as two literal
+quote characters. Either way the documented form failed on the shell this
+repo is developed on. pwsh 7 passes it fine, which is why it looked correct
+when tested.
+
+Fixed by classifying a **single** argument against the filesystem instead of
+by position (`resolve_selection_in`):
+
+- a directory that lists at least one save is ticket 008's saves directory,
+  unchanged — `citybuilder D:/curseforge/instance/saves`;
+- anything else is the save — `citybuilder nbt_test`, or a path straight to
+  one, `citybuilder D:/worlds/nbt_test`. A save path is readable as a
+  directory but lists no saves of its own (`data`, `datapacks`, `dimensions`
+  aren't saves), which is what separates the two cases.
+
+Two arguments still mean directory then save, and the empty-first form still
+resolves for shells that do pass it through — `save_args_from` now treats an
+argument that is empty, whitespace, or nothing but quote characters as not
+given, which covers PowerShell 5.1's literal-quotes delivery too.

@@ -202,7 +202,7 @@ fn world_section(ui: &mut egui::Ui, save: &LoadedSave, issue: &StartupIssue) {
     ui.label(format!("{} ({} regions)", save.0.meta.name, save.0.meta.regions.len()));
     if let Some(reason) = &issue.0 {
         ui.colored_label(egui::Color32::RED, reason);
-        ui.label("Pass a saves directory and save name: citybuilder -- <saves dir> <save name>");
+        ui.label("Name the save on the command line: citybuilder <save name>");
     }
 }
 
