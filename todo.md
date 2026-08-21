@@ -1066,3 +1066,57 @@ Needs a human at the window:
 
 Note: any road built with a *previous* build of the app is still sitting at
 Y=0 in the world and won't be cleaned up by this fix — see the ticket.
+
+- [ ] **066 road piece rotation: corners, dead ends and Ts point the right
+  way.** `cargo run --bin citybuilder -- nbt_test`, press `T` for the road
+  tool. `canonical_pattern` was claiming a different orientation than
+  `assets/city/roads/dirt/*.nbt` were actually exported at, so every dead end
+  and corner came out 180° off and every T 90° off. A test now reads the real
+  `.nbt` files and checks the table against them
+  (`road_catalogue::the_shipped_dirt_pieces_are_authored_at_the_canonical_orientations`),
+  but "does the bend actually bend the right way on screen" still needs eyes:
+
+  1. **Drag an L.** The corner cell should turn *into* both of its
+     neighbours — the paving continuous through the bend, the grass shoulder
+     on the outside of it. A corner rotated 180° looks like a bend pointing
+     into two empty cells with grass where the road should join.
+  2. **Place a single cell, then extend it by one.** The first cell is a dead
+     end: its stub should open toward the cell you extend into, not away from
+     it.
+  3. **Build a T** (a straight run with one cell branching off the side). All
+     three arms should meet the paving; the closed arm should be the one with
+     no neighbour.
+  4. **Known asset gap, not a code bug:** a *lone* cell with no neighbours
+     renders as a south-pointing dead-end stub, because `isolated.nbt` is a
+     byte-identical copy of `dead_end.nbt`. Re-export a real island piece in
+     Minecraft if you want one.
+
+- [ ] **067 road height: a drag builds one continuous road, not a staircase
+  of cliffs.** Same launch. Roads used to fit each 6x6 cell to its own
+  ground; now the whole drag gets one level (from its first cell), with
+  optional 4-block steps via `stair.nbt`.
+
+  1. **Drag a long run across a slope.** Every cell should sit at the same Y
+     — the one the cell you *started* the drag on was fitted to. No
+     one-block steps between cells. Expect the road to be buried where the
+     hill rises above it and to stand proud where the ground falls away:
+     that's the rule working, and the dig/level tools (`T` again) are the
+     current answer to it.
+  2. **The ghost previews the same level.** While dragging, the translucent
+     preview should already be flat at the start level, not following the
+     terrain.
+  3. **Start a second drag on (or beside) the end of the first.** The new
+     road should continue at the *existing* road's height, not drop back to
+     the ground under it. That's `anchor_level`; a seam means it isn't
+     firing.
+  4. **Once `assets/city/roads/dirt/stair.nbt` exists** (see that directory's
+     README for the orientation and cross-section to author it to): drag a
+     run whose two ends are ~4+ blocks apart in height. One stair cell should
+     appear in the middle of the run, its low end flush with the flat road
+     behind it and its top step flush with the flat road ahead. A run that's
+     too short for the climb should refuse the whole drag with a message in
+     the console rather than building a cliff.
+  5. **Save, quit, reopen.** Heights and stairs come back. Note: an existing
+     `<save>/citybuilder/city.ron` is version 4 and will be *refused* on load
+     (`city save is version 4, this build reads version 5`) — delete it to
+     clear the message; the buildings and roads it recorded go with it.

@@ -50,6 +50,16 @@
 //! file's cells have no height to recover and defaulting them to *anything*
 //! would either re-bury them or drop them on terrain they were never fitted
 //! to. Refused rather than guessed at, same as the two bumps before it.
+//!
+//! Bumped again to `5` by ticket 067: a road cell can now be a *stair*,
+//! carrying the direction it climbs ([`super::state::RoadCell::ascent`]).
+//! A version-4 file's cells are all implicitly flat, which — unlike the
+//! earlier bumps — would actually be a *safe* default to fill in. It's still
+//! refused, for the same reason the version check is an equality test at
+//! all: the moment one field is quietly defaulted, the next one that isn't
+//! safe to default has to argue its case against a precedent. A migration
+//! function is the answer when one is worth writing, not a per-field
+//! exception here.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -57,12 +67,13 @@ use std::path::{Path, PathBuf};
 use bevy::math::{IVec2, IVec3};
 use serde::{Deserialize, Serialize};
 
+use super::road::Direction;
 use super::state::{BuildingId, City, PlacedBuilding, PlacementError};
 use crate::blueprint::Rotation;
 
 /// The `CitySave` schema version this build writes and reads. Bumped only
 /// alongside a migration path — see the module docs.
-pub const CURRENT_VERSION: u32 = 4;
+pub const CURRENT_VERSION: u32 = 5;
 
 /// Where [`save_city`]/[`load_city`] look, relative to a save's root
 /// (`SaveMeta::path`) — the roadmap's own `<save>/citybuilder/city.ron`.
@@ -96,8 +107,9 @@ struct SavedBuilding {
 }
 
 /// One saved road cell — cell coordinates plus the style
-/// (`super::road_catalogue::RoadCatalogue`'s key) it was built as and the
-/// world Y its piece sits at (ticket 065).
+/// (`super::road_catalogue::RoadCatalogue`'s key) it was built as, the world
+/// Y its piece sits at (ticket 065) and, for a stair, which way it climbs
+/// (ticket 067).
 #[derive(Debug, Serialize, Deserialize)]
 struct SavedRoadCell {
     x: i32,
@@ -106,6 +118,10 @@ struct SavedRoadCell {
     /// coordinates (ticket 054). See [`super::state::RoadCell::base_y`].
     y: i32,
     style: String,
+    /// `None` for a flat cell; the direction a stair cell climbs otherwise.
+    /// [`super::road::Direction`] itself, not a mirror enum — see that
+    /// type's own docs.
+    ascent: Option<Direction>,
 }
 
 /// Why [`save_city`] or [`load_city`] failed.
@@ -168,7 +184,13 @@ pub fn save_city(city: &City, save_root: &Path) -> Result<(), PersistenceError> 
 
     let mut road_cells: Vec<SavedRoadCell> = city
         .road_cells_with_data()
-        .map(|(cell, road)| SavedRoadCell { x: cell.x, z: cell.y, y: road.base_y, style: road.style.clone() })
+        .map(|(cell, road)| SavedRoadCell {
+            x: cell.x,
+            z: cell.y,
+            y: road.base_y,
+            style: road.style.clone(),
+            ascent: road.ascent,
+        })
         .collect();
     road_cells.sort_by_key(|cell| (cell.x, cell.z));
 
@@ -216,7 +238,8 @@ pub fn load_city(save_root: &Path) -> Result<City, PersistenceError> {
     let mut road_cells = save.road_cells;
     road_cells.sort_by_key(|cell| (cell.x, cell.z));
     for cell in road_cells {
-        city.add_road_cell(IVec2::new(cell.x, cell.z), cell.style, cell.y).map_err(PersistenceError::Corrupt)?;
+        city.add_road_cell(IVec2::new(cell.x, cell.z), cell.style, cell.y, cell.ascent)
+            .map_err(PersistenceError::Corrupt)?;
     }
 
     // `insert_loaded` already raised `next_id` past every id it inserted;
@@ -275,8 +298,11 @@ mod tests {
         let b = city
             .place_building("house01", IVec3::new(0, 70, 0), Rotation::Deg90, IVec2::new(3, 5))
             .unwrap();
-        city.add_road_cell(IVec2::new(50, 50), "dirt", 64).unwrap();
-        city.add_road_cell(IVec2::new(50, 51), "paved", 71).unwrap();
+        city.add_road_cell(IVec2::new(50, 50), "dirt", 64, None).unwrap();
+        city.add_road_cell(IVec2::new(50, 51), "paved", 71, None).unwrap();
+        // Ticket 067: a stair cell, so the ascent field is exercised by the
+        // round trip rather than only by its own dedicated test.
+        city.add_road_cell(IVec2::new(50, 52), "dirt", 71, Some(Direction::East)).unwrap();
 
         save_city(&city, &dir).unwrap();
         let loaded = load_city(&dir).unwrap();
@@ -293,7 +319,7 @@ mod tests {
         // The rotated occupancy rectangle should have round-tripped too.
         assert_eq!(loaded.occupant_at(IVec2::new(4, 2)), Some(crate::city::state::Occupant::Building(b)));
 
-        assert_eq!(loaded.road_cells().count(), 2);
+        assert_eq!(loaded.road_cells().count(), 3);
         assert!(loaded.is_road_cell(IVec2::new(50, 50)));
         // Ticket 059: each cell's own style round-trips too, not just its
         // coordinate.
@@ -303,6 +329,10 @@ mod tests {
         assert_eq!(loaded.road_cell_at(IVec2::new(50, 50)).map(|road| road.base_y), Some(64));
         assert_eq!(loaded.road_cell_at(IVec2::new(50, 51)).map(|road| road.base_y), Some(71));
         assert_eq!(loaded.road_style_at(IVec2::new(50, 51)), Some("paved"));
+        // Ticket 067: a flat cell comes back flat and a stair comes back
+        // climbing the way it was built, not merely "some stair".
+        assert_eq!(loaded.road_cell_at(IVec2::new(50, 50)).and_then(|road| road.ascent), None);
+        assert_eq!(loaded.road_cell_at(IVec2::new(50, 52)).and_then(|road| road.ascent), Some(Direction::East));
     }
 
     /// The scenario the module docs call out: the *highest*-id building is
@@ -383,6 +413,25 @@ mod tests {
         assert!(matches!(err, PersistenceError::Parse(_) | PersistenceError::UnsupportedVersion(2)), "{err:?}");
     }
 
+    /// Ticket 067: a version-4 file's `road_cells` have no `ascent`, so
+    /// every road in one is flat — which, unlike the earlier bumps, *would*
+    /// be a safe thing to default. Refused anyway: see the module docs'
+    /// "No migration path yet" for why one safe default is still the wrong
+    /// precedent to set here.
+    #[test]
+    fn an_old_ascentless_road_cell_save_is_refused_not_silently_defaulted() {
+        let dir = temp_dir("old_road_cell_ascent");
+        fs::create_dir_all(dir.join("citybuilder")).unwrap();
+        fs::write(
+            dir.join("citybuilder/city.ron"),
+            r#"(version: 4, next_id: 0, buildings: [], road_cells: [(x: 5, z: 5, y: 64, style: "dirt")])"#,
+        )
+        .unwrap();
+
+        let err = load_city(&dir).unwrap_err();
+        assert!(matches!(err, PersistenceError::Parse(_) | PersistenceError::UnsupportedVersion(4)), "{err:?}");
+    }
+
     /// Ticket 065: a version-3 file's `road_cells` had no `y` — every road
     /// in it was written at the hardcoded Y=0 that ticket fixed, so there is
     /// no height to recover and nothing sensible to default to. Refused, the
@@ -419,17 +468,22 @@ mod tests {
     fn two_overlapping_saved_buildings_is_corrupt_not_a_bad_city() {
         let dir = temp_dir("overlap");
         fs::create_dir_all(dir.join("citybuilder")).unwrap();
+        // `CURRENT_VERSION` rather than a pinned literal: this fixture is
+        // about *occupancy* being rejected, not about versioning, and pinning
+        // it made it start failing for the wrong reason on every schema bump.
         fs::write(
             dir.join("citybuilder/city.ron"),
-            r#"(
-                version: 4,
+            format!(
+                r#"(
+                version: {CURRENT_VERSION},
                 next_id: 2,
                 buildings: [
                     (id: 0, definition: "house01", origin: (0, 64, 0), rotation: Deg0, footprint: (4, 4)),
                     (id: 1, definition: "house01", origin: (3, 64, 3), rotation: Deg0, footprint: (4, 4)),
                 ],
                 road_cells: [],
-            )"#,
+            )"#
+            ),
         )
         .unwrap();
 
@@ -441,16 +495,19 @@ mod tests {
     fn a_saved_road_cell_colliding_with_a_building_is_corrupt() {
         let dir = temp_dir("road_overlap");
         fs::create_dir_all(dir.join("citybuilder")).unwrap();
+        // See the note in `two_overlapping_saved_buildings_is_corrupt_not_a_bad_city`.
         fs::write(
             dir.join("citybuilder/city.ron"),
-            r#"(
-                version: 4,
+            format!(
+                r#"(
+                version: {CURRENT_VERSION},
                 next_id: 1,
                 buildings: [
                     (id: 0, definition: "house01", origin: (0, 64, 0), rotation: Deg0, footprint: (2, 2)),
                 ],
-                road_cells: [(x: 0, z: 0, y: 64, style: "dirt")],
-            )"#,
+                road_cells: [(x: 0, z: 0, y: 64, style: "dirt", ascent: None)],
+            )"#
+            ),
         )
         .unwrap();
 

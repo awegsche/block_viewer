@@ -8,14 +8,14 @@
 //! [`blueprint::load_catalogue_dir`](crate::blueprint::load_catalogue_dir)
 //! (ticket 039) indexes *whatever* `.nbt` files it finds, keyed by filename.
 //! A road piece isn't an open-ended catalogue that way — there are exactly
-//! six kinds ([`RoadPieceKind::ALL`](super::road::RoadPieceKind::ALL)) per
+//! kinds ([`RoadPieceKind::ALL`](super::road::RoadPieceKind::ALL)) per
 //! style, each with one canonical filename. What *is* open-ended (ticket
 //! 059) is the set of styles: `assets/city/roads/<style>/*.nbt`, one
 //! subdirectory per style, the subdirectory's own name serving as the style
 //! id — the same "the filename is the id" call
 //! [`blueprint::load_catalogue_dir`] makes for a building, just one level up
 //! the path. [`load_road_catalogue_dir`] scans `assets/city/roads` for
-//! subdirectories, then looks inside each one for those six fixed filenames
+//! subdirectories, then looks inside each one for those fixed filenames
 //! by name rather than scanning it. A missing file is reported per
 //! `(style, kind)` the same tolerant way 039 reports a bad file — the
 //! catalogue that *does* load is still usable, just short a piece — rather
@@ -106,6 +106,7 @@ fn filename_for(kind: RoadPieceKind) -> &'static str {
         RoadPieceKind::Corner => "corner",
         RoadPieceKind::T => "t",
         RoadPieceKind::Cross => "cross",
+        RoadPieceKind::Stair => "stair",
     }
 }
 
@@ -296,7 +297,7 @@ mod tests {
         assert_eq!(catalogue.len(), 1);
         assert!(catalogue.get("dirt", RoadPieceKind::Straight).is_some());
         assert_eq!(catalogue.styles(), vec!["dirt"]);
-        assert_eq!(skipped.len(), 5, "the other five kinds of this one style still have no file");
+        assert_eq!(skipped.len(), RoadPieceKind::ALL.len() - 1, "every other kind of this one style still has no file");
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -317,15 +318,15 @@ mod tests {
     }
 
     #[test]
-    fn all_six_kinds_load_independently_for_one_style() {
-        let dir = temp_dir("all_six");
+    fn every_kind_loads_independently_for_one_style() {
+        let dir = temp_dir("all_kinds");
         for kind in RoadPieceKind::ALL {
             write_piece(&dir, "dirt", kind, &one_stone(IVec3::new(6, 2, 6)));
         }
 
         let (catalogue, skipped) = load_road_catalogue_dir(&dir);
         assert!(skipped.is_empty(), "{skipped:?}");
-        assert_eq!(catalogue.len(), 6);
+        assert_eq!(catalogue.len(), RoadPieceKind::ALL.len());
         for kind in RoadPieceKind::ALL {
             assert!(catalogue.get("dirt", kind).is_some());
         }
@@ -346,7 +347,7 @@ mod tests {
 
         let (catalogue, skipped) = load_road_catalogue_dir(&dir);
         assert!(skipped.is_empty(), "{skipped:?}");
-        assert_eq!(catalogue.len(), 12);
+        assert_eq!(catalogue.len(), RoadPieceKind::ALL.len() * 2);
         assert_eq!(catalogue.styles(), vec!["dirt", "paved"]);
         for style in ["dirt", "paved"] {
             for kind in RoadPieceKind::ALL {
@@ -367,12 +368,75 @@ mod tests {
 
         let (catalogue, skipped) = load_road_catalogue_dir(&dir);
         assert!(catalogue.get("dirt", RoadPieceKind::Straight).is_some());
-        assert_eq!(skipped.len(), 5, "the other five kinds of this style");
+        assert_eq!(skipped.len(), RoadPieceKind::ALL.len() - 1, "every other kind of this style");
         for (style, _, err) in &skipped {
             assert_eq!(style, "dirt");
             assert!(matches!(err, RoadCatalogueError::Missing));
         }
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    // -- the shipped assets vs the authoring convention (ticket 066) --------
+
+    /// Which of a piece's four edges its road surface actually reaches, read
+    /// off the blueprint's surface course.
+    ///
+    /// "The road surface" is defined as *whatever block sits at the piece's
+    /// own centre* — a road cell is always paved through the middle, whatever
+    /// the style paves it with — so this doesn't hard-code
+    /// `minecraft:dirt_path` and works for a future style paved in stone.
+    /// An edge is open when both of its two centre columns carry that same
+    /// block; a kerb or a grass shoulder closing the edge off reads as shut.
+    fn open_edges(piece: &Blueprint) -> super::super::road::RoadConnections {
+        let (sx, sz) = (piece.size.x as usize, piece.size.z as usize);
+        let y = super::super::road_build::ROAD_PIECE_SUBGRADE_DEPTH as usize;
+        let at = |x: usize, z: usize| piece.palette[piece.blocks[y * sz * sx + z * sx + x] as usize].name.as_str();
+
+        let mid = (ROAD_CELL_SIZE / 2) as usize; // 3 — the far half of the two centre columns
+        let surface = at(mid, mid);
+        let both = |a: (usize, usize), b: (usize, usize)| at(a.0, a.1) == surface && at(b.0, b.1) == surface;
+
+        super::super::road::RoadConnections {
+            north: both((mid - 1, 0), (mid, 0)),
+            south: both((mid - 1, sz - 1), (mid, sz - 1)),
+            west: both((0, mid - 1), (0, mid)),
+            east: both((sx - 1, mid - 1), (sx - 1, mid)),
+        }
+    }
+
+    /// The guard ticket 066 exists because nothing had: the `.nbt` files
+    /// checked into `assets/city/roads/dirt` are read, and each one's real
+    /// open edges are compared against the orientation
+    /// [`super::super::road::canonical_pattern`] claims it was authored at.
+    /// A re-export at a different orientation, or a table edited without the
+    /// assets, fails here rather than silently rotating every corner in the
+    /// world by 180°.
+    ///
+    /// [`RoadPieceKind::Isolated`] is skipped: `isolated.nbt` currently ships
+    /// as a byte-identical copy of `dead_end.nbt` (a south-pointing stub),
+    /// which the canonical "connects to nothing" can't describe and
+    /// `select_piece` — which always answers `Deg0` for an unoriented piece —
+    /// has no rotation to fix it with. Re-exporting a real island piece is
+    /// noted in `todo.md`; it needs Minecraft, not code.
+    #[test]
+    fn the_shipped_dirt_pieces_are_authored_at_the_canonical_orientations() {
+        let (catalogue, _skipped) = load_road_catalogue_dir(Path::new("assets/city/roads"));
+        assert!(catalogue.get("dirt", RoadPieceKind::Straight).is_some(), "the dirt style should be checked in");
+
+        for kind in RoadPieceKind::ALL {
+            if kind == RoadPieceKind::Isolated {
+                continue; // see the doc comment
+            }
+            let Some(piece) = catalogue.get("dirt", kind) else {
+                continue; // a kind with no shipped asset yet — tolerated, same as the loader does
+            };
+            assert_eq!(
+                open_edges(piece),
+                super::super::road::canonical_pattern(kind),
+                "assets/city/roads/dirt/{}.nbt is exported at a different orientation than city::road::canonical_pattern                  claims — fix whichever is wrong, and keep road.rs's module docs and the style's README with it",
+                filename_for(kind),
+            );
+        }
     }
 }

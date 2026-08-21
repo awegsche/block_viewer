@@ -145,7 +145,25 @@ pub struct RoadCell {
     /// offsets this before handing it to `super::commit::blueprint_edit`.
     /// What's stored here is the *ground reading*, so a piece whose geometry
     /// changes shape doesn't invalidate every recorded cell.
+    ///
+    /// For a **stair** cell ([`Self::ascent`]) this is the *low* end: the
+    /// piece climbs from here to `base_y + ROAD_STAIR_RISE` across the cell.
     pub base_y: i32,
+    /// `None` for an ordinary flat cell. `Some(direction)` marks this cell a
+    /// [`RoadPieceKind::Stair`](super::road::RoadPieceKind::Stair) climbing
+    /// `super::road_build::ROAD_STAIR_RISE` blocks toward `direction` — so
+    /// its low end (and [`Self::base_y`]) is on the `direction.opposite()`
+    /// side, and the flat cell it meets on the `direction` side records
+    /// `base_y + ROAD_STAIR_RISE`.
+    ///
+    /// Ticket 067. Stored rather than derived from the neighbours' heights
+    /// for the same reason `base_y` is: a cell's shape has to survive its
+    /// neighbours changing, and a ramp that recomputed which way it pointed
+    /// every time a road was built beside it would flip under the player.
+    /// Nothing about a cell's *connections* can imply this either — a stair
+    /// and a straight connect identically, which is why
+    /// [`super::road::select_piece`] never returns `Stair`.
+    pub ascent: Option<super::road::Direction>,
 }
 
 /// What one tile of the occupancy grid holds.
@@ -370,16 +388,24 @@ impl City {
     /// as a road built in `style` (ticket 059 —
     /// `super::road_catalogue::RoadCatalogue`'s own key), occupying all 36
     /// block tiles [`road_cell_tiles`] lists for it. Idempotent if `cell` is
-    /// already a road — `style` and `base_y` are both ignored in that case
-    /// and the cell's *existing* record is kept; repainting a road cell to a
-    /// different style is out of scope here (a demolish-and-rebuild away, for
-    /// now), and keeping the original `base_y` is what stops a re-tiled cell
-    /// from drifting upward (ticket 065 — see [`RoadCell`]). Refused,
+    /// already a road — `style`, `base_y` and `ascent` are all ignored in
+    /// that case and the cell's *existing* record is kept; repainting a road
+    /// cell to a different style is out of scope here (a demolish-and-rebuild
+    /// away, for now), keeping the original `base_y` is what stops a re-tiled
+    /// cell from drifting upward (ticket 065 — see [`RoadCell`]), and keeping
+    /// the original `ascent` is what stops a drag that merely *crosses* an
+    /// existing stair from flattening it (ticket 067). Refused,
     /// all-or-nothing, if *any* of the 36 tiles a *new* cell would claim are
     /// held by a building or another road cell — the same "plan every tile
     /// before marking any of them" shape [`place_building`](Self::place_building)
     /// uses, so a refused road cell never leaves a partial one behind.
-    pub fn add_road_cell(&mut self, cell: IVec2, style: impl Into<String>, base_y: i32) -> Result<(), PlacementError> {
+    pub fn add_road_cell(
+        &mut self,
+        cell: IVec2,
+        style: impl Into<String>,
+        base_y: i32,
+        ascent: Option<super::road::Direction>,
+    ) -> Result<(), PlacementError> {
         if self.road_cells.contains_key(&cell) {
             return Ok(());
         }
@@ -394,7 +420,7 @@ impl City {
         for &tile in &tiles {
             self.occupancy.insert(tile, Occupant::Road);
         }
-        self.road_cells.insert(cell, RoadCell { style: style.into(), base_y });
+        self.road_cells.insert(cell, RoadCell { style: style.into(), base_y, ascent });
         Ok(())
     }
 
@@ -548,7 +574,7 @@ mod tests {
     #[test]
     fn placing_a_road_cell_occupies_exactly_its_36_tiles() {
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(1, 2), "dirt", 64).unwrap();
+        city.add_road_cell(IVec2::new(1, 2), "dirt", 64, None).unwrap();
 
         for x in 6..12 {
             for z in 12..18 {
@@ -571,14 +597,14 @@ mod tests {
 
         // Cell (0, 0) covers block tiles 0..6 x 0..6, which overlaps the
         // building's 2x2 footprint at its very first checked tile.
-        let err = city.add_road_cell(IVec2::new(0, 0), "dirt", 64).unwrap_err();
+        let err = city.add_road_cell(IVec2::new(0, 0), "dirt", 64, None).unwrap_err();
         assert!(matches!(
             err,
             PlacementError::TileOccupied { tile, by: Occupant::Building(id) }
                 if tile == IVec2::new(0, 0) && id == building_id
         ));
 
-        city.add_road_cell(IVec2::new(5, 5), "dirt", 64).expect("an empty cell should accept a road");
+        city.add_road_cell(IVec2::new(5, 5), "dirt", 64, None).expect("an empty cell should accept a road");
         // Cell (5, 5) covers block tiles 30..36 x 30..36.
         let err = city
             .place_building("house01", IVec3::new(30, 64, 30), Rotation::Deg0, IVec2::new(1, 1))
@@ -592,8 +618,8 @@ mod tests {
     #[test]
     fn adding_the_same_road_cell_twice_is_a_no_op() {
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(1, 1), "dirt", 64).unwrap();
-        city.add_road_cell(IVec2::new(1, 1), "dirt", 64).expect("re-adding the same road cell should succeed");
+        city.add_road_cell(IVec2::new(1, 1), "dirt", 64, None).unwrap();
+        city.add_road_cell(IVec2::new(1, 1), "dirt", 64, None).expect("re-adding the same road cell should succeed");
         assert_eq!(city.road_cells().count(), 1);
     }
 
@@ -602,7 +628,7 @@ mod tests {
     #[test]
     fn road_style_at_reports_the_style_a_cell_was_built_as() {
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(0, 0), "paved", 64).unwrap();
+        city.add_road_cell(IVec2::new(0, 0), "paved", 64, None).unwrap();
         assert_eq!(city.road_style_at(IVec2::new(0, 0)), Some("paved"));
     }
 
@@ -619,8 +645,8 @@ mod tests {
     #[test]
     fn re_adding_an_existing_road_cell_keeps_its_original_style() {
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(0, 0), "dirt", 64).unwrap();
-        city.add_road_cell(IVec2::new(0, 0), "paved", 64).unwrap();
+        city.add_road_cell(IVec2::new(0, 0), "dirt", 64, None).unwrap();
+        city.add_road_cell(IVec2::new(0, 0), "paved", 64, None).unwrap();
         assert_eq!(city.road_style_at(IVec2::new(0, 0)), Some("dirt"));
     }
 
@@ -632,24 +658,24 @@ mod tests {
     #[test]
     fn re_adding_an_existing_road_cell_keeps_its_original_base_y() {
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(0, 0), "dirt", 64).unwrap();
-        city.add_road_cell(IVec2::new(0, 0), "dirt", 65).unwrap();
+        city.add_road_cell(IVec2::new(0, 0), "dirt", 64, None).unwrap();
+        city.add_road_cell(IVec2::new(0, 0), "dirt", 65, None).unwrap();
         assert_eq!(city.road_cell_at(IVec2::new(0, 0)).map(|road| road.base_y), Some(64));
     }
 
     #[test]
     fn road_cell_at_reports_the_style_and_height_a_cell_was_built_with() {
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(3, -2), "paved", 71).unwrap();
-        assert_eq!(city.road_cell_at(IVec2::new(3, -2)), Some(&RoadCell { style: "paved".to_string(), base_y: 71 }));
+        city.add_road_cell(IVec2::new(3, -2), "paved", 71, None).unwrap();
+        assert_eq!(city.road_cell_at(IVec2::new(3, -2)), Some(&RoadCell { style: "paved".to_string(), base_y: 71, ascent: None }));
         assert_eq!(city.road_cell_at(IVec2::new(0, 0)), None);
     }
 
     #[test]
     fn road_cells_with_data_iterates_every_cell_with_its_style_and_height() {
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(0, 0), "dirt", 64).unwrap();
-        city.add_road_cell(IVec2::new(5, 5), "paved", 71).unwrap();
+        city.add_road_cell(IVec2::new(0, 0), "dirt", 64, None).unwrap();
+        city.add_road_cell(IVec2::new(5, 5), "paved", 71, None).unwrap();
 
         let found: HashSet<(IVec2, String, i32)> =
             city.road_cells_with_data().map(|(&cell, road)| (cell, road.style.clone(), road.base_y)).collect();
@@ -691,14 +717,14 @@ mod tests {
     fn remove_road_cell_reports_whether_a_cell_was_actually_a_road() {
         let mut city = City::default();
         assert!(!city.remove_road_cell(IVec2::new(0, 0)), "never added");
-        city.add_road_cell(IVec2::new(0, 0), "dirt", 64).unwrap();
+        city.add_road_cell(IVec2::new(0, 0), "dirt", 64, None).unwrap();
         assert!(city.remove_road_cell(IVec2::new(0, 0)));
         assert!(city.is_tile_free(IVec2::new(0, 0)));
         assert!(!city.is_road_cell(IVec2::new(0, 0)));
 
         // Removing frees every one of the cell's 36 tiles, not just its
         // corner.
-        city.add_road_cell(IVec2::new(0, 0), "dirt", 64).unwrap();
+        city.add_road_cell(IVec2::new(0, 0), "dirt", 64, None).unwrap();
         city.remove_road_cell(IVec2::new(0, 0));
         for x in 0..6 {
             for z in 0..6 {
@@ -732,8 +758,8 @@ mod tests {
         let mut city = City::default();
         let a = city.place_building("house01", IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::ONE).unwrap();
         let b = city.place_building("house01", IVec3::new(5, 64, 5), Rotation::Deg0, IVec2::ONE).unwrap();
-        city.add_road_cell(IVec2::new(2, 2), "dirt", 64).unwrap();
-        city.add_road_cell(IVec2::new(2, 3), "dirt", 64).unwrap();
+        city.add_road_cell(IVec2::new(2, 2), "dirt", 64, None).unwrap();
+        city.add_road_cell(IVec2::new(2, 3), "dirt", 64, None).unwrap();
 
         let ids: HashSet<BuildingId> = city.buildings().map(|(id, _)| id).collect();
         assert_eq!(ids, HashSet::from([a, b]));

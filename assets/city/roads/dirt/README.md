@@ -1,19 +1,63 @@
 # `dirt` road style — geometry
 
-`city::road_catalogue::load_road_catalogue_dir` scans this directory for six
-fixed-name `.nbt` structure-block exports, one per `RoadPieceKind`:
+`city::road_catalogue::load_road_catalogue_dir` scans this directory for
+fixed-name `.nbt` structure-block exports, one per `RoadPieceKind`.
 
-- `isolated.nbt` — no neighbours
-- `dead_end.nbt` — exactly one neighbour
-- `straight.nbt` — two opposite neighbours
-- `corner.nbt` — two adjacent neighbours (90° bend)
-- `t.nbt` — three neighbours
-- `cross.nbt` — all four neighbours
+## Orientation: the authoring convention (ticket 066)
 
-No real Minecraft structure-block export ships in this repo yet (same scope
-note as tickets 054/059) — a missing piece here is skipped, not fatal, so
-this directory can stay partially (or entirely) empty until real geometry
-is exported and dropped in under the filenames above.
+`city::road::select_piece` is style-blind — it answers with a piece *kind*
+and the `Rotation` that turns **that kind's canonically-authored blueprint**
+into the shape a cell's neighbours call for. So every piece has to be
+exported at the orientation `city::road::canonical_pattern` names, or every
+cell of that kind comes out rotated wrong in the world.
 
-See `assets/city/road_types/dirt.ron` for this style's game data
-(travel speed, capacity).
+The rule, in one line: **every piece opens to the south.** Per file:
+
+| file           | road surface reaches   |
+|----------------|------------------------|
+| `isolated.nbt` | nothing (no neighbours)|
+| `dead_end.nbt` | south                  |
+| `straight.nbt` | north + south          |
+| `corner.nbt`   | south + west           |
+| `t.nbt`        | north + south + east   |
+| `cross.nbt`    | all four               |
+| `stair.nbt`    | north + south, ascending toward **north** (ticket 067) |
+
+`city::road_catalogue`'s
+`the_shipped_dirt_pieces_are_authored_at_the_canonical_orientations` reads
+these files and checks exactly that, so a re-export at a different
+orientation fails a test rather than showing up as a bent corner in-game.
+
+## Cross-section and height
+
+Each piece is `6` blocks on x and z (`ROAD_CELL_SIZE`) — that's enforced by
+the loader — laid out cross-section as shoulder / kerb / surface / surface /
+kerb / shoulder. Vertically the six flat pieces are `6x5x6`:
+
+- `y=0` — subgrade (solid), written one block *below* the terrain surface
+- `y=1` — the surface course a player walks on, flush with the terrain
+- `y=2..4` — air, deliberate clearance that mows whatever grew over the road
+
+`city::road_build::ROAD_PIECE_SUBGRADE_DEPTH` is the `1` in "the surface
+course is one layer up"; see that module's docs.
+
+### `stair.nbt` (ticket 067)
+
+The piece that bridges two road levels. Same `6` x/z footprint, but it
+climbs `ROAD_STAIR_RISE = 4` blocks across the cell:
+
+- `y=0` — subgrade under the whole cell, as above
+- `y=1` — the surface course at the **south** edge (the low end)
+- `y=1..5` — the surface steps up one block at a time toward the **north**
+  edge, which finishes at `y=5`; everything under each step is solid fill,
+  not air
+- three air layers of clearance above the highest step
+
+so the piece is `6x9x6`. A road cell records its stair's *low* end as its
+`base_y`, and the flat cell on the high side records `base_y + 4` — see
+`city::road_build`'s "Height" docs.
+
+## Game data
+
+See `assets/city/road_types/dirt.ron` for this style's travel speed and
+capacity.

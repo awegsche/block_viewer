@@ -75,21 +75,42 @@
 //! every cell fell back to the quad this didn't matter; ticket 065 is where
 //! it started to.
 //!
-//! ## Height: fitted once, remembered, offset by the piece's subgrade
+//! ## Height: decided once, for the whole placement
 //!
-//! Ticket 065. A cell's ground is read *once*, when the drag that places it
-//! commits ([`cell_height`], the same [`super::grid::fit_footprint`] the
-//! preview meshes against), and stored on the cell as
-//! [`super::state::RoadCell::base_y`] — never re-derived, because once a
-//! piece has been written [`super::grid::ground_height_at`] samples the road
-//! surface as ground and a re-tiled neighbour would climb a block per
-//! rewrite. [`cell_write_origin`] turns that reading into the piece's actual
-//! write origin, dropping it by [`ROAD_PIECE_SUBGRADE_DEPTH`] so the piece's
-//! surface course lands flush with the terrain rather than perched above it.
-//!
-//! Before that ticket the write origin's Y was a hardcoded `0`: every road
+//! Ticket 065 established that a cell's height is read *once* and then
+//! remembered on [`super::state::RoadCell::base_y`], never re-derived —
+//! because once a piece has been written [`super::grid::ground_height_at`]
+//! samples the road surface as ground, so a re-tiled neighbour would climb a
+//! block per rewrite. [`cell_write_origin`] turns that reading into the
+//! piece's actual write origin, dropping it by [`ROAD_PIECE_SUBGRADE_DEPTH`]
+//! so the surface course lands flush with the terrain rather than perched
+//! above it. (Before 065 the write origin's Y was a hardcoded `0`: every road
 //! ever built went into the deepslate, reported as written, and was never
-//! seen.
+//! seen.)
+//!
+//! Ticket 067 changed *what* is read once. 065 fitted every cell to its own
+//! 6x6 patch of ground, which across a slope produced a run of individually
+//! correct pieces separated by one-block cliffs — a road that isn't
+//! continuous isn't a road. The unit that owns a height is the **placement**,
+//! not the cell:
+//!
+//! - the drag's **first** cell fixes the starting level;
+//! - the **last** cell fixes the ending level, snapped to the first's plus a
+//!   whole number of [`ROAD_STAIR_RISE`] steps, because a
+//!   [`RoadPieceKind::Stair`] piece is the only thing that bridges a level
+//!   change and it bridges exactly four blocks;
+//! - the cells **between** run flat, except for the few [`spread_evenly`]
+//!   picks to be stairs, each climbing one step;
+//! - with no `stair.nbt` loaded, or with both ends on one level, the whole
+//!   drag is flat at the first cell's level — the plain "one Y per road"
+//!   rule, as the degenerate case rather than a second mode.
+//!
+//! [`plan_drag`] is all of that, as one function shared by the preview and
+//! the commit so the ghost can't disagree with the blocks — the same thing
+//! 065 did for [`cell_write_origin`], one level up. Which levels the ends
+//! *land* on comes from [`anchor_level`]: an existing road cell's own
+//! recorded height wins over the terrain, so a new drag joins an old road
+//! flush instead of at whatever the ground under it happens to be.
 //!
 //! ## Terrain fit, reusing E2 rather than reinventing it for cells
 //!
@@ -361,7 +382,7 @@ fn cell_min_corner(cell: IVec2) -> IVec3 {
 /// and isn't threaded into the write path at all. If a style ever ships
 /// pieces with a different subgrade depth, this is the thing that becomes a
 /// field there.
-const ROAD_PIECE_SUBGRADE_DEPTH: i32 = 1;
+pub(super) const ROAD_PIECE_SUBGRADE_DEPTH: i32 = 1;
 
 /// Where a cell's piece is written: [`cell_min_corner`]'s `(x, z)`, and a Y
 /// that puts the piece's surface course at the terrain surface — see
@@ -402,6 +423,255 @@ fn cell_height(cell: IVec2, world: &DecodedWorld) -> Option<i32> {
             let corner = cell_min_corner(cell);
             grid::ground_height_at(IVec2::new(corner.x, corner.z), world)
         }
+    }
+}
+
+// -----------------------------------------------------------------------------------------------
+// ---- height: one level per placement, stairs between levels (ticket 067) -----------------------
+// -----------------------------------------------------------------------------------------------
+
+/// How many blocks of world Y one [`RoadPieceKind::Stair`] piece climbs
+/// across its cell — and therefore the *only* level change a road can make,
+/// which is why a drag's end level snaps to a multiple of this.
+///
+/// A constant for the same reason [`ROAD_PIECE_SUBGRADE_DEPTH`] is one: it
+/// describes the shipped geometry (`assets/city/roads/<style>/stair.nbt`,
+/// authored to climb four blocks), and `assets/city/road_types/*.ron` is
+/// game data that never reaches the write path. A style shipping a
+/// differently-pitched stair is what turns this into a field there.
+pub(super) const ROAD_STAIR_RISE: i32 = 4;
+
+/// One cell of a planned drag: where its piece goes and, if it's a stair,
+/// which way it climbs. [`plan_drag`]'s output, shared by the preview and
+/// the commit so the ghost can't stand somewhere the blocks won't land —
+/// the same reason ticket 065 made both go through [`cell_write_origin`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct CellPlan {
+    pub(super) cell: IVec2,
+    /// The cell's [`state::RoadCell::base_y`]: its road surface for a flat
+    /// cell, its *low* end for a stair.
+    pub(super) base_y: i32,
+    /// `None` for a flat cell, else the direction this cell climbs — see
+    /// [`state::RoadCell::ascent`].
+    pub(super) ascent: Option<road::Direction>,
+}
+
+/// Why a drag has no contiguous height profile, and so can't be built at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PlanRefusal {
+    /// No ground reading for this cell — its chunk isn't decoded, the same
+    /// state [`cell_height`] answers `None` for.
+    NoGround(IVec2),
+    /// The drag's two ends are `steps` stair-pieces apart in Y, and the path
+    /// between them has only `eligible` cells that could *be* a stair (see
+    /// [`stair_eligible`]). Refused whole rather than built with a cliff in
+    /// it, the same all-or-nothing call [`try_commit_drag`] makes about
+    /// validity.
+    NotEnoughRoomToClimb { steps: i32, eligible: usize },
+}
+
+impl std::fmt::Display for PlanRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PlanRefusal::NoGround(cell) => write!(f, "no ground height for cell {cell}"),
+            PlanRefusal::NotEnoughRoomToClimb { steps, eligible } => write!(
+                f,
+                "the ends are {} step(s) apart in height but only {eligible} cell(s) on the path can be stairs \
+                 — drag further, or level the ground first",
+                steps.abs()
+            ),
+        }
+    }
+}
+
+/// The road-surface level `road` presents on the edge facing `edge`.
+///
+/// A flat cell is the same height all the way round. A stair is
+/// [`state::RoadCell::base_y`] on its low side and `base_y + ROAD_STAIR_RISE`
+/// on the side it climbs toward — so a road meeting a stair has to know
+/// *which* side it is meeting it on, and this is that answer.
+fn level_on_edge(road: &state::RoadCell, edge: road::Direction) -> i32 {
+    if road.ascent == Some(edge) {
+        road.base_y + ROAD_STAIR_RISE
+    } else {
+        road.base_y
+    }
+}
+
+/// The level one end of a drag should be pinned at, preferring what the city
+/// already knows over what the terrain says — see the ticket's "Joining an
+/// existing road":
+///
+/// 1. `cell`'s own record, if it is already a road cell, read on the `edge`
+///    the path runs through it;
+/// 2. otherwise an adjacent existing road cell's record, read on *its* edge
+///    facing `cell`, so a new road starting beside an old one meets it flush
+///    rather than at whatever the ground under it happens to be;
+/// 3. otherwise [`cell_height`]'s terrain reading.
+///
+/// `edge` is `None` for a one-cell drag, which has no direction to run in.
+fn anchor_level(cell: IVec2, edge: Option<road::Direction>, world: &DecodedWorld, city: &City) -> Option<i32> {
+    if let Some(road) = city.road_cell_at(cell) {
+        return Some(match edge {
+            Some(edge) => level_on_edge(road, edge),
+            None => road.base_y,
+        });
+    }
+    for direction in road::Direction::ALL {
+        if let Some(neighbour) = city.road_cell_at(cell + direction.offset()) {
+            return Some(level_on_edge(neighbour, direction.opposite()));
+        }
+    }
+    cell_height(cell, world)
+}
+
+/// The cardinal step from `from` to `to`, which every consecutive pair in a
+/// [`drag_path`] is by construction (that's the whole reason the path is an
+/// L and not a diagonal). `None` for any other pair.
+fn step_direction(from: IVec2, to: IVec2) -> Option<road::Direction> {
+    road::Direction::ALL.into_iter().find(|d| from + d.offset() == to)
+}
+
+/// Whether the cell at `index` could be a stair in this drag.
+///
+/// Four things have to hold, and each rules out a way a ramp would come out
+/// broken rather than merely ugly:
+///
+/// - it is **not an end** of the drag — those two are the fixed levels the
+///   climb runs between;
+/// - the path runs **straight through** it (the previous and next cells are
+///   on opposite sides), so the L's corner cell is never a ramp;
+/// - **nothing else connects** to it — a stair is shaped like a straight, so
+///   a cell that a third road branches into needs a T or a cross, and can't
+///   be both;
+/// - it is **not already a road cell**, whose recorded height and shape
+///   `City::add_road_cell` keeps (deliberately — ticket 065) and this drag
+///   therefore cannot change.
+fn stair_eligible(path: &[IVec2], index: usize, city: &City) -> bool {
+    if index == 0 || index + 1 >= path.len() {
+        return false;
+    }
+    let cell = path[index];
+    if city.is_road_cell(cell) {
+        return false;
+    }
+    let (Some(into), Some(out_of)) = (step_direction(path[index - 1], cell), step_direction(cell, path[index + 1]))
+    else {
+        return false;
+    };
+    if into != out_of {
+        return false; // the L's corner
+    }
+    connections_with_path(city, path, cell).count() == 2
+}
+
+/// `count` indices picked out of `eligible`, spread as evenly along it as
+/// integer arithmetic allows: the midpoint of each of `count` equal buckets.
+/// Distinct by construction whenever `count <= eligible.len()`, which
+/// [`plan_drag`] checks before calling.
+fn spread_evenly(eligible: &[usize], count: usize) -> Vec<usize> {
+    (0..count).map(|i| eligible[(2 * i + 1) * eligible.len() / (2 * count)]).collect()
+}
+
+/// The height profile for a whole drag — the rule ticket 067 exists for.
+///
+/// The first cell's level is fixed by [`anchor_level`]; the last cell's is
+/// too, then **snapped** to the first's plus a whole number of
+/// [`ROAD_STAIR_RISE`] steps, because a stair piece is the only thing that
+/// can bridge a level change and it bridges exactly that much. Every cell in
+/// between runs flat at the level it is on, except for the `steps` of them
+/// [`spread_evenly`] picks out of the [`stair_eligible`] ones, each of which
+/// climbs one step in the direction the path is travelling (or, on a
+/// descending drag, back the way it came — a stair's `ascent` always points
+/// uphill).
+///
+/// With no stair piece loaded for the style, or with the two ends on the
+/// same level, the whole path comes back flat at the first cell's level.
+/// That is the user's original "Y of the first tile dictates Y of the entire
+/// road" rule, and it's the degenerate case of this one rather than a
+/// separate mode.
+///
+/// Cells that are *already* road are still planned (a plan covers the whole
+/// path), but `City::add_road_cell` will keep their own recorded height and
+/// shape — see [`stair_eligible`]'s last bullet.
+fn plan_drag(
+    path: &[IVec2],
+    world: &DecodedWorld,
+    city: &City,
+    stair_available: bool,
+) -> Result<Vec<CellPlan>, PlanRefusal> {
+    let Some(&first) = path.first() else { return Ok(Vec::new()) };
+    let leaving = path.get(1).and_then(|&next| step_direction(first, next));
+    let start_y = anchor_level(first, leaving, world, city).ok_or(PlanRefusal::NoGround(first))?;
+
+    let flat = |level: i32| path.iter().map(|&cell| CellPlan { cell, base_y: level, ascent: None }).collect::<Vec<_>>();
+    if path.len() < 2 || !stair_available {
+        return Ok(flat(start_y));
+    }
+
+    let last = path[path.len() - 1];
+    let arriving = step_direction(path[path.len() - 2], last);
+    // The edge of the last cell the path arrives *through* is the one facing
+    // back the way it came.
+    let end_y =
+        anchor_level(last, arriving.map(road::Direction::opposite), world, city).ok_or(PlanRefusal::NoGround(last))?;
+
+    // Round to the nearest whole stair, halves away from zero, without
+    // floating point: a 6-block difference climbs two steps rather than one.
+    let difference = end_y - start_y;
+    let steps = (difference * 2 + difference.signum() * ROAD_STAIR_RISE) / (ROAD_STAIR_RISE * 2);
+    if steps == 0 {
+        return Ok(flat(start_y));
+    }
+
+    let eligible: Vec<usize> = (0..path.len()).filter(|&i| stair_eligible(path, i, city)).collect();
+    let needed = steps.unsigned_abs() as usize;
+    if needed > eligible.len() {
+        return Err(PlanRefusal::NotEnoughRoomToClimb { steps, eligible: eligible.len() });
+    }
+    let stairs = spread_evenly(&eligible, needed);
+
+    let mut plan = Vec::with_capacity(path.len());
+    let mut level = start_y;
+    for (index, &cell) in path.iter().enumerate() {
+        if !stairs.contains(&index) {
+            plan.push(CellPlan { cell, base_y: level, ascent: None });
+            continue;
+        }
+        // `stair_eligible` already established this cell has a next one and
+        // that the path runs straight through it.
+        let travel = step_direction(cell, path[index + 1]).expect("a stair-eligible cell has a cardinal successor");
+        if steps > 0 {
+            // Climbing: this cell's low end meets the flat run behind it.
+            plan.push(CellPlan { cell, base_y: level, ascent: Some(travel) });
+            level += ROAD_STAIR_RISE;
+        } else {
+            // Descending: the *high* end meets the run behind it, so the
+            // recorded low end is a step down and the ascent points back.
+            plan.push(CellPlan { cell, base_y: level - ROAD_STAIR_RISE, ascent: Some(travel.opposite()) });
+            level -= ROAD_STAIR_RISE;
+        }
+    }
+    Ok(plan)
+}
+
+/// Whether `style` has a stair piece loaded — the one thing [`plan_drag`]
+/// needs to know about the catalogue. `false` (every cell flat) when there's
+/// no catalogue, no selected style, or no `stair.nbt` for it, which is the
+/// state the shipped `dirt` style is in until one is exported.
+fn stair_available(catalogue: Option<&RoadCatalogue>, style: Option<&str>) -> bool {
+    matches!((catalogue, style), (Some(catalogue), Some(style)) if catalogue.get(style, RoadPieceKind::Stair).is_some())
+}
+
+/// The piece kind and rotation a cell calls for: a stair if it has an
+/// [`state::RoadCell::ascent`], else whatever its connections imply. The
+/// write path's and the preview's shared answer — see
+/// [`RoadPieceKind::Stair`]'s docs for why a cell's connections alone can
+/// never say "ramp".
+fn piece_for(connections: RoadConnections, ascent: Option<road::Direction>) -> (RoadPieceKind, Rotation) {
+    match ascent {
+        Some(ascent) => (RoadPieceKind::Stair, road::stair_rotation(ascent)),
+        None => road::select_piece(connections),
     }
 }
 
@@ -676,11 +946,28 @@ fn update_drag_preview(
     };
 
     let selected_style = style_selection.as_deref().and_then(|s| s.current.as_deref());
-    for (index, &cell) in path.iter().enumerate() {
-        let Some(height) = cell_height(cell, &world) else { continue };
-        let valid = cell_valid(cell, &world, &city);
+
+    // Ticket 067: the ghost stands on the *plan*'s heights, not on each
+    // cell's own terrain — that difference is the whole visible half of the
+    // rule, and previewing per-cell ground while committing a plan would put
+    // the ghost somewhere the blocks never land.
+    //
+    // A refused plan (not enough room to climb) still previews, flat at the
+    // path's own first-cell level and tinted invalid throughout, so the
+    // player sees *where* the road would go and that it won't build, rather
+    // than the preview blinking out with no explanation.
+    let stairs = stair_available(catalogue.as_deref(), selected_style);
+    let plan = plan_drag(&path, &world, &city, stairs);
+    let refused = plan.is_err();
+    let plan = plan.unwrap_or_else(|_| {
+        plan_drag(&path, &world, &city, false).unwrap_or_default()
+    });
+
+    for (index, planned) in plan.iter().enumerate() {
+        let CellPlan { cell, base_y, ascent } = *planned;
+        let valid = !refused && cell_valid(cell, &world, &city);
         let style = style_for_cell(cell, &city, selected_style);
-        let (kind, rotation) = road::select_piece(connections_with_path(&city, &path, cell));
+        let (kind, rotation) = piece_for(connections_with_path(&city, &path, cell), ascent);
         let (mesh, anchor) = preview_mesh(
             &mut preview,
             style,
@@ -694,7 +981,7 @@ fn update_drag_preview(
         );
         let ghost_materials = ensure_materials(&mut preview, &terrain_material.0, &mut materials);
         let material = if valid { ghost_materials.valid.clone() } else { ghost_materials.invalid.clone() };
-        let transform = cell_transform(cell, height, anchor);
+        let transform = cell_transform(cell, base_y, anchor);
 
         let entity = match preview.entities.get(index) {
             Some(&entity) => entity,
@@ -714,7 +1001,7 @@ fn update_drag_preview(
         }
     }
 
-    for &entity in preview.entities.iter().skip(path.len()) {
+    for &entity in preview.entities.iter().skip(plan.len()) {
         if let Ok((mut visibility, ..)) = query.get_mut(entity) {
             *visibility = Visibility::Hidden;
         }
@@ -738,7 +1025,9 @@ fn road_write_edit(affected: &[IVec2], catalogue: &RoadCatalogue, city: &City) -
 
     for &cell in affected {
         let Some(road) = city.road_cell_at(cell) else { continue };
-        let (kind, rotation) = road::select_piece(road::connections_at(city, cell));
+        // Ticket 067: a cell recorded with an ascent is a stair, whatever its
+        // connections look like — see `piece_for`.
+        let (kind, rotation) = piece_for(road::connections_at(city, cell), road.ascent);
         let Some(piece) = catalogue.get(&road.style, kind) else { continue };
 
         let rotated;
@@ -804,20 +1093,6 @@ fn try_commit_drag(
         return;
     }
 
-    // Ticket 065: each cell's write height, resolved here — once, off the
-    // same fit the preview meshed against — and handed to `add_road_cell` to
-    // be remembered. `cell_valid` just confirmed every cell `Fits`, so this
-    // can't actually be `None`; refusing rather than defaulting keeps a road
-    // from being buried at Y=0 again if that ever stops holding.
-    let mut heights = Vec::with_capacity(path.len());
-    for &cell in &path {
-        let Some(height) = cell_height(cell, &world) else {
-            println!("block_viewer: road drag refused: no ground height for cell {cell}");
-            return;
-        };
-        heights.push(height);
-    }
-
     // Ticket 059: any *new* cell in this path needs a style to be recorded
     // under. An already-road cell keeps whatever it already has — see
     // `add_road_cell`'s own docs — so it's fine for `selected_style` to go
@@ -829,13 +1104,28 @@ fn try_commit_drag(
     }
     let build_style = selected_style.unwrap_or_default();
 
+    // Tickets 065/067: the whole drag's height profile, resolved here — once,
+    // off the same `plan_drag` the preview meshed against — and handed cell
+    // by cell to `add_road_cell` to be remembered. 065's lesson was that a
+    // height re-derived later drifts; 067's is that it has to be decided for
+    // the *placement*, not per cell, or the road comes out as a run of
+    // one-block cliffs.
+    let stairs = stair_available(catalogue.as_deref(), Some(build_style.as_str()));
+    let plan = match plan_drag(&path, &world, &city, stairs) {
+        Ok(plan) => plan,
+        Err(refusal) => {
+            println!("block_viewer: road drag refused: {refusal}");
+            return;
+        }
+    };
+
     let newly_added: Vec<IVec2> = path.iter().copied().filter(|&cell| !city.is_road_cell(cell)).collect();
-    for (&cell, &base_y) in path.iter().zip(&heights) {
+    for &CellPlan { cell, base_y, ascent } in &plan {
         // Already validated above; `add_road_cell` only fails on occupancy,
         // which `cell_valid` just confirmed clear (or already-road, which is
-        // idempotent — and keeps its own recorded style and height) — see the
-        // module docs' "Committing".
-        if let Err(err) = city.add_road_cell(cell, build_style.clone(), base_y) {
+        // idempotent — and keeps its own recorded style, height and ascent) —
+        // see the module docs' "Committing".
+        if let Err(err) = city.add_road_cell(cell, build_style.clone(), base_y, ascent) {
             println!("block_viewer: road drag refused partway through (a race with another edit?): {err}");
             for cell in &newly_added {
                 city.remove_road_cell(*cell);
@@ -982,7 +1272,7 @@ mod tests {
     fn cell_occupancy_ok_is_true_for_free_or_already_road_ground() {
         let mut city = City::default();
         assert!(cell_occupancy_ok(IVec2::new(0, 0), &city));
-        city.add_road_cell(IVec2::new(0, 0), "dirt", 64).unwrap();
+        city.add_road_cell(IVec2::new(0, 0), "dirt", 64, None).unwrap();
         assert!(cell_occupancy_ok(IVec2::new(0, 0), &city), "already-road counts as ok, not blocked");
     }
 
@@ -996,8 +1286,8 @@ mod tests {
     #[test]
     fn affected_cells_includes_the_path_and_its_already_road_neighbours() {
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(-1, 0), "dirt", 64).unwrap(); // west neighbour of (0, 0)
-        city.add_road_cell(IVec2::new(5, 5), "dirt", 64).unwrap(); // unrelated, far away
+        city.add_road_cell(IVec2::new(-1, 0), "dirt", 64, None).unwrap(); // west neighbour of (0, 0)
+        city.add_road_cell(IVec2::new(5, 5), "dirt", 64, None).unwrap(); // unrelated, far away
 
         let affected = affected_cells(&[IVec2::new(0, 0)], &city);
         assert!(affected.contains(&IVec2::new(0, 0)));
@@ -1009,7 +1299,7 @@ mod tests {
     #[test]
     fn affected_cells_does_not_duplicate_a_neighbour_shared_by_two_path_cells() {
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(1, 1), "dirt", 64).unwrap();
+        city.add_road_cell(IVec2::new(1, 1), "dirt", 64, None).unwrap();
 
         // Both (0, 1) and (2, 1) border (1, 1); (1, 0)/(1, 2) also border it.
         let affected = affected_cells(&[IVec2::new(0, 1), IVec2::new(2, 1)], &city);
@@ -1032,7 +1322,7 @@ mod tests {
     #[test]
     fn connections_with_path_still_sees_real_city_roads() {
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(0, -1), "dirt", 64).unwrap(); // north of (0, 0)
+        city.add_road_cell(IVec2::new(0, -1), "dirt", 64, None).unwrap(); // north of (0, 0)
         let connections = connections_with_path(&city, &[IVec2::new(0, 0)], IVec2::new(0, 0));
         assert!(connections.north);
     }
@@ -1112,7 +1402,7 @@ mod tests {
         let dir = temp_dir("write_edit_isolated");
         let catalogue = catalogue_with_isolated(&dir);
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(0, 0), "dirt", 64).unwrap();
+        city.add_road_cell(IVec2::new(0, 0), "dirt", 64, None).unwrap();
 
         let edit = road_write_edit(&[IVec2::new(0, 0)], &catalogue, &city);
         assert_eq!(edit.len(), (ROAD_CELL_SIZE * ROAD_CELL_SIZE) as usize, "every block in the one cell's piece");
@@ -1128,7 +1418,7 @@ mod tests {
         let dir = temp_dir("write_edit_unknown_style");
         let catalogue = catalogue_with_isolated(&dir); // only "dirt" is loaded
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(0, 0), "paved", 64).unwrap();
+        city.add_road_cell(IVec2::new(0, 0), "paved", 64, None).unwrap();
 
         let edit = road_write_edit(&[IVec2::new(0, 0)], &catalogue, &city);
         assert!(edit.is_empty());
@@ -1143,7 +1433,7 @@ mod tests {
         write_piece(&dir, "dirt", RoadPieceKind::Straight, &one_stone_piece());
         let (catalogue, _skipped) = load_road_catalogue_dir(&dir);
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(0, 0), "dirt", 64).unwrap();
+        city.add_road_cell(IVec2::new(0, 0), "dirt", 64, None).unwrap();
 
         let edit = road_write_edit(&[IVec2::new(0, 0)], &catalogue, &city);
         assert!(edit.is_empty());
@@ -1155,8 +1445,8 @@ mod tests {
         let dir = temp_dir("write_edit_offset");
         let catalogue = catalogue_with_isolated(&dir);
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(0, 0), "dirt", 64).unwrap();
-        city.add_road_cell(IVec2::new(2, 0), "dirt", 64).unwrap();
+        city.add_road_cell(IVec2::new(0, 0), "dirt", 64, None).unwrap();
+        city.add_road_cell(IVec2::new(2, 0), "dirt", 64, None).unwrap();
 
         let edit = road_write_edit(&[IVec2::new(0, 0), IVec2::new(2, 0)], &catalogue, &city);
         let positions: std::collections::HashSet<IVec3> = edit.edits().iter().map(|e| e.at).collect();
@@ -1180,7 +1470,7 @@ mod tests {
         let dir = temp_dir("write_edit_base_y");
         let catalogue = catalogue_with_isolated(&dir);
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(0, 0), "dirt", 71).unwrap();
+        city.add_road_cell(IVec2::new(0, 0), "dirt", 71, None).unwrap();
 
         let edit = road_write_edit(&[IVec2::new(0, 0)], &catalogue, &city);
         assert!(!edit.is_empty());
@@ -1211,8 +1501,8 @@ mod tests {
         let dir = temp_dir("write_edit_two_heights");
         let catalogue = catalogue_with_isolated(&dir);
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(0, 0), "dirt", 64).unwrap();
-        city.add_road_cell(IVec2::new(2, 0), "dirt", 70).unwrap();
+        city.add_road_cell(IVec2::new(0, 0), "dirt", 64, None).unwrap();
+        city.add_road_cell(IVec2::new(2, 0), "dirt", 70, None).unwrap();
 
         let edit = road_write_edit(&[IVec2::new(0, 0), IVec2::new(2, 0)], &catalogue, &city);
         let positions: std::collections::HashSet<IVec3> = edit.edits().iter().map(|e| e.at).collect();
@@ -1246,9 +1536,9 @@ mod tests {
         // A straight run of three cells: the middle one sees a north *and*
         // a south neighbour, resolving to Straight — the two ends resolve
         // to DeadEnd, which this catalogue has no piece for.
-        city.add_road_cell(IVec2::new(0, -1), "dirt", 64).unwrap();
-        city.add_road_cell(IVec2::new(0, 0), "dirt", 64).unwrap();
-        city.add_road_cell(IVec2::new(0, 1), "dirt", 64).unwrap();
+        city.add_road_cell(IVec2::new(0, -1), "dirt", 64, None).unwrap();
+        city.add_road_cell(IVec2::new(0, 0), "dirt", 64, None).unwrap();
+        city.add_road_cell(IVec2::new(0, 1), "dirt", 64, None).unwrap();
 
         let edit = road_write_edit(&[IVec2::new(0, -1), IVec2::new(0, 0), IVec2::new(0, 1)], &catalogue, &city);
         assert_eq!(
@@ -1270,8 +1560,8 @@ mod tests {
         let (catalogue, _skipped) = load_road_catalogue_dir(&dir);
 
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(0, 0), "dirt", 64).unwrap();
-        city.add_road_cell(IVec2::new(100, 100), "paved", 64).unwrap();
+        city.add_road_cell(IVec2::new(0, 0), "dirt", 64, None).unwrap();
+        city.add_road_cell(IVec2::new(100, 100), "paved", 64, None).unwrap();
 
         let edit = road_write_edit(&[IVec2::new(0, 0), IVec2::new(100, 100)], &catalogue, &city);
         assert_eq!(
@@ -1317,7 +1607,7 @@ mod tests {
     #[test]
     fn poll_road_build_success_fires_chunks_edited_and_records_the_write() {
         let mut app = road_build_test_app();
-        app.world_mut().resource_mut::<City>().add_road_cell(IVec2::new(0, 0), "dirt", 64).unwrap();
+        app.world_mut().resource_mut::<City>().add_road_cell(IVec2::new(0, 0), "dirt", 64, None).unwrap();
 
         let report = EditReport { blocks_written: 36, chunks: vec![(0, 0)], regions: vec![(0, 0)], replaced: None };
         let task = pool().spawn(async move { Ok(report) });
@@ -1339,8 +1629,8 @@ mod tests {
         let mut app = road_build_test_app();
         {
             let mut city = app.world_mut().resource_mut::<City>();
-            city.add_road_cell(IVec2::new(0, 0), "dirt", 64).unwrap(); // pre-existing neighbour, not newly added
-            city.add_road_cell(IVec2::new(1, 0), "dirt", 64).unwrap(); // this drag's own new cell
+            city.add_road_cell(IVec2::new(0, 0), "dirt", 64, None).unwrap(); // pre-existing neighbour, not newly added
+            city.add_road_cell(IVec2::new(1, 0), "dirt", 64, None).unwrap(); // this drag's own new cell
         }
 
         let task = pool().spawn(async { Err(EditRefusal::Empty) });
@@ -1362,7 +1652,7 @@ mod tests {
     #[test]
     fn style_for_cell_prefers_a_cells_own_recorded_style_over_the_selection() {
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(0, 0), "dirt", 64).unwrap();
+        city.add_road_cell(IVec2::new(0, 0), "dirt", 64, None).unwrap();
         assert_eq!(style_for_cell(IVec2::new(0, 0), &city, Some("paved")), Some("dirt"));
     }
 
@@ -1445,6 +1735,341 @@ mod tests {
         app.insert_resource(ActiveTool::Building);
         app.update();
         assert_eq!(app.world().resource::<RoadStyleSelection>().current, None, "not auto-picked outside the road tool");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // -- height planning (ticket 067) ----------------------------------------
+
+    use super::super::road::Direction;
+
+    /// A `DecodedWorld` whose ground is flat at the given height across each
+    /// listed *cell*'s full 6x6 footprint — `fit_footprint` samples all 36
+    /// tiles and takes the minimum, so a half-filled cell would read as the
+    /// lower half's height. Built the same way `city::grid`'s own fixtures
+    /// build theirs: one stone block per tile, everything else air, chunks
+    /// that cover nothing simply absent.
+    fn world_with_cell_ground(cells: &[(IVec2, i32)]) -> DecodedWorld {
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+
+        use crate::world::{BiomeRegistry, BlockRegistry, ChunkColumn, ChunkSection};
+
+        let mut registry = BlockRegistry::new();
+        let stone = registry.intern("minecraft:stone");
+        let size = world::SECTION_SIZE as i32;
+        let mut columns: HashMap<(i32, i32), ChunkColumn> = HashMap::new();
+
+        for &(cell, height) in cells {
+            // `ground_height_at` answers "topmost solid + 1", so the block
+            // itself goes one below the height the caller means.
+            let y = height - 1;
+            for tile in state::road_cell_tiles(cell) {
+                let chunk = (tile.x.div_euclid(size), tile.y.div_euclid(size));
+                let (local_x, local_z) = (tile.x.rem_euclid(size) as usize, tile.y.rem_euclid(size) as usize);
+                let section_y = y.div_euclid(size) as i8;
+                let local_y = y.rem_euclid(size) as usize;
+
+                let column = columns.entry(chunk).or_insert_with(|| ChunkColumn {
+                    x: chunk.0,
+                    z: chunk.1,
+                    sections: Vec::new(),
+                    floor_y: world::WORLD_MIN_Y,
+                });
+                let section = match column.sections.iter().position(|s| s.y == section_y) {
+                    Some(index) => index,
+                    None => {
+                        column.sections.push(ChunkSection {
+                            y: section_y,
+                            blocks: Box::new([BlockRegistry::AIR; world::SECTION_VOLUME]),
+                            biomes: Box::new([BiomeRegistry::PLAINS; world::BIOME_GRID_VOLUME]),
+                        });
+                        column.sections.len() - 1
+                    }
+                };
+                column.sections[section].blocks[ChunkSection::index(local_x, local_y, local_z)] = stone;
+            }
+        }
+
+        DecodedWorld {
+            registry: Arc::new(Mutex::new(registry)),
+            biomes: Arc::new(Mutex::new(BiomeRegistry::new())),
+            columns,
+        }
+    }
+
+    fn levels(plan: &[CellPlan]) -> Vec<i32> {
+        plan.iter().map(|c| c.base_y).collect()
+    }
+
+    fn ascents(plan: &[CellPlan]) -> Vec<Option<Direction>> {
+        plan.iter().map(|c| c.ascent).collect()
+    }
+
+    /// The rule the user asked for first: one drag, one level, taken from
+    /// the cell the drag *started* on — even though the ground under the run
+    /// climbs a block per cell.
+    #[test]
+    fn a_drag_across_a_slope_is_flat_at_the_first_cells_level_when_no_stair_exists() {
+        let path: Vec<IVec2> = (0..5).map(|x| IVec2::new(x, 0)).collect();
+        let world = world_with_cell_ground(&path.iter().enumerate().map(|(i, &c)| (c, 64 + i as i32)).collect::<Vec<_>>());
+
+        let plan = plan_drag(&path, &world, &City::default(), false).unwrap();
+        assert_eq!(levels(&plan), vec![64; 5], "every cell should sit at the first cell's ground, not its own");
+        assert!(ascents(&plan).iter().all(Option::is_none));
+    }
+
+    /// Even with a stair piece available, a run whose ends are less than half
+    /// a step apart snaps to one level — the "Y of the first tile dictates Y
+    /// of the entire road" case, reached through the same code path as the
+    /// stepped one.
+    #[test]
+    fn a_gentle_slope_snaps_to_a_single_level_even_with_stairs_available() {
+        let path: Vec<IVec2> = (0..4).map(|x| IVec2::new(x, 0)).collect();
+        // Ends one block apart: nowhere near the four a stair bridges.
+        let world = world_with_cell_ground(&[(path[0], 64), (path[1], 64), (path[2], 65), (path[3], 65)]);
+
+        let plan = plan_drag(&path, &world, &City::default(), true).unwrap();
+        assert_eq!(levels(&plan), vec![64; 4]);
+        assert!(ascents(&plan).iter().all(Option::is_none));
+    }
+
+    /// One four-block step: a single stair somewhere in the middle, the run
+    /// before it at the start level and the run after it a step up.
+    #[test]
+    fn a_four_block_climb_becomes_one_stair_with_flat_runs_either_side() {
+        let path: Vec<IVec2> = (0..5).map(|x| IVec2::new(x, 0)).collect();
+        let world = world_with_cell_ground(&[
+            (path[0], 64),
+            (path[1], 65),
+            (path[2], 66),
+            (path[3], 67),
+            (path[4], 68),
+        ]);
+
+        let plan = plan_drag(&path, &world, &City::default(), true).unwrap();
+        let stair_count = plan.iter().filter(|c| c.ascent.is_some()).count();
+        assert_eq!(stair_count, 1, "{plan:?}");
+
+        let stair = plan.iter().position(|c| c.ascent.is_some()).unwrap();
+        assert!(stair > 0 && stair < plan.len() - 1, "a stair must not be an end of the drag");
+        assert_eq!(plan[stair].ascent, Some(Direction::East), "the path travels east, so the climb does too");
+        // Low end level with everything behind it, high end level with
+        // everything ahead: that is what "contiguous" means here.
+        assert!(plan[..stair].iter().all(|c| c.base_y == 64), "{plan:?}");
+        assert_eq!(plan[stair].base_y, 64);
+        assert!(plan[stair + 1..].iter().all(|c| c.base_y == 68), "{plan:?}");
+    }
+
+    /// A descending drag: the stair still *ascends* — back the way the path
+    /// came — and its recorded `base_y` is its low end, on the downhill side.
+    #[test]
+    fn a_descending_drag_records_the_stairs_low_end_and_an_uphill_ascent() {
+        let path: Vec<IVec2> = (0..5).map(|x| IVec2::new(x, 0)).collect();
+        let world = world_with_cell_ground(&[
+            (path[0], 68),
+            (path[1], 67),
+            (path[2], 66),
+            (path[3], 65),
+            (path[4], 64),
+        ]);
+
+        let plan = plan_drag(&path, &world, &City::default(), true).unwrap();
+        let stair = plan.iter().position(|c| c.ascent.is_some()).expect("one stair");
+        assert_eq!(plan[stair].ascent, Some(Direction::West), "the path runs east and drops, so the climb faces west");
+        assert_eq!(plan[stair].base_y, 64, "a stair's base_y is its low end");
+        assert!(plan[..stair].iter().all(|c| c.base_y == 68), "{plan:?}");
+        assert!(plan[stair + 1..].iter().all(|c| c.base_y == 64), "{plan:?}");
+    }
+
+    /// Two steps get two stairs, spread rather than stacked, and the levels
+    /// walk 64 -> 68 -> 72 exactly.
+    #[test]
+    fn an_eight_block_climb_spreads_two_stairs_along_the_path() {
+        let path: Vec<IVec2> = (0..9).map(|x| IVec2::new(x, 0)).collect();
+        let mut ground: Vec<(IVec2, i32)> = path.iter().map(|&c| (c, 64)).collect();
+        ground[8].1 = 72;
+
+        let plan = plan_drag(&path, &world_with_cell_ground(&ground), &City::default(), true).unwrap();
+        let stairs: Vec<usize> = plan.iter().enumerate().filter(|(_, c)| c.ascent.is_some()).map(|(i, _)| i).collect();
+        assert_eq!(stairs.len(), 2, "{plan:?}");
+        assert!(stairs[1] - stairs[0] > 1, "the two stairs should be spread, not adjacent: {stairs:?}");
+
+        let mut expected_levels: Vec<i32> = Vec::new();
+        let mut level = 64;
+        for (index, cell) in plan.iter().enumerate() {
+            expected_levels.push(level);
+            if cell.ascent.is_some() {
+                level += ROAD_STAIR_RISE;
+            }
+            let _ = index;
+        }
+        assert_eq!(levels(&plan), expected_levels);
+        assert_eq!(*levels(&plan).last().unwrap(), 72, "the last cell lands on the snapped end level");
+    }
+
+    /// The end level always snaps to a whole number of stairs off the start,
+    /// halves away from zero — six blocks is closer to two steps than one.
+    #[test]
+    fn the_end_level_snaps_to_a_whole_number_of_stair_steps() {
+        for (raw_rise, expected_end) in [(0, 64), (1, 64), (2, 68), (5, 68), (6, 72), (7, 72), (-2, 60), (-6, 56)] {
+            let path: Vec<IVec2> = (0..9).map(|x| IVec2::new(x, 0)).collect();
+            let mut ground: Vec<(IVec2, i32)> = path.iter().map(|&c| (c, 64)).collect();
+            ground[8].1 = 64 + raw_rise;
+
+            let plan = plan_drag(&path, &world_with_cell_ground(&ground), &City::default(), true).unwrap();
+            assert_eq!(
+                *levels(&plan).last().unwrap(),
+                expected_end,
+                "a {raw_rise}-block difference should snap to {expected_end}"
+            );
+            assert_eq!(levels(&plan)[0], 64, "the start level is never snapped — it's the anchor");
+        }
+    }
+
+    /// The L's corner cell can't be a bend and a ramp at once, so it's never
+    /// picked as a stair.
+    #[test]
+    fn the_corner_of_an_l_shaped_drag_is_never_a_stair() {
+        let path = drag_path(IVec2::new(0, 0), IVec2::new(3, 3));
+        let corner = IVec2::new(3, 0);
+        let corner_index = path.iter().position(|&c| c == corner).expect("the L turns at (3, 0)");
+
+        let mut ground: Vec<(IVec2, i32)> = path.iter().map(|&c| (c, 64)).collect();
+        ground.last_mut().unwrap().1 = 68;
+
+        let plan = plan_drag(&path, &world_with_cell_ground(&ground), &City::default(), true).unwrap();
+        assert_eq!(plan[corner_index].ascent, None, "{plan:?}");
+        assert_eq!(plan.iter().filter(|c| c.ascent.is_some()).count(), 1);
+    }
+
+    /// A three-cell drag has exactly one interior cell, so it can bridge one
+    /// step and no more. Two is refused whole — no partial road, no cliff.
+    #[test]
+    fn a_climb_with_nowhere_to_put_the_stairs_is_refused_whole() {
+        let path: Vec<IVec2> = (0..3).map(|x| IVec2::new(x, 0)).collect();
+        let one_step = plan_drag(&path, &world_with_cell_ground(&[(path[0], 64), (path[1], 64), (path[2], 68)]), &City::default(), true);
+        assert!(one_step.is_ok(), "one interior cell can carry one step");
+
+        let two_steps =
+            plan_drag(&path, &world_with_cell_ground(&[(path[0], 64), (path[1], 64), (path[2], 72)]), &City::default(), true);
+        assert_eq!(two_steps, Err(PlanRefusal::NotEnoughRoomToClimb { steps: 2, eligible: 1 }));
+    }
+
+    /// A drag starting *on* an existing road cell continues at that cell's
+    /// recorded level, not at the terrain under it — which is what stops a
+    /// road extended in two drags from having a seam.
+    #[test]
+    fn a_drag_starting_on_an_existing_road_cell_continues_at_its_recorded_level() {
+        let mut city = City::default();
+        city.add_road_cell(IVec2::new(0, 0), "dirt", 80, None).unwrap();
+
+        let path: Vec<IVec2> = (0..4).map(|x| IVec2::new(x, 0)).collect();
+        let world = world_with_cell_ground(&path.iter().map(|&c| (c, 64)).collect::<Vec<_>>());
+
+        let plan = plan_drag(&path, &world, &city, false).unwrap();
+        assert_eq!(levels(&plan), vec![80; 4], "the ground says 64; the road that's already there says 80");
+    }
+
+    /// A drag starting *beside* an existing road meets it flush, rather than
+    /// dropping to the ground the new cells happen to sit on.
+    #[test]
+    fn a_drag_starting_beside_an_existing_road_cell_meets_it_flush() {
+        let mut city = City::default();
+        city.add_road_cell(IVec2::new(-1, 0), "dirt", 80, None).unwrap();
+
+        let path: Vec<IVec2> = (0..4).map(|x| IVec2::new(x, 0)).collect();
+        let world = world_with_cell_ground(&path.iter().map(|&c| (c, 64)).collect::<Vec<_>>());
+
+        let plan = plan_drag(&path, &world, &city, false).unwrap();
+        assert_eq!(levels(&plan), vec![80; 4]);
+    }
+
+    /// Joining an existing *stair* picks up the level of the edge actually
+    /// being joined: its high end on the side it climbs to, its low end on
+    /// the other.
+    #[test]
+    fn joining_a_stair_reads_the_level_of_the_edge_being_joined() {
+        let mut city = City::default();
+        // A stair at (-1, 0) climbing east — so its east edge (facing the
+        // drag below) is four blocks above its recorded base.
+        city.add_road_cell(IVec2::new(-1, 0), "dirt", 80, Some(Direction::East)).unwrap();
+
+        let path: Vec<IVec2> = (0..4).map(|x| IVec2::new(x, 0)).collect();
+        let world = world_with_cell_ground(&path.iter().map(|&c| (c, 64)).collect::<Vec<_>>());
+        let plan = plan_drag(&path, &world, &city, false).unwrap();
+        assert_eq!(levels(&plan), vec![84; 4], "the stair's high end, not its recorded low end");
+
+        // The same stair, but climbing *away* from the drag: now the edge
+        // being joined is its low end, and the new road runs at the recorded
+        // base instead of four blocks up.
+        let mut low_side = City::default();
+        low_side.add_road_cell(IVec2::new(-1, 0), "dirt", 80, Some(Direction::West)).unwrap();
+        let plan = plan_drag(&path, &world, &low_side, false).unwrap();
+        assert_eq!(levels(&plan), vec![80; 4]);
+    }
+
+    /// A stair's high end sits exactly on its uphill neighbour's surface —
+    /// the arithmetic the whole thing rests on, checked against
+    /// `cell_write_origin` rather than restated.
+    #[test]
+    fn a_stairs_high_end_is_level_with_its_uphill_neighbours_surface() {
+        let path: Vec<IVec2> = (0..5).map(|x| IVec2::new(x, 0)).collect();
+        let mut ground: Vec<(IVec2, i32)> = path.iter().map(|&c| (c, 64)).collect();
+        ground[4].1 = 68;
+
+        let plan = plan_drag(&path, &world_with_cell_ground(&ground), &City::default(), true).unwrap();
+        let stair = plan.iter().position(|c| c.ascent.is_some()).unwrap();
+        let uphill = plan[stair + 1];
+
+        // The stair piece is written from its own origin; its top step is
+        // ROAD_STAIR_RISE above its bottom one.
+        let stair_low_surface = cell_write_origin(plan[stair].cell, plan[stair].base_y).y + ROAD_PIECE_SUBGRADE_DEPTH;
+        let stair_high_surface = stair_low_surface + ROAD_STAIR_RISE;
+        let uphill_surface = cell_write_origin(uphill.cell, uphill.base_y).y + ROAD_PIECE_SUBGRADE_DEPTH;
+        assert_eq!(stair_high_surface, uphill_surface);
+    }
+
+    /// `piece_for` is the one place a cell's ascent overrides its
+    /// connection-derived shape — and the rotation it hands back is the one
+    /// that actually points the canonical stair the right way.
+    #[test]
+    fn piece_for_turns_a_recorded_ascent_into_a_rotated_stair() {
+        let straight = RoadConnections { north: true, south: true, ..RoadConnections::default() };
+        assert_eq!(piece_for(straight, None), (RoadPieceKind::Straight, Rotation::Deg0));
+
+        for ascent in Direction::ALL {
+            let (kind, rotation) = piece_for(straight, Some(ascent));
+            assert_eq!(kind, RoadPieceKind::Stair);
+            assert_eq!(rotation, road::stair_rotation(ascent));
+        }
+    }
+
+    /// A cell recorded as a stair is *written* as one, whatever its
+    /// neighbours would otherwise have made it — the write-path half of
+    /// `piece_for`.
+    #[test]
+    fn road_write_edit_writes_a_stair_for_a_cell_with_a_recorded_ascent() {
+        let dir = temp_dir("write_stair");
+        write_piece(&dir, "dirt", RoadPieceKind::Straight, &one_stone_piece());
+        let mut stair_piece = one_stone_piece();
+        stair_piece.palette[1] = state_named("minecraft:cobblestone");
+        write_piece(&dir, "dirt", RoadPieceKind::Stair, &stair_piece);
+        let (catalogue, _) = super::super::road_catalogue::load_road_catalogue_dir(&dir);
+
+        let mut city = City::default();
+        city.add_road_cell(IVec2::new(0, -1), "dirt", 64, None).unwrap();
+        city.add_road_cell(IVec2::new(0, 0), "dirt", 64, Some(road::Direction::North)).unwrap();
+        city.add_road_cell(IVec2::new(0, 1), "dirt", 64, None).unwrap();
+
+        let edit = road_write_edit(&[IVec2::new(0, 0)], &catalogue, &city);
+        let solid: std::collections::HashSet<&str> =
+            edit.edits().iter().map(|e| e.state.name.as_str()).filter(|name| *name != "minecraft:air").collect();
+        assert_eq!(
+            solid,
+            std::collections::HashSet::from(["minecraft:cobblestone"]),
+            "a two-opposite-neighbour cell would be written as a Straight without its recorded ascent"
+        );
+
         std::fs::remove_dir_all(&dir).ok();
     }
 }

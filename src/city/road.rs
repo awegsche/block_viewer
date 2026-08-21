@@ -34,6 +34,31 @@
 //! [`reachable_from`] is the BFS primitive F4's "what does this road segment
 //! reach" is built on; [`is_connected`] is the two-cell special case.
 //!
+//! ## The authoring convention every style's `.nbt` pieces follow
+//!
+//! [`select_piece`] is style-blind: it answers with a [`RoadPieceKind`] and
+//! the [`Rotation`] that turns *that kind's canonically-authored blueprint*
+//! into the shape a cell's connections describe. Which means every style's
+//! six pieces have to be exported at the same orientation, and that
+//! orientation has to be the one [`canonical_pattern`] names. It is:
+//!
+//! | file           | connects              |
+//! |----------------|-----------------------|
+//! | `isolated.nbt` | nothing (unoriented)  |
+//! | `dead_end.nbt` | **south**             |
+//! | `straight.nbt` | north + south         |
+//! | `corner.nbt`   | **south + west**      |
+//! | `t.nbt`        | north + south + east  |
+//! | `cross.nbt`    | all four              |
+//! | `stair.nbt`    | north + south, **ascending north** (ticket 067) |
+//!
+//! Read off the shipped `dirt` pieces (ticket 063) rather than imposed on
+//! them — every one of the six already connects south, so "south is always
+//! open" is the rule, and the table above is it spelled out per kind.
+//! Ticket 066 is where [`canonical_pattern`] stopped disagreeing with them.
+//! `assets/city/roads/dirt/README.md` repeats it where an asset author will
+//! actually look.
+//!
 //! ## F4: bridging a building to the network (ticket 056)
 //!
 //! Everything above works in road-cell space only — nothing yet ties a
@@ -52,6 +77,8 @@ use std::collections::{HashSet, VecDeque};
 
 use bevy::math::IVec2;
 
+use serde::{Deserialize, Serialize};
+
 use crate::blueprint::Rotation;
 
 use super::state::{self, BuildingId, City, PlacedBuilding};
@@ -61,7 +88,13 @@ use bevy::math::IVec3;
 
 /// One of the four cardinal directions a road cell can connect in, in
 /// Minecraft's own `x`/`z` convention — see the module docs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Derives `Serialize`/`Deserialize` for ticket 067: a stair cell's ascent
+/// direction is part of [`super::state::RoadCell`] and therefore of
+/// `city.ron`, exactly the way [`Rotation`] is part of a placed building's
+/// record — a mirror enum in `super::persistence` would be one more place
+/// for the four cardinals to disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Direction {
     North,
     South,
@@ -93,9 +126,35 @@ impl Direction {
     /// rotates a canonical connection pattern through this to find the
     /// [`Rotation`] that reproduces an actual one.
     fn rotated(self, turns: u8) -> Direction {
-        const ORDER: [Direction; 4] = [Direction::North, Direction::East, Direction::South, Direction::West];
-        let index = ORDER.iter().position(|&d| d == self).expect("ORDER covers every Direction");
-        ORDER[(index + turns as usize) % 4]
+        Self::CLOCKWISE[(self.clockwise_index() + turns as usize) % 4]
+    }
+
+    /// The four cardinals in the clockwise order every rotation in this
+    /// module and in [`crate::blueprint::rotate`] walks — north -> east ->
+    /// south -> west.
+    const CLOCKWISE: [Direction; 4] = [Direction::North, Direction::East, Direction::South, Direction::West];
+
+    fn clockwise_index(self) -> usize {
+        Self::CLOCKWISE.iter().position(|&d| d == self).expect("CLOCKWISE covers every Direction")
+    }
+
+    /// The direction facing the other way — `North.opposite() == South`.
+    /// Ticket 067: a stair placed on a *descending* leg of a drag ascends
+    /// back toward the cell the path came from, which is exactly this.
+    pub fn opposite(self) -> Direction {
+        self.rotated(2)
+    }
+
+    /// The [`Rotation`] that turns a piece authored facing *north* into one
+    /// facing `self` — [`stair_rotation`]'s whole body, kept next to
+    /// [`Direction::rotated`] so the two can't drift apart.
+    fn rotation_from_north(self) -> Rotation {
+        match self.clockwise_index() {
+            0 => Rotation::Deg0,
+            1 => Rotation::Deg90,
+            2 => Rotation::Deg180,
+            _ => Rotation::Deg270,
+        }
     }
 }
 
@@ -318,36 +377,70 @@ pub enum RoadPieceKind {
     T,
     /// All four neighbours.
     Cross,
+    /// Two *opposite* neighbours like [`RoadPieceKind::Straight`], but
+    /// climbing [`ROAD_STAIR_RISE`](super::road_build::ROAD_STAIR_RISE)
+    /// blocks across the cell instead of running level — the piece that
+    /// bridges two road levels (ticket 067).
+    ///
+    /// Never returned by [`select_piece`]: a cell's *connections* look
+    /// identical to a straight's, so nothing about them can say "this one is
+    /// a ramp". It's chosen from [`super::state::RoadCell::ascent`], which
+    /// `super::road_build::plan_drag` decides when the drag that places the
+    /// cell commits, and [`stair_rotation`] is what turns that direction into
+    /// the rotation the canonical piece needs.
+    Stair,
 }
 
 impl RoadPieceKind {
     /// Every kind, for [`super::road_catalogue`] to iterate when loading the
     /// fixed set of `.nbt` files it expects one of.
-    pub const ALL: [RoadPieceKind; 6] = [
+    pub const ALL: [RoadPieceKind; 7] = [
         RoadPieceKind::Isolated,
         RoadPieceKind::DeadEnd,
         RoadPieceKind::Straight,
         RoadPieceKind::Corner,
         RoadPieceKind::T,
         RoadPieceKind::Cross,
+        RoadPieceKind::Stair,
     ];
 }
 
+/// The [`Rotation`] a [`RoadPieceKind::Stair`] piece needs to climb toward
+/// `ascent`. The canonical `stair.nbt` ascends toward **north** (see
+/// [`canonical_pattern`] and the module docs' authoring convention), so this
+/// is just "how far is `ascent` from north, clockwise" — derived through
+/// [`Direction`]'s own order rather than a second four-way table that could
+/// disagree with it.
+pub fn stair_rotation(ascent: Direction) -> Rotation {
+    ascent.rotation_from_north()
+}
+
 /// The canonical connection pattern each oriented [`RoadPieceKind`] is
-/// authored at — the shape its own `.nbt` file is assumed to have been built
-/// to match. [`select_piece`] rotates these until one equals the actual
-/// connections; [`RoadPieceKind::Isolated`]/[`RoadPieceKind::Cross`] aren't
-/// here because neither has an orientation to search over (see
-/// [`select_piece`]).
-fn canonical_pattern(kind: RoadPieceKind) -> RoadConnections {
+/// authored at — the shape its own `.nbt` file is *actually* built to match.
+/// [`select_piece`] rotates these until one equals the actual connections;
+/// [`RoadPieceKind::Isolated`] isn't oriented at all and
+/// [`RoadPieceKind::Cross`] is symmetric under every turn, so neither has an
+/// orientation to search over (see [`select_piece`]).
+///
+/// **This table is the authoring contract**, not a guess — see the module
+/// docs' "The authoring convention". Ticket 066: it originally described a
+/// different set of orientations than the shipped `dirt` pieces were built
+/// at, which rotated every dead end and corner by 180° and every T by 90°.
+/// Straight and cross hid it: both are symmetric under exactly the turn they
+/// were wrong by.
+pub(super) fn canonical_pattern(kind: RoadPieceKind) -> RoadConnections {
     match kind {
         RoadPieceKind::Isolated => RoadConnections::default(),
-        RoadPieceKind::DeadEnd => RoadConnections { north: true, ..RoadConnections::default() },
+        RoadPieceKind::DeadEnd => RoadConnections { south: true, ..RoadConnections::default() },
         RoadPieceKind::Straight => RoadConnections { north: true, south: true, ..RoadConnections::default() },
-        RoadPieceKind::Corner => RoadConnections { north: true, east: true, ..RoadConnections::default() },
-        // Missing south: a T pointing away from south.
-        RoadPieceKind::T => RoadConnections { north: true, east: true, west: true, ..RoadConnections::default() },
+        RoadPieceKind::Corner => RoadConnections { south: true, west: true, ..RoadConnections::default() },
+        // Missing west: a T pointing away from west.
+        RoadPieceKind::T => RoadConnections { north: true, south: true, east: true, ..RoadConnections::default() },
         RoadPieceKind::Cross => RoadConnections { north: true, south: true, east: true, west: true },
+        // Ticket 067: shaped like a straight, and — like every other piece
+        // here — open to the south, which is its *low* end. It climbs toward
+        // north; see `stair_rotation`.
+        RoadPieceKind::Stair => RoadConnections { north: true, south: true, ..RoadConnections::default() },
     }
 }
 
@@ -416,7 +509,7 @@ mod tests {
     #[test]
     fn connections_at_reports_no_neighbours_for_an_isolated_road_cell() {
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(0, 0), "dirt", 64).unwrap();
+        city.add_road_cell(IVec2::new(0, 0), "dirt", 64, None).unwrap();
 
         let connections = connections_at(&city, IVec2::new(0, 0));
         assert_eq!(connections, RoadConnections::default());
@@ -427,9 +520,9 @@ mod tests {
     fn connections_at_reports_exactly_the_road_neighbours() {
         let mut city = City::default();
         // A road cell with north and east neighbours, but not south or west.
-        city.add_road_cell(IVec2::new(0, 0), "dirt", 64).unwrap();
-        city.add_road_cell(IVec2::new(0, -1), "dirt", 64).unwrap(); // north
-        city.add_road_cell(IVec2::new(1, 0), "dirt", 64).unwrap(); // east
+        city.add_road_cell(IVec2::new(0, 0), "dirt", 64, None).unwrap();
+        city.add_road_cell(IVec2::new(0, -1), "dirt", 64, None).unwrap(); // north
+        city.add_road_cell(IVec2::new(1, 0), "dirt", 64, None).unwrap(); // east
 
         let connections = connections_at(&city, IVec2::new(0, 0));
         assert_eq!(connections, RoadConnections { north: true, south: false, east: true, west: false });
@@ -439,7 +532,7 @@ mod tests {
     #[test]
     fn connections_at_ignores_a_building_neighbour() {
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(0, 0), "dirt", 64).unwrap();
+        city.add_road_cell(IVec2::new(0, 0), "dirt", 64, None).unwrap();
         // Cell (0, -1) is north of (0, 0): block tiles -6..0 x z. Place a
         // building inside that block range so it's the road cell's north
         // neighbour, but as a building, not a road.
@@ -453,7 +546,7 @@ mod tests {
     #[test]
     fn connections_at_works_from_a_cell_that_is_not_itself_a_road() {
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(0, -1), "dirt", 64).unwrap();
+        city.add_road_cell(IVec2::new(0, -1), "dirt", 64, None).unwrap();
 
         // Asking "what would connect here" before placing anything.
         let connections = connections_at(&city, IVec2::new(0, 0));
@@ -463,9 +556,9 @@ mod tests {
     #[test]
     fn connections_at_reports_a_full_cross() {
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(0, 0), "dirt", 64).unwrap();
+        city.add_road_cell(IVec2::new(0, 0), "dirt", 64, None).unwrap();
         for offset in [IVec2::new(0, -1), IVec2::new(0, 1), IVec2::new(1, 0), IVec2::new(-1, 0)] {
-            city.add_road_cell(offset, "dirt", 64).unwrap();
+            city.add_road_cell(offset, "dirt", 64, None).unwrap();
         }
 
         assert_eq!(connections_at(&city, IVec2::new(0, 0)).count(), 4);
@@ -480,7 +573,7 @@ mod tests {
     #[test]
     fn reachable_from_a_single_cell_island_is_only_itself() {
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(5, 5), "dirt", 64).unwrap();
+        city.add_road_cell(IVec2::new(5, 5), "dirt", 64, None).unwrap();
         assert_eq!(reachable_from(&city, IVec2::new(5, 5)), HashSet::from([IVec2::new(5, 5)]));
     }
 
@@ -488,7 +581,7 @@ mod tests {
     fn reachable_from_walks_a_straight_run() {
         let mut city = City::default();
         for x in 0..5 {
-            city.add_road_cell(IVec2::new(x, 0), "dirt", 64).unwrap();
+            city.add_road_cell(IVec2::new(x, 0), "dirt", 64, None).unwrap();
         }
 
         let reached = reachable_from(&city, IVec2::new(0, 0));
@@ -501,9 +594,9 @@ mod tests {
         let mut city = City::default();
         // A horizontal run with one cell branching south from the middle.
         for x in 0..3 {
-            city.add_road_cell(IVec2::new(x, 0), "dirt", 64).unwrap();
+            city.add_road_cell(IVec2::new(x, 0), "dirt", 64, None).unwrap();
         }
-        city.add_road_cell(IVec2::new(1, 1), "dirt", 64).unwrap();
+        city.add_road_cell(IVec2::new(1, 1), "dirt", 64, None).unwrap();
 
         let reached = reachable_from(&city, IVec2::new(0, 0));
         assert_eq!(
@@ -517,7 +610,7 @@ mod tests {
         let mut city = City::default();
         // A 2x2 loop of road cells.
         for cell in [IVec2::new(0, 0), IVec2::new(1, 0), IVec2::new(0, 1), IVec2::new(1, 1)] {
-            city.add_road_cell(cell, "dirt", 64).unwrap();
+            city.add_road_cell(cell, "dirt", 64, None).unwrap();
         }
 
         let reached = reachable_from(&city, IVec2::new(0, 0));
@@ -527,10 +620,10 @@ mod tests {
     #[test]
     fn reachable_from_does_not_cross_to_a_disconnected_island() {
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(0, 0), "dirt", 64).unwrap();
-        city.add_road_cell(IVec2::new(1, 0), "dirt", 64).unwrap();
+        city.add_road_cell(IVec2::new(0, 0), "dirt", 64, None).unwrap();
+        city.add_road_cell(IVec2::new(1, 0), "dirt", 64, None).unwrap();
         // A second island, far away and not adjacent to the first.
-        city.add_road_cell(IVec2::new(100, 100), "dirt", 64).unwrap();
+        city.add_road_cell(IVec2::new(100, 100), "dirt", 64, None).unwrap();
 
         let reached = reachable_from(&city, IVec2::new(0, 0));
         assert_eq!(reached, HashSet::from([IVec2::new(0, 0), IVec2::new(1, 0)]));
@@ -540,7 +633,7 @@ mod tests {
     fn is_connected_is_true_within_one_island() {
         let mut city = City::default();
         for x in 0..3 {
-            city.add_road_cell(IVec2::new(x, 0), "dirt", 64).unwrap();
+            city.add_road_cell(IVec2::new(x, 0), "dirt", 64, None).unwrap();
         }
         assert!(is_connected(&city, IVec2::new(0, 0), IVec2::new(2, 0)));
     }
@@ -548,15 +641,15 @@ mod tests {
     #[test]
     fn is_connected_is_false_across_two_islands() {
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(0, 0), "dirt", 64).unwrap();
-        city.add_road_cell(IVec2::new(100, 100), "dirt", 64).unwrap();
+        city.add_road_cell(IVec2::new(0, 0), "dirt", 64, None).unwrap();
+        city.add_road_cell(IVec2::new(100, 100), "dirt", 64, None).unwrap();
         assert!(!is_connected(&city, IVec2::new(0, 0), IVec2::new(100, 100)));
     }
 
     #[test]
     fn is_connected_is_false_when_an_endpoint_is_not_a_road_cell() {
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(0, 0), "dirt", 64).unwrap();
+        city.add_road_cell(IVec2::new(0, 0), "dirt", 64, None).unwrap();
         assert!(!is_connected(&city, IVec2::new(0, 0), IVec2::new(1, 0)));
         assert!(!is_connected(&city, IVec2::new(1, 0), IVec2::new(0, 0)));
     }
@@ -566,7 +659,7 @@ mod tests {
     #[test]
     fn touching_road_cells_is_empty_for_a_building_nowhere_near_a_road() {
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(0, 0), "dirt", 64).unwrap(); // block tiles 0..6 x 0..6
+        city.add_road_cell(IVec2::new(0, 0), "dirt", 64, None).unwrap(); // block tiles 0..6 x 0..6
         let id = city
             .place_building("house01", IVec3::new(100, 64, 100), Rotation::Deg0, IVec2::new(2, 2))
             .unwrap();
@@ -578,7 +671,7 @@ mod tests {
     #[test]
     fn touching_road_cells_finds_a_cell_just_outside_the_footprint() {
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(0, 0), "dirt", 64).unwrap(); // block tiles 0..6 x 0..6
+        city.add_road_cell(IVec2::new(0, 0), "dirt", 64, None).unwrap(); // block tiles 0..6 x 0..6
         // Directly east of the road cell: x = 6..8, z = 0..2. Its west edge
         // (x = 6) neighbours x = 5, inside the road cell's tile range.
         let id = city
@@ -592,8 +685,8 @@ mod tests {
     #[test]
     fn touching_road_cells_finds_every_cell_along_a_wide_footprint() {
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(0, 0), "dirt", 64).unwrap(); // block tiles 0..6 x 0..6
-        city.add_road_cell(IVec2::new(1, 0), "dirt", 64).unwrap(); // block tiles 6..12 x 0..6
+        city.add_road_cell(IVec2::new(0, 0), "dirt", 64, None).unwrap(); // block tiles 0..6 x 0..6
+        city.add_road_cell(IVec2::new(1, 0), "dirt", 64, None).unwrap(); // block tiles 6..12 x 0..6
         // South of both cells: x = 0..12, z = 6..8. Its north edge (z = 6)
         // neighbours z = 5, spanning both road cells' x ranges.
         let id = city
@@ -615,7 +708,7 @@ mod tests {
     #[test]
     fn is_building_connected_distinguishes_touching_from_untouching() {
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(0, 0), "dirt", 64).unwrap();
+        city.add_road_cell(IVec2::new(0, 0), "dirt", 64, None).unwrap();
         let far = city
             .place_building("house01", IVec3::new(100, 64, 100), Rotation::Deg0, IVec2::new(2, 2))
             .unwrap();
@@ -633,7 +726,7 @@ mod tests {
     #[test]
     fn is_building_connected_is_true_next_to_an_isolated_road_island() {
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(0, 0), "dirt", 64).unwrap();
+        city.add_road_cell(IVec2::new(0, 0), "dirt", 64, None).unwrap();
         assert_eq!(connections_at(&city, IVec2::new(0, 0)).count(), 0, "sanity: a lone road cell");
 
         let id = city
@@ -657,8 +750,8 @@ mod tests {
     fn buildings_connected_is_true_across_a_shared_road_network() {
         let mut city = City::default();
         // A two-cell straight run: (0,0) block tiles 0..6x0..6, (1,0) 6..12x0..6.
-        city.add_road_cell(IVec2::new(0, 0), "dirt", 64).unwrap();
-        city.add_road_cell(IVec2::new(1, 0), "dirt", 64).unwrap();
+        city.add_road_cell(IVec2::new(0, 0), "dirt", 64, None).unwrap();
+        city.add_road_cell(IVec2::new(1, 0), "dirt", 64, None).unwrap();
 
         // South of cell (0,0): touches only the west cell.
         let a = city
@@ -675,8 +768,8 @@ mod tests {
     #[test]
     fn buildings_connected_is_false_across_disconnected_road_islands() {
         let mut city = City::default();
-        city.add_road_cell(IVec2::new(0, 0), "dirt", 64).unwrap();
-        city.add_road_cell(IVec2::new(100, 100), "dirt", 64).unwrap();
+        city.add_road_cell(IVec2::new(0, 0), "dirt", 64, None).unwrap();
+        city.add_road_cell(IVec2::new(100, 100), "dirt", 64, None).unwrap();
 
         let a = city
             .place_building("house01", IVec3::new(6, 64, 0), Rotation::Deg0, IVec2::new(2, 2))
@@ -711,9 +804,9 @@ mod tests {
     fn buildings_reachable_from_finds_only_buildings_on_the_same_network() {
         let mut city = City::default();
         // Straight run (0,0)-(1,0), plus a disconnected island at (100,100).
-        city.add_road_cell(IVec2::new(0, 0), "dirt", 64).unwrap();
-        city.add_road_cell(IVec2::new(1, 0), "dirt", 64).unwrap();
-        city.add_road_cell(IVec2::new(100, 100), "dirt", 64).unwrap();
+        city.add_road_cell(IVec2::new(0, 0), "dirt", 64, None).unwrap();
+        city.add_road_cell(IVec2::new(1, 0), "dirt", 64, None).unwrap();
+        city.add_road_cell(IVec2::new(100, 100), "dirt", 64, None).unwrap();
 
         let reachable = city
             .place_building("house01", IVec3::new(6, 64, 6), Rotation::Deg0, IVec2::new(2, 2))
@@ -738,6 +831,84 @@ mod tests {
         assert_eq!(select_piece(RoadConnections::default()), (RoadPieceKind::Isolated, Rotation::Deg0));
         let full = RoadConnections { north: true, south: true, east: true, west: true };
         assert_eq!(select_piece(full), (RoadPieceKind::Cross, Rotation::Deg0));
+    }
+
+    /// Ticket 066: the canonical table *is* the contract
+    /// `assets/city/roads/<style>/*.nbt` are exported against, so it gets
+    /// pinned here rather than only being exercised indirectly through
+    /// `select_piece`'s round trip (which derives its expectation from this
+    /// same table and so agrees with it no matter what it says). If this
+    /// fails, either the shipped pieces were re-exported at a new
+    /// orientation — in which case the module docs and the assets' README
+    /// need the same edit — or the table drifted.
+    #[test]
+    fn the_canonical_patterns_match_the_documented_authoring_convention() {
+        let expected = |north, south, east, west| RoadConnections { north, south, east, west };
+        assert_eq!(canonical_pattern(RoadPieceKind::Isolated), expected(false, false, false, false));
+        assert_eq!(canonical_pattern(RoadPieceKind::DeadEnd), expected(false, true, false, false));
+        assert_eq!(canonical_pattern(RoadPieceKind::Straight), expected(true, true, false, false));
+        assert_eq!(canonical_pattern(RoadPieceKind::Corner), expected(false, true, false, true));
+        assert_eq!(canonical_pattern(RoadPieceKind::T), expected(true, true, true, false));
+        assert_eq!(canonical_pattern(RoadPieceKind::Cross), expected(true, true, true, true));
+        assert_eq!(canonical_pattern(RoadPieceKind::Stair), expected(true, true, false, false));
+    }
+
+    // -- stairs (ticket 067) -------------------------------------------------
+
+    /// [`stair_rotation`] answers with the turn that actually carries the
+    /// canonical piece's ascent (north) onto the asked-for direction — the
+    /// same round-trip property `select_piece_round_trips_every_connection_pattern`
+    /// checks for the connection-driven kinds, on the one axis a stair adds.
+    #[test]
+    fn stair_rotation_round_trips_every_ascent_direction() {
+        for ascent in Direction::ALL {
+            let turns = match stair_rotation(ascent) {
+                Rotation::Deg0 => 0,
+                Rotation::Deg90 => 1,
+                Rotation::Deg180 => 2,
+                Rotation::Deg270 => 3,
+            };
+            assert_eq!(
+                Direction::North.rotated(turns),
+                ascent,
+                "rotating the canonical north-ascending stair by {:?} should make it ascend {ascent:?}",
+                stair_rotation(ascent)
+            );
+        }
+    }
+
+    /// A stair still has to *fit* where a straight would — its two open
+    /// edges are the same pair — or a cell couldn't be swapped between the
+    /// two without its neighbours noticing.
+    #[test]
+    fn a_stairs_canonical_shape_matches_a_straights() {
+        assert_eq!(canonical_pattern(RoadPieceKind::Stair), canonical_pattern(RoadPieceKind::Straight));
+    }
+
+    #[test]
+    fn opposite_is_a_half_turn_in_both_directions() {
+        assert_eq!(Direction::North.opposite(), Direction::South);
+        assert_eq!(Direction::South.opposite(), Direction::North);
+        assert_eq!(Direction::East.opposite(), Direction::West);
+        assert_eq!(Direction::West.opposite(), Direction::East);
+        for direction in Direction::ALL {
+            assert_eq!(direction.opposite().opposite(), direction);
+            assert_eq!(direction.offset(), -direction.opposite().offset());
+        }
+    }
+
+    /// Every oriented piece has its south edge open — the one-line form of
+    /// the table above, and the property an asset author can check at a
+    /// glance against a structure block. `Isolated` is the exception: it
+    /// connects to nothing by definition.
+    #[test]
+    fn every_oriented_canonical_pattern_opens_to_the_south() {
+        for kind in RoadPieceKind::ALL {
+            if kind == RoadPieceKind::Isolated {
+                continue;
+            }
+            assert!(canonical_pattern(kind).south, "{kind:?} should be authored with its south edge open");
+        }
     }
 
     #[test]
