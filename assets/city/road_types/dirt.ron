@@ -1,0 +1,7 @@
+// Definition for the "dirt" road style (ticket 063, follow-up to 059/060).
+// Geometry lives at assets/city/roads/dirt/ — see that directory's README.md.
+RoadType(
+    name: "Dirt Path",
+    travel_speed: 1.0,
+    capacity: 4,
+)

@@ -605,18 +605,20 @@ these itself (see CLAUDE.md's "Manual/visual verification").
   `block_viewer: loaded 1 building definition from assets/city/buildings`
   followed by a `house01 — "House" tier 1, footprint WxD` line, no `skipped`
   lines, and still no panic before the window opens.
-- [ ] **060 road type definitions: startup loads and logs them without
-  panicking.** Same shape as the 039/040 check above. With no real road
-  assets on disk yet (`assets/city/roads` and `assets/city/road_types` both
-  empty/absent — see 054/059/060's own "no real assets" notes), confirm the
-  console prints `block_viewer: loaded 0 road pieces from assets/city/roads`
-  and `block_viewer: loaded 0 road types from assets/city/road_types`, no
-  `skipped` lines, and no panic before the window opens. Worth repeating
-  once real `.nbt`/`.ron` pairs exist for at least one style: confirm the
-  road-type line shows the right `speed`/`capacity` numbers and that a
-  `.ron` naming a style with no matching `assets/city/roads/<style>/`
-  directory shows up as a `skipped ... has no geometry in the road
-  catalogue` line rather than silently loading.
+- [ ] **060/063 road type definitions: startup loads and logs them without
+  panicking.** Same shape as the 039/040 check above. As of ticket 063,
+  `assets/city/road_types/dirt.ron` exists but `assets/city/roads/dirt/` is
+  still geometry-less (a `README.md` only, no real `.nbt` pieces — see that
+  directory's own note), so `dirt` currently has **no piece loaded** and
+  therefore isn't in `RoadCatalogue::styles()` yet. Confirm the console
+  prints `block_viewer: loaded 0 road pieces from assets/city/roads`
+  followed by `block_viewer: loaded 0 road types from assets/city/road_types`
+  and a `block_viewer:   skipped assets/city/road_types/dirt.ron: style
+  "dirt" has no geometry in the road catalogue` line — not a silent load —
+  and no panic before the window opens. Worth repeating once real `.nbt`
+  pieces land under `assets/city/roads/dirt/`: confirm it flips to
+  `loaded 1 road type` with a `dirt — "Dirt Path" (speed 1, capacity 4)`
+  line and the `skipped` line disappears.
 - [ ] **043 city save/load: the real app lifecycle actually fires the
   save.** The automated suite covers `persistence::{save_city, load_city}`
   directly (round trips, the removed-highest-id `next_id` case, corrupt/
