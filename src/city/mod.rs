@@ -139,6 +139,18 @@
 //! are written — without it, quitting with something unsaved would leave
 //! those two files describing buildings the world never actually got.
 //!
+//! ## The game clock (ticket 077, roadmap H2)
+//!
+//! [`clock::ClockPlugin`] is the time base the economy runs on — the
+//! roadmap's own decision that "the economy runs on a game clock with pause
+//! and speed controls, not on raw wall-clock time". `Space` pauses, the city
+//! panel's Time section is the real control, and
+//! [`clock::GameClock::delta_minutes`] is the only time ticket 078's
+//! production and 080's haulage ever read, so a paused game produces nothing
+//! and 4x means the same thing to both. Not persisted: nothing downstream
+//! reads an absolute time, so the clock starts at zero each run — see
+//! [`clock`]'s own docs.
+//!
 //! ## The build menu and city panel (ticket 050, roadmap G)
 //!
 //! [`ui::UiPlugin`] is the citybuilder's first real UI — its own
@@ -264,6 +276,7 @@
 
 use std::path::{Path, PathBuf};
 
+mod clock;
 mod commit;
 mod definition;
 mod demolish;
@@ -396,6 +409,7 @@ pub fn run() {
         .insert_resource(hot_reload::RoadTypeSnapshot(road_type_snapshot))
         .insert_resource(definition_errors)
         .add_plugins(hot_reload::DefinitionHotReloadPlugin)
+        .add_plugins(clock::ClockPlugin)
         .add_plugins(tool::ToolPlugin)
         .add_plugins(picking::PickingPlugin)
         .add_plugins(placement::PlacementPlugin)

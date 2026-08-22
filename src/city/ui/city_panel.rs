@@ -36,6 +36,7 @@ use bevy_egui::{egui, EguiContexts};
 use crate::chunk_pipeline::SharedRegionCache;
 use crate::{LoadedSave, StartupIssue};
 
+use super::super::clock::{GameClock, GameSpeed};
 use super::super::inventory::{short_name, Stock};
 use super::super::journal::Journal;
 use super::super::save::{SaveCommand, SaveState};
@@ -219,11 +220,35 @@ fn world_section(ui: &mut egui::Ui, save: &LoadedSave, issue: &StartupIssue) {
     }
 }
 
-/// Egui window: the save, buildings, roads, write status, world save, undo.
-/// See the module docs.
+/// The "Time" section (ticket 077): the speed buttons and the game clock they
+/// drive. A row of four, the running one highlighted — the same
+/// "selected/not" shape the build menu's own rows use, rather than a slider
+/// over a multiplier nothing else in the game would be correct at.
+///
+/// `Space` toggles pause too (`super::super::clock::toggle_pause`); as with
+/// every other binding in this game the keyboard is the stand-in and the
+/// panel is the real control, so the hint says so.
+fn time_section(ui: &mut egui::Ui, clock: &GameClock, speed: &mut GameSpeed) {
+    ui.horizontal(|ui| {
+        for option in GameSpeed::ALL {
+            if ui.selectable_label(*speed == option, option.label()).clicked() {
+                *speed = option;
+            }
+        }
+        ui.label(clock.elapsed_label());
+    });
+    if *speed == GameSpeed::Paused {
+        ui.label("Paused — space resumes.");
+    }
+}
+
+/// Egui window: the save, time, buildings, roads, write status, world save,
+/// undo. See the module docs.
 pub(super) fn city_panel(
     mut contexts: EguiContexts,
     city: Res<state::City>,
+    clock: Res<GameClock>,
+    mut speed: ResMut<GameSpeed>,
     stock: Res<Stock>,
     journal: Res<Journal>,
     write_status: Res<WriteStatus>,
@@ -236,6 +261,10 @@ pub(super) fn city_panel(
     egui::Window::new("City").show(contexts.ctx_mut(), |ui| {
         ui.heading("World");
         world_section(ui, &loaded_save, &startup_issue);
+
+        ui.separator();
+        ui.heading("Time");
+        time_section(ui, &clock, &mut speed);
 
         ui.separator();
         ui.heading("Buildings");

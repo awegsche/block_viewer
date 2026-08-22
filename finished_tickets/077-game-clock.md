@@ -1,7 +1,13 @@
 # 077 - The game clock: pause and speed
 
 ## Status
-Open
+Done — `cargo test` green.
+
+Landed as described. One thing the tests forced into the open: any delta big
+enough to make a round number of minutes is already past `MAX_FRAME_ADVANCE`,
+so `delta_minutes` is tested on a directly-constructed `GameClock` rather than
+through the app — driving it through `advance` would only have re-tested the
+clamp.
 
 ## Why
 
