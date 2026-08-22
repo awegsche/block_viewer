@@ -112,6 +112,10 @@ pub struct Conversion {
 /// the stock file it seeds.
 #[derive(Debug, Default, Deserialize)]
 struct EconomyFile {
+    /// Ticket 078. Defaulted rather than required, so an `economy.ron`
+    /// written before production existed keeps working.
+    #[serde(default = "default_stack_size")]
+    stack_size: u64,
     #[serde(default)]
     start_stock: HashMap<String, u64>,
     #[serde(default)]
@@ -122,10 +126,27 @@ struct EconomyFile {
     interchangeable: Vec<Vec<String>>,
 }
 
+/// Minecraft's own stack, and the unit a haul carries (ticket 078/080). A
+/// tunable rather than a constant because it is a *balance* number — how big
+/// a batch a farm accumulates before a cart comes for it — that happens to
+/// coincide with the game's own.
+fn default_stack_size() -> u64 {
+    64
+}
+
 /// The loaded economy knobs. [`Default`] is the "no `economy.ron`" config:
-/// no grant, no conversions — exactly the game ticket 073 shipped.
-#[derive(Resource, Debug, Default)]
+/// no grant, no conversions, and a vanilla stack — exactly the game ticket
+/// 073 shipped, plus the one number ticket 078 needs a value for whether or
+/// not a file supplies it.
+///
+/// Hand-written rather than derived: a derived `Default` would give
+/// `stack_size` a zero, and a stack of nothing is a divide-by-zero waiting in
+/// every buffer calculation downstream.
+#[derive(Resource, Debug)]
 pub struct EconomyConfig {
+    /// How many items make one stack — a producer's buffer is measured in
+    /// these, and one is what a haul carries.
+    pub stack_size: u64,
     /// What a city with no `stock.ron` is founded with.
     pub start_stock: Parcel,
     /// Applied by [`plan_payment`], in file order — the first conversion
@@ -136,6 +157,17 @@ pub struct EconomyConfig {
     /// the module docs. Tried *after* [`Self::conversions`], so an explicit
     /// ratio always wins over a synonym.
     pub groups: Vec<Vec<String>>,
+}
+
+impl Default for EconomyConfig {
+    fn default() -> Self {
+        EconomyConfig {
+            stack_size: default_stack_size(),
+            start_stock: Parcel::default(),
+            conversions: Vec::new(),
+            groups: Vec::new(),
+        }
+    }
 }
 
 /// Why `economy.ron` didn't load. A missing file is **not** one of these —
@@ -160,6 +192,9 @@ pub enum EconomyError {
     /// second is the real hazard: "which group wins" is not a question this
     /// file should be able to ask.
     DuplicateGroupMember(String),
+    /// `stack_size: 0` (ticket 078) — a buffer measured in stacks of nothing
+    /// holds nothing, so every producer would stall on its first tick.
+    ZeroStackSize,
 }
 
 impl std::fmt::Display for EconomyError {
@@ -170,6 +205,7 @@ impl std::fmt::Display for EconomyError {
             EconomyError::ZeroCount(what) => write!(f, "conversion {what} has a count of 0"),
             EconomyError::EmptyItem(what) => write!(f, "conversion {what} has a blank item name"),
             EconomyError::SelfConversion(item) => write!(f, "{item} is listed as converting to itself"),
+            EconomyError::ZeroStackSize => write!(f, "stack_size must be > 0"),
             EconomyError::GroupTooSmall(index) => {
                 write!(f, "interchangeable group {index} has fewer than two materials in it")
             }
@@ -258,7 +294,11 @@ pub fn load_economy(path: &Path) -> Result<EconomyConfig, EconomyError> {
         groups.push(members);
     }
 
-    Ok(EconomyConfig { start_stock, conversions, groups })
+    if file.stack_size == 0 {
+        return Err(EconomyError::ZeroStackSize);
+    }
+
+    Ok(EconomyConfig { stack_size: file.stack_size, start_stock, conversions, groups })
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -489,7 +529,7 @@ mod tests {
     /// A config with a conversion table and no groups — what every ticket
     /// 074 test was written against.
     fn table(conversions: Vec<Conversion>) -> EconomyConfig {
-        EconomyConfig { start_stock: Parcel::default(), conversions, groups: Vec::new() }
+        EconomyConfig { conversions, ..EconomyConfig::default() }
     }
 
     fn logs_to_planks() -> EconomyConfig {
@@ -629,12 +669,12 @@ mod tests {
     /// plank type is the same plank.
     fn wood_economy() -> EconomyConfig {
         EconomyConfig {
-            start_stock: Parcel::default(),
             conversions: vec![
                 conversion(("minecraft:oak_log", 1), ("minecraft:oak_planks", 4)),
                 conversion(("minecraft:birch_log", 1), ("minecraft:birch_planks", 4)),
             ],
             groups: vec![vec!["minecraft:oak_planks".to_string(), "minecraft:birch_planks".to_string()]],
+            ..EconomyConfig::default()
         }
     }
 
@@ -714,6 +754,29 @@ mod tests {
         let config = load_economy(&path).expect("a missing file is not an error");
         assert!(config.start_stock.is_empty());
         assert!(config.conversions.is_empty());
+        assert_eq!(config.stack_size, 64, "a missing file still has to name a stack size");
+    }
+
+    /// Ticket 078: an `economy.ron` written before production existed has no
+    /// `stack_size` and must keep working, with the vanilla stack.
+    #[test]
+    fn a_file_with_no_stack_size_gets_the_vanilla_one() {
+        let config = config_from(r#"(start_stock: {"dirt": 1})"#).expect("loads");
+        assert_eq!(config.stack_size, 64);
+    }
+
+    #[test]
+    fn a_stated_stack_size_is_read() {
+        let config = config_from(r#"(stack_size: 16)"#).expect("loads");
+        assert_eq!(config.stack_size, 16);
+    }
+
+    /// A buffer measured in stacks of nothing holds nothing, so every
+    /// producer would stall on its first tick.
+    #[test]
+    fn a_zero_stack_size_is_refused() {
+        let err = config_from(r#"(stack_size: 0)"#).expect_err("zero stack size");
+        assert!(matches!(err, EconomyError::ZeroStackSize), "{err}");
     }
 
     #[test]

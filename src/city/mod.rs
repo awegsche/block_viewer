@@ -151,6 +151,23 @@
 //! reads an absolute time, so the clock starts at zero each run — see
 //! [`clock`]'s own docs.
 //!
+//! ## Production (ticket 078, roadmap H2)
+//!
+//! [`production::ProductionPlugin`] is what finally reads
+//! [`definition::Production`], loaded and inert since ticket 040. A placed
+//! building with a `production` block turns [`clock::GameClock`] time into
+//! materials — into a buffer of its *own*, not into the city's
+//! [`inventory::Stock`] — and **stops** when that buffer fills, which is the
+//! mechanic rather than a limitation: a farm that has visibly stalled is a
+//! problem a player can fix, where one quietly producing into nowhere is
+//! not. Ticket 080's haulage is what empties it.
+//!
+//! Its state lives in `<save>/citybuilder/logistics.ron`, loaded by
+//! [`load_logistics`] and written by [`save_logistics_on_exit`] — its own
+//! file for the reason ticket 072 gave `stock.ron` one, and the one save
+//! file in this crate whose version mismatch starts empty instead of being
+//! refused. See [`production`]'s own docs for that argument.
+//!
 //! ## The build menu and city panel (ticket 050, roadmap G)
 //!
 //! [`ui::UiPlugin`] is the citybuilder's first real UI — its own
@@ -289,6 +306,7 @@ mod journal;
 mod persistence;
 mod picking;
 mod placement;
+mod production;
 mod road;
 mod road_build;
 mod road_catalogue;
@@ -379,6 +397,7 @@ pub fn run() {
     let city = load_city(&save_root);
     let journal = load_journal(&save_root);
     let stock = load_stock(&save_root, &economy_config);
+    let production = load_logistics(&save_root, &city);
 
     app.insert_resource(RenderFloor(FloorPolicy::BelowSurface { margin: 16 }))
         // Ticket 070: further than the viewer's default 10. The RTS camera
@@ -402,6 +421,7 @@ pub fn run() {
         .insert_resource(drop_table)
         .insert_resource(economy_config)
         .insert_resource(stock)
+        .insert_resource(production)
         .insert_resource(CitySavePath(if save_root.as_os_str().is_empty() { None } else { Some(save_root) }))
         // Ticket 061, roadmap C4: hot reload, seeded above so the first
         // `Update` tick doesn't immediately redo the load just above.
@@ -410,6 +430,7 @@ pub fn run() {
         .insert_resource(definition_errors)
         .add_plugins(hot_reload::DefinitionHotReloadPlugin)
         .add_plugins(clock::ClockPlugin)
+        .add_plugins(production::ProductionPlugin)
         .add_plugins(tool::ToolPlugin)
         .add_plugins(picking::PickingPlugin)
         .add_plugins(placement::PlacementPlugin)
@@ -429,7 +450,11 @@ pub fn run() {
         // `flush_world_on_exit` first: `city.ron`/`journal.ron` describe
         // buildings whose blocks need to have actually reached disk by the
         // time they're written — see the module docs' "Save world".
-        .add_systems(Last, (flush_world_on_exit, save_city_on_exit, save_journal_on_exit, save_stock_on_exit).chain())
+        .add_systems(
+            Last,
+            (flush_world_on_exit, save_city_on_exit, save_journal_on_exit, save_stock_on_exit, save_logistics_on_exit)
+                .chain(),
+        )
         .run();
 }
 
@@ -641,6 +666,49 @@ fn load_economy() -> (economy::EconomyConfig, Vec<(PathBuf, String)>) {
 /// Saves [`inventory::Stock`] to [`CitySavePath`] on every [`AppExit`], the
 /// same trigger and the same no-op-when-`None` contract
 /// [`save_city_on_exit`]/[`save_journal_on_exit`] use.
+/// Loads [`production::ProductionState`] from `save_root`. Unlike
+/// [`load_city`], a version this build doesn't know is logged and started
+/// empty rather than refused — see [`production`]'s own module docs for why
+/// that call is right for this file and for no other in the save.
+fn load_logistics(save_root: &Path, city: &state::City) -> production::ProductionState {
+    if save_root.as_os_str().is_empty() {
+        return production::ProductionState::default();
+    }
+
+    match production::load_logistics(save_root, city) {
+        Ok(loaded) => {
+            if loaded.len() > 0 {
+                println!(
+                    "block_viewer: loaded {} producer{} from {}",
+                    loaded.len(),
+                    if loaded.len() == 1 { "" } else { "s" },
+                    production::logistics_file_path_for_log(save_root).display(),
+                );
+            }
+            loaded
+        }
+        Err(err) => {
+            println!("block_viewer: could not load production state, starting empty: {err}");
+            production::ProductionState::default()
+        }
+    }
+}
+
+fn save_logistics_on_exit(
+    mut exit_events: EventReader<AppExit>,
+    production: Res<production::ProductionState>,
+    save_path: Res<CitySavePath>,
+) {
+    if exit_events.read().count() == 0 {
+        return;
+    }
+    let Some(save_root) = &save_path.0 else { return };
+
+    if let Err(err) = production::save_logistics(&production, save_root) {
+        println!("block_viewer: could not save production state: {err}");
+    }
+}
+
 fn save_stock_on_exit(
     mut exit_events: EventReader<AppExit>,
     stock: Res<inventory::Stock>,

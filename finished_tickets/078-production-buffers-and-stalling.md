@@ -1,7 +1,21 @@
 # 078 - Production: outputs accumulate into a buffer, and stall when it fills
 
 ## Status
-Open
+Done — `cargo test` green (722 passed).
+
+Landed as described, with two additions the work turned up:
+
+- **`Producer::short_of`**, not persisted: which input a starved producer is
+  waiting for, so the panel reads "starved (needs coal)" rather than sending
+  the player looking. Re-derived on the first tick after a load.
+- **Two new definition/economy validations**, both cases that would otherwise
+  read in-game as a building that silently doesn't work: `stack_size: 0`
+  (`EconomyError::ZeroStackSize`) and `production.buffer_stacks: 0`
+  (`DefinitionError::ZeroBufferStacks`).
+
+`tick` returns early on a zero delta rather than running with one, which is
+what makes "paused produces nothing" true by construction rather than by
+arithmetic that happens to come out at zero.
 
 ## Why
 

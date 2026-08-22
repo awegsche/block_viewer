@@ -139,6 +139,19 @@ pub struct Production {
     #[serde(default)]
     #[allow(dead_code)]
     pub radius: Option<u32>,
+    /// How many stacks (`economy.stack_size`) this building can hold before
+    /// it stops working and waits for a haul — ticket 078. A *building*
+    /// property rather than an economy-wide one: a grain silo holding more
+    /// than a fisherman's hut is the kind of difference a definition exists
+    /// to state.
+    #[serde(default = "default_buffer_stacks")]
+    pub buffer_stacks: u32,
+}
+
+/// Four stacks: enough that a warehouse a short haul away never starves a
+/// producer, few enough that one across the city visibly does.
+fn default_buffer_stacks() -> u32 {
+    4
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -179,6 +192,8 @@ pub enum DefinitionError {
     InvalidCost { block: String, count: u32 },
     /// A `production` entry's `per_minute` is negative.
     InvalidProduction { item: String, per_minute: f32 },
+    /// `production.buffer_stacks: 0` (ticket 078) — see `check_building`.
+    ZeroBufferStacks,
     /// `footprint: Explicit { x, z }` has a non-positive axis.
     InvalidFootprint { x: i32, z: i32 },
     /// The filename has nothing usable before its extension.
@@ -211,6 +226,7 @@ impl std::fmt::Display for DefinitionError {
             DefinitionError::InvalidCost { block, count } => {
                 write!(f, "cost entry for {block:?} has non-positive count {count}")
             }
+            DefinitionError::ZeroBufferStacks => write!(f, "production.buffer_stacks must be > 0"),
             DefinitionError::InvalidProduction { item, per_minute } => write!(
                 f,
                 "production entry for {item:?} has negative per_minute {per_minute}"
@@ -322,6 +338,12 @@ fn validate(building: &Building) -> Result<(), DefinitionError> {
                     per_minute: item.per_minute,
                 });
             }
+        }
+        // Ticket 078: a producer with nowhere to put its output stalls on its
+        // first tick and never recovers, which reads in-game as a building
+        // that silently doesn't work.
+        if production.buffer_stacks == 0 {
+            return Err(DefinitionError::ZeroBufferStacks);
         }
     }
     if let FootprintSpec::Explicit { x, z } = building.footprint {

@@ -38,7 +38,10 @@ use crate::{LoadedSave, StartupIssue};
 
 use super::super::clock::{GameClock, GameSpeed};
 use super::super::inventory::{short_name, Stock};
+use super::super::definition::BuildingDefinitions;
+use super::super::economy::EconomyConfig;
 use super::super::journal::Journal;
+use super::super::production::{buffer_capacity, ProductionState};
 use super::super::save::{SaveCommand, SaveState};
 use super::super::state;
 use super::super::undo::{UndoCommand, UndoState};
@@ -242,11 +245,48 @@ fn time_section(ui: &mut egui::Ui, clock: &GameClock, speed: &mut GameSpeed) {
     }
 }
 
-/// Egui window: the save, time, buildings, roads, write status, world save,
-/// undo. See the module docs.
+/// One producer's line: what it is, what it's doing, and how full its buffer
+/// is — `farm01: running, 37/256`. A plain function over the three things a
+/// row needs, so the formatting is testable without an `egui::Context` the
+/// same way [`building_counts`] and [`stock_lines`] are.
+///
+/// `Starved` names the input it is short of: "starved (needs wheat)" is a
+/// fixable problem, where "starved" alone sends the player looking.
+fn producer_lines(
+    city: &state::City,
+    production: &ProductionState,
+    definitions: &BuildingDefinitions,
+    economy: &EconomyConfig,
+) -> Vec<String> {
+    let mut lines: Vec<String> = production
+        .iter()
+        .filter_map(|(id, producer)| {
+            let placed = city.building(id)?;
+            let name = placed.definition_id.as_deref().unwrap_or(&placed.catalogue_id);
+            let capacity = definitions
+                .get(name)
+                .and_then(|definition| definition.building.production.as_ref())
+                .map(|spec| buffer_capacity(spec, economy))
+                .unwrap_or(0);
+            let state = match &producer.short_of {
+                Some(item) => format!("{} (needs {})", producer.state.label(), short_name(item)),
+                None => producer.state.label().to_string(),
+            };
+            Some(format!("  {name}: {state}, {}/{capacity}", producer.buffer.total()))
+        })
+        .collect();
+    lines.sort();
+    lines
+}
+
+/// Egui window: the save, time, buildings, roads, production, write status,
+/// world save, undo. See the module docs.
 pub(super) fn city_panel(
     mut contexts: EguiContexts,
     city: Res<state::City>,
+    production: Res<ProductionState>,
+    definitions: Res<BuildingDefinitions>,
+    economy: Res<EconomyConfig>,
     clock: Res<GameClock>,
     mut speed: ResMut<GameSpeed>,
     stock: Res<Stock>,
@@ -280,6 +320,17 @@ pub(super) fn city_panel(
         ui.separator();
         ui.heading("Roads");
         ui.label(format!("{} cell(s)", city.road_cells().count()));
+
+        ui.separator();
+        ui.heading("Production");
+        let producers = producer_lines(&city, &production, &definitions, &economy);
+        if producers.is_empty() {
+            ui.label("(nothing producing)");
+        } else {
+            for line in producers {
+                ui.label(line);
+            }
+        }
 
         ui.separator();
         ui.heading("Stock");

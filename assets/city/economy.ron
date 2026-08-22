@@ -1,7 +1,12 @@
-// The economy's tunable numbers (tickets 074, 075). See `src/city/economy.rs`.
+// The economy's tunable numbers (tickets 074, 075, 078). See
+// `src/city/economy.rs`.
 //
-// Three knobs:
+// Four knobs:
 //
+//   stack_size      how many items make one stack. A producer's buffer is
+//                   measured in these (`buffer_stacks` on its definition),
+//                   and one stack is what a haul carries to a warehouse.
+//                   Minecraft's own 64 by default.
 //   start_stock     what a city with NO `citybuilder/stock.ron` is founded
 //                   with. A save that already has a stock file is never
 //                   topped up, however empty it is.
@@ -22,6 +27,9 @@
 // rather than followed. An explicit `conversions` ratio is always tried
 // before an `interchangeable` synonym.
 (
+    // ---- the unit the economy moves things in ---------------------------
+    stack_size: 64,
+
     // ---- the founding grant ---------------------------------------------
     // Enough to lay out a first street without terraforming for it: the
     // shipped House costs 40 oak_planks + 20 cobblestone, so this is about

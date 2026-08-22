@@ -425,7 +425,7 @@ mod tests {
 
     #[test]
     fn production_with_no_outputs_is_none() {
-        let production = Production { outputs: vec![], inputs: vec![], radius: None };
+        let production = Production { outputs: vec![], inputs: vec![], radius: None, buffer_stacks: 4 };
         assert!(production_line(&production).is_none());
     }
 
@@ -438,6 +438,7 @@ mod tests {
             ],
             inputs: vec![],
             radius: None,
+            buffer_stacks: 4,
         };
         assert_eq!(production_line(&production), Some("wood 4.0/min, planks 2.5/min".to_string()));
     }
