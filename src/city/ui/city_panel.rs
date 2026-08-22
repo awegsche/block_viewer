@@ -288,7 +288,11 @@ fn producer_lines(
                 }
                 None => "unserved".to_string(),
             };
-            Some(format!("  {name}: {state}, {}/{capacity} — {haul}", producer.buffer.total()))
+            // Ticket 080: whether this producer's stack is on the road, or
+            // still waiting for a slot, is the difference between "be
+            // patient" and "build another warehouse".
+            let carting = if production.is_hauling(id) { ", hauling" } else { "" };
+            Some(format!("  {name}: {state}, {}/{capacity}{carting} — {haul}", producer.buffer.total()))
         })
         .collect();
     lines.sort();
@@ -310,6 +314,34 @@ pub(super) struct EconomyPanel<'w> {
     storage: Res<'w, StorageCapacity>,
     definitions: Res<'w, BuildingDefinitions>,
     economy: Res<'w, EconomyConfig>,
+}
+
+/// One line per warehouse: how much of its haulage capacity is in use, and
+/// how much of that is stuck because the city has nowhere to put it (ticket
+/// 080). `2/2 hauls, 1 blocked (storage full)` is the whole diagnostic for a
+/// city whose production has quietly stopped moving.
+fn warehouse_lines(
+    city: &state::City,
+    production: &ProductionState,
+    definitions: &BuildingDefinitions,
+    coverage: &Coverage,
+) -> Vec<String> {
+    coverage
+        .warehouses()
+        .iter()
+        .filter_map(|&id| {
+            let name = city.building(id)?.definition_id.clone()?;
+            let spec = definitions.get(&name)?.building.warehouse.as_ref()?;
+            let blocked = production.blocked_hauls_to(id);
+            let blocked = if blocked > 0 { format!(", {blocked} blocked (storage full)") } else { String::new() };
+            Some(format!(
+                "  {name}: {}/{} haul(s){blocked}, serving {}",
+                production.hauls_to(id),
+                spec.concurrent_hauls,
+                coverage.producers_of(id).count(),
+            ))
+        })
+        .collect()
 }
 
 /// Egui window: the save, time, buildings, roads, production, stock, write
@@ -361,6 +393,9 @@ pub(super) fn city_panel(
             for line in producers {
                 ui.label(line);
             }
+        }
+        for line in warehouse_lines(&city, &economy.production, &economy.definitions, &economy.coverage) {
+            ui.label(line);
         }
 
         ui.separator();

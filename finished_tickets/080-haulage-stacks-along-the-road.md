@@ -1,7 +1,26 @@
 # 080 - Haulage: a stack travels the road to its warehouse
 
 ## Status
-Open
+Done — `cargo test` green (752 passed).
+
+Landed as described, with three refinements the implementation forced:
+
+- **One stack in flight per producer.** Without it a single farm with a full
+  buffer takes every slot a warehouse has, and the second farm on the same
+  road never moves. `concurrent_hauls` limits the *warehouse*; this limits the
+  producer.
+- **Deliveries run before dispatch inside one tick**, so a slot freed by an
+  arrival is usable the same frame. With `concurrent_hauls: 1` the other order
+  idles the cart for a frame between every stack.
+- **A partial unload keeps only the remainder.** A blocked shipment holds
+  `overflow`, not the stack it arrived with — handing the whole stack back
+  would duplicate materials on the next tick, and that is the one bug in this
+  ticket that would have been invisible until someone noticed the city getting
+  richer.
+
+`Shipment` is not `Serialize` itself: `BuildingId` deliberately isn't either,
+so `SavedShipment` mirrors it with bare `u64`s, the shape every other save
+file in this crate already uses.
 
 ## Why
 

@@ -189,6 +189,19 @@
 //! paths that credit the stock. See [`warehouse`]'s own docs for how that
 //! squares with ticket 072's unbounded pile.
 //!
+//! ## Haulage (ticket 080, roadmap H2)
+//!
+//! The last of H2's "still open". A producer's buffer is emptied by a
+//! [`production::Shipment`]: one stack, dispatched to the warehouse
+//! [`warehouse::Coverage`] names, arriving `travel_minutes +
+//! handling_minutes` of game time later. `concurrent_hauls` is the
+//! "transport per time" limit, and a delivery the city has no room for
+//! **blocks at the warehouse holding its goods** rather than dropping them —
+//! which closes the loop the storage cap opens: stock full -> hauls block ->
+//! buffers fill -> producers stall, every step visible in the city panel and
+//! every step fixed by another warehouse. `logistics.ron` moves to version 2
+//! to carry the in-flight stacks across a quit.
+//!
 //! ## The build menu and city panel (ticket 050, roadmap G)
 //!
 //! [`ui::UiPlugin`] is the citybuilder's first real UI — its own

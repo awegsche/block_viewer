@@ -48,6 +48,34 @@
 //! the passage of time; an "Undo" that clawed back a farm's output would be a
 //! different mechanic wearing the same button.
 //!
+//! ## Haulage (ticket 080)
+//!
+//! A buffer is emptied by a [`Shipment`]: one stack of one item, dispatched
+//! to the warehouse ticket 079's [`Coverage`] says serves this producer, and
+//! delivered `travel_minutes + handling_minutes` of game time later. What a
+//! warehouse can have in flight at once is its `concurrent_hauls`, which is
+//! the "transport per time" knob — one warehouse serving six farms delivers
+//! them a stack at a time and falls behind.
+//!
+//! Three rules that are less obvious than they look:
+//!
+//! - **A stalled producer ships its largest partial stack**, below
+//!   `stack_size`. Without this, a building whose outputs are *mixed* can
+//!   fill its buffer to the cap without any one item ever reaching a full
+//!   stack, and deadlock there forever.
+//! - **A delivery the city has no room for blocks at the warehouse** holding
+//!   its goods, rather than dropping them. That closes the loop the storage
+//!   cap opens: stock full -> hauls block -> hauler slots stay occupied ->
+//!   buffers fill -> producers stall, every step of it visible in the city
+//!   panel and every step fixed by another warehouse.
+//! - **One way only.** The cart coming back empty isn't modelled;
+//!   `concurrent_hauls` is what stands in for its occupancy.
+//!
+//! `RoadType::capacity` is deliberately *not* read here. Congestion — several
+//! hauls sharing a cell and slowing each other — is a real mechanic and a
+//! different ticket; using a road's number as a per-warehouse limit would put
+//! it in the wrong place and make the eventual real thing harder to add.
+//!
 //! ## Persistence
 //!
 //! `<save>/citybuilder/logistics.ron`, its own file for the reason ticket 072
@@ -75,6 +103,7 @@ use super::definition::{BuildingDefinitions, Production};
 use super::economy::EconomyConfig;
 use super::inventory::{Parcel, Stock};
 use super::state::{BuildingId, City};
+use super::warehouse::{self, Coverage, CoverageSet, StorageCapacity};
 
 /// What one producing building is doing right now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -126,6 +155,29 @@ pub struct Producer {
     pub short_of: Option<String>,
 }
 
+/// One stack on its way from a producer to the warehouse serving it — ticket
+/// 080. See the module docs for why it is one-way and why a full city blocks
+/// it rather than losing it.
+/// Not `Serialize`/`Deserialize` itself: [`BuildingId`] deliberately isn't
+/// either, so every save file in this crate writes the bare `u64` through
+/// `as_u64`/`from_u64` — [`SavedShipment`] is this type's mirror, the same
+/// shape [`super::persistence::SavedBuilding`] has.
+#[derive(Debug, Clone)]
+pub struct Shipment {
+    pub from: BuildingId,
+    pub to: BuildingId,
+    /// One stack of one item. A [`Parcel`] rather than a `(String, u64)`
+    /// because that is what [`Stock::add_parcel_capped`] takes and what a
+    /// blocked shipment hands back.
+    pub parcel: Parcel,
+    /// Game minutes still to travel. Counted down by [`tick`]; at zero the
+    /// stack is delivered, or blocked if the city has no room.
+    pub remaining: f32,
+    /// Arrived, but the city is at capacity — see the module docs. Retried
+    /// every tick, and it delivers the instant room appears.
+    pub blocked: bool,
+}
+
 /// Every producing building's [`Producer`], keyed by placement.
 ///
 /// A resource alongside [`City`] rather than a field inside it, the same
@@ -135,6 +187,11 @@ pub struct Producer {
 #[derive(Resource, Debug, Default)]
 pub struct ProductionState {
     producers: HashMap<BuildingId, Producer>,
+    /// In flight right now (ticket 080). Held here rather than in a resource
+    /// of their own: dispatch reads a producer's buffer and writes a
+    /// shipment in the same tick, and two resources mutating each other
+    /// inside one system is a borrow fight for no benefit.
+    shipments: Vec<Shipment>,
 }
 
 impl ProductionState {
@@ -149,6 +206,38 @@ impl ProductionState {
 
     pub fn len(&self) -> usize {
         self.producers.len()
+    }
+
+    /// Every stack currently on the road. The panel asks its narrower
+    /// questions ([`hauls_to`](Self::hauls_to),
+    /// [`blocked_hauls_to`](Self::blocked_hauls_to),
+    /// [`is_hauling`](Self::is_hauling)) instead; this is the whole list, for
+    /// tests and for whatever wants to draw the carts.
+    #[allow(dead_code)]
+    pub fn shipments(&self) -> &[Shipment] {
+        &self.shipments
+    }
+
+    /// How many stacks are on their way to `warehouse` — what
+    /// `concurrent_hauls` is checked against.
+    pub fn hauls_to(&self, warehouse: BuildingId) -> usize {
+        self.shipments.iter().filter(|shipment| shipment.to == warehouse).count()
+    }
+
+    /// How many of those have arrived and can't be unloaded, for the panel.
+    pub fn blocked_hauls_to(&self, warehouse: BuildingId) -> usize {
+        self.shipments.iter().filter(|shipment| shipment.to == warehouse && shipment.blocked).count()
+    }
+
+    /// Whether `producer` already has a stack on the road — one at a time
+    /// per producer, so a single farm can't monopolise a warehouse's slots.
+    pub fn is_hauling(&self, producer: BuildingId) -> bool {
+        self.shipments.iter().any(|shipment| shipment.from == producer)
+    }
+
+    #[cfg(test)]
+    pub fn push_shipment(&mut self, shipment: Shipment) {
+        self.shipments.push(shipment);
     }
 
     /// Inserts a [`Producer`] under an id the caller supplies — for
@@ -166,6 +255,10 @@ impl ProductionState {
     /// nothing.
     fn retain_placed(&mut self, city: &City) {
         self.producers.retain(|&id, _| city.building(id).is_some());
+        // A shipment whose producer or warehouse has been demolished goes
+        // with it, goods and all — the warehouse it was going to no longer
+        // exists, and there is nowhere for it to turn around to.
+        self.shipments.retain(|shipment| city.building(shipment.from).is_some() && city.building(shipment.to).is_some());
     }
 }
 
@@ -182,7 +275,10 @@ pub struct ProductionPlugin;
 
 impl Plugin for ProductionPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<ProductionState>().add_systems(Update, tick);
+        // After `CoverageSet`, so a haul is never dispatched against last
+        // frame's coverage — a road built this frame should be usable this
+        // frame, not next.
+        app.init_resource::<ProductionState>().add_systems(Update, tick.after(CoverageSet));
     }
 }
 
@@ -194,6 +290,8 @@ fn tick(
     city: Res<City>,
     definitions: Res<BuildingDefinitions>,
     economy: Res<EconomyConfig>,
+    coverage: Option<Res<Coverage>>,
+    capacity: Option<Res<StorageCapacity>>,
     mut stock: ResMut<Stock>,
     mut production: ResMut<ProductionState>,
 ) {
@@ -215,6 +313,104 @@ fn tick(
         let mut producer = production.producers.remove(&id).unwrap_or_default();
         advance_producer(&mut producer, spec, economy.as_ref(), &mut stock, minutes);
         production.producers.insert(id, producer);
+    }
+
+    // Ticket 080. Deliveries before dispatch, so a slot freed by an arrival
+    // is usable on the same tick rather than one later — with
+    // `concurrent_hauls: 1` the other order would idle the cart for a frame
+    // between every stack.
+    let capacity = warehouse::storage_capacity(capacity.as_deref());
+    deliver_arrivals(&mut production, &mut stock, capacity, minutes);
+    if let Some(coverage) = coverage {
+        dispatch_hauls(&mut production, &city, &definitions, &coverage, economy.stack_size);
+    }
+}
+
+/// Counts every in-flight shipment down and unloads the ones that have
+/// arrived, blocking (not dropping) whatever the city has no room for — see
+/// the module docs.
+fn deliver_arrivals(production: &mut ProductionState, stock: &mut Stock, capacity: u64, minutes: f32) {
+    let mut arrived: Vec<usize> = Vec::new();
+    for (index, shipment) in production.shipments.iter_mut().enumerate() {
+        if !shipment.blocked {
+            shipment.remaining -= minutes;
+        }
+        if shipment.remaining <= 0.0 {
+            arrived.push(index);
+        }
+    }
+
+    for &index in &arrived {
+        let shipment = &mut production.shipments[index];
+        let overflow = stock.add_parcel_capped(&shipment.parcel, capacity);
+        shipment.blocked = !overflow.is_empty();
+        shipment.parcel = overflow;
+    }
+
+    // Only the ones that fully unloaded leave the road. A blocked shipment
+    // keeps its slot, which is exactly the back-pressure the storage cap is
+    // there to create.
+    production.shipments.retain(|shipment| !(shipment.remaining <= 0.0 && !shipment.blocked));
+}
+
+/// Dispatches at most one stack per producer per tick, subject to its
+/// warehouse's `concurrent_hauls` — see the module docs for what "a stack"
+/// means and why a stalled producer may ship a partial one.
+fn dispatch_hauls(
+    production: &mut ProductionState,
+    city: &City,
+    definitions: &BuildingDefinitions,
+    coverage: &Coverage,
+    stack_size: u64,
+) {
+    // Deterministic order: two producers competing for the last slot of a
+    // tier-1 warehouse should resolve the same way every frame, not by
+    // whichever the hash map happened to yield first.
+    let mut candidates: Vec<BuildingId> = production.producers.keys().copied().collect();
+    candidates.sort();
+
+    for producer_id in candidates {
+        if production.is_hauling(producer_id) {
+            continue;
+        }
+        let Some(served) = coverage.served(producer_id) else { continue };
+        let Some(spec) = warehouse::warehouse_of(city, definitions, served.warehouse) else { continue };
+        if production.hauls_to(served.warehouse) >= spec.concurrent_hauls as usize {
+            continue;
+        }
+
+        let Some(producer) = production.producers.get_mut(&producer_id) else { continue };
+        let Some((item, count)) = ready_stack(producer, stack_size) else { continue };
+
+        producer.buffer.remove(&item, count);
+        let mut parcel = Parcel::default();
+        parcel.add(&item, count);
+        production.shipments.push(Shipment {
+            from: producer_id,
+            to: served.warehouse,
+            parcel,
+            remaining: served.travel_minutes + spec.handling_minutes,
+            blocked: false,
+        });
+    }
+}
+
+/// Which stack this producer is ready to send, if any: a full one, or — once
+/// it has stalled — its largest partial. See the module docs for why the
+/// second case exists.
+///
+/// Ties between two items of equal size go to the lower id, so a mixed
+/// producer's dispatch order doesn't wander.
+fn ready_stack(producer: &Producer, stack_size: u64) -> Option<(String, u64)> {
+    let largest = producer.buffer.iter().max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(a.0)))?;
+    let (item, held) = (largest.0.to_string(), largest.1);
+
+    if held >= stack_size {
+        Some((item, stack_size))
+    } else if producer.state == ProducerState::BufferFull && held > 0 {
+        Some((item, held))
+    } else {
+        None
     }
 }
 
@@ -308,10 +504,12 @@ fn pay_inputs(producer: &mut Producer, spec: &Production, stock: &mut Stock, min
 // ---- persistence ---------------------------------------------------------------------------------
 // -------------------------------------------------------------------------------------------------
 
-/// The `logistics.ron` schema version this build writes. See the module docs
-/// for why a mismatch starts empty here rather than being refused the way
-/// `city.ron`'s is.
-pub const CURRENT_VERSION: u32 = 1;
+/// The `logistics.ron` schema version this build writes. Version 2 (ticket
+/// 080) added the in-flight shipments beside version 1's producers. See the
+/// module docs for why a mismatch starts empty here rather than being refused
+/// the way `city.ron`'s is — which is also why this bump costs a player a
+/// buffer and a cart rather than a city.
+pub const CURRENT_VERSION: u32 = 2;
 
 const LOGISTICS_FILE: &str = "citybuilder/logistics.ron";
 
@@ -328,6 +526,23 @@ pub(crate) fn logistics_file_path_for_log(save_root: &Path) -> PathBuf {
 struct LogisticsSave {
     version: u32,
     producers: Vec<SavedProducer>,
+    #[serde(default)]
+    shipments: Vec<SavedShipment>,
+}
+
+/// [`Shipment`] with its ids as the bare `u64`s every other save file in this
+/// crate writes.
+#[derive(Debug, Serialize, Deserialize)]
+struct SavedShipment {
+    from: u64,
+    to: u64,
+    parcel: Parcel,
+    /// Minutes *remaining*, not elapsed — a stack does not teleport home
+    /// because the player closed the window, and it does not evaporate
+    /// either.
+    remaining: f32,
+    #[serde(default)]
+    blocked: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -370,7 +585,19 @@ pub fn save_logistics(production: &ProductionState, save_root: &Path) -> Result<
         .collect();
     producers.sort_by_key(|entry| entry.building);
 
-    let save = LogisticsSave { version: CURRENT_VERSION, producers };
+    let shipments: Vec<SavedShipment> = production
+        .shipments
+        .iter()
+        .map(|shipment| SavedShipment {
+            from: shipment.from.as_u64(),
+            to: shipment.to.as_u64(),
+            parcel: shipment.parcel.clone(),
+            remaining: shipment.remaining,
+            blocked: shipment.blocked,
+        })
+        .collect();
+
+    let save = LogisticsSave { version: CURRENT_VERSION, producers, shipments };
     let text = ron::ser::to_string_pretty(&save, ron::ser::PrettyConfig::default())
         .map_err(|err| LogisticsError::Parse(err.to_string()))?;
     fs::write(&path, text).map_err(LogisticsError::Io)
@@ -397,6 +624,19 @@ pub fn load_logistics(save_root: &Path, city: &City) -> Result<ProductionState, 
     for entry in save.producers {
         production.insert(BuildingId::from_u64(entry.building), entry.producer);
     }
+    production.shipments = save
+        .shipments
+        .into_iter()
+        .map(|saved| Shipment {
+            from: BuildingId::from_u64(saved.from),
+            to: BuildingId::from_u64(saved.to),
+            parcel: saved.parcel,
+            remaining: saved.remaining,
+            blocked: saved.blocked,
+        })
+        .collect();
+    // Drops both orphaned producers and shipments whose producer or
+    // warehouse is gone — see `retain_placed`.
     production.retain_placed(city);
     Ok(production)
 }
@@ -630,6 +870,285 @@ mod tests {
         app.update();
 
         assert!(app.world().resource::<ProductionState>().get(id).is_none());
+    }
+
+    // --- haulage (ticket 080) -----------------------------------------------
+
+    use crate::city::definition::{Building, FootprintSpec, Integrity, LoadedBuilding, Warehouse};
+    use crate::city::road::RoadPieceVariant;
+    use crate::city::road_definition::RoadTypes;
+    use crate::city::state::ROAD_CELL_SIZE;
+    use crate::city::warehouse::compute_coverage;
+
+    fn definition(id: &str, warehouse: Option<Warehouse>, production: Option<Production>) -> LoadedBuilding {
+        LoadedBuilding {
+            id: id.to_string(),
+            path: PathBuf::from(format!("{id}.ron")),
+            building: Building {
+                name: id.to_string(),
+                blueprint: format!("{id}.nbt"),
+                tier: 1,
+                requires: Vec::new(),
+                footprint: FootprintSpec::FromBlueprint,
+                production,
+                cost: Vec::new(),
+                warehouse,
+                integrity: Integrity { pristine_above: 0.95, ruined_below: 0.6 },
+            },
+            footprint: IVec2::ONE,
+            catalogue_id: id.to_string(),
+        }
+    }
+
+    /// One warehouse with `concurrent_hauls` slots, and a farm — the two
+    /// definitions every haulage test below shares.
+    fn haul_definitions(concurrent_hauls: u32) -> BuildingDefinitions {
+        BuildingDefinitions::from_entries(vec![
+            definition(
+                "warehouse01",
+                Some(Warehouse { radius_cells: 8, concurrent_hauls, handling_minutes: 0.0, storage: 100_000 }),
+                None,
+            ),
+            definition("farm01", None, Some(spec(&[("minecraft:wheat", 60.0)], &[], 2))),
+        ])
+    }
+
+    /// A warehouse at road cell 0 and `farms` farms strung along one road,
+    /// each one cell further out.
+    fn road_town(city: &mut City, farms: usize) -> (BuildingId, Vec<BuildingId>) {
+        for x in 0..=(farms as i32) {
+            city.add_road_cell(IVec2::new(x, 0), "dirt", 64, None, RoadPieceVariant::Surface).unwrap();
+        }
+        let at = |cell: i32| IVec3::new(cell * ROAD_CELL_SIZE, 64, -1);
+        let warehouse = city
+            .place_building("warehouse01", Some("warehouse01".to_string()), at(0), Rotation::Deg0, IVec2::ONE)
+            .unwrap();
+        let farms = (1..=farms as i32)
+            .map(|cell| {
+                city.place_building("farm01", Some("farm01".to_string()), at(cell), Rotation::Deg0, IVec2::ONE).unwrap()
+            })
+            .collect();
+        (warehouse, farms)
+    }
+
+    /// Dispatches against a real [`Coverage`] rather than a hand-built one,
+    /// so these exercise the same road-distance answer the game uses.
+    fn dispatch(production: &mut ProductionState, city: &City, definitions: &BuildingDefinitions, stack_size: u64) {
+        let coverage = compute_coverage(city, definitions, &RoadTypes::default());
+        dispatch_hauls(production, city, definitions, &coverage, stack_size);
+    }
+
+    fn producer_holding(item: &str, count: u64, state: ProducerState) -> Producer {
+        let mut producer = Producer::default();
+        producer.buffer.add(item, count);
+        producer.state = state;
+        producer
+    }
+
+    #[test]
+    fn a_full_stack_is_dispatched_to_the_serving_warehouse() {
+        let mut city = City::default();
+        let (warehouse, farms) = road_town(&mut city, 1);
+        let definitions = haul_definitions(2);
+
+        let mut production = ProductionState::default();
+        production.insert(farms[0], producer_holding("minecraft:wheat", 70, ProducerState::Running));
+        dispatch(&mut production, &city, &definitions, 64);
+
+        assert_eq!(production.shipments().len(), 1);
+        let shipment = &production.shipments()[0];
+        assert_eq!(shipment.to, warehouse);
+        assert_eq!(shipment.parcel.get("minecraft:wheat"), 64, "exactly one stack leaves");
+        assert_eq!(production.get(farms[0]).unwrap().buffer.get("minecraft:wheat"), 6, "the rest waits");
+        assert!(shipment.remaining > 0.0, "one road cell away is not instant");
+    }
+
+    #[test]
+    fn less_than_a_stack_waits_while_the_producer_is_still_running() {
+        let mut city = City::default();
+        let (_, farms) = road_town(&mut city, 1);
+        let definitions = haul_definitions(2);
+
+        let mut production = ProductionState::default();
+        production.insert(farms[0], producer_holding("minecraft:wheat", 63, ProducerState::Running));
+        dispatch(&mut production, &city, &definitions, 64);
+
+        assert!(production.shipments().is_empty());
+    }
+
+    /// The module docs' deadlock guard: a stalled producer whose outputs are
+    /// mixed may never reach a full stack of any one of them.
+    #[test]
+    fn a_stalled_producer_ships_its_largest_partial_stack() {
+        let mut city = City::default();
+        let (_, farms) = road_town(&mut city, 1);
+        let definitions = haul_definitions(2);
+
+        let mut producer = producer_holding("minecraft:wheat", 40, ProducerState::BufferFull);
+        producer.buffer.add("minecraft:carrot", 24);
+
+        let mut production = ProductionState::default();
+        production.insert(farms[0], producer);
+        dispatch(&mut production, &city, &definitions, 64);
+
+        assert_eq!(production.shipments().len(), 1);
+        assert_eq!(production.shipments()[0].parcel.get("minecraft:wheat"), 40, "the largest partial goes first");
+    }
+
+    /// The throughput knob: a tier-1 warehouse with one cart serving two
+    /// farms sends one stack, not two.
+    #[test]
+    fn concurrent_hauls_limits_what_a_warehouse_has_in_flight() {
+        let mut city = City::default();
+        let (warehouse, farms) = road_town(&mut city, 2);
+        let definitions = haul_definitions(1);
+
+        let mut production = ProductionState::default();
+        for &farm in &farms {
+            production.insert(farm, producer_holding("minecraft:wheat", 128, ProducerState::Running));
+        }
+        dispatch(&mut production, &city, &definitions, 64);
+
+        assert_eq!(production.hauls_to(warehouse), 1, "one cart, one stack on the road");
+    }
+
+    #[test]
+    fn a_producer_already_hauling_does_not_send_a_second_stack() {
+        let mut city = City::default();
+        let (_, farms) = road_town(&mut city, 1);
+        let definitions = haul_definitions(4);
+
+        let mut production = ProductionState::default();
+        production.insert(farms[0], producer_holding("minecraft:wheat", 256, ProducerState::Running));
+        dispatch(&mut production, &city, &definitions, 64);
+        dispatch(&mut production, &city, &definitions, 64);
+
+        assert_eq!(production.shipments().len(), 1);
+    }
+
+    /// An unserved producer — no road, or no warehouse in range — sends
+    /// nothing however full it is. Ticket 079's whole point, from this side.
+    #[test]
+    fn an_unserved_producer_dispatches_nothing() {
+        let mut city = City::default();
+        road_town(&mut city, 1);
+        let definitions = haul_definitions(2);
+        let stranded = city
+            .place_building("farm01", Some("farm01".to_string()), IVec3::new(900, 64, 900), Rotation::Deg0, IVec2::ONE)
+            .unwrap();
+
+        let mut production = ProductionState::default();
+        production.insert(stranded, producer_holding("minecraft:wheat", 640, ProducerState::BufferFull));
+        dispatch(&mut production, &city, &definitions, 64);
+
+        assert!(production.shipments().is_empty());
+    }
+
+    // --- arrival ------------------------------------------------------------
+
+    fn in_flight(from: BuildingId, to: BuildingId, count: u64, remaining: f32) -> Shipment {
+        let mut parcel = Parcel::default();
+        parcel.add("minecraft:wheat", count);
+        Shipment { from, to, parcel, remaining, blocked: false }
+    }
+
+    #[test]
+    fn a_shipment_arrives_when_its_time_runs_out() {
+        let mut production = ProductionState::default();
+        production.push_shipment(in_flight(BuildingId::from_u64(1), BuildingId::from_u64(0), 64, 2.0));
+        let mut stock = Stock::default();
+
+        deliver_arrivals(&mut production, &mut stock, u64::MAX, 1.0);
+        assert_eq!(stock.count("minecraft:wheat"), 0, "still on the road");
+        assert_eq!(production.shipments().len(), 1);
+
+        deliver_arrivals(&mut production, &mut stock, u64::MAX, 1.5);
+        assert_eq!(stock.count("minecraft:wheat"), 64);
+        assert!(production.shipments().is_empty());
+    }
+
+    /// The loop the storage cap opens: a delivery the city has no room for
+    /// waits at the warehouse holding its goods rather than dropping them,
+    /// and keeps its hauler slot while it does.
+    #[test]
+    fn a_delivery_into_a_full_city_blocks_rather_than_losing_the_stack() {
+        let warehouse = BuildingId::from_u64(0);
+        let mut production = ProductionState::default();
+        production.push_shipment(in_flight(BuildingId::from_u64(1), warehouse, 64, 0.5));
+
+        let mut stock = Stock::default();
+        stock.add("minecraft:dirt", 100);
+
+        deliver_arrivals(&mut production, &mut stock, 100, 1.0);
+        assert_eq!(stock.count("minecraft:wheat"), 0);
+        assert_eq!(production.shipments().len(), 1, "the shipment keeps its slot");
+        assert!(production.shipments()[0].blocked);
+        assert_eq!(production.blocked_hauls_to(warehouse), 1);
+        assert_eq!(production.shipments()[0].parcel.get("minecraft:wheat"), 64, "and it still holds the goods");
+    }
+
+    #[test]
+    fn a_blocked_delivery_lands_the_instant_room_appears() {
+        let mut production = ProductionState::default();
+        production.push_shipment(in_flight(BuildingId::from_u64(1), BuildingId::from_u64(0), 64, 0.0));
+        let mut stock = Stock::default();
+        stock.add("minecraft:dirt", 100);
+
+        deliver_arrivals(&mut production, &mut stock, 100, 0.1);
+        assert!(production.shipments()[0].blocked);
+
+        stock.remove("minecraft:dirt", 100);
+        deliver_arrivals(&mut production, &mut stock, 100, 0.1);
+
+        assert_eq!(stock.count("minecraft:wheat"), 64);
+        assert!(production.shipments().is_empty());
+    }
+
+    /// A partial unload keeps only the remainder — handing the whole stack
+    /// back would duplicate materials on the next tick.
+    #[test]
+    fn a_partial_unload_keeps_only_what_did_not_fit() {
+        let mut production = ProductionState::default();
+        production.push_shipment(in_flight(BuildingId::from_u64(1), BuildingId::from_u64(0), 64, 0.0));
+        let mut stock = Stock::default();
+        stock.add("minecraft:dirt", 80);
+
+        deliver_arrivals(&mut production, &mut stock, 100, 0.1);
+
+        assert_eq!(stock.count("minecraft:wheat"), 20);
+        assert_eq!(production.shipments()[0].parcel.get("minecraft:wheat"), 44);
+        assert!(production.shipments()[0].blocked);
+    }
+
+    /// A blocked shipment's clock does not keep running — it has arrived, and
+    /// a negative `remaining` would be meaningless in the panel.
+    #[test]
+    fn a_blocked_shipment_stops_counting_down() {
+        let mut production = ProductionState::default();
+        production.push_shipment(in_flight(BuildingId::from_u64(1), BuildingId::from_u64(0), 64, 0.0));
+        let mut stock = Stock::default();
+        stock.add("minecraft:dirt", 100);
+
+        deliver_arrivals(&mut production, &mut stock, 100, 0.1);
+        let after_block = production.shipments()[0].remaining;
+        deliver_arrivals(&mut production, &mut stock, 100, 5.0);
+
+        assert_eq!(production.shipments()[0].remaining, after_block);
+    }
+
+    /// A shipment whose warehouse was demolished mid-flight goes with it —
+    /// there is nowhere left for it to arrive.
+    #[test]
+    fn a_shipment_to_a_demolished_warehouse_is_dropped() {
+        let mut city = City::default();
+        let (warehouse, farms) = road_town(&mut city, 1);
+
+        let mut production = ProductionState::default();
+        production.push_shipment(in_flight(farms[0], warehouse, 64, 1.0));
+        city.remove_building(warehouse);
+        production.retain_placed(&city);
+
+        assert!(production.shipments().is_empty());
     }
 
     // --- persistence --------------------------------------------------------

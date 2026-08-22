@@ -126,6 +126,20 @@ impl Parcel {
     /// Folds `other` into this parcel — used where one action's materials
     /// arrive in two pieces (ticket 074: a placement's cost *plus* what its
     /// conversions consumed both count as debited).
+    /// Removes up to `amount` of `item`, clamped at zero, and returns how
+    /// much was actually removed — [`Stock::remove`]'s shape, one level down.
+    /// Ticket 080's dispatch takes a stack out of a producer's buffer this
+    /// way.
+    pub fn remove(&mut self, item: &str, amount: u64) -> u64 {
+        let Some(held) = self.items.get_mut(item) else { return 0 };
+        let taken = amount.min(*held);
+        *held -= taken;
+        if *held == 0 {
+            self.items.remove(item);
+        }
+        taken
+    }
+
     pub fn add_all(&mut self, other: &Parcel) {
         for (item, count) in other.iter() {
             self.add(item, count);

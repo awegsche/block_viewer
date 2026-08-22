@@ -2,7 +2,7 @@
 
 Not a work item: the design document for the citybuilder game and the shared
 world-edit infrastructure it uses. High-level tasks here get split into
-numbered tickets in this directory when picked up (**next free number: 076**).
+numbered tickets in this directory when picked up (**next free number: 081**).
 Companion to `ROADMAP.md`, which covers the viewer 001–029.
 
 ## The goal
@@ -77,7 +77,7 @@ changes here often require editing those repos too.
 # Current state
 
 Groups W/B/C/D/E/F/G/H/I/R below are the labels tickets and code comments use.
-Everything in W, B, C, D, E, F, G, R and H1 is built; H2 and all of I are not.
+Everything in W, B, C, D, E, F, G, R, H1 and H2 is built; all of I is not.
 
 ## W — The write path (`edit/`, plus `ranvil`/`rnbt` upstream)
 
@@ -516,7 +516,7 @@ emitted into `PendingChunkWork::to_unload` (nothing drains that list).
 
 # Remaining plan
 
-## H2 — Materials, yields and cost (iteration 2, in progress)
+## H2 — Materials, cost, production and haulage (iteration 2, done)
 
 **Materials are Minecraft item ids** — the stock is keyed by
 `minecraft:oak_planks`, not by an invented `"wood"`, so a building's existing
@@ -622,11 +622,101 @@ world is made of are the economy's own units.
     able to ask. Collapsing wood to one id in `drops.ron` was the
     alternative, and it would have made a building that genuinely wants
     birch impossible to express.
-- **Still open**: production, warehouses, and haulage along roads —
-  a producer's output has to reach a warehouse, and how long that takes comes
-  from the road distance and each road type's `travel_speed` (loaded and
-  inert since ticket 060). **Decided**: the economy runs on a game clock with
-  pause and speed controls, not on raw wall-clock time.
+- **A placed building knows its definition (ticket 076, done)** — 073's
+  "known gap" closed, because everything below is a *definition* property
+  read per placed instance. `PlacedBuilding::definition` had held a
+  **catalogue** id since 042 while its name claimed otherwise; the two
+  keyspaces coincided only because the one shipped `.nbt`/`.ron` pair shares
+  a stem. Renamed to `catalogue_id`, with `definition_id: Option<String>`
+  beside it and `City::definition_of` as the lookup. `city.ron` -> **7**,
+  refused rather than defaulted (a version-6 file's field holds a *wrong*
+  answer, not an absent one); `journal.ron` -> **3**, where the same field
+  *is* defaulted inside its existing band, because a placement journalled
+  before this genuinely has no definition. `None` stays the honest value for
+  `city::placement`'s keyboard stand-in, which picks geometry and has no game
+  data behind it.
+- **The game clock (ticket 077, done)** — `city::clock`, the decision above
+  turned into `GameSpeed` (`|| 1x 2x 4x`, pause as a *speed* rather than a
+  second flag) and `GameClock` (`elapsed` plus this frame's `delta`, zero
+  while paused), advanced in `First`. `delta_minutes()` is the unit every
+  `per_minute` in a definition is already written in, so nothing downstream
+  divides by 60 itself, and it is the **only** time the economy reads — a
+  producer's accumulator and a cart's remaining travel cannot disagree about
+  what "4x" meant. A per-frame clamp drops what a hitch would otherwise
+  deliver at once; the remainder is dropped, not banked. Not persisted:
+  nothing reads an absolute time, and a save that reopened paused would look
+  broken.
+- **Production (ticket 078, done)** — `city::production` reads
+  `definition::Production`, inert since 040. Output goes into the *building's*
+  own buffer, not the city stock, and a full buffer stops **everything**,
+  inputs included. That stall is the mechanic: a farm that has visibly
+  stopped is a fixable problem, one producing into nowhere loses half its
+  output to a mistake nobody can see. Inputs are all-or-nothing across the
+  whole list and paid a whole unit at a time (a `u64` stock cannot be charged
+  0.003 of a plank); a starved producer keeps its debt and resumes from it.
+  **No journal entry, ever** — production writes no blocks, and an "Undo"
+  that clawed back a farm's output would be a different mechanic wearing the
+  same button. State lives in `<save>/citybuilder/logistics.ron`, its own
+  file for the reason 072 gave `stock.ron` one, and the **one** save file
+  here whose version mismatch starts empty rather than refusing: a buffer
+  regenerates in minutes, where a placement or an as-built baseline never
+  does.
+- **Warehouses (ticket 079, done)** — `definition::Warehouse`:
+  `radius_cells`, `concurrent_hauls`, `handling_minutes`, `storage`. A
+  warehouse **tier is not a new concept** — it is `tier` + `requires`, which
+  041's tech tree and the build menu already implement, so warehouse02 is
+  warehouse01 with bigger numbers.
+  - **The working radius is measured along the road**, in cells: a BFS to
+    `radius_cells` hops for coverage, then a Dijkstra *restricted to what it
+    found* for the haul time, charging `1.0 / travel_speed` per cell entered.
+    Two passes rather than one pruned Dijkstra, because the hop count along a
+    *fastest* path can exceed the radius while a slower path stays inside it
+    — one pass has to approximate one of the two questions. Hops for range
+    and time for speed keeps a fast road from silently buying reach.
+  - **A producer off the road is unserved**, and fills up and stops. That is
+    the point rather than a limitation: it is what makes the road network the
+    thing the economy runs on rather than decoration, and it is the first
+    consumer of F4's connectivity queries (ticket 056), unused since they
+    landed. An undescribed road style travels at 1.0 rather than being
+    impassable.
+  - **Storage is capped** — `economy.base_storage` plus every placed
+    warehouse's `storage`. This cuts against 072's unbounded pile, and the
+    reconciliation is that the cap is a *warehouse* property enforced against
+    the pile, not per-warehouse storage: goods still don't live anywhere.
+    `Stock::add_parcel_capped` is where it bites, on the three paths that
+    credit the stock, and overflow is **reported, never dropped in silence**.
+    `base_storage` exists so a fresh city can hold its own founding grant.
+- **Haulage (ticket 080, done)** — one stack of one item, dispatched to the
+  serving warehouse, arriving `travel_minutes + handling_minutes` later.
+  `concurrent_hauls` is the "transport per time" knob; one warehouse serving
+  six farms delivers them a stack at a time and falls behind, and that is
+  what a tier upgrade fixes. One stack in flight per producer, so one full
+  farm can't take every slot. One way only — the empty cart home isn't
+  modelled, and `concurrent_hauls` stands in for its occupancy.
+  - **A stalled producer ships its largest partial stack.** Without it a
+    building with *mixed* outputs can fill its buffer without any one item
+    reaching a full stack, and deadlock there forever.
+  - **A delivery the city has no room for blocks at the warehouse holding its
+    goods.** That closes the loop the storage cap opens: stock full -> hauls
+    block -> slots stay occupied -> buffers fill -> producers stall, every
+    step visible in the city panel and every step fixed by another warehouse.
+    A partial unload keeps only the remainder, or the next tick would
+    duplicate the stack.
+  - **`RoadType::capacity` stays inert, deliberately.** Congestion — several
+    hauls sharing a cell and slowing each other — is a real mechanic and a
+    different ticket; using a *road's* number as a per-warehouse limit would
+    put it on the wrong thing and make the eventual real one harder to add.
+  - `logistics.ron` -> **2**, carrying in-flight stacks across a quit with
+    their `remaining` intact: a stack does not teleport home because the
+    player closed the window, and does not evaporate either.
+- **Still open in H2**: production *chains* have never been played — the
+  shipped set is one farm with no inputs, so `Production::inputs`, the
+  starved state and `resolve_requirements`' tier tree are all implemented and
+  untested against a real recipe graph. Balance is a guess throughout.
+  `Production::radius` is still inert (078 had no use for it). And all three
+  shipped economy buildings run on **placeholder geometry** — `house01.nbt`
+  is the only structure export on disk — so a city with two warehouses and a
+  farm currently looks like three identical houses; see `../todo.md`.
 
 ## I — Damage: the world diffing back (iteration 2, except I1)
 
@@ -732,9 +822,12 @@ reusing `selection::gizmo`) beats making the player click to find out.
   the entities are dropped with a warning. Removing *existing* ones we
   overwrite is in scope — corruption avoidance, not a feature.
 - **Entities and mobs.** Structure files can carry them. Ignored.
-- **Production simulation.** Resources and spending landed in iteration 2
-  (H2, tickets 072/073); production itself, warehouses and haulage have not,
-  and I4's malus still has nothing to multiply.
+- **Production simulation.** Landed in full: resources and spending (072-075),
+  then production, warehouses and haulage (076-080). I4's malus now has
+  something to multiply — a damaged producer's rate — which makes M7 a
+  better-connected target than it was when this line was written. What is
+  still *not* in scope: congestion (`RoadType::capacity`), obstruction, and
+  anything that models where goods physically sit.
 - **Damage detection (I2–I7).** Iteration 2 — but I1's baseline belongs to
   iteration 1, since it can't be added retroactively.
 - **Obstruction as a distinct mechanic** (blocks placed in a building's
@@ -752,6 +845,10 @@ reusing `selection::gizmo`) beats making the player click to find out.
 M1 ("two binaries"), M2 ("the world can be changed"), M3 ("a building has a
 shape"), M4 ("a city exists"), M5 ("streets") and M6 ("and it's mine" —
 demolish, undo, terraform) are all done. Iteration 1 is delivered.
+
+M-H2 ("the economy runs") is done as of ticket 080: a farm produces, a cart
+carries a stack down the road you built, and a warehouse's radius and tier
+decide whether it arrives. Roads stopped being decoration.
 
 **M7 — "the world answers back"**: I2–I7 plus `ranvil` 020. Break a wall in
 Minecraft, come back, and the building says so. The first mechanic that makes
