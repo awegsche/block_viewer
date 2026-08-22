@@ -30,6 +30,7 @@
 
 use std::collections::HashMap;
 
+use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts};
 
@@ -42,6 +43,7 @@ use super::super::definition::BuildingDefinitions;
 use super::super::economy::EconomyConfig;
 use super::super::journal::Journal;
 use super::super::production::{buffer_capacity, ProductionState};
+use super::super::warehouse::{Coverage, StorageCapacity};
 use super::super::save::{SaveCommand, SaveState};
 use super::super::state;
 use super::super::undo::{UndoCommand, UndoState};
@@ -257,6 +259,7 @@ fn producer_lines(
     production: &ProductionState,
     definitions: &BuildingDefinitions,
     economy: &EconomyConfig,
+    coverage: &Coverage,
 ) -> Vec<String> {
     let mut lines: Vec<String> = production
         .iter()
@@ -272,24 +275,51 @@ fn producer_lines(
                 Some(item) => format!("{} (needs {})", producer.state.label(), short_name(item)),
                 None => producer.state.label().to_string(),
             };
-            Some(format!("  {name}: {state}, {}/{capacity}", producer.buffer.total()))
+            // Ticket 079: which warehouse is coming for this, and how far
+            // away it is — or `unserved`, which is the whole diagnostic for
+            // "why has my farm stopped".
+            let haul = match coverage.served(id) {
+                Some(served) => {
+                    let warehouse = city
+                        .building(served.warehouse)
+                        .and_then(|placed| placed.definition_id.clone())
+                        .unwrap_or_else(|| "warehouse".to_string());
+                    format!("{warehouse} {:.1} min away", served.travel_minutes)
+                }
+                None => "unserved".to_string(),
+            };
+            Some(format!("  {name}: {state}, {}/{capacity} — {haul}", producer.buffer.total()))
         })
         .collect();
     lines.sort();
     lines
 }
 
-/// Egui window: the save, time, buildings, roads, production, write status,
-/// world save, undo. See the module docs.
+/// The six read-only resources the Production and Stock sections need,
+/// bundled into one [`SystemParam`].
+///
+/// Not organisation for its own sake: [`city_panel`] reached Bevy's
+/// seventeen-parameter ceiling when ticket 079 added coverage and the storage
+/// cap, and these six are exactly the ones that belong together — everything
+/// the economy half of the panel reads, and nothing it writes.
+#[derive(SystemParam)]
+pub(super) struct EconomyPanel<'w> {
+    stock: Res<'w, Stock>,
+    production: Res<'w, ProductionState>,
+    coverage: Res<'w, Coverage>,
+    storage: Res<'w, StorageCapacity>,
+    definitions: Res<'w, BuildingDefinitions>,
+    economy: Res<'w, EconomyConfig>,
+}
+
+/// Egui window: the save, time, buildings, roads, production, stock, write
+/// status, world save, undo. See the module docs.
 pub(super) fn city_panel(
     mut contexts: EguiContexts,
     city: Res<state::City>,
-    production: Res<ProductionState>,
-    definitions: Res<BuildingDefinitions>,
-    economy: Res<EconomyConfig>,
+    economy: EconomyPanel,
     clock: Res<GameClock>,
     mut speed: ResMut<GameSpeed>,
-    stock: Res<Stock>,
     journal: Res<Journal>,
     write_status: Res<WriteStatus>,
     region_cache: Option<Res<SharedRegionCache>>,
@@ -323,7 +353,8 @@ pub(super) fn city_panel(
 
         ui.separator();
         ui.heading("Production");
-        let producers = producer_lines(&city, &production, &definitions, &economy);
+        let producers =
+            producer_lines(&city, &economy.production, &economy.definitions, &economy.economy, &economy.coverage);
         if producers.is_empty() {
             ui.label("(nothing producing)");
         } else {
@@ -334,10 +365,23 @@ pub(super) fn city_panel(
 
         ui.separator();
         ui.heading("Stock");
+        // Ticket 079: the ceiling, and how close the pile is to it — a city
+        // whose credits are starting to bounce should be able to see why
+        // before it happens rather than after.
+        let stock = &economy.stock;
+        ui.label(format!(
+            "{}/{} stored ({} warehouse(s))",
+            stock.total(),
+            economy.storage.0,
+            economy.coverage.warehouses().len()
+        ));
+        if stock.total() >= economy.storage.0 {
+            ui.colored_label(egui::Color32::RED, "Storage full — build a warehouse.");
+        }
         if stock.is_empty() {
             ui.label("(nothing stockpiled)");
         } else {
-            for line in stock_lines(&stock) {
+            for line in stock_lines(stock) {
                 ui.label(line);
             }
         }

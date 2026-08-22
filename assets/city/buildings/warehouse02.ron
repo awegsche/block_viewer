@@ -1,0 +1,31 @@
+// Ticket 079, roadmap H2. The tier-2 warehouse — the same building with
+// bigger numbers, unlocked by having built the first. A warehouse "tier" is
+// `tier` + `requires`, which the tech tree (ticket 041) and the build menu
+// already implement; there is no separate notion of one.
+//
+// PLACEHOLDER GEOMETRY — see warehouse01.ron.
+Building(
+    name: "Depot",
+    blueprint: "house01.nbt",
+    tier: 2,
+    requires: ["warehouse01"],
+    footprint: Explicit(x: 11, z: 11),
+    cost: [
+        (block: "minecraft:oak_planks", count: 128),
+        (block: "minecraft:cobblestone", count: 192),
+    ],
+    warehouse: Some((
+        radius_cells: 16,
+        // Three carts: the reason to upgrade rather than to keep building
+        // tier-1 sheds is that one depot keeps six farms moving.
+        concurrent_hauls: 3,
+        // And it turns a stack around faster, so it helps its near
+        // neighbours too, not only the distant ones.
+        handling_minutes: 0.2,
+        storage: 16384,
+    )),
+    integrity: Integrity(
+        pristine_above: 0.95,
+        ruined_below: 0.60,
+    ),
+)

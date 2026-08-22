@@ -148,6 +148,27 @@ impl Parcel {
 /// What a [`Stock::spend`] was short of — the *missing* amounts, not the
 /// requested ones, so a message can read "needs 12 more oak_planks" without
 /// the caller re-deriving the difference.
+/// `12x dirt, 3x cobblestone` — what a parcel reads as in a log line or a
+/// panel, in the ascending item order [`Parcel::iter`] gives, with the short
+/// names every player-facing string in this crate uses. Empty renders as
+/// `nothing`, for the same reason [`Shortfall`]'s does.
+impl std::fmt::Display for Parcel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.is_empty() {
+            return write!(f, "nothing");
+        }
+        let mut first = true;
+        for (item, count) in self.iter() {
+            if !first {
+                write!(f, ", ")?;
+            }
+            first = false;
+            write!(f, "{count}x {}", short_name(item))?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Shortfall {
     pub missing: Parcel,
@@ -216,6 +237,38 @@ impl Stock {
         for (item, count) in parcel.iter() {
             self.add(item, count);
         }
+    }
+
+    /// Everything currently held, across every material — the number
+    /// [`add_parcel_capped`](Self::add_parcel_capped) measures against a
+    /// warehouse capacity.
+    pub fn total(&self) -> u64 {
+        self.items.values().copied().fold(0, u64::saturating_add)
+    }
+
+    /// [`add_parcel`](Self::add_parcel) against a ceiling (ticket 079): adds
+    /// what fits under `capacity` and **returns the overflow**, in the
+    /// ascending item order [`Parcel::iter`] gives.
+    ///
+    /// The overflow is the caller's to deal with, never silently dropped
+    /// here. Ticket 080's haulage holds it at the warehouse and retries;
+    /// every other caller reports how much was lost. That is the whole
+    /// reason this returns a [`Parcel`] rather than a `bool`.
+    ///
+    /// [`add`](Self::add)/[`add_parcel`](Self::add_parcel) stay uncapped as
+    /// the primitive: a failed placement's refund is settling a spend that
+    /// already fit, and bouncing it would take a player's materials for a
+    /// building they never got.
+    pub fn add_parcel_capped(&mut self, parcel: &Parcel, capacity: u64) -> Parcel {
+        let mut room = capacity.saturating_sub(self.total());
+        let mut overflow = Parcel::default();
+        for (item, count) in parcel.iter() {
+            let fits = count.min(room);
+            self.add(item, fits);
+            room -= fits;
+            overflow.add(item, count - fits);
+        }
+        overflow
     }
 
     /// Removes up to `amount` of `item`, **clamped at zero**, and returns
@@ -398,6 +451,68 @@ pub fn load_stock(save_root: &Path) -> Result<Option<Stock>, StockError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- the storage cap (ticket 079) ---------------------------------------
+
+    #[test]
+    fn total_is_every_material_added_up() {
+        let mut stock = Stock::default();
+        stock.add("minecraft:dirt", 12);
+        stock.add("minecraft:stone", 30);
+        assert_eq!(stock.total(), 42);
+    }
+
+    #[test]
+    fn a_capped_add_takes_what_fits_and_hands_back_the_rest() {
+        let mut stock = Stock::default();
+        stock.add("minecraft:dirt", 90);
+
+        let mut parcel = Parcel::default();
+        parcel.add("minecraft:stone", 20);
+        let overflow = stock.add_parcel_capped(&parcel, 100);
+
+        assert_eq!(stock.count("minecraft:stone"), 10);
+        assert_eq!(stock.total(), 100);
+        assert_eq!(overflow.get("minecraft:stone"), 10);
+    }
+
+    #[test]
+    fn a_capped_add_into_a_full_stock_stores_nothing() {
+        let mut stock = Stock::default();
+        stock.add("minecraft:dirt", 100);
+
+        let mut parcel = Parcel::default();
+        parcel.add("minecraft:stone", 5);
+        let overflow = stock.add_parcel_capped(&parcel, 100);
+
+        assert_eq!(stock.count("minecraft:stone"), 0);
+        assert_eq!(overflow.get("minecraft:stone"), 5);
+    }
+
+    /// A stock already over capacity — the player built a warehouse and then
+    /// demolished it — accepts nothing more, and does not underflow working
+    /// out how much room it has.
+    #[test]
+    fn a_stock_already_over_capacity_accepts_nothing_without_underflowing() {
+        let mut stock = Stock::default();
+        stock.add("minecraft:dirt", 500);
+
+        let mut parcel = Parcel::default();
+        parcel.add("minecraft:stone", 5);
+        let overflow = stock.add_parcel_capped(&parcel, 100);
+
+        assert_eq!(stock.count("minecraft:dirt"), 500, "what is already held is never confiscated");
+        assert_eq!(overflow.get("minecraft:stone"), 5);
+    }
+
+    #[test]
+    fn a_parcel_displays_as_short_names_in_id_order() {
+        let mut parcel = Parcel::default();
+        parcel.add("minecraft:stone", 3);
+        parcel.add("minecraft:dirt", 12);
+        assert_eq!(parcel.to_string(), "12x dirt, 3x stone");
+        assert_eq!(Parcel::default().to_string(), "nothing");
+    }
 
     fn cost(block: &str, count: u32) -> Cost {
         Cost { block: block.to_string(), count }

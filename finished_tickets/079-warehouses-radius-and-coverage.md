@@ -1,7 +1,22 @@
 # 079 - Warehouses: working radius, road coverage, and storage capacity
 
 ## Status
-Open
+Done — `cargo test` green (740 passed).
+
+Landed as described. Three things the work turned up:
+
+- **A test that every shipped `.ron` parses** (`the_shipped_definitions_all_parse`),
+  which immediately caught all three new files: RON needs an explicit
+  `Some(..)` around an `Option` field, so `production: (..)` and
+  `warehouse: (..)` were silently unparseable. That test is worth more than
+  the three files it fixed.
+- **`city_panel` hit Bevy's system-parameter ceiling** at seventeen. The six
+  read-only economy resources are now one `#[derive(SystemParam)]`
+  `EconomyPanel`, which is the grouping that was implicit anyway.
+- **`StorageCapacity` defaults to `u64::MAX`, not 0**, and every caller reads
+  it through `Option<Res<..>>` — so a test `App` that never adds
+  `WarehousePlugin` credits the stock exactly as it did before this ticket,
+  the same tolerance `tool::ActiveTool` already documents.
 
 ## Why
 

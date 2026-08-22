@@ -43,9 +43,10 @@ use crate::edit::{EditPolicy, EditRefusal, EditReport};
 use crate::region_cache::RegionCache;
 
 use super::commit::apply_building_edit;
-use super::inventory::Stock;
+use super::inventory::{Parcel, Stock};
 use super::journal::{Journal, JournalEntry, Ledger};
 use super::state::{BuildingId, City};
+use super::warehouse::{storage_capacity, StorageCapacity};
 use super::write_status::{WriteKind, WriteStatus};
 
 /// Which half of a [`JournalEntry`] an undo reversed — `city::ui::city_panel`
@@ -145,12 +146,16 @@ impl Plugin for UndoPlugin {
 ///
 /// Taking back a credit is clamped by [`Stock::remove_parcel`], so undoing a
 /// placement whose yield has since been spent leaves the stock at zero
-/// rather than in debt. A plain function rather than two lines inside
+/// rather than in debt. Putting a debit *back* is capped by the city's
+/// storage (ticket 079) and returns whatever didn't fit, for the caller to
+/// report — an undo that quietly evaporated a building's materials would be
+/// the one operation in the game a player could not see going wrong. A plain function rather than two lines inside
 /// [`start_undo`] so it's testable without a loaded save — `start_undo`
 /// refuses before it ever reaches this without one.
-fn settle_reverse(stock: &mut Stock, ledger: &Ledger) {
-    stock.add_parcel(&ledger.debited);
+fn settle_reverse(stock: &mut Stock, ledger: &Ledger, capacity: u64) -> Parcel {
+    let overflow = stock.add_parcel_capped(&ledger.debited, capacity);
     stock.remove_parcel(&ledger.credited);
+    overflow
 }
 
 /// Dispatches a requested undo: synchronously reverses the journal's most
@@ -163,6 +168,7 @@ fn start_undo(
     mut city: ResMut<City>,
     region_cache: Option<Res<SharedRegionCache>>,
     mut stock: ResMut<Stock>,
+    capacity: Option<Res<StorageCapacity>>,
 ) {
     if !std::mem::take(&mut undo.requested) {
         return;
@@ -206,7 +212,10 @@ fn start_undo(
     // the world is behind city state *and* the ledger. That gap is the one
     // the module docs already name; this ticket puts a third thing on the
     // near side of it rather than opening a new one.
-    settle_reverse(&mut stock, &step.ledger);
+    let overflow = settle_reverse(&mut stock, &step.ledger, storage_capacity(capacity.as_deref()));
+    if !overflow.is_empty() {
+        println!("block_viewer: storage full — {overflow} could not be put back");
+    }
 
     let cache: Arc<Mutex<RegionCache>> = region_cache.0.clone();
     let policy = EditPolicy { allow_dirty_regions: true, ..EditPolicy::default() };
@@ -314,7 +323,7 @@ mod tests {
 
         stock.remove("minecraft:oak_planks", 40);
         stock.add("minecraft:dirt", 12);
-        settle_reverse(&mut stock, &Ledger { credited: parcel(&[("minecraft:dirt", 12)]), debited: parcel(&[("minecraft:oak_planks", 40)]) });
+        settle_reverse(&mut stock, &Ledger { credited: parcel(&[("minecraft:dirt", 12)]), debited: parcel(&[("minecraft:oak_planks", 40)]) }, u64::MAX);
 
         assert_eq!(stock, before);
     }
@@ -327,7 +336,7 @@ mod tests {
         let mut stock = Stock::default();
         stock.add("minecraft:dirt", 3);
 
-        settle_reverse(&mut stock, &Ledger { credited: parcel(&[("minecraft:dirt", 12)]), debited: parcel(&[]) });
+        settle_reverse(&mut stock, &Ledger { credited: parcel(&[("minecraft:dirt", 12)]), debited: parcel(&[]) }, u64::MAX);
 
         assert_eq!(stock.count("minecraft:dirt"), 0);
     }
@@ -340,9 +349,23 @@ mod tests {
         stock.add("minecraft:dirt", 3);
         let before = stock.clone();
 
-        settle_reverse(&mut stock, &Ledger::default());
+        settle_reverse(&mut stock, &Ledger::default(), u64::MAX);
 
         assert_eq!(stock, before);
+    }
+
+    /// Ticket 079: an undo puts materials back under the city's storage cap,
+    /// and hands the caller whatever didn't fit rather than dropping it.
+    #[test]
+    fn undoing_into_a_full_city_reports_what_would_not_fit() {
+        let mut stock = Stock::default();
+        stock.add("minecraft:dirt", 8);
+
+        let overflow =
+            settle_reverse(&mut stock, &Ledger { credited: parcel(&[]), debited: parcel(&[("minecraft:dirt", 6)]) }, 10);
+
+        assert_eq!(stock.count("minecraft:dirt"), 10, "the cap is what the stock reaches");
+        assert_eq!(overflow.get("minecraft:dirt"), 4, "and the rest comes back to the caller");
     }
 
     #[test]

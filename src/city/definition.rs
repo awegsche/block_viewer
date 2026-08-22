@@ -110,7 +110,43 @@ pub struct Building {
     pub production: Option<Production>,
     #[serde(default)]
     pub cost: Vec<Cost>,
+    /// `Some` makes this building a warehouse (ticket 079, roadmap H2) — it
+    /// collects from the producers it can reach along the road, and adds its
+    /// `storage` to what the city can hold. `None` for everything else.
+    ///
+    /// A warehouse *tier* is not a concept of its own: it is
+    /// [`tier`](Self::tier) and [`requires`](Self::requires), which
+    /// `resolve_requirements` (ticket 041) and the build menu already
+    /// implement. A tier-2 warehouse is a second `.ron` with bigger numbers.
+    #[serde(default)]
+    pub warehouse: Option<Warehouse>,
     pub integrity: Integrity,
+}
+
+/// What a warehouse does, and the four knobs a tier moves — see
+/// [`super::warehouse`] for how coverage is worked out and
+/// [`Building::warehouse`] for why there is no `tier` field here.
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct Warehouse {
+    /// How far along the road network this warehouse reaches, in road cells
+    /// ([`super::state::ROAD_CELL_SIZE`] blocks each). Hops, not travel time:
+    /// a working radius is a *distance*, and a faster road should make a haul
+    /// quicker rather than make the warehouse reach further.
+    pub radius_cells: u32,
+    /// How many stacks this warehouse can have in flight at once (ticket
+    /// 080) — the throughput knob. One warehouse serving six farms delivers
+    /// them a stack at a time and falls behind; a tier upgrade is how that
+    /// gets fixed.
+    pub concurrent_hauls: u32,
+    /// A fixed load/unload cost added to every haul, on top of its travel
+    /// time — so a tier upgrade helps nearby producers too, not only distant
+    /// ones.
+    #[serde(default)]
+    pub handling_minutes: f32,
+    /// What this warehouse adds to the city's total storage capacity
+    /// (`economy.base_storage` is the floor under it). Not per-warehouse
+    /// storage: the pile stays global — see [`super::inventory::Stock`].
+    pub storage: u64,
 }
 
 /// How a building's horizontal footprint is determined. `FromBlueprint` (the
@@ -194,6 +230,10 @@ pub enum DefinitionError {
     InvalidProduction { item: String, per_minute: f32 },
     /// `production.buffer_stacks: 0` (ticket 078) — see `check_building`.
     ZeroBufferStacks,
+    /// A `warehouse` block with a value nothing downstream could use
+    /// (ticket 079) — carries the rule it broke, since there are three and
+    /// they read the same way in a panel.
+    InvalidWarehouse(&'static str),
     /// `footprint: Explicit { x, z }` has a non-positive axis.
     InvalidFootprint { x: i32, z: i32 },
     /// The filename has nothing usable before its extension.
@@ -227,6 +267,7 @@ impl std::fmt::Display for DefinitionError {
                 write!(f, "cost entry for {block:?} has non-positive count {count}")
             }
             DefinitionError::ZeroBufferStacks => write!(f, "production.buffer_stacks must be > 0"),
+            DefinitionError::InvalidWarehouse(rule) => write!(f, "warehouse.{rule}"),
             DefinitionError::InvalidProduction { item, per_minute } => write!(
                 f,
                 "production entry for {item:?} has negative per_minute {per_minute}"
@@ -284,6 +325,15 @@ pub struct BuildingDefinitions {
 }
 
 impl BuildingDefinitions {
+    /// A set built from an explicit list rather than a directory scan — for
+    /// tests in *other* modules, which need a definition set to look a
+    /// placement up in but have no `.ron` files to load.
+    /// [`build_definitions`] is the only production constructor.
+    #[cfg(test)]
+    pub fn from_entries(entries: Vec<LoadedBuilding>) -> Self {
+        BuildingDefinitions { entries: entries.into_iter().map(|entry| (entry.id.clone(), entry)).collect() }
+    }
+
     /// `city::ui::build_menu` (ticket 050, roadmap G1) is the real caller
     /// now — a missing-requirement id's display name, and the currently
     /// selected entry's own name.
@@ -344,6 +394,21 @@ fn validate(building: &Building) -> Result<(), DefinitionError> {
         // that silently doesn't work.
         if production.buffer_stacks == 0 {
             return Err(DefinitionError::ZeroBufferStacks);
+        }
+    }
+    // Ticket 079: a warehouse that reaches nowhere or can carry nothing is a
+    // mistake in the file, not a value the coverage pass should have to
+    // defend against — the same call `road_definition` makes for
+    // `travel_speed`/`capacity`.
+    if let Some(warehouse) = &building.warehouse {
+        if warehouse.radius_cells == 0 {
+            return Err(DefinitionError::InvalidWarehouse("radius_cells must be > 0"));
+        }
+        if warehouse.concurrent_hauls == 0 {
+            return Err(DefinitionError::InvalidWarehouse("concurrent_hauls must be > 0"));
+        }
+        if warehouse.handling_minutes < 0.0 {
+            return Err(DefinitionError::InvalidWarehouse("handling_minutes must be >= 0"));
         }
     }
     if let FootprintSpec::Explicit { x, z } = building.footprint {
@@ -575,6 +640,25 @@ fn find_cycle(graph: &HashMap<String, Vec<String>>) -> Option<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every `.ron` this repo actually ships parses into a [`Building`].
+    /// Deliberately only the parse — cross-checking `blueprint` against the
+    /// catalogue would need the `.nbt` files loaded, which is
+    /// `load_definitions_dir`'s own job and a much heavier test. What this
+    /// catches is the thing that actually goes wrong when a definition is
+    /// hand-edited: a typo, a renamed field, a missing `Some`.
+    #[test]
+    fn the_shipped_definitions_all_parse() {
+        for entry in fs::read_dir("assets/city/buildings").expect("the shipped definitions directory") {
+            let path = entry.unwrap().path();
+            if !is_ron_file(&path) {
+                continue;
+            }
+            let text = fs::read_to_string(&path).unwrap();
+            let parsed: Result<Building, _> = ron::de::from_str(&text);
+            assert!(parsed.is_ok(), "{} does not parse: {}", path.display(), parsed.unwrap_err());
+        }
+    }
     use bevy::math::IVec3;
 
     use crate::blueprint::BlockState;

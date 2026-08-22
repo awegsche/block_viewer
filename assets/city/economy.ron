@@ -1,8 +1,12 @@
 // The economy's tunable numbers (tickets 074, 075, 078). See
 // `src/city/economy.rs`.
 //
-// Four knobs:
+// Five knobs:
 //
+//   base_storage    what the city can hold before it builds a single
+//                   warehouse. Each placed warehouse's `storage` adds to it.
+//                   Has to be at least as big as `start_stock`, or a fresh
+//                   city would be over capacity before its first click.
 //   stack_size      how many items make one stack. A producer's buffer is
 //                   measured in these (`buffer_stacks` on its definition),
 //                   and one stack is what a haul carries to a warehouse.
@@ -29,6 +33,11 @@
 (
     // ---- the unit the economy moves things in ---------------------------
     stack_size: 64,
+
+    // ---- what the city can hold with no warehouse -----------------------
+    // The founding grant below is 960 items, so this leaves room to work
+    // before the first warehouse goes up.
+    base_storage: 2048,
 
     // ---- the founding grant ---------------------------------------------
     // Enough to lay out a first street without terraforming for it: the

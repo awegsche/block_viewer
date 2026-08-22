@@ -1,0 +1,28 @@
+// Ticket 079, roadmap H2. The first producer — something for ticket 078's
+// production tick and 080's haulage to actually move.
+//
+// PLACEHOLDER GEOMETRY — see warehouse01.ron.
+Building(
+    name: "Wheat Farm",
+    blueprint: "house01.nbt",
+    tier: 1,
+    requires: [],
+    footprint: Explicit(x: 9, z: 9),
+    cost: [
+        (block: "minecraft:oak_planks", count: 24),
+        (block: "minecraft:dirt", count: 64),
+    ],
+    production: Some((
+        outputs: [
+            (item: "minecraft:wheat", per_minute: 12.0),
+        ],
+        // Four stacks at 12/min is a little over twenty minutes of unhauled
+        // output before it stops — long enough not to nag, short enough that
+        // a farm with no warehouse is noticed.
+        buffer_stacks: 4,
+    )),
+    integrity: Integrity(
+        pristine_above: 0.95,
+        ruined_below: 0.60,
+    ),
+)

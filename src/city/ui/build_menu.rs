@@ -315,6 +315,7 @@ mod tests {
             footprint: FootprintSpec::FromBlueprint,
             production: None,
             cost: Vec::new(),
+            warehouse: None,
             integrity: Integrity { pristine_above: 0.95, ruined_below: 0.6 },
         }
     }

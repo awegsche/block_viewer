@@ -391,7 +391,9 @@ fn poll_commit(
     mut edited: EventWriter<ChunksEdited>,
     mut stock: ResMut<Stock>,
     drops: Res<DropTable>,
+    capacity: Option<Res<super::warehouse::StorageCapacity>>,
 ) {
+    let capacity = super::warehouse::storage_capacity(capacity.as_deref());
     let result = {
         let Some(pending) = &mut commit.pending else { return };
         let Some(result) = block_on(poll_once(&mut pending.task)) else {
@@ -420,7 +422,13 @@ fn poll_commit(
                 // is what each written position held before — air included,
                 // which the drop table drops on the floor.
                 let mut credited = drops.parcel_for(baseline.previous.iter().map(|(_, state)| state));
-                stock.add_parcel(&credited);
+                // Ticket 079: the cleared terrain goes in under the city's
+                // storage cap, and what doesn't fit is reported rather than
+                // silently lost.
+                let overflow = stock.add_parcel_capped(&credited, capacity);
+                if !overflow.is_empty() {
+                    println!("block_viewer: storage full — {overflow} could not be stored");
+                }
                 // Ticket 074's conversions are part of the same action: what
                 // they made is already in the stock, and belongs on the
                 // ledger so undo takes it back out with everything else.

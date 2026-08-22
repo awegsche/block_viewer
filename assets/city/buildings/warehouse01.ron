@@ -1,0 +1,34 @@
+// Ticket 079, roadmap H2. A tier-1 warehouse: it collects from every
+// producer it can reach along the road, and adds its `storage` to what the
+// city can hold.
+//
+// PLACEHOLDER GEOMETRY: `blueprint` points at house01.nbt because that is the
+// only structure export on disk. The `footprint` below is the size this
+// building *should* be, so the placement rules are already right; a real
+// warehouse01.nbt exported over it will look correct without touching this
+// file. See ../../../todo.md.
+Building(
+    name: "Warehouse",
+    blueprint: "house01.nbt",
+    tier: 1,
+    requires: [],
+    footprint: Explicit(x: 7, z: 7),
+    cost: [
+        (block: "minecraft:oak_planks", count: 64),
+        (block: "minecraft:cobblestone", count: 64),
+    ],
+    warehouse: Some((
+        // Eight road cells is 48 blocks of road — a few streets, not a
+        // district. Reaching further is what warehouse02 is for.
+        radius_cells: 8,
+        // One cart. A second farm on the same warehouse waits its turn,
+        // which is the pressure to upgrade or to build another warehouse.
+        concurrent_hauls: 1,
+        handling_minutes: 0.5,
+        storage: 4096,
+    )),
+    integrity: Integrity(
+        pristine_above: 0.95,
+        ruined_below: 0.60,
+    ),
+)

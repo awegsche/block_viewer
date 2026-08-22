@@ -1263,3 +1263,22 @@ Y=0 in the world and won't be cleaned up by this fix — see the ticket.
   (the stock keeps saying `birch_log` for what you cut — only the payment is
   type-blind). Worth a second pass with `stripped_spruce_log` and
   `cherry_wood`, which route through the same group.
+- [ ] **079 placeholder geometry: warehouse and farm need real `.nbt`
+  exports.** `assets/city/buildings/warehouse01.ron`, `warehouse02.ron` and
+  `farm01.ron` all point `blueprint` at `house01.nbt`, because that is the
+  only structure export on disk — so all three currently place a house. Their
+  `footprint: Explicit(...)` is already the size each building should be, so
+  exporting a real `warehouse01.nbt`/`farm01.nbt` (the 019-024 selection →
+  "Save structure" flow in `block_viewer`) and pointing `blueprint` at it is
+  the whole job; nothing in `src/` has to change. Until then, a city with two
+  warehouses and a farm is three identical houses, which is worth knowing
+  before eyeballing anything.
+- [ ] **077/078/079 economy, end to end in the real app.** `cargo run --bin
+  citybuilder` against a real save. Build a `Wheat Farm` and a `Warehouse`,
+  drag a dirt road between them, and watch the City panel: the farm's row
+  should read `farm01: running, n/256 — warehouse01 X.X min away` with `n`
+  climbing, and `unserved` in its place until the road actually connects the
+  two. Check the Time section's `|| 1x 2x 4x` buttons and `Space`: paused
+  should freeze `n` and the elapsed clock together. Then demolish the road
+  between them and confirm the farm goes back to `unserved` and eventually
+  `buffer full`.

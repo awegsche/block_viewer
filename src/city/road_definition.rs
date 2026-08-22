@@ -137,6 +137,13 @@ pub struct RoadTypes {
 }
 
 impl RoadTypes {
+    /// The same test-only constructor [`super::definition::BuildingDefinitions::from_entries`]
+    /// has, and for the same reason.
+    #[cfg(test)]
+    pub fn from_entries(entries: Vec<LoadedRoadType>) -> Self {
+        RoadTypes { entries: entries.into_iter().map(|entry| (entry.id.clone(), entry)).collect() }
+    }
+
     #[allow(dead_code)] // no caller yet — see the module docs
     pub fn get(&self, id: &str) -> Option<&LoadedRoadType> {
         self.entries.get(id)

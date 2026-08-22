@@ -116,6 +116,10 @@ struct EconomyFile {
     /// written before production existed keeps working.
     #[serde(default = "default_stack_size")]
     stack_size: u64,
+    /// Ticket 079 — the storage a city has before it builds a single
+    /// warehouse. Defaulted for the same reason `stack_size` is.
+    #[serde(default = "default_base_storage")]
+    base_storage: u64,
     #[serde(default)]
     start_stock: HashMap<String, u64>,
     #[serde(default)]
@@ -134,6 +138,13 @@ fn default_stack_size() -> u64 {
     64
 }
 
+/// What a city can hold with no warehouse at all. Not zero, and not a
+/// rounding of the founding grant: a fresh save has to be able to *hold* its
+/// grant, or it would be over capacity before its first click.
+fn default_base_storage() -> u64 {
+    2048
+}
+
 /// The loaded economy knobs. [`Default`] is the "no `economy.ron`" config:
 /// no grant, no conversions, and a vanilla stack — exactly the game ticket
 /// 073 shipped, plus the one number ticket 078 needs a value for whether or
@@ -147,6 +158,9 @@ pub struct EconomyConfig {
     /// How many items make one stack — a producer's buffer is measured in
     /// these, and one is what a haul carries.
     pub stack_size: u64,
+    /// The city's storage capacity before any warehouse adds to it (ticket
+    /// 079) — see [`super::warehouse::StorageCapacity`].
+    pub base_storage: u64,
     /// What a city with no `stock.ron` is founded with.
     pub start_stock: Parcel,
     /// Applied by [`plan_payment`], in file order — the first conversion
@@ -163,6 +177,7 @@ impl Default for EconomyConfig {
     fn default() -> Self {
         EconomyConfig {
             stack_size: default_stack_size(),
+            base_storage: default_base_storage(),
             start_stock: Parcel::default(),
             conversions: Vec::new(),
             groups: Vec::new(),
@@ -298,7 +313,13 @@ pub fn load_economy(path: &Path) -> Result<EconomyConfig, EconomyError> {
         return Err(EconomyError::ZeroStackSize);
     }
 
-    Ok(EconomyConfig { stack_size: file.stack_size, start_stock, conversions, groups })
+    Ok(EconomyConfig {
+        stack_size: file.stack_size,
+        base_storage: file.base_storage,
+        start_stock,
+        conversions,
+        groups,
+    })
 }
 
 // -------------------------------------------------------------------------------------------------

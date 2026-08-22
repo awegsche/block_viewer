@@ -168,6 +168,27 @@
 //! file in this crate whose version mismatch starts empty instead of being
 //! refused. See [`production`]'s own docs for that argument.
 //!
+//! ## Warehouses (ticket 079, roadmap H2)
+//!
+//! [`warehouse::WarehousePlugin`] answers the two questions ticket 080's
+//! haulage runs on: **which** warehouse serves each producer, and **how far**
+//! it is along the road. A warehouse's working radius is measured in road
+//! cells (a BFS to `radius_cells` hops), and the haul time inside it comes
+//! from a Dijkstra over each cell's own `RoadType::travel_speed` — loaded and
+//! inert since ticket 060. A producer that touches no road, or whose road
+//! island holds no warehouse, is served by nobody and (ticket 078) fills up
+//! and stops: measuring the radius along the road is what makes the road
+//! network the thing the economy runs on.
+//!
+//! It is also the first consumer of roadmap F4's connectivity queries
+//! (ticket 056), which have been "proven, not yet used" ever since.
+//!
+//! The same plugin keeps [`warehouse::StorageCapacity`] — `base_storage`
+//! plus every placed warehouse's `storage` — and
+//! [`inventory::Stock::add_parcel_capped`] is where it bites, on the three
+//! paths that credit the stock. See [`warehouse`]'s own docs for how that
+//! squares with ticket 072's unbounded pile.
+//!
 //! ## The build menu and city panel (ticket 050, roadmap G)
 //!
 //! [`ui::UiPlugin`] is the citybuilder's first real UI — its own
@@ -317,6 +338,7 @@ mod terraform;
 mod tool;
 mod ui;
 mod undo;
+mod warehouse;
 mod write_status;
 
 use bevy::app::AppExit;
@@ -430,6 +452,7 @@ pub fn run() {
         .insert_resource(definition_errors)
         .add_plugins(hot_reload::DefinitionHotReloadPlugin)
         .add_plugins(clock::ClockPlugin)
+        .add_plugins(warehouse::WarehousePlugin)
         .add_plugins(production::ProductionPlugin)
         .add_plugins(tool::ToolPlugin)
         .add_plugins(picking::PickingPlugin)
