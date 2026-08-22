@@ -580,7 +580,7 @@ mod tests {
         // Cell (0, -1) is north of (0, 0): block tiles -6..0 x z. Place a
         // building inside that block range so it's the road cell's north
         // neighbour, but as a building, not a road.
-        city.place_building("house01", bevy::math::IVec3::new(0, 64, -6), crate::blueprint::Rotation::Deg0, IVec2::ONE)
+        city.place_building("house01", None, bevy::math::IVec3::new(0, 64, -6), crate::blueprint::Rotation::Deg0, IVec2::ONE)
             .unwrap();
 
         let connections = connections_at(&city, IVec2::new(0, 0));
@@ -705,7 +705,7 @@ mod tests {
         let mut city = City::default();
         city.add_road_cell(IVec2::new(0, 0), "dirt", 64, None, RoadPieceVariant::Surface).unwrap(); // block tiles 0..6 x 0..6
         let id = city
-            .place_building("house01", IVec3::new(100, 64, 100), Rotation::Deg0, IVec2::new(2, 2))
+            .place_building("house01", None, IVec3::new(100, 64, 100), Rotation::Deg0, IVec2::new(2, 2))
             .unwrap();
         let building = city.building(id).unwrap();
 
@@ -719,7 +719,7 @@ mod tests {
         // Directly east of the road cell: x = 6..8, z = 0..2. Its west edge
         // (x = 6) neighbours x = 5, inside the road cell's tile range.
         let id = city
-            .place_building("house01", IVec3::new(6, 64, 0), Rotation::Deg0, IVec2::new(2, 2))
+            .place_building("house01", None, IVec3::new(6, 64, 0), Rotation::Deg0, IVec2::new(2, 2))
             .unwrap();
         let building = city.building(id).unwrap();
 
@@ -734,7 +734,7 @@ mod tests {
         // South of both cells: x = 0..12, z = 6..8. Its north edge (z = 6)
         // neighbours z = 5, spanning both road cells' x ranges.
         let id = city
-            .place_building("house01", IVec3::new(0, 64, 6), Rotation::Deg0, IVec2::new(12, 2))
+            .place_building("house01", None, IVec3::new(0, 64, 6), Rotation::Deg0, IVec2::new(12, 2))
             .unwrap();
         let building = city.building(id).unwrap();
 
@@ -744,7 +744,7 @@ mod tests {
     #[test]
     fn is_building_connected_is_none_for_an_id_that_is_not_placed() {
         let mut city = City::default();
-        let id = city.place_building("house01", IVec3::ZERO, Rotation::Deg0, IVec2::ONE).unwrap();
+        let id = city.place_building("house01", None, IVec3::ZERO, Rotation::Deg0, IVec2::ONE).unwrap();
         city.remove_building(id);
         assert_eq!(is_building_connected(&city, id), None);
     }
@@ -754,10 +754,10 @@ mod tests {
         let mut city = City::default();
         city.add_road_cell(IVec2::new(0, 0), "dirt", 64, None, RoadPieceVariant::Surface).unwrap();
         let far = city
-            .place_building("house01", IVec3::new(100, 64, 100), Rotation::Deg0, IVec2::new(2, 2))
+            .place_building("house01", None, IVec3::new(100, 64, 100), Rotation::Deg0, IVec2::new(2, 2))
             .unwrap();
         let touching = city
-            .place_building("house01", IVec3::new(6, 64, 0), Rotation::Deg0, IVec2::new(2, 2))
+            .place_building("house01", None, IVec3::new(6, 64, 0), Rotation::Deg0, IVec2::new(2, 2))
             .unwrap();
 
         assert_eq!(is_building_connected(&city, far), Some(false));
@@ -774,7 +774,7 @@ mod tests {
         assert_eq!(connections_at(&city, IVec2::new(0, 0)).count(), 0, "sanity: a lone road cell");
 
         let id = city
-            .place_building("house01", IVec3::new(6, 64, 0), Rotation::Deg0, IVec2::new(2, 2))
+            .place_building("house01", None, IVec3::new(6, 64, 0), Rotation::Deg0, IVec2::new(2, 2))
             .unwrap();
         assert_eq!(is_building_connected(&city, id), Some(true));
     }
@@ -782,8 +782,8 @@ mod tests {
     #[test]
     fn buildings_connected_is_none_when_either_id_is_not_placed() {
         let mut city = City::default();
-        let placed = city.place_building("house01", IVec3::ZERO, Rotation::Deg0, IVec2::ONE).unwrap();
-        let removed = city.place_building("house01", IVec3::new(50, 64, 50), Rotation::Deg0, IVec2::ONE).unwrap();
+        let placed = city.place_building("house01", None, IVec3::ZERO, Rotation::Deg0, IVec2::ONE).unwrap();
+        let removed = city.place_building("house01", None, IVec3::new(50, 64, 50), Rotation::Deg0, IVec2::ONE).unwrap();
         city.remove_building(removed);
 
         assert_eq!(buildings_connected(&city, placed, removed), None);
@@ -799,11 +799,11 @@ mod tests {
 
         // South of cell (0,0): touches only the west cell.
         let a = city
-            .place_building("house01", IVec3::new(0, 64, 6), Rotation::Deg0, IVec2::new(2, 2))
+            .place_building("house01", None, IVec3::new(0, 64, 6), Rotation::Deg0, IVec2::new(2, 2))
             .unwrap();
         // South of cell (1,0): touches only the east cell.
         let b = city
-            .place_building("house01", IVec3::new(6, 64, 6), Rotation::Deg0, IVec2::new(2, 2))
+            .place_building("house01", None, IVec3::new(6, 64, 6), Rotation::Deg0, IVec2::new(2, 2))
             .unwrap();
 
         assert_eq!(buildings_connected(&city, a, b), Some(true));
@@ -816,10 +816,10 @@ mod tests {
         city.add_road_cell(IVec2::new(100, 100), "dirt", 64, None, RoadPieceVariant::Surface).unwrap();
 
         let a = city
-            .place_building("house01", IVec3::new(6, 64, 0), Rotation::Deg0, IVec2::new(2, 2))
+            .place_building("house01", None, IVec3::new(6, 64, 0), Rotation::Deg0, IVec2::new(2, 2))
             .unwrap();
         let b = city
-            .place_building("house01", IVec3::new(606, 64, 600), Rotation::Deg0, IVec2::new(2, 2))
+            .place_building("house01", None, IVec3::new(606, 64, 600), Rotation::Deg0, IVec2::new(2, 2))
             .unwrap();
 
         assert_eq!(buildings_connected(&city, a, b), Some(false));
@@ -829,10 +829,10 @@ mod tests {
     fn buildings_connected_is_false_when_neither_touches_a_road() {
         let mut city = City::default();
         let a = city
-            .place_building("house01", IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::new(2, 2))
+            .place_building("house01", None, IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::new(2, 2))
             .unwrap();
         let b = city
-            .place_building("house01", IVec3::new(100, 64, 100), Rotation::Deg0, IVec2::new(2, 2))
+            .place_building("house01", None, IVec3::new(100, 64, 100), Rotation::Deg0, IVec2::new(2, 2))
             .unwrap();
 
         assert_eq!(buildings_connected(&city, a, b), Some(false));
@@ -853,13 +853,13 @@ mod tests {
         city.add_road_cell(IVec2::new(100, 100), "dirt", 64, None, RoadPieceVariant::Surface).unwrap();
 
         let reachable = city
-            .place_building("house01", IVec3::new(6, 64, 6), Rotation::Deg0, IVec2::new(2, 2))
+            .place_building("house01", None, IVec3::new(6, 64, 6), Rotation::Deg0, IVec2::new(2, 2))
             .unwrap(); // south of cell (1,0)
         let unreachable_island = city
-            .place_building("house01", IVec3::new(606, 64, 600), Rotation::Deg0, IVec2::new(2, 2))
+            .place_building("house01", None, IVec3::new(606, 64, 600), Rotation::Deg0, IVec2::new(2, 2))
             .unwrap(); // south of the disconnected cell
         let untouching = city
-            .place_building("house01", IVec3::new(300, 64, 300), Rotation::Deg0, IVec2::new(2, 2))
+            .place_building("house01", None, IVec3::new(300, 64, 300), Rotation::Deg0, IVec2::new(2, 2))
             .unwrap(); // touches nothing
 
         let found = buildings_reachable_from(&city, IVec2::new(0, 0));

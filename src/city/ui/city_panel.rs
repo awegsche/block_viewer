@@ -69,7 +69,7 @@ const WROTE_COLOR: egui::Color32 = egui::Color32::from_rgb(120, 220, 120);
 fn building_counts(city: &state::City) -> Vec<(String, usize)> {
     let mut counts: HashMap<&str, usize> = HashMap::new();
     for (_, building) in city.buildings() {
-        *counts.entry(building.definition.as_str()).or_insert(0) += 1;
+        *counts.entry(building.catalogue_id.as_str()).or_insert(0) += 1;
     }
     let mut counts: Vec<(String, usize)> = counts.into_iter().map(|(id, n)| (id.to_string(), n)).collect();
     counts.sort_by(|a, b| a.0.cmp(&b.0));
@@ -291,9 +291,9 @@ mod tests {
     #[test]
     fn buildings_are_grouped_by_definition_and_sorted() {
         let mut city = state::City::default();
-        city.place_building("house01", IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::ONE).unwrap();
-        city.place_building("house01", IVec3::new(2, 64, 0), Rotation::Deg0, IVec2::ONE).unwrap();
-        city.place_building("carpenter", IVec3::new(4, 64, 0), Rotation::Deg0, IVec2::ONE).unwrap();
+        city.place_building("house01", None, IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::ONE).unwrap();
+        city.place_building("house01", None, IVec3::new(2, 64, 0), Rotation::Deg0, IVec2::ONE).unwrap();
+        city.place_building("carpenter", None, IVec3::new(4, 64, 0), Rotation::Deg0, IVec2::ONE).unwrap();
 
         let counts = building_counts(&city);
         assert_eq!(counts, vec![("carpenter".to_string(), 1), ("house01".to_string(), 2)]);

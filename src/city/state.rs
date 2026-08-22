@@ -12,15 +12,28 @@
 //! ticket. Neither is persistence (D2) or a journal (D3) — [`City`] lives in
 //! memory only, for now.
 //!
-//! ## Two kinds of id
+//! ## Three kinds of id
 //!
 //! A [`BuildingId`] names one *placed instance* — assigned by
-//! [`City::place_building`], never reused. A definition id (`"house01"`,
-//! [`super::definition::BuildingDefinitions`]'s key) names a building
-//! *type*. Two houses placed side by side share the second and must not
-//! share the first, which is why [`PlacedBuilding::definition`] is a
-//! `String` (the type) while [`City::place_building`]'s return value is a
-//! fresh [`BuildingId`] (the instance).
+//! [`City::place_building`], never reused. Two houses placed side by side
+//! must not share it, which is why it's minted per placement.
+//!
+//! The other two both name a building *type*, and ticket 076 is where this
+//! module stopped pretending they were one:
+//!
+//! - a **catalogue id** ([`PlacedBuilding::catalogue_id`]) is a blueprint's
+//!   filename stem, [`super::blueprint::BuildingCatalogue`]'s key — the
+//!   building's geometry;
+//! - a **definition id** ([`PlacedBuilding::definition_id`]) is a `.ron`'s
+//!   filename stem, [`super::definition::BuildingDefinitions`]'s key — the
+//!   building's game data (tier, cost, production, integrity).
+//!
+//! They are separate keyspaces that happen to agree for the single shipped
+//! `house01.nbt`/`house01.ron` pair. Until 076 only the first was stored,
+//! under the name `definition`, which meant a *placed* building could not
+//! find its own `.ron` — roadmap H2's own "known gap", and the thing every
+//! per-instance mechanic from production onward needs.
+//! [`City::definition_of`] is the lookup that replaced the guess.
 //!
 //! ## The occupancy grid
 //!
@@ -102,10 +115,32 @@ impl BuildingId {
 /// back — without the entry borrowing from `City` and outliving it.
 #[derive(Debug, Clone)]
 pub struct PlacedBuilding {
-    /// The building's *type* — a key into
-    /// [`super::definition::BuildingDefinitions`]/[`super::blueprint::BuildingCatalogue`],
-    /// not this instance's own [`BuildingId`].
-    pub definition: String,
+    /// Which *geometry* this instance was placed from — a key into
+    /// [`super::blueprint::BuildingCatalogue`] (a blueprint's filename stem),
+    /// not this instance's own [`BuildingId`] and **not** a
+    /// [`super::definition::BuildingDefinitions`] key.
+    ///
+    /// Ticket 076 renamed this from `definition`, which is what it had been
+    /// called since 042 while holding a catalogue id the whole time: the two
+    /// keyspaces are separate (`house01.nbt` -> `house01` for the catalogue,
+    /// `house01.ron` -> `house01` for the definitions) and coincided only
+    /// because the one shipped pair of files shares a stem. See
+    /// [`definition_id`](Self::definition_id) for the other half.
+    pub catalogue_id: String,
+    /// Which *game data* this instance was placed from — a key into
+    /// [`super::definition::BuildingDefinitions`], and the thing every
+    /// per-instance mechanic from roadmap H2 onward (production rates,
+    /// warehouse radii, `integrity` thresholds) has to go through to find
+    /// this building's own `.ron`.
+    ///
+    /// `None` for a placement made through `super::placement`'s keyboard
+    /// stand-in, which picks a *catalogue* entry and has no definition
+    /// behind it at all — the same hole that already leaves such a placement
+    /// with no requirements and no cost (ticket 073). A `None` here is
+    /// "this building has no game data", not "look it up by
+    /// [`catalogue_id`](Self::catalogue_id)": guessing that the stems
+    /// coincide is precisely the bug ticket 076 exists to remove.
+    pub definition_id: Option<String>,
     /// Minecraft world coordinates of the footprint's minimum `(x, z)`
     /// corner (the same convention [`crate::edit`]/[`crate::selection`] use
     /// throughout — no `bevy.z = -mc.z` flip belongs in this module).
@@ -286,10 +321,13 @@ pub struct City {
 }
 
 impl City {
-    /// Places a building of type `definition` at `origin`/`rotation`,
-    /// covering `footprint`'s rotated extent. All-or-nothing: every tile is
-    /// checked before any of them is marked occupied, so a refusal never
-    /// leaves a partial building behind — see the module docs.
+    /// Places a building of geometry `catalogue_id` — and, if the placement
+    /// came from anything that knows one, game data `definition_id` (ticket
+    /// 076; see [`PlacedBuilding::definition_id`] for why a placement can
+    /// legitimately have none) — at `origin`/`rotation`, covering
+    /// `footprint`'s rotated extent. All-or-nothing: every tile is checked
+    /// before any of them is marked occupied, so a refusal never leaves a
+    /// partial building behind — see the module docs.
     ///
     /// Called synchronously by `city::commit::try_commit_placement` (ticket
     /// 048, roadmap E4) the instant a click is accepted — before the write
@@ -298,7 +336,8 @@ impl City {
     /// [`remove_building`](Self::remove_building) is the rollback.
     pub fn place_building(
         &mut self,
-        definition: impl Into<String>,
+        catalogue_id: impl Into<String>,
+        definition_id: Option<String>,
         origin: IVec3,
         rotation: Rotation,
         footprint: IVec2,
@@ -317,7 +356,7 @@ impl City {
         }
         self.buildings.insert(
             id,
-            PlacedBuilding { definition: definition.into(), origin, rotation, footprint },
+            PlacedBuilding { catalogue_id: catalogue_id.into(), definition_id, origin, rotation, footprint },
         );
         Ok(id)
     }
@@ -345,6 +384,23 @@ impl City {
     /// placement itself.
     pub fn building(&self, id: BuildingId) -> Option<&PlacedBuilding> {
         self.buildings.get(&id)
+    }
+
+    /// Which [`super::definition::BuildingDefinitions`] entry `id` was placed
+    /// from, if it was placed from one at all — the lookup ticket 076 exists
+    /// to make possible and every per-instance mechanic after it goes
+    /// through, so nothing else has to reach into
+    /// [`PlacedBuilding::definition_id`] and decide for itself what a `None`
+    /// means.
+    ///
+    /// Two distinct `None`s collapse here on purpose: `id` isn't a placed
+    /// building, and `id` is a placed building with no definition behind it.
+    /// Every caller so far treats them the same — no definition, no game
+    /// data, no production — and [`building`](Self::building) is right there
+    /// for anything that needs to tell them apart.
+    #[allow(dead_code)] // ticket 078's production tick is the first caller
+    pub fn definition_of(&self, id: BuildingId) -> Option<&str> {
+        self.buildings.get(&id)?.definition_id.as_deref()
     }
 
     pub fn buildings(&self) -> impl Iterator<Item = (BuildingId, &PlacedBuilding)> {
@@ -532,7 +588,7 @@ mod tests {
         let origin = IVec3::new(10, 64, 20);
         let footprint = IVec2::new(3, 2);
         let id = city
-            .place_building("house01", origin, Rotation::Deg0, footprint)
+            .place_building("house01", None, origin, Rotation::Deg0, footprint)
             .expect("should place on an empty grid");
 
         for x in 10..13 {
@@ -553,7 +609,7 @@ mod tests {
         let origin = IVec3::new(0, 64, 0);
         let footprint = IVec2::new(3, 5); // 3 wide (x), 5 deep (z), unrotated
         let id = city
-            .place_building("house01", origin, Rotation::Deg90, footprint)
+            .place_building("house01", None, origin, Rotation::Deg90, footprint)
             .expect("should place on an empty grid");
 
         // Rotated 90°: the occupied rectangle is 5 wide (x), 3 deep (z).
@@ -570,12 +626,12 @@ mod tests {
     fn an_overlapping_placement_is_refused_and_leaves_the_grid_unchanged() {
         let mut city = City::default();
         let first = city
-            .place_building("house01", IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::new(4, 4))
+            .place_building("house01", None, IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::new(4, 4))
             .unwrap();
 
         // Overlaps the first building's last column/row (x=3, z=3..7).
         let err = city
-            .place_building("house01", IVec3::new(3, 64, 3), Rotation::Deg0, IVec2::new(4, 4))
+            .place_building("house01", None, IVec3::new(3, 64, 3), Rotation::Deg0, IVec2::new(4, 4))
             .unwrap_err();
         assert!(matches!(
             err,
@@ -611,7 +667,7 @@ mod tests {
     fn a_road_cell_cannot_be_placed_on_a_building_and_vice_versa() {
         let mut city = City::default();
         let building_id = city
-            .place_building("house01", IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::new(2, 2))
+            .place_building("house01", None, IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::new(2, 2))
             .unwrap();
 
         // Cell (0, 0) covers block tiles 0..6 x 0..6, which overlaps the
@@ -626,7 +682,7 @@ mod tests {
         city.add_road_cell(IVec2::new(5, 5), "dirt", 64, None, RoadPieceVariant::Surface).expect("an empty cell should accept a road");
         // Cell (5, 5) covers block tiles 30..36 x 30..36.
         let err = city
-            .place_building("house01", IVec3::new(30, 64, 30), Rotation::Deg0, IVec2::new(1, 1))
+            .place_building("house01", None, IVec3::new(30, 64, 30), Rotation::Deg0, IVec2::new(1, 1))
             .unwrap_err();
         assert!(matches!(
             err,
@@ -712,22 +768,22 @@ mod tests {
         let mut city = City::default();
         let origin = IVec3::new(0, 64, 0);
         let footprint = IVec2::new(2, 2);
-        let id = city.place_building("house01", origin, Rotation::Deg0, footprint).unwrap();
+        let id = city.place_building("house01", None, origin, Rotation::Deg0, footprint).unwrap();
 
         let removed = city.remove_building(id).expect("the id was just placed");
-        assert_eq!(removed.definition, "house01");
+        assert_eq!(removed.catalogue_id, "house01");
         assert!(city.is_tile_free(IVec2::new(0, 0)));
         assert!(city.is_empty());
 
         // The freed tiles accept a new placement.
-        city.place_building("house01", origin, Rotation::Deg0, footprint)
+        city.place_building("house01", None, origin, Rotation::Deg0, footprint)
             .expect("tiles freed by removal should be placeable again");
     }
 
     #[test]
     fn removing_an_unknown_id_is_none_not_a_panic() {
         let mut city = City::default();
-        let id = city.place_building("house01", IVec3::ZERO, Rotation::Deg0, IVec2::ONE).unwrap();
+        let id = city.place_building("house01", None, IVec3::ZERO, Rotation::Deg0, IVec2::ONE).unwrap();
         city.remove_building(id);
         assert!(city.remove_building(id).is_none(), "already removed");
     }
@@ -775,8 +831,8 @@ mod tests {
     #[test]
     fn buildings_and_roads_iterate_what_was_added() {
         let mut city = City::default();
-        let a = city.place_building("house01", IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::ONE).unwrap();
-        let b = city.place_building("house01", IVec3::new(5, 64, 5), Rotation::Deg0, IVec2::ONE).unwrap();
+        let a = city.place_building("house01", None, IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::ONE).unwrap();
+        let b = city.place_building("house01", None, IVec3::new(5, 64, 5), Rotation::Deg0, IVec2::ONE).unwrap();
         city.add_road_cell(IVec2::new(2, 2), "dirt", 64, None, RoadPieceVariant::Surface).unwrap();
         city.add_road_cell(IVec2::new(2, 3), "dirt", 64, None, RoadPieceVariant::Surface).unwrap();
 

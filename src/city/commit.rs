@@ -342,7 +342,13 @@ fn try_commit_placement(
         return;
     }
 
-    let building = match city.place_building(id.clone(), origin, selection.rotation, entry.footprint) {
+    // Ticket 076: the definition id travels onto the placement itself, not
+    // just into this frame's pricing — a *placed* building has to be able to
+    // find its own `.ron` for anything per-instance (production rates,
+    // warehouse radii) to read it later. `None` here is the keyboard
+    // stand-in's placement, priced free a few lines up for the same reason.
+    let definition_id = selection.definition_id.clone();
+    let building = match city.place_building(id.clone(), definition_id.clone(), origin, selection.rotation, entry.footprint) {
         Ok(building) => building,
         Err(err) => {
             println!("block_viewer: placement refused: {err}");
@@ -357,7 +363,8 @@ fn try_commit_placement(
     let mut spent = stock.spend(&costs).expect("plan_payment said this was affordable, and nothing since has touched the stock");
     spent.add_all(&consumed);
     let gained = produced;
-    let placed = PlacedBuilding { definition: id, origin, rotation: selection.rotation, footprint: entry.footprint };
+    let placed =
+        PlacedBuilding { catalogue_id: id, definition_id, origin, rotation: selection.rotation, footprint: entry.footprint };
 
     let cache: Arc<Mutex<RegionCache>> = region_cache.0.clone();
     let policy = EditPolicy { capture_replaced: true, allow_dirty_regions: true, ..EditPolicy::default() };
@@ -401,7 +408,7 @@ fn poll_commit(
             let chunks = report.chunks.len();
             println!(
                 "block_viewer: placed {} ({blocks} block(s) across {chunks} chunk(s), not yet saved to disk)",
-                placement.definition
+                placement.catalogue_id
             );
             // `EditPolicy::capture_replaced` was on, so `report.replaced` is
             // `Some` and this always succeeds — the `if let` is the same
@@ -427,7 +434,7 @@ fn poll_commit(
                 }
                 journal.record_placement(building, placement.clone(), baseline, Ledger { credited, debited: spent });
             }
-            write_status.record_success(WriteKind::Placed, placement.definition, &report);
+            write_status.record_success(WriteKind::Placed, placement.catalogue_id, &report);
             edited.send(ChunksEdited(report.chunks));
         }
         Err(err) => {
@@ -437,8 +444,8 @@ fn poll_commit(
             // logs return and the planks they became do not.
             stock.add_parcel(&spent);
             stock.remove_parcel(&gained);
-            println!("block_viewer: placement of {} failed, rolled back: {err}", placement.definition);
-            write_status.record_failure(WriteKind::Placed, placement.definition, err.to_string());
+            println!("block_viewer: placement of {} failed, rolled back: {err}", placement.catalogue_id);
+            write_status.record_failure(WriteKind::Placed, placement.catalogue_id, err.to_string());
         }
     }
 }
@@ -679,7 +686,13 @@ mod tests {
     }
 
     fn a_placement() -> PlacedBuilding {
-        PlacedBuilding { definition: "house01".to_string(), origin: IVec3::new(0, 64, 0), rotation: Rotation::Deg0, footprint: IVec2::new(2, 2) }
+        PlacedBuilding {
+            catalogue_id: "house01".to_string(),
+            definition_id: None,
+            origin: IVec3::new(0, 64, 0),
+            rotation: Rotation::Deg0,
+            footprint: IVec2::new(2, 2),
+        }
     }
 
     #[test]
@@ -688,7 +701,7 @@ mod tests {
         let building = app
             .world_mut()
             .resource_mut::<state::City>()
-            .place_building("house01", IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::new(2, 2))
+            .place_building("house01", None, IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::new(2, 2))
             .unwrap();
 
         let mut edit = WorldEdit::new();
@@ -727,7 +740,7 @@ mod tests {
         let building = app
             .world_mut()
             .resource_mut::<state::City>()
-            .place_building("house01", IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::new(2, 2))
+            .place_building("house01", None, IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::new(2, 2))
             .unwrap();
 
         let task = pool().spawn(async { Err(EditRefusal::Empty) });
@@ -777,7 +790,7 @@ mod tests {
         let building = app
             .world_mut()
             .resource_mut::<state::City>()
-            .place_building("house01", IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::new(2, 2))
+            .place_building("house01", None, IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::new(2, 2))
             .unwrap();
 
         // Two stone, one air: with the default (empty) drop table stone
@@ -835,7 +848,7 @@ mod tests {
         let building = app
             .world_mut()
             .resource_mut::<state::City>()
-            .place_building("house01", IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::new(2, 2))
+            .place_building("house01", None, IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::new(2, 2))
             .unwrap();
         let replaced = vec![(IVec3::new(0, 64, 0), state_named("minecraft:dirt"))];
         let report = EditReport {
@@ -876,7 +889,7 @@ mod tests {
         let building = app
             .world_mut()
             .resource_mut::<state::City>()
-            .place_building("house01", IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::new(2, 2))
+            .place_building("house01", None, IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::new(2, 2))
             .unwrap();
         let mut pending = pending_that_replaced(
             building,
@@ -902,7 +915,7 @@ mod tests {
         let building = app
             .world_mut()
             .resource_mut::<state::City>()
-            .place_building("house01", IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::new(2, 2))
+            .place_building("house01", None, IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::new(2, 2))
             .unwrap();
 
         app.world_mut().resource_mut::<CommitState>().pending = Some(pending_that_replaced(

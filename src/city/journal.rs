@@ -533,8 +533,9 @@ pub fn repair_edit(report: &ReconcileReport) -> Option<WorldEdit> {
 // benefit.
 
 /// The journal file's schema version. Version 2 (ticket 073) added each
-/// entry's [`Ledger`].
-pub const CURRENT_VERSION: u32 = 2;
+/// entry's [`Ledger`]; version 3 (ticket 076) added each saved placement's
+/// `definition_id`.
+pub const CURRENT_VERSION: u32 = 3;
 
 /// The oldest version [`load_journal`] will read — a **band**, not
 /// [`super::persistence`]'s equality check, and ticket 069's precedent for
@@ -598,7 +599,16 @@ enum SavedEntry {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct SavedPlacement {
-    definition: String,
+    catalogue_id: String,
+    /// Ticket 076. `#[serde(default)]` rather than a hard refusal, unlike
+    /// `city.ron`'s own version-7 bump: a version-1/2 entry genuinely
+    /// doesn't know which definition its building came from, and `None` is
+    /// the *correct* value for it — the same "no game data behind this
+    /// placement" a keyboard stand-in's placement carries — not a guess
+    /// standing in for one. The version still moves to 3 so the file says
+    /// which shape it was written in; see [`CURRENT_VERSION`].
+    #[serde(default)]
+    definition_id: Option<String>,
     origin: (i32, i32, i32),
     rotation: Rotation,
     footprint: (i32, i32),
@@ -613,7 +623,8 @@ struct SavedBaseline {
 
 fn saved_placement(placement: &PlacedBuilding) -> SavedPlacement {
     SavedPlacement {
-        definition: placement.definition.clone(),
+        catalogue_id: placement.catalogue_id.clone(),
+        definition_id: placement.definition_id.clone(),
         origin: (placement.origin.x, placement.origin.y, placement.origin.z),
         rotation: placement.rotation,
         footprint: (placement.footprint.x, placement.footprint.y),
@@ -624,7 +635,8 @@ fn placement_from_saved(saved: SavedPlacement) -> PlacedBuilding {
     let (x, y, z) = saved.origin;
     let (fx, fz) = saved.footprint;
     PlacedBuilding {
-        definition: saved.definition,
+        catalogue_id: saved.catalogue_id,
+        definition_id: saved.definition_id,
         origin: IVec3::new(x, y, z),
         rotation: saved.rotation,
         footprint: bevy::math::IVec2::new(fx, fz),

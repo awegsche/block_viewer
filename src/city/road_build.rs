@@ -1455,7 +1455,7 @@ mod tests {
     #[test]
     fn cell_occupancy_ok_is_false_over_a_building() {
         let mut city = City::default();
-        city.place_building("house01", IVec3::new(0, 64, 0), crate::blueprint::Rotation::Deg0, IVec2::new(2, 2)).unwrap();
+        city.place_building("house01", None, IVec3::new(0, 64, 0), crate::blueprint::Rotation::Deg0, IVec2::new(2, 2)).unwrap();
         assert!(!cell_occupancy_ok(IVec2::new(0, 0), &city));
     }
 

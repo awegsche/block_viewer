@@ -247,7 +247,7 @@ fn poll_demolish(
             let chunks = report.chunks.len();
             println!(
                 "block_viewer: demolished {} ({blocks} block(s) restored across {chunks} chunk(s), not yet saved to disk)",
-                placement.definition
+                placement.catalogue_id
             );
             // `EditPolicy::capture_replaced` was on, so this is always
             // `Some` here — see the module docs on what each half of this
@@ -274,12 +274,12 @@ fn poll_demolish(
                     Ledger { credited: Default::default(), debited },
                 );
             }
-            write_status.record_success(WriteKind::Demolished, placement.definition, &report);
+            write_status.record_success(WriteKind::Demolished, placement.catalogue_id, &report);
             edited.send(ChunksEdited(report.chunks));
         }
         Err(err) => {
-            println!("block_viewer: demolition of {} failed, nothing was changed: {err}", placement.definition);
-            write_status.record_failure(WriteKind::Demolished, placement.definition, err.to_string());
+            println!("block_viewer: demolition of {} failed, nothing was changed: {err}", placement.catalogue_id);
+            write_status.record_failure(WriteKind::Demolished, placement.catalogue_id, err.to_string());
         }
     }
 }
@@ -299,7 +299,13 @@ mod tests {
     }
 
     fn a_placement() -> PlacedBuilding {
-        PlacedBuilding { definition: "house01".to_string(), origin: IVec3::new(0, 64, 0), rotation: Rotation::Deg0, footprint: IVec2::new(2, 2) }
+        PlacedBuilding {
+            catalogue_id: "house01".to_string(),
+            definition_id: None,
+            origin: IVec3::new(0, 64, 0),
+            rotation: Rotation::Deg0,
+            footprint: IVec2::new(2, 2),
+        }
     }
 
     fn a_baseline() -> Baseline {
@@ -333,7 +339,7 @@ mod tests {
     #[test]
     fn resolve_demolition_target_refuses_a_building_with_no_baseline() {
         let mut city = City::default();
-        let id = city.place_building("house01", IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::new(1, 1)).unwrap();
+        let id = city.place_building("house01", None, IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::new(1, 1)).unwrap();
         let journal = Journal::default();
 
         let result = resolve_demolition_target(IVec3::new(0, 64, 0), &city, &journal);
@@ -343,14 +349,14 @@ mod tests {
     #[test]
     fn resolve_demolition_target_finds_a_journaled_building() {
         let mut city = City::default();
-        let id = city.place_building("house01", IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::new(1, 1)).unwrap();
+        let id = city.place_building("house01", None, IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::new(1, 1)).unwrap();
         let mut journal = Journal::default();
         journal.record_placement(id, a_placement(), a_baseline(), Ledger::default());
 
         let result = resolve_demolition_target(IVec3::new(0, 64, 0), &city, &journal);
         let DemolitionTarget::Found { building, placement, baseline } = result else { panic!("expected Found") };
         assert_eq!(building, id);
-        assert_eq!(placement.definition, "house01");
+        assert_eq!(placement.catalogue_id, "house01");
         assert_eq!(baseline, a_baseline());
     }
 
@@ -391,7 +397,7 @@ mod tests {
         let building = app
             .world_mut()
             .resource_mut::<City>()
-            .place_building("house01", IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::new(1, 1))
+            .place_building("house01", None, IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::new(1, 1))
             .unwrap();
 
         let mut edit = WorldEdit::new();
@@ -445,7 +451,7 @@ mod tests {
         let building = app
             .world_mut()
             .resource_mut::<City>()
-            .place_building("house01", IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::new(1, 1))
+            .place_building("house01", None, IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::new(1, 1))
             .unwrap();
 
         // The restoring edit writes the dirt back; `replaced` is the
@@ -485,7 +491,7 @@ mod tests {
         let building = app
             .world_mut()
             .resource_mut::<City>()
-            .place_building("house01", IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::new(1, 1))
+            .place_building("house01", None, IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::new(1, 1))
             .unwrap();
 
         let mut edit = WorldEdit::new();
@@ -514,7 +520,7 @@ mod tests {
         let building = app
             .world_mut()
             .resource_mut::<City>()
-            .place_building("house01", IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::new(1, 1))
+            .place_building("house01", None, IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::new(1, 1))
             .unwrap();
 
         let task = pool().spawn(async { Err(EditRefusal::Empty) });

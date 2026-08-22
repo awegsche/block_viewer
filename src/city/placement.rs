@@ -656,7 +656,7 @@ mod tests {
     fn resolve_placement_is_invalid_when_a_tile_is_occupied() {
         let world = flat_world(63);
         let mut city = state::City::default();
-        city.place_building("house01", IVec3::new(2, 64, 2), Rotation::Deg0, IVec2::new(1, 1)).unwrap();
+        city.place_building("house01", None, IVec3::new(2, 64, 2), Rotation::Deg0, IVec2::new(1, 1)).unwrap();
 
         let placement = resolve_placement(IVec3::new(2, 63, 2), IVec2::new(3, 3), Rotation::Deg0, 0, &world, &city);
         assert!(!placement.valid, "the footprint overlaps an already-placed building");
@@ -869,7 +869,7 @@ mod tests {
         let world = flat_world(63);
         let (atlas, maps) = atlas_and_maps();
         let mut city = state::City::default();
-        city.place_building("house01", IVec3::new(2, 64, 2), Rotation::Deg0, IVec2::new(1, 1)).unwrap();
+        city.place_building("house01", None, IVec3::new(2, 64, 2), Rotation::Deg0, IVec2::new(1, 1)).unwrap();
         let mut meshes = Assets::<Mesh>::default();
         let mut materials = Assets::<StandardMaterial>::default();
         let terrain_material = materials.add(StandardMaterial::default());

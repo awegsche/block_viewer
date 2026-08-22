@@ -77,10 +77,18 @@ fn production_line(production: &Production) -> Option<String> {
 }
 
 /// Every `requires` id `building` names that no placed building's own
-/// `definition` currently satisfies — empty means unlocked. See the module
+/// definition currently satisfies — empty means unlocked. See the module
 /// docs' "Unlocking, defined for the first time here". A plain function, not
 /// a system, so it's testable directly against a bare [`state::City`] the
 /// same way [`crate::city::placement::resolve_placement`] is.
+///
+/// Ticket 076: a `requires` entry is a *definition* id, so this compares
+/// against [`state::PlacedBuilding::definition_id`] and not, as it did until
+/// then, against the placement's catalogue id — a comparison that only
+/// happened to work while every definition's `.ron` stem matched its
+/// blueprint's. A placement with no definition behind it (the keyboard
+/// stand-in's) unlocks nothing, which is the same "no game data" it already
+/// gets no cost and no production from.
 /// `"10x oak_log"` — what a row's cost will eat out of the stock through
 /// ticket 074's conversion table. Same `count`/short-name shape
 /// [`cost_line`] uses, because it's read in the same glance.
@@ -92,7 +100,7 @@ fn missing_requirements(building: &Building, city: &state::City) -> Vec<String> 
     building
         .requires
         .iter()
-        .filter(|req| !city.buildings().any(|(_, placed)| &placed.definition == *req))
+        .filter(|req| !city.buildings().any(|(_, placed)| placed.definition_id.as_deref() == Some(req.as_str())))
         .cloned()
         .collect()
 }
@@ -334,7 +342,8 @@ mod tests {
     #[test]
     fn a_requirement_is_met_once_that_type_is_placed() {
         let mut city = state::City::default();
-        city.place_building("house01", IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::ONE).unwrap();
+        city.place_building("house01", Some("house01".to_string()), IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::ONE)
+            .unwrap();
         let missing = missing_requirements(&building("carpenter", 2, vec!["house01"]), &city);
         assert!(missing.is_empty());
     }
@@ -342,7 +351,39 @@ mod tests {
     #[test]
     fn only_a_matching_definition_id_satisfies_a_requirement() {
         let mut city = state::City::default();
-        city.place_building("some_other_building", IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::ONE).unwrap();
+        city.place_building(
+            "some_other_building",
+            Some("some_other_building".to_string()),
+            IVec3::new(0, 64, 0),
+            Rotation::Deg0,
+            IVec2::ONE,
+        )
+        .unwrap();
+        let missing = missing_requirements(&building("carpenter", 2, vec!["house01"]), &city);
+        assert_eq!(missing, vec!["house01".to_string()]);
+    }
+
+    /// Ticket 076: the two ids are separate keyspaces, and a `requires` entry
+    /// names a *definition*. A placement whose blueprint happens to be called
+    /// `house01` but whose game data is `manor.ron` does not unlock what
+    /// `house01.ron` unlocks — which is what this check silently got wrong
+    /// while it compared against the catalogue id.
+    #[test]
+    fn a_matching_catalogue_id_alone_does_not_satisfy_a_requirement() {
+        let mut city = state::City::default();
+        city.place_building("house01", Some("manor".to_string()), IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::ONE)
+            .unwrap();
+        let missing = missing_requirements(&building("carpenter", 2, vec!["house01"]), &city);
+        assert_eq!(missing, vec!["house01".to_string()], "the requirement names house01.ron, not house01.nbt");
+    }
+
+    /// A placement made through `city::placement`'s keyboard stand-in has no
+    /// definition behind it at all, so it unlocks nothing — the same "no game
+    /// data" that already leaves it with no cost and no production.
+    #[test]
+    fn a_placement_with_no_definition_unlocks_nothing() {
+        let mut city = state::City::default();
+        city.place_building("house01", None, IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::ONE).unwrap();
         let missing = missing_requirements(&building("carpenter", 2, vec!["house01"]), &city);
         assert_eq!(missing, vec!["house01".to_string()]);
     }

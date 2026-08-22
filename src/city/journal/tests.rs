@@ -20,7 +20,7 @@ fn dirt() -> BlockState {
 }
 
 fn placed(definition: &str, origin: IVec3, footprint: IVec2) -> PlacedBuilding {
-    PlacedBuilding { definition: definition.to_string(), origin, rotation: Rotation::Deg0, footprint }
+    PlacedBuilding { catalogue_id: definition.to_string(), definition_id: None, origin, rotation: Rotation::Deg0, footprint }
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -82,7 +82,7 @@ fn sample_baseline() -> Baseline {
 fn recording_and_undoing_a_placement_removes_the_building_and_restores_the_previous_blocks() {
     let mut city = City::default();
     let id = city
-        .place_building("house01", IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::new(2, 1))
+        .place_building("house01", None, IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::new(2, 1))
         .unwrap();
     let snapshot = city.building(id).unwrap().clone();
 
@@ -113,7 +113,7 @@ fn undo_on_an_empty_journal_is_an_error() {
 fn recording_and_undoing_a_demolition_reinserts_the_building_under_its_original_id() {
     let mut city = City::default();
     let id = city
-        .place_building("house01", IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::new(2, 1))
+        .place_building("house01", None, IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::new(2, 1))
         .unwrap();
     let snapshot = city.remove_building(id).unwrap();
 
@@ -130,7 +130,7 @@ fn recording_and_undoing_a_demolition_reinserts_the_building_under_its_original_
     );
 
     let restored = city.building(id).expect("undo put the building back under its own id");
-    assert_eq!(restored.definition, "house01");
+    assert_eq!(restored.catalogue_id, "house01");
     assert!(journal.is_empty());
 }
 
@@ -138,7 +138,7 @@ fn recording_and_undoing_a_demolition_reinserts_the_building_under_its_original_
 fn undoing_a_demolition_is_refused_when_the_tile_is_occupied_now() {
     let mut city = City::default();
     let id = city
-        .place_building("house01", IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::new(2, 1))
+        .place_building("house01", None, IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::new(2, 1))
         .unwrap();
     let snapshot = city.remove_building(id).unwrap();
 
@@ -146,7 +146,7 @@ fn undoing_a_demolition_is_refused_when_the_tile_is_occupied_now() {
     journal.record_demolition(id, snapshot, sample_baseline(), Ledger::default());
 
     // Something else claims the freed tile before the undo runs.
-    city.place_building("house01", IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::new(1, 1))
+    city.place_building("house01", None, IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::new(1, 1))
         .unwrap();
 
     let err = journal.undo_last(&mut city).unwrap_err();
@@ -269,7 +269,7 @@ impl RegionSource for FixtureRegions {
 /// entry whose baseline says `at` should hold `expected`.
 fn city_and_journal_with_one_building(id_seed: IVec3, at: IVec3, expected: BlockState) -> (City, Journal) {
     let mut city = City::default();
-    let id = city.place_building("house01", id_seed, Rotation::Deg0, IVec2::ONE).unwrap();
+    let id = city.place_building("house01", None, id_seed, Rotation::Deg0, IVec2::ONE).unwrap();
     let building = city.building(id).unwrap().clone();
 
     let mut journal = Journal::default();
@@ -350,7 +350,7 @@ fn a_building_with_no_placement_record_is_skipped_rather_than_reported() {
     // building it has no baseline for, so it says nothing rather than
     // treating the whole thing as unknown or mismatched.
     let mut city = City::default();
-    city.place_building("house01", IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::ONE).unwrap();
+    city.place_building("house01", None, IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::ONE).unwrap();
     let journal = Journal::default();
     let mut source = FixtureRegions { regions: StdBTreeMap::new() };
 
@@ -499,7 +499,7 @@ fn a_version_1_journal_still_loads_with_empty_ledgers() {
             entries: [
                 Placed(
                     building: 7,
-                    placement: (definition: "house01", origin: (1, 64, 2), rotation: Deg0, footprint: (3, 3)),
+                    placement: (catalogue_id: "house01", origin: (1, 64, 2), rotation: Deg0, footprint: (3, 3)),
                     baseline: (
                         written: [((1, 64, 2), (name: "minecraft:stone", properties: []))],
                         previous: [((1, 64, 2), (name: "minecraft:dirt", properties: []))],
@@ -525,7 +525,7 @@ fn undo_last_hands_back_the_entrys_own_ledger() {
     // Undo settles what was settled — not a fresh reading of a definition
     // that may have been edited since.
     let mut city = City::default();
-    let id = city.place_building("house01", IVec3::ZERO, Rotation::Deg0, IVec2::ONE).unwrap();
+    let id = city.place_building("house01", None, IVec3::ZERO, Rotation::Deg0, IVec2::ONE).unwrap();
     let building = city.building(id).unwrap().clone();
     let ledger = Ledger { credited: parcel(&[("minecraft:dirt", 9)]), debited: parcel(&[("minecraft:oak_planks", 40)]) };
 

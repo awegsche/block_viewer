@@ -172,7 +172,7 @@ fn start_undo(
         undo.state = UndoState::Failed { message: "there is nothing to undo".to_string() };
         return;
     };
-    let definition = last.placement().definition.clone();
+    let definition = last.placement().catalogue_id.clone();
     let kind = match last {
         JournalEntry::Placed { .. } => UndoneKind::Placement,
         JournalEntry::Demolished { .. } => UndoneKind::Demolition,
@@ -364,10 +364,11 @@ mod tests {
         let building = app
             .world_mut()
             .resource_mut::<City>()
-            .place_building("house01", IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::ONE)
+            .place_building("house01", None, IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::ONE)
             .unwrap();
         let placement = crate::city::state::PlacedBuilding {
-            definition: "house01".to_string(),
+            catalogue_id: "house01".to_string(),
+            definition_id: None,
             origin: IVec3::new(0, 64, 0),
             rotation: Rotation::Deg0,
             footprint: IVec2::ONE,
@@ -392,7 +393,7 @@ mod tests {
     fn a_finished_undo_reports_done_and_fires_chunks_edited() {
         let mut app = app();
         app.world_mut().resource_mut::<UndoCommand>().pending = Some(PendingUndo {
-            building: super::super::state::City::default().place_building("house01", IVec3::ZERO, Rotation::Deg0, IVec2::ONE).unwrap(),
+            building: super::super::state::City::default().place_building("house01", None, IVec3::ZERO, Rotation::Deg0, IVec2::ONE).unwrap(),
             definition: "house01".to_string(),
             kind: UndoneKind::Placement,
             task: pool().spawn(async {
@@ -420,7 +421,7 @@ mod tests {
     fn a_write_failure_after_dispatch_is_reported_not_rolled_back() {
         let mut app = app();
         app.world_mut().resource_mut::<UndoCommand>().pending = Some(PendingUndo {
-            building: super::super::state::City::default().place_building("house01", IVec3::ZERO, Rotation::Deg0, IVec2::ONE).unwrap(),
+            building: super::super::state::City::default().place_building("house01", None, IVec3::ZERO, Rotation::Deg0, IVec2::ONE).unwrap(),
             definition: "house01".to_string(),
             kind: UndoneKind::Demolition,
             task: pool().spawn(async { Err(EditRefusal::ChunkNotGenerated { chunk: (5, 0) }) }),

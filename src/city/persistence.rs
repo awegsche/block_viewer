@@ -61,6 +61,17 @@
 //! function is the answer when one is worth writing, not a per-field
 //! exception here.
 //!
+//! Bumped again to `7` by ticket 076: a placement now records the
+//! *definition* it was built from ([`super::state::PlacedBuilding::definition_id`])
+//! alongside the catalogue id it always did — and the field that held the
+//! catalogue id, misleadingly called `definition` since 043, is renamed
+//! `catalogue_id` to say so. Both halves make a version-6 file
+//! unreadable-as-written rather than merely incomplete: its `definition`
+//! field is a *catalogue* id, so reading it into the new `definition_id`
+//! would hand every loaded building a definition key that is only correct
+//! while the two stems coincide — which is the exact bug 076 removes.
+//! Refused, same as the five bumps before it.
+//!
 //! Bumped again to `6` by ticket 071: a road cell also remembers whether it
 //! was built as a surface or a *tunnel* piece
 //! ([`super::state::RoadCell::variant`]). Defaulting a version-5 file's
@@ -81,7 +92,7 @@ use crate::blueprint::Rotation;
 
 /// The `CitySave` schema version this build writes and reads. Bumped only
 /// alongside a migration path — see the module docs.
-pub const CURRENT_VERSION: u32 = 6;
+pub const CURRENT_VERSION: u32 = 7;
 
 /// Where [`save_city`]/[`load_city`] look, relative to a save's root
 /// (`SaveMeta::path`) — the roadmap's own `<save>/citybuilder/city.ron`.
@@ -108,7 +119,14 @@ struct CitySave {
 #[derive(Debug, Serialize, Deserialize)]
 struct SavedBuilding {
     id: u64,
-    definition: String,
+    /// The blueprint stem — `super::blueprint::BuildingCatalogue`'s key.
+    /// Called `definition` on disk up to version 6, which is what it had
+    /// never been; see the module docs' version-7 note.
+    catalogue_id: String,
+    /// The `.ron` stem — `super::definition::BuildingDefinitions`'s key, and
+    /// `None` for a placement made without a definition behind it. Ticket
+    /// 076.
+    definition_id: Option<String>,
     origin: (i32, i32, i32),
     rotation: Rotation,
     footprint: (i32, i32),
@@ -185,7 +203,8 @@ pub fn save_city(city: &City, save_root: &Path) -> Result<(), PersistenceError> 
         .buildings()
         .map(|(id, building)| SavedBuilding {
             id: id.as_u64(),
-            definition: building.definition.clone(),
+            catalogue_id: building.catalogue_id.clone(),
+            definition_id: building.definition_id.clone(),
             origin: (building.origin.x, building.origin.y, building.origin.z),
             rotation: building.rotation,
             footprint: (building.footprint.x, building.footprint.y),
@@ -238,7 +257,8 @@ pub fn load_city(save_root: &Path) -> Result<City, PersistenceError> {
         let (x, y, z) = saved.origin;
         let (fx, fz) = saved.footprint;
         let building = PlacedBuilding {
-            definition: saved.definition,
+            catalogue_id: saved.catalogue_id,
+            definition_id: saved.definition_id,
             origin: IVec3::new(x, y, z),
             rotation: saved.rotation,
             footprint: IVec2::new(fx, fz),
@@ -305,10 +325,10 @@ mod tests {
         let dir = temp_dir("full_round_trip");
         let mut city = City::default();
         let a = city
-            .place_building("house01", IVec3::new(10, 64, 20), Rotation::Deg0, IVec2::new(3, 2))
+            .place_building("house01", Some("house01".to_string()), IVec3::new(10, 64, 20), Rotation::Deg0, IVec2::new(3, 2))
             .unwrap();
         let b = city
-            .place_building("house01", IVec3::new(0, 70, 0), Rotation::Deg90, IVec2::new(3, 5))
+            .place_building("house01", None, IVec3::new(0, 70, 0), Rotation::Deg90, IVec2::new(3, 5))
             .unwrap();
         city.add_road_cell(IVec2::new(50, 50), "dirt", 64, None, RoadPieceVariant::Surface).unwrap();
         city.add_road_cell(IVec2::new(50, 51), "paved", 71, None, RoadPieceVariant::Surface).unwrap();
@@ -323,7 +343,16 @@ mod tests {
 
         assert_eq!(loaded.len(), 2);
         let loaded_a = loaded.building(a).expect("building a should round-trip under the same id");
-        assert_eq!(loaded_a.definition, "house01");
+        assert_eq!(loaded_a.catalogue_id, "house01");
+        // Ticket 076: the definition id round-trips as its own field, and a
+        // placement made without one comes back without one rather than
+        // borrowing the catalogue id.
+        assert_eq!(loaded_a.definition_id.as_deref(), Some("house01"));
+        assert_eq!(
+            loaded.building(b).and_then(|placed| placed.definition_id.clone()),
+            None,
+            "building b was placed without a definition and must come back without one"
+        );
         assert_eq!(loaded_a.origin, IVec3::new(10, 64, 20));
         assert_eq!(loaded_a.rotation, Rotation::Deg0);
         assert_eq!(loaded_a.footprint, IVec2::new(3, 2));
@@ -359,6 +388,27 @@ mod tests {
         );
     }
 
+    /// A placement whose definition stem differs from its blueprint stem
+    /// round-trips as two distinct ids — the case that could not be
+    /// represented at all before ticket 076, and the reason `city.ron` moved
+    /// to version 7 rather than defaulting the new field.
+    #[test]
+    fn the_two_ids_round_trip_independently() {
+        let dir = temp_dir("two_ids");
+        let mut city = City::default();
+        let id = city
+            .place_building("house01", Some("manor".to_string()), IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::ONE)
+            .unwrap();
+
+        save_city(&city, &dir).unwrap();
+        let loaded = load_city(&dir).unwrap();
+
+        let placed = loaded.building(id).expect("the building should round-trip under the same id");
+        assert_eq!(placed.catalogue_id, "house01", "the geometry it was placed from");
+        assert_eq!(placed.definition_id.as_deref(), Some("manor"), "the game data it was placed from");
+        assert_eq!(loaded.definition_of(id), Some("manor"));
+    }
+
     /// The scenario the module docs call out: the *highest*-id building is
     /// the one removed before saving, so recomputing `next_id` from the
     /// survivors alone would reissue its id.
@@ -367,10 +417,10 @@ mod tests {
         let dir = temp_dir("next_id_gap");
         let mut city = City::default();
         let first = city
-            .place_building("house01", IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::ONE)
+            .place_building("house01", None, IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::ONE)
             .unwrap();
         let second = city
-            .place_building("house01", IVec3::new(5, 64, 5), Rotation::Deg0, IVec2::ONE)
+            .place_building("house01", None, IVec3::new(5, 64, 5), Rotation::Deg0, IVec2::ONE)
             .unwrap();
         city.remove_building(second).unwrap();
 
@@ -381,7 +431,7 @@ mod tests {
 
         // A fresh placement must not reissue `second`'s old id.
         let third = loaded
-            .place_building("house01", IVec3::new(10, 64, 10), Rotation::Deg0, IVec2::ONE)
+            .place_building("house01", None, IVec3::new(10, 64, 10), Rotation::Deg0, IVec2::ONE)
             .unwrap();
         assert_ne!(third, second, "second's id must never be reissued, even across a save/load round trip");
     }
@@ -521,8 +571,8 @@ mod tests {
                 version: {CURRENT_VERSION},
                 next_id: 2,
                 buildings: [
-                    (id: 0, definition: "house01", origin: (0, 64, 0), rotation: Deg0, footprint: (4, 4)),
-                    (id: 1, definition: "house01", origin: (3, 64, 3), rotation: Deg0, footprint: (4, 4)),
+                    (id: 0, catalogue_id: "house01", origin: (0, 64, 0), rotation: Deg0, footprint: (4, 4)),
+                    (id: 1, catalogue_id: "house01", origin: (3, 64, 3), rotation: Deg0, footprint: (4, 4)),
                 ],
                 road_cells: [],
             )"#
@@ -546,7 +596,7 @@ mod tests {
                 version: {CURRENT_VERSION},
                 next_id: 1,
                 buildings: [
-                    (id: 0, definition: "house01", origin: (0, 64, 0), rotation: Deg0, footprint: (2, 2)),
+                    (id: 0, catalogue_id: "house01", origin: (0, 64, 0), rotation: Deg0, footprint: (2, 2)),
                 ],
                 road_cells: [(x: 0, z: 0, y: 64, style: "dirt", ascent: None, variant: Surface)],
             )"#
