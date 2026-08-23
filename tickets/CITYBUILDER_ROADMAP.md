@@ -2,7 +2,7 @@
 
 Not a work item: the design document for the citybuilder game and the shared
 world-edit infrastructure it uses. High-level tasks here get split into
-numbered tickets in this directory when picked up (**next free number: 081**).
+numbered tickets in this directory when picked up (**next free number: 082**).
 Companion to `ROADMAP.md`, which covers the viewer 001–029.
 
 ## The goal
@@ -511,6 +511,31 @@ evicting the farthest first. Defaults 2 / 30s / 256. Two consequences worth
 remembering: `unload`'s in-flight cancellation is computed against the retain
 square, not the load square, and a lingering entry deliberately survives being
 emitted into `PendingChunkWork::to_unload` (nothing drains that list).
+
+## L — Console logging (`world::warn`, ticket 081)
+
+Nothing here goes through Bevy's `AssetServer` — every console line is one of
+this crate's own `println!`s. The fallback warnings ("no texture mapping for
+X", "unknown biome X", "section has no usable biome data") used to dedupe
+against a `HashSet` built *inside* `build_block_uv_table` /
+`build_block_tint_table` / `build_biome_tint_table` / `decode_chunk`, all of
+which run **per background chunk task** — so "warn once" was once per chunk
+and a few hundred streamed chunks reprinted each line a few hundred times.
+
+`world::warn::WarnLedger` is that set declared as a `static` instead: keyed by
+the missing thing (block name, biome name, chunk/region coordinate) so
+distinct gaps stay enumerable, and printed exactly once per process.
+`WarnLedger::new()` is a `const fn` and callers take one by reference, so it
+is a shared value rather than a hidden global and tests hold their own.
+Ledgers live next to the code that prints: `atlas::MISSING_TEXTURE` (also used
+by `blueprint::mesh`, which re-meshes on every ghost rebuild),
+`tint::MISSING_TINT`, `tint::UNKNOWN_BIOME`, `decode::MISSING_BIOME_DATA`,
+`chunk_pipeline::UNDECODABLE_CHUNK`, `region_cache::UNREADABLE_REGION`.
+
+The last two are the "failed to load" lines proper, and only their *logging*
+is deduped — `region_cache` still retries after `FAILED_RETRY_COOLDOWN` and
+the pipeline still returns `None`. Anything per-user-action (placement
+refusals, save/load summaries, catalogue counts) is deliberately untouched.
 
 ---
 

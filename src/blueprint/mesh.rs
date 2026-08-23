@@ -43,15 +43,13 @@
 //! `mesh_chunk_column` uses for chunk-local X/Z, extended here to Y as well
 //! since a blueprint has no absolute world height of its own.
 
-use std::collections::HashSet;
-
 use bevy::{asset::RenderAssetUsages, prelude::*, render::mesh::Indices};
 
-use crate::world::atlas::{resolve_faces, AtlasUvIndex, BlockFaces};
+use crate::world::atlas::{resolve_faces, AtlasUvIndex, BlockFaces, MISSING_TEXTURE};
 use crate::world::mesh::{
     is_solid_name, push_quad, push_quad_offset, resolve_tint_color, Face, OVERLAY_EPSILON,
 };
-use crate::world::tint::{resolve_block_tint, BiomeColors, BlockTint};
+use crate::world::tint::{resolve_block_tint, BiomeColors, BlockTint, MISSING_TINT};
 
 use super::Blueprint;
 
@@ -70,8 +68,10 @@ struct PaletteEntry {
 /// per-block loop below then does one `Vec` index per block instead of a
 /// name lookup.
 fn resolve_palette(blueprint: &Blueprint, atlas: &AtlasUvIndex) -> Vec<PaletteEntry> {
-    let mut warned_uv = HashSet::new();
-    let mut warned_tint = HashSet::new();
+    // The same process-wide ledgers the world mesher warns against (ticket
+    // 081), not sets local to this call: a blueprint is re-meshed on every
+    // ghost-preview rebuild, and a palette entry the resource pack has no
+    // texture for is the same missing texture each time.
     blueprint
         .palette
         .iter()
@@ -79,8 +79,8 @@ fn resolve_palette(blueprint: &Blueprint, atlas: &AtlasUvIndex) -> Vec<PaletteEn
             let name = state.name.strip_prefix("minecraft:").unwrap_or(&state.name);
             PaletteEntry {
                 solid: is_solid_name(&state.name),
-                faces: resolve_faces(name, atlas, &mut warned_uv),
-                tint: resolve_block_tint(name, atlas, &mut warned_tint),
+                faces: resolve_faces(name, atlas, &MISSING_TEXTURE),
+                tint: resolve_block_tint(name, atlas, &MISSING_TINT),
             }
         })
         .collect()

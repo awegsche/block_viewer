@@ -5,7 +5,6 @@
 //! reading `models/block/*.json` for the general answer is pass 2, a
 //! separate ticket.
 
-use std::collections::HashSet;
 use std::path::Path;
 
 use bevy::image::ImageSampler;
@@ -15,6 +14,7 @@ use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use image::{Rgba, RgbaImage};
 
 use super::block::{BlockId, BlockRegistry};
+use super::warn::WarnLedger;
 
 /// Width/height of one texture tile, in pixels — vanilla's block texture
 /// convention. Animated textures (`water_still.png`, ...) stack extra
@@ -288,11 +288,17 @@ const OVERRIDES: &[(&str, &str, &str, &str)] = &[
     ("lava", "lava_still", "lava_still", "lava_still"),
 ];
 
+/// Block names already reported as having no atlas texture (ticket 081).
+///
+/// Process-wide rather than per [`build_block_uv_table`] call, because that
+/// table is rebuilt in every background chunk task — see [`super::warn`].
+pub(crate) static MISSING_TEXTURE: WarnLedger = WarnLedger::new();
+
 /// `pub(crate)`: [`super::super::blueprint::mesh`] (ticket 037, roadmap B2)
 /// resolves a blueprint palette entry's faces the same way, straight off its
 /// `BlockState::name` — a blueprint has no [`BlockRegistry`] to route
 /// through [`build_block_uv_table`].
-pub(crate) fn resolve_faces(name: &str, atlas: &AtlasUvIndex, warned: &mut HashSet<String>) -> BlockFaces {
+pub(crate) fn resolve_faces(name: &str, atlas: &AtlasUvIndex, warned: &WarnLedger) -> BlockFaces {
     if let Some(&(_, top, bottom, side)) = OVERRIDES.iter().find(|&&(n, ..)| n == name) {
         return BlockFaces {
             top: atlas.tile(top).unwrap_or(atlas.fallback),
@@ -306,7 +312,7 @@ pub(crate) fn resolve_faces(name: &str, atlas: &AtlasUvIndex, warned: &mut HashS
     let bottom = atlas.tile(&format!("{name}_bottom")).or(base);
     let side = atlas.tile(&format!("{name}_side")).or(base);
 
-    if (top.is_none() || bottom.is_none() || side.is_none()) && warned.insert(name.to_string()) {
+    if (top.is_none() || bottom.is_none() || side.is_none()) && warned.first_time(name) {
         println!("block_viewer: no texture mapping for 'minecraft:{name}' — using fallback checker");
     }
 
@@ -320,19 +326,20 @@ pub(crate) fn resolve_faces(name: &str, atlas: &AtlasUvIndex, warned: &mut HashS
 /// Resolves every name interned in `registry` to a [`BlockFaces`], indexed
 /// directly by [`BlockId`] (i.e. `table[id.0 as usize]` — valid because
 /// [`BlockRegistry`] hands out ids `0..len()`). Unmapped names are logged
-/// once each, not once per block instance, so the gaps stay enumerable.
+/// once each — once per *process* (via [`MISSING_TEXTURE`]), not once per
+/// call, since this runs per chunk task — so the gaps stay enumerable
+/// without one line per streamed chunk.
 ///
 /// Takes the atlas's [`AtlasUvIndex`] rather than the full [`TextureAtlas`]
 /// so this can run inside a background chunk-load task (ticket 005-c)
 /// without dragging the packed [`Image`] across the `Send` boundary.
 pub fn build_block_uv_table(registry: &BlockRegistry, atlas: &AtlasUvIndex) -> Vec<BlockFaces> {
-    let mut warned = HashSet::new();
     (0..registry.len())
         .map(|i| {
             let id = BlockId(i as u16);
             let full_name = registry.name(id);
             let name = full_name.strip_prefix("minecraft:").unwrap_or(full_name);
-            resolve_faces(name, atlas, &mut warned)
+            resolve_faces(name, atlas, &MISSING_TEXTURE)
         })
         .collect()
 }
@@ -365,7 +372,7 @@ mod tests {
     #[test]
     fn default_texture_used_for_every_face_when_no_suffixed_variant_exists() {
         let atlas = atlas_with(&[("stone", rect(1.0))]);
-        let faces = resolve_faces("stone", &atlas, &mut HashSet::new());
+        let faces = resolve_faces("stone", &atlas, &WarnLedger::new());
         assert_eq!(faces.top, rect(1.0));
         assert_eq!(faces.bottom, rect(1.0));
         assert_eq!(faces.side, rect(1.0));
@@ -376,22 +383,41 @@ mod tests {
         // oak_log: _top exists, side falls back to the base texture (no
         // oak_log_side.png in the real resource pack either).
         let atlas = atlas_with(&[("oak_log", rect(1.0)), ("oak_log_top", rect(2.0))]);
-        let faces = resolve_faces("oak_log", &atlas, &mut HashSet::new());
+        let faces = resolve_faces("oak_log", &atlas, &WarnLedger::new());
         assert_eq!(faces.top, rect(2.0));
         assert_eq!(faces.bottom, rect(1.0));
         assert_eq!(faces.side, rect(1.0));
     }
 
+    /// The regression ticket 081 fixes: `build_block_uv_table` runs once per
+    /// background chunk task, so its warn-once set has to outlive the call.
+    /// Asserted by asking the process-wide ledger afterwards — a second
+    /// build would find the name already recorded and print nothing.
+    #[test]
+    fn the_missing_texture_ledger_outlives_one_table_build() {
+        // A name no other test warns about, since the ledger is shared.
+        const NAME: &str = "ledger_probe_block";
+        let mut registry = BlockRegistry::new();
+        registry.intern(&format!("minecraft:{NAME}"));
+
+        build_block_uv_table(&registry, &atlas_with(&[]));
+
+        assert!(
+            !MISSING_TEXTURE.first_time(NAME),
+            "the name should still be recorded after the table build returned"
+        );
+    }
+
     #[test]
     fn unmapped_name_falls_back_to_the_checker_and_warns_once() {
         let atlas = atlas_with(&[]);
-        let mut warned = HashSet::new();
-        let faces = resolve_faces("some_unknown_block", &atlas, &mut warned);
+        let warned = WarnLedger::new();
+        let faces = resolve_faces("some_unknown_block", &atlas, &warned);
         assert_eq!(faces.top, atlas.fallback);
         assert_eq!(faces.bottom, atlas.fallback);
         assert_eq!(faces.side, atlas.fallback);
 
-        resolve_faces("some_unknown_block", &atlas, &mut warned);
+        resolve_faces("some_unknown_block", &atlas, &warned);
         assert_eq!(
             warned.len(),
             1,
@@ -406,7 +432,7 @@ mod tests {
             ("grass_block_side", rect(2.0)),
             ("dirt", rect(3.0)),
         ]);
-        let faces = resolve_faces("grass_block", &atlas, &mut HashSet::new());
+        let faces = resolve_faces("grass_block", &atlas, &WarnLedger::new());
         assert_eq!(faces.top, rect(1.0));
         assert_eq!(faces.side, rect(2.0));
         assert_eq!(faces.bottom, rect(3.0), "grass's underside is dirt, not a (nonexistent) grass_block_bottom.png");

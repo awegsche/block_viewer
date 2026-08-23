@@ -1282,3 +1282,14 @@ Y=0 in the world and won't be cleaned up by this fix — see the ticket.
   should freeze `n` and the elapsed clock together. Then demolish the road
   between them and confirm the farm goes back to `unserved` and eventually
   `buffer full`.
+- [ ] **081 the console is actually quiet now.** `cargo run --bin citybuilder`
+  against a real save, then fly around long enough to stream a few hundred
+  chunks. Each distinct `no texture mapping for 'minecraft:<name>' — using
+  fallback checker` / `unknown biome ...` line should appear **exactly once**
+  for the whole session, no matter how much terrain loads (before 081 they
+  reprinted once per chunk), and `section has no usable biome data` should
+  appear at most once total. What should still show up normally: the startup
+  lines (save loaded, atlas packed, catalogues loaded), `Chunk streaming:
+  camera entered chunk ...`, and every placement/road/save message — those
+  were deliberately left alone, so if any of *those* went missing something
+  is wrong.

@@ -72,6 +72,7 @@ use bevy::tasks::{block_on, poll_once, AsyncComputeTaskPool, Task};
 
 use crate::region_cache::{chunk_to_region_coord, RegionCache};
 use crate::streaming::PendingChunkWork;
+use crate::world::warn::WarnLedger;
 use crate::world::{self, AtlasUvIndex, BiomeRegistry, BlockRegistry, ChunkColumn, ColorMaps};
 use crate::{BlockMesh, DecodedWorld};
 
@@ -842,6 +843,10 @@ fn mesh_column_with_neighbors(
     )
 }
 
+/// Chunk coordinates already reported as undecodable (ticket 081), so a
+/// corrupt chunk is logged once per run rather than once per re-stream.
+static UNDECODABLE_CHUNK: WarnLedger = WarnLedger::new();
+
 /// Runs entirely inside a background task: resolves `coord`'s region via
 /// the shared [`RegionCache`] (005-b), decodes the chunk (002) if it hasn't
 /// been already, and meshes it (003) against whatever neighbour columns
@@ -882,7 +887,13 @@ fn load_and_mesh_chunk(
         // for genuine failures — corrupt/unexpected NBT — to be logged).
         Err(world::DecodeError::NotFullyGenerated(_)) => return None,
         Err(err) => {
-            println!("block_viewer: skipping chunk {coord:?} — failed to decode: {err}");
+            // Once per chunk coordinate for the whole run (ticket 081), not
+            // once per attempt: a chunk that streams out and back in is the
+            // same corrupt chunk, and re-reporting it every time the camera
+            // revisits the area drowns out everything else.
+            if UNDECODABLE_CHUNK.first_time(&format!("{coord:?}")) {
+                println!("block_viewer: skipping chunk {coord:?} — failed to decode: {err}");
+            }
             return None;
         }
     };

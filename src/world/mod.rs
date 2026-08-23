@@ -14,6 +14,7 @@ pub mod block;
 pub mod decode;
 pub mod mesh;
 pub mod tint;
+pub(crate) mod warn;
 
 // Not every re-export has a caller in this repo yet (`BlockId`, the raw
 // section/error types, and `is_solid` are part of the public API for

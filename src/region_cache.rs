@@ -19,6 +19,8 @@ use mc_anvil::chunkregion::ChunkRegion;
 use mc_anvil::region::{Region, REGION_WIDTH_IN_CHUNKS};
 use mc_anvil::{MCLoadError, SaveMeta};
 
+use crate::world::warn::WarnLedger;
+
 /// How long a region that failed to load stays remembered as failed before
 /// [`RegionCache::load_if_absent`] will try it again (ticket 062 follow-up).
 /// A region's own file can fail transiently — Windows Explorer or an
@@ -31,6 +33,10 @@ use mc_anvil::{MCLoadError, SaveMeta};
 /// different, permanent case and never touches `failed` at all — see
 /// [`RegionCache::load_if_absent`].
 const FAILED_RETRY_COOLDOWN: Duration = Duration::from_secs(10);
+
+/// Region coordinates already reported as unreadable (ticket 081) — the
+/// cooldown above governs *retries*, this governs the console line.
+static UNREADABLE_REGION: WarnLedger = WarnLedger::new();
 
 /// Converts a chunk coordinate into the coordinate of the region that
 /// contains it. Anvil regions are 32x32 chunks; `div_euclid` floors toward
@@ -179,9 +185,15 @@ impl RegionCache {
             let mut region: ChunkRegion = Region::new(rx, rz, path).into();
             if let Err(err) = region.load_chunks() {
                 self.failed.insert(region_coord, Instant::now());
-                println!(
-                    "block_viewer: skipping region ({rx}, {rz}) — failed to load {path_display}: {err}"
-                );
+                // Logged once per region for the whole run (ticket 081).
+                // The retry below is unchanged — but a region that stays
+                // unreadable would otherwise print this line afresh every
+                // time `FAILED_RETRY_COOLDOWN` expires, forever.
+                if UNREADABLE_REGION.first_time(&format!("{rx},{rz}")) {
+                    println!(
+                        "block_viewer: skipping region ({rx}, {rz}) — failed to load {path_display}: {err}"
+                    );
+                }
                 return Err(err);
             }
             // A cooldown-expired retry that succeeds clears the old failure

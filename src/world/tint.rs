@@ -10,6 +10,11 @@
 //! - [`build_biome_tint_table`] — what each biome resolves a tint source to
 //!   ([`BiomeColors`], indexed by [`super::BiomeId`]).
 //!
+//! Because both are per-task, the "this has no tint mapping" / "unknown
+//! biome" warnings dedupe against the process-wide ledgers in
+//! [`super::warn`] rather than a set local to the build (ticket 081) —
+//! otherwise every streamed chunk reprints them.
+//!
 //! `mesh_chunk_column` multiplies the two together per emitted face.
 //!
 //! ## Colour space
@@ -20,7 +25,6 @@
 //! face. Storing sRGB and converting later would also work but costs a
 //! conversion per face, and the type wouldn't say which space it's in.
 
-use std::collections::HashSet;
 use std::path::Path;
 
 use bevy::prelude::*;
@@ -29,6 +33,7 @@ use super::atlas::{AtlasUvIndex, UvRect};
 use super::biome::{BiomeId, BiomeRegistry};
 use super::biome_data;
 use super::block::{BlockId, BlockRegistry};
+use super::warn::WarnLedger;
 
 /// What a face is tinted *by* — resolved against a [`BiomeColors`] (for the
 /// biome-dependent variants) at the point a face is emitted.
@@ -223,16 +228,24 @@ const WATER_TINTED: &[&str] = &["water", "water_cauldron", "bubble_column"];
 /// side split `super::atlas::resolve_faces` resolves.
 const GRASS_SIDE_OVERLAY: &str = "grass_block_side_overlay";
 
+/// Names already reported as missing a tint mapping (ticket 081) — the
+/// grass side overlay, and `_leaves` blocks the tables below don't cover.
+///
+/// Process-wide rather than per [`build_block_tint_table`] call, because
+/// that table is rebuilt in every background chunk task — see
+/// [`super::warn`].
+pub(crate) static MISSING_TINT: WarnLedger = WarnLedger::new();
+
 /// `pub(crate)`: [`super::super::blueprint::mesh`] (ticket 037, roadmap B2)
 /// resolves a blueprint palette entry's tint the same way, straight off its
 /// `BlockState::name` — a blueprint has no [`BlockRegistry`] to route
 /// through [`build_block_tint_table`].
-pub(crate) fn resolve_block_tint(name: &str, atlas: &AtlasUvIndex, warned: &mut HashSet<String>) -> BlockTint {
+pub(crate) fn resolve_block_tint(name: &str, atlas: &AtlasUvIndex, warned: &WarnLedger) -> BlockTint {
     if name == "grass_block" {
         // Bottom is dirt, side is dirt + 014's green fringe overlay — only
         // the top face is grass texture at all.
         let side_overlay = atlas.tile(GRASS_SIDE_OVERLAY).map(|uv| (uv, TintSource::Grass));
-        if side_overlay.is_none() && warned.insert(GRASS_SIDE_OVERLAY.to_string()) {
+        if side_overlay.is_none() && warned.first_time(GRASS_SIDE_OVERLAY) {
             println!(
                 "block_viewer: no '{GRASS_SIDE_OVERLAY}' texture found — grass blocks will have plain dirt sides"
             );
@@ -260,10 +273,7 @@ pub(crate) fn resolve_block_tint(name: &str, atlas: &AtlasUvIndex, warned: &mut 
     // Heuristic for catching an omission in the tables above: a `_leaves`
     // block not accounted for anywhere (tinted, fixed, or explicitly
     // pre-coloured) is suspicious enough to warn about once.
-    if !NO_TINT_LEAVES.contains(&name)
-        && name.ends_with("_leaves")
-        && warned.insert(name.to_string())
-    {
+    if !NO_TINT_LEAVES.contains(&name) && name.ends_with("_leaves") && warned.first_time(name) {
         println!(
             "block_viewer: 'minecraft:{name}' looks like it should be tinted (ends with _leaves) but has no tint mapping"
         );
@@ -280,23 +290,26 @@ pub(crate) fn resolve_block_tint(name: &str, atlas: &AtlasUvIndex, warned: &mut 
 /// a texture lookup outside any [`super::atlas::BlockFaces`]'s top/bottom/
 /// side split, so it can't come from `uv_table` the way other UVs do.
 pub fn build_block_tint_table(registry: &BlockRegistry, atlas: &AtlasUvIndex) -> Vec<BlockTint> {
-    let mut warned = HashSet::new();
     (0..registry.len())
         .map(|i| {
             let id = BlockId(i as u16);
             let full_name = registry.name(id);
             let name = full_name.strip_prefix("minecraft:").unwrap_or(full_name);
-            resolve_block_tint(name, atlas, &mut warned)
+            resolve_block_tint(name, atlas, &MISSING_TINT)
         })
         .collect()
 }
 
+/// Biome names already reported as absent from [`biome_data`]'s table
+/// (ticket 081). Process-wide, for the same reason as [`MISSING_TINT`].
+static UNKNOWN_BIOME: WarnLedger = WarnLedger::new();
+
 /// Resolves one biome's [`BiomeColors`], applying the hardcoded exceptions
 /// (swamp/mangrove_swamp, badlands family, dark_forest) documented in ticket
 /// 013 before falling back to a plain colormap lookup.
-fn biome_colors_for(name: &str, maps: &ColorMaps, warned: &mut HashSet<String>) -> BiomeColors {
+fn biome_colors_for(name: &str, maps: &ColorMaps, warned: &WarnLedger) -> BiomeColors {
     let params = biome_data::params_for(name).unwrap_or_else(|| {
-        if warned.insert(name.to_string()) {
+        if warned.first_time(name) {
             println!(
                 "block_viewer: unknown biome 'minecraft:{name}' — falling back to plains tint values"
             );
@@ -342,13 +355,12 @@ fn biome_colors_for(name: &str, maps: &ColorMaps, warned: &mut HashSet<String>) 
 /// Resolves every name interned in `registry` to a [`BiomeColors`], indexed
 /// directly by [`BiomeId`], mirroring [`build_block_tint_table`].
 pub fn build_biome_tint_table(registry: &BiomeRegistry, maps: &ColorMaps) -> Vec<BiomeColors> {
-    let mut warned = HashSet::new();
     (0..registry.len())
         .map(|i| {
             let id = BiomeId(i as u16);
             let full_name = registry.name(id);
             let name = full_name.strip_prefix("minecraft:").unwrap_or(full_name);
-            biome_colors_for(name, maps, &mut warned)
+            biome_colors_for(name, maps, &UNKNOWN_BIOME)
         })
         .collect()
 }

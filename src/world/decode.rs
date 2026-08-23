@@ -11,12 +11,11 @@
 //! minimum on the bit width, and a 4x4x4 (not 16x16x16) grid. See
 //! [`decode_biomes`] for the differences in full.
 
-use std::collections::HashSet;
-
 use rnbt::NbtField;
 
 use super::biome::{BiomeId, BiomeRegistry};
 use super::block::{BlockId, BlockRegistry};
+use super::warn::WarnLedger;
 
 /// Width/height/depth of a chunk section, in blocks.
 pub const SECTION_SIZE: usize = 16;
@@ -301,12 +300,6 @@ pub fn decode_chunk(
         .as_compound_list()
         .ok_or(DecodeError::UnexpectedType("sections"))?;
 
-    // Dedupes the "no biome data" log line to once per chunk (mirrors
-    // `atlas::build_block_uv_table`'s per-call warned set) rather than once
-    // per missing section — a chunk missing biomes on one section is
-    // usually missing it on all of them.
-    let mut warned_missing_biomes: HashSet<&'static str> = HashSet::new();
-
     let mut sections = Vec::new();
     for section in section_entries {
         // Select sections by their own `Y` tag, not list position — the
@@ -361,7 +354,7 @@ pub fn decode_chunk(
                 continue;
             }
             let section_biomes =
-                decode_biomes(section, biomes, &mut warned_missing_biomes)?;
+                decode_biomes(section, biomes)?;
             sections.push(ChunkSection {
                 y,
                 blocks: Box::new([id; SECTION_VOLUME]),
@@ -394,7 +387,7 @@ pub fn decode_chunk(
                 .ok_or(DecodeError::PaletteIndexOutOfRange(palette_index))?;
         }
 
-        let section_biomes = decode_biomes(section, biomes, &mut warned_missing_biomes)?;
+        let section_biomes = decode_biomes(section, biomes)?;
         sections.push(ChunkSection { y, blocks, biomes: section_biomes });
     }
 
@@ -414,32 +407,37 @@ pub fn decode_chunk(
 ///    16x16x16 — same X-fastest, Y-slowest index order as `block_states`,
 ///    just at a quarter resolution per axis.
 ///
+/// Whether the "no usable biome data" line has already been printed
+/// (ticket 081) — one key, so it is one line for the whole run.
+static MISSING_BIOME_DATA: WarnLedger = WarnLedger::new();
+
 /// A section with no `biomes` compound, or an empty palette, fills with
-/// [`BiomeRegistry::PLAINS`] and logs once per chunk via `warned` (the
-/// caller's `HashSet`, not a fresh one per section) rather than once per
-/// section.
+/// [`BiomeRegistry::PLAINS`] and logs **once per process** via
+/// [`MISSING_BIOME_DATA`] (ticket 081). This runs per section of per chunk
+/// of a streaming world, and a save that is missing biome data is missing it
+/// on section after section, so anything finer-grained than that reprints
+/// the same line hundreds of times.
 fn decode_biomes(
     section: &NbtField,
     registry: &mut BiomeRegistry,
-    warned: &mut HashSet<&'static str>,
 ) -> Result<Box<[BiomeId; BIOME_GRID_VOLUME]>, DecodeError> {
-    let missing = |warned: &mut HashSet<&'static str>| {
-        if warned.insert("biomes") {
+    let missing = || {
+        if MISSING_BIOME_DATA.first_time("biomes") {
             println!(
-                "block_viewer: section has no usable biome data — defaulting to minecraft:plains"
+                "block_viewer: section has no usable biome data — defaulting to minecraft:plains (logged once)"
             );
         }
         Box::new([BiomeRegistry::PLAINS; BIOME_GRID_VOLUME])
     };
 
     let Some(biomes) = section.get("biomes") else {
-        return Ok(missing(warned));
+        return Ok(missing());
     };
     let Some(palette) = biomes.get_list("palette").and_then(|list| list.as_string_list()) else {
-        return Ok(missing(warned));
+        return Ok(missing());
     };
     if palette.is_empty() {
-        return Ok(missing(warned));
+        return Ok(missing());
     }
 
     let palette_ids: Vec<BiomeId> = palette.iter().map(|name| registry.intern(name)).collect();
