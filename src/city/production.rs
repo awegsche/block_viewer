@@ -874,7 +874,7 @@ mod tests {
 
     // --- haulage (ticket 080) -----------------------------------------------
 
-    use crate::city::definition::{Building, FootprintSpec, Integrity, LoadedBuilding, Warehouse};
+    use crate::city::definition::{Building, Category, FootprintSpec, Integrity, LoadedBuilding, Warehouse};
     use crate::city::road::RoadPieceVariant;
     use crate::city::road_definition::RoadTypes;
     use crate::city::state::ROAD_CELL_SIZE;
@@ -893,6 +893,7 @@ mod tests {
                 production,
                 cost: Vec::new(),
                 warehouse,
+                category: Category::Production,
                 integrity: Integrity { pristine_above: 0.95, ruined_below: 0.6 },
             },
             footprint: IVec2::ONE,

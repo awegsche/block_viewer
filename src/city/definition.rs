@@ -120,7 +120,31 @@ pub struct Building {
     /// implement. A tier-2 warehouse is a second `.ron` with bigger numbers.
     #[serde(default)]
     pub warehouse: Option<Warehouse>,
+    /// Which section of the build menu (ticket 082, roadmap G1) this
+    /// building lists under. `#[serde(default)]` rather than required —
+    /// unlike `blueprint`/`footprint` this gates no real validation, only
+    /// where a menu draws a row, so treating a missing value as a schema
+    /// error would only cost every existing fixture a field for no matching
+    /// safety gained. Defaults to `Production` rather than, say,
+    /// `Residential`: a mis-set category reads as "producer with nothing to
+    /// produce" faster than it reads as "house that doesn't house anyone".
+    #[serde(default)]
+    pub category: Category,
     pub integrity: Integrity,
+}
+
+/// The build menu's top-level grouping (ticket 082, roadmap G1) — orthogonal
+/// to [`Building::tier`], which is the sub-heading within a category.
+/// `Street` is never a [`Building`] a `.ron` file actually declares: road
+/// styles live in [`super::road_definition::RoadTypes`] instead, and the
+/// build menu's `Street` section lists those, not [`BuildingDefinitions`]
+/// entries — see `city::ui::build_menu`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+pub enum Category {
+    #[default]
+    Production,
+    Residential,
+    Street,
 }
 
 /// What a warehouse does, and the four knobs a tier moves — see
@@ -762,6 +786,55 @@ Building(
         assert!(skipped.is_empty(), "{skipped:?}");
         let entry = definitions.get("house01").unwrap();
         assert_eq!(entry.footprint, IVec2::new(10, 12));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Ticket 082: `category` is `#[serde(default)]` rather than required —
+    /// every other fixture in this file already relies on this (none of them
+    /// name a `category:` field), but this is the one that says why: a file
+    /// with no opinion on it loads as `Production`, not as a schema error.
+    #[test]
+    fn a_missing_category_defaults_to_production() {
+        let catalogue = catalogue_with_house01();
+        let dir = temp_dir("missing_category");
+        fs::write(
+            dir.join("house01.ron"),
+            r#"Building(
+                name: "House",
+                blueprint: "house01.nbt",
+                tier: 1,
+                integrity: Integrity(pristine_above: 0.9, ruined_below: 0.5),
+            )"#,
+        )
+        .unwrap();
+
+        let (definitions, skipped) = load_definitions_dir(&dir, &catalogue);
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert_eq!(definitions.get("house01").unwrap().building.category, Category::Production);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_explicit_category_is_read_back() {
+        let catalogue = catalogue_with_house01();
+        let dir = temp_dir("explicit_category");
+        fs::write(
+            dir.join("house01.ron"),
+            r#"Building(
+                name: "House",
+                blueprint: "house01.nbt",
+                tier: 1,
+                category: Residential,
+                integrity: Integrity(pristine_above: 0.9, ruined_below: 0.5),
+            )"#,
+        )
+        .unwrap();
+
+        let (definitions, skipped) = load_definitions_dir(&dir, &catalogue);
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert_eq!(definitions.get("house01").unwrap().building.category, Category::Residential);
 
         fs::remove_dir_all(&dir).ok();
     }

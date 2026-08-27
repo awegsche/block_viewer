@@ -2,7 +2,7 @@
 
 Not a work item: the design document for the citybuilder game and the shared
 world-edit infrastructure it uses. High-level tasks here get split into
-numbered tickets in this directory when picked up (**next free number: 082**).
+numbered tickets in this directory when picked up (**next free number: 085**).
 Companion to `ROADMAP.md`, which covers the viewer 001–029.
 
 ## The goal

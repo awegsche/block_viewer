@@ -9,6 +9,7 @@ Building(
     blueprint: "house01.nbt",
     tier: 2,
     requires: ["warehouse01"],
+    category: Production,
     footprint: Explicit(x: 11, z: 11),
     cost: [
         (block: "minecraft:oak_planks", count: 128),

@@ -41,11 +41,28 @@
 use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts};
 
-use super::super::definition::{Building, BuildingDefinitions, Cost, LoadedBuilding, Production};
+use super::super::definition::{Building, BuildingDefinitions, Category, Cost, LoadedBuilding, Production};
 use super::super::economy::{self, EconomyConfig};
 use super::super::inventory::Stock;
 use super::super::placement::{rotation_degrees, PlacementSelection};
+use super::super::road_build::RoadStyleSelection;
+use super::super::road_definition::{LoadedRoadType, RoadTypes};
 use super::super::state;
+use super::super::tool::ActiveTool;
+
+/// The build menu's sections, outer to inner (ticket 082, roadmap G1) — a
+/// player thinking "I want to build a farm" goes to one section rather than
+/// scanning every tier for it. `Building::tier` stays the sub-heading within
+/// a section.
+const CATEGORIES: [Category; 3] = [Category::Production, Category::Residential, Category::Street];
+
+fn category_label(category: Category) -> &'static str {
+    match category {
+        Category::Production => "Production",
+        Category::Residential => "Residential",
+        Category::Street => "Street",
+    }
+}
 
 /// A block or item id's short display form — `"minecraft:oak_planks"` ->
 /// `"oak_planks"`. Every id this panel shows is already namespaced
@@ -105,16 +122,16 @@ fn missing_requirements(building: &Building, city: &state::City) -> Vec<String> 
         .collect()
 }
 
-/// [`BuildingDefinitions::iter`]'s entries, grouped by tier and sorted by id
-/// within a tier — `BuildingDefinitions` is keyed by a `HashMap`, whose
-/// iteration order a menu can't be built on.
-fn sorted_entries(definitions: &BuildingDefinitions) -> Vec<&LoadedBuilding> {
-    let mut entries: Vec<&LoadedBuilding> = definitions.iter().collect();
+/// [`BuildingDefinitions::iter`]'s entries matching `category`, sorted by
+/// tier then id within it — `BuildingDefinitions` is keyed by a `HashMap`,
+/// whose iteration order a menu can't be built on.
+fn entries_in_category(definitions: &BuildingDefinitions, category: Category) -> Vec<&LoadedBuilding> {
+    let mut entries: Vec<&LoadedBuilding> = definitions.iter().filter(|entry| entry.building.category == category).collect();
     sort_by_tier_then_id(&mut entries);
     entries
 }
 
-/// The comparison [`sorted_entries`] applies, split out so it's directly
+/// The comparison [`entries_in_category`] applies, split out so it's directly
 /// testable against a hand-built `Vec<&LoadedBuilding>` — every field of
 /// [`LoadedBuilding`] is public, but [`BuildingDefinitions`] itself has no
 /// public constructor beyond loading real files off disk (see
@@ -137,6 +154,11 @@ fn requirement_label(id: &str, definitions: &BuildingDefinitions) -> String {
 
 /// One row: name, footprint, cost, production, and either a click target (if
 /// unlocked) or a disabled row naming what's missing (if not).
+///
+/// Clicking also switches `*tool` to [`ActiveTool::Building`] (ticket 082) —
+/// the menu is now how placement mode is *entered*, mirroring the Street
+/// section's own row switching to [`ActiveTool::Road`].
+#[allow(clippy::too_many_arguments)]
 fn entry_row(
     ui: &mut egui::Ui,
     entry: &LoadedBuilding,
@@ -145,6 +167,7 @@ fn entry_row(
     city: &state::City,
     stock: &Stock,
     economy: &EconomyConfig,
+    tool: &mut ActiveTool,
 ) {
     let missing = missing_requirements(&entry.building, city);
     let unlocked = missing.is_empty();
@@ -160,6 +183,7 @@ fn entry_row(
         // it — see `PlacementSelection::definition_id`.
         selection.definition_id = Some(entry.id.clone());
         selection.y_offset = 0;
+        *tool = ActiveTool::Building;
     }
     if !unlocked {
         response.on_disabled_hover_text(format!("Requires: {}", missing_names()));
@@ -253,11 +277,41 @@ fn key_legend(ui: &mut egui::Ui) {
     });
 }
 
+/// The `Street` section (ticket 082): one row per loaded [`RoadType`]
+/// (`super::super::road_definition::RoadType`), not a [`BuildingDefinitions`]
+/// entry — see the module docs' "Street category". Clicking a row selects
+/// that style (mirroring `road_build`'s `[`/`]` stand-in, which keeps working
+/// alongside this) and switches `*tool` to [`ActiveTool::Road`], the road
+/// tool's counterpart of a building row switching to [`ActiveTool::Building`].
+fn street_section(ui: &mut egui::Ui, road_types: Option<&RoadTypes>, style_selection: &mut RoadStyleSelection, tool: &mut ActiveTool) {
+    let mut entries: Vec<&LoadedRoadType> = road_types.map(|types| types.iter().collect()).unwrap_or_default();
+    entries.sort_by(|a, b| a.id.cmp(&b.id));
+
+    if entries.is_empty() {
+        // Today's actual state per ticket 060/063's own note: `dirt` has a
+        // type file but no loaded geometry yet — see
+        // `assets/city/roads/dirt/README.md`.
+        ui.label("(no road styles loaded)");
+        return;
+    }
+
+    for entry in entries {
+        let selected = style_selection.current.as_deref() == Some(entry.id.as_str());
+        let label =
+            format!("{}  (speed {}, capacity {})", entry.road_type.name, entry.road_type.travel_speed, entry.road_type.capacity);
+        if ui.add(egui::SelectableLabel::new(selected, label)).clicked() {
+            style_selection.current = Some(entry.id.clone());
+            *tool = ActiveTool::Road;
+        }
+    }
+}
+
 /// Egui window: the build menu. Empty definitions (nothing loaded, or an
 /// `assets/city/buildings` directory that doesn't exist) shows a plain
 /// message rather than an empty, confusing window — the same "(nothing
 /// selected...)"-style tone the rest of the crate's panels use for an empty
 /// state that isn't an error.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn build_menu_panel(
     mut contexts: EguiContexts,
     definitions: Option<Res<BuildingDefinitions>>,
@@ -265,7 +319,19 @@ pub(super) fn build_menu_panel(
     stock: Res<Stock>,
     economy: Res<EconomyConfig>,
     mut selection: ResMut<PlacementSelection>,
+    road_types: Option<Res<RoadTypes>>,
+    mut style_selection: Option<ResMut<RoadStyleSelection>>,
+    mut tool: Option<ResMut<ActiveTool>>,
 ) {
+    // `entry_row`/`street_section` need `&mut ActiveTool`/`RoadStyleSelection`
+    // to switch tools on a click — both are optional resources (same
+    // tolerant shape `tool::ActiveTool`'s own docs describe) so a minimal
+    // test `App` that never adds `ToolPlugin`/`RoadBuildPlugin` doesn't panic
+    // here. A fallback owned value absorbs the write when either is missing.
+    let mut fallback_tool = ActiveTool::default();
+    let tool = tool.as_deref_mut().unwrap_or(&mut fallback_tool);
+    let mut fallback_style_selection = RoadStyleSelection::default();
+    let style_selection = style_selection.as_deref_mut().unwrap_or(&mut fallback_style_selection);
     egui::Window::new("Build").show(contexts.ctx_mut(), |ui| {
         let Some(definitions) = definitions else {
             ui.label("(no building definitions loaded)");
@@ -284,14 +350,28 @@ pub(super) fn build_menu_panel(
         }
         ui.separator();
 
-        let entries = sorted_entries(&definitions);
-        let mut current_tier = None;
-        for entry in entries {
-            if current_tier != Some(entry.building.tier) {
-                current_tier = Some(entry.building.tier);
-                ui.heading(format!("Tier {}", entry.building.tier));
+        for category in CATEGORIES {
+            ui.heading(category_label(category));
+            if category == Category::Street {
+                street_section(ui, road_types.as_deref(), &mut *style_selection, &mut *tool);
+                ui.separator();
+                continue;
             }
-            entry_row(ui, entry, &definitions, &mut selection, &city, &stock, &economy);
+
+            let entries = entries_in_category(&definitions, category);
+            if entries.is_empty() {
+                ui.label("(nothing here yet)");
+            } else {
+                let mut current_tier = None;
+                for entry in entries {
+                    if current_tier != Some(entry.building.tier) {
+                        current_tier = Some(entry.building.tier);
+                        ui.strong(format!("Tier {}", entry.building.tier));
+                    }
+                    entry_row(ui, entry, &definitions, &mut selection, &city, &stock, &economy, &mut *tool);
+                    ui.separator();
+                }
+            }
             ui.separator();
         }
 
@@ -303,7 +383,7 @@ pub(super) fn build_menu_panel(
 mod tests {
     use super::*;
     use crate::blueprint::Rotation;
-    use crate::city::definition::{FootprintSpec, Integrity, ProductionItem};
+    use crate::city::definition::{Category, FootprintSpec, Integrity, ProductionItem};
     use std::path::PathBuf;
 
     fn building(name: &str, tier: u32, requires: Vec<&str>) -> Building {
@@ -316,6 +396,7 @@ mod tests {
             production: None,
             cost: Vec::new(),
             warehouse: None,
+            category: Category::Production,
             integrity: Integrity { pristine_above: 0.95, ruined_below: 0.6 },
         }
     }
@@ -402,6 +483,25 @@ mod tests {
 
         let ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
         assert_eq!(ids, vec!["aaa_tier1", "zzz_tier1", "mid_tier2"], "tier 1 before tier 2, alphabetical within a tier");
+    }
+
+    // --- entries_in_category (ticket 082) ------------------------------------
+
+    #[test]
+    fn entries_in_category_only_returns_matching_entries() {
+        let mut farm = building("farm", 1, vec![]);
+        farm.category = Category::Production;
+        let mut house = building("house", 1, vec![]);
+        house.category = Category::Residential;
+        let defs = BuildingDefinitions::from_entries(vec![loaded("farm", farm), loaded("house", house)]);
+
+        let production: Vec<&str> = entries_in_category(&defs, Category::Production).iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(production, vec!["farm"]);
+
+        let residential: Vec<&str> = entries_in_category(&defs, Category::Residential).iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(residential, vec!["house"]);
+
+        assert!(entries_in_category(&defs, Category::Street).is_empty(), "Street is never a BuildingDefinitions entry");
     }
 
     // --- cost_line / production_line ---------------------------------------

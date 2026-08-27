@@ -363,7 +363,7 @@ impl PartialOrd for Step {
 mod tests {
     use super::*;
     use crate::blueprint::Rotation;
-    use crate::city::definition::{Building, FootprintSpec, Integrity, LoadedBuilding, Production, ProductionItem};
+    use crate::city::definition::{Building, Category, FootprintSpec, Integrity, LoadedBuilding, Production, ProductionItem};
     use crate::city::road::RoadPieceVariant;
     use crate::city::road_definition::{LoadedRoadType, RoadType};
     use crate::city::state::ROAD_CELL_SIZE;
@@ -380,6 +380,7 @@ mod tests {
             production,
             cost: Vec::new(),
             warehouse,
+            category: Category::Production,
             integrity: Integrity { pristine_above: 0.95, ruined_below: 0.6 },
         }
     }
