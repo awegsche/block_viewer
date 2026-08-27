@@ -1,0 +1,29 @@
+// Real geometry (unlike farm01/warehouse01/02, which still point at
+// house01.nbt as a placeholder) — the lumberjack's hut, main building only.
+// The tree farm this belongs to isn't designed yet:
+//   - whether the footprint stays FromBlueprint or widens to reserve ground
+//     for Anno-style farm tiles placed around it (working radius, tile
+//     count -> production %) is still open;
+//   - `production` is left out entirely rather than stubbed, since output
+//     here is meant to land in an in-world chest rather than an abstract
+//     buffer (078's model), and nothing scans a blueprint for chest
+//     positions yet. The exported .nbt now has chests in it for exactly
+//     that; the catalogue/definition loaders don't read block entities at
+//     all yet (roadmap: block entities are dropped on write).
+// Both come back once the tree-farm mechanic itself is settled.
+Building(
+    name: "Lumberjack's Hut",
+    blueprint: "lumber.nbt",
+    tier: 1,
+    requires: [],
+    category: Production,
+    footprint: FromBlueprint,
+    cost: [
+        (block: "minecraft:oak_planks", count: 20),
+        (block: "minecraft:oak_log", count: 10),
+    ],
+    integrity: Integrity(
+        pristine_above: 0.95,
+        ruined_below: 0.60,
+    ),
+)
