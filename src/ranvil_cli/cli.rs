@@ -46,7 +46,11 @@ pub struct Cli {
 /// `Heightmap`, the first command that returns a per-column (rather than
 /// per-chunk-summary) grid.
 /// Ticket 091 adds `Get`, the first command that decodes a section's packed
-/// block-state indices rather than just chunk/heightmap metadata.
+/// block-state indices rather than just chunk/heightmap metadata. Ticket 092
+/// adds `GetArea`, the same read over a box rather than one block — a
+/// `SelectionBounds`/`extract_blueprint` call under a CLI wrapper (see
+/// `block::get_area`), and the shared box-scan primitive later `copy`/
+/// `struct export` tickets reuse rather than growing their own.
 /// Every later `ranvil-cli` ticket adds one more, routing to its own
 /// submodule the same way.
 #[derive(Debug, Subcommand)]
@@ -70,6 +74,8 @@ pub enum Command {
     Heightmap(HeightmapArgs),
     /// One block's name + properties.
     Get(GetArgs),
+    /// A box of blocks, as a palette + dense index array.
+    GetArea(GetAreaArgs),
 }
 
 /// `saves` takes no arguments of its own — the instance directory it lists
@@ -175,6 +181,20 @@ pub struct GetArgs {
     /// `allow_hyphen_values`.
     #[arg(allow_hyphen_values = true)]
     pub pos: BlockPos,
+}
+
+/// `get-area <x1>,<y1>,<z1> <x2>,<y2>,<z2>` (ticket 092). Either corner may
+/// be given in either order — [`super::block::get_area`] normalizes them via
+/// [`crate::selection::SelectionBounds::from_corners`], the same as
+/// [`ChunksArgs::from`]/[`ChunksArgs::to`] do for chunk rectangles.
+#[derive(Debug, Args)]
+pub struct GetAreaArgs {
+    /// One corner, "x,y,z". See [`ChunkArgs::pos`] on why `allow_hyphen_values`.
+    #[arg(allow_hyphen_values = true)]
+    pub from: BlockPos,
+    /// The opposite corner, "x,y,z".
+    #[arg(allow_hyphen_values = true)]
+    pub to: BlockPos,
 }
 
 impl HeightmapKindArg {

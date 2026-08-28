@@ -8,7 +8,8 @@
 //! subcommand to [`cli::Command`] and one more arm to [`run`]'s dispatch.
 //!
 //! [`chunk`] gained `chunk`/`chunks` in ticket 089; [`heightmap`] adds
-//! `heightmap` in ticket 090; [`block`] adds `get` in ticket 091.
+//! `heightmap` in ticket 090; [`block`] adds `get` in ticket 091 and
+//! `get-area` in ticket 092.
 //! [`edit`], [`structure`] are still empty stubs — later tickets fill them
 //! in.
 
@@ -92,6 +93,11 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
         }
         Command::Get(args) => {
             let result = block::get(cli, args)?;
+            print(&result, cli.format);
+            Ok(())
+        }
+        Command::GetArea(args) => {
+            let result = block::get_area(cli, args)?;
             print(&result, cli.format);
             Ok(())
         }

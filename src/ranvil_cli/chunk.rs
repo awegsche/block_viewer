@@ -447,7 +447,12 @@ pub fn chunks(cli: &Cli, args: &ChunksArgs) -> Result<ChunksResult, CliError> {
 /// spans — sized so [`RegionCache`] never has to evict mid-walk, rather than
 /// the render-distance-shaped budget [`crate::region_cache::recommended_capacity`]
 /// is for.
-fn region_span(cx_min: i32, cx_max: i32, cz_min: i32, cz_max: i32) -> usize {
+///
+/// `pub(crate)`: [`super::block::get_area`] (ticket 092) sizes its own
+/// `RegionCache` the same way, over a block-coordinate box rather than a
+/// chunk-coordinate one — reusing this rather than growing a second copy of
+/// the region-span arithmetic.
+pub(crate) fn region_span(cx_min: i32, cx_max: i32, cz_min: i32, cz_max: i32) -> usize {
     let (rx_min, rz_min) = chunk_to_region_coord((cx_min, cz_min));
     let (rx_max, rz_max) = chunk_to_region_coord((cx_max, cz_max));
     (((rx_max - rx_min) as usize + 1) * ((rz_max - rz_min) as usize + 1)).max(1)
