@@ -18,12 +18,19 @@
 
 use std::path::PathBuf;
 
+use bevy::math::IVec3;
 use mc_anvil::SaveMeta;
+use serde_json::{json, Value};
 
+use crate::blueprint::{BlockState, MAX_BLOCKS};
 use crate::edit::{EditPolicy, EditReport, WorldEdit, WriteSession};
 use crate::region_cache::RegionCache;
+use crate::selection::SelectionBounds;
 
+use super::cli::{Cli, SetAreaArgs, SetArgs};
 use super::error::CliError;
+use super::format::Render;
+use super::save::resolve_save;
 
 /// The [`RegionCache`] capacity a one-shot CLI write gets.
 ///
@@ -134,6 +141,170 @@ pub fn run_write(
         regions_written: summary.regions_written,
         backups: summary.backups,
     })
+}
+
+// -------------------------------------------------------------------------------------------------
+// ---- set / set-area (ticket 095) -----------------------------------------------------------------
+// -------------------------------------------------------------------------------------------------
+
+/// The [`WriteOutcome`] fields every write command's `render_json` shares —
+/// `status` first and unconditionally, so a `--dry-run`'s JSON reads
+/// unmistakably as a plan rather than a completed write even on a skim, per
+/// the ticket ("a script can't mistake a dry run's JSON for a real one").
+fn outcome_json_fields(outcome: &WriteOutcome) -> Vec<(&'static str, Value)> {
+    let region_json = |coords: &[(i32, i32)]| {
+        json!(coords.iter().map(|&(x, z)| json!([x, z])).collect::<Vec<_>>())
+    };
+
+    vec![
+        ("status", json!(if outcome.dry_run { "dry-run" } else { "applied" })),
+        ("blocks_written", json!(outcome.report.blocks_written)),
+        ("chunks", region_json(&outcome.report.chunks)),
+        ("regions", region_json(&outcome.report.regions)),
+        ("regions_written", region_json(&outcome.regions_written)),
+        (
+            "backups",
+            json!(outcome.backups.iter().map(|p| p.display().to_string()).collect::<Vec<_>>()),
+        ),
+        ("backup_dir", json!(outcome.backup_dir.display().to_string())),
+    ]
+}
+
+/// The one summary line every write command's `text`/`compact` rendering
+/// shares: `[dry-run]` up front when nothing was actually written — visible
+/// in *every* format, not just `json`, per the ticket.
+fn outcome_summary(prefix: String, outcome: &WriteOutcome) -> String {
+    let verb = if outcome.dry_run { "would write" } else { "wrote" };
+    let blocks = outcome.report.blocks_written;
+    let regions = outcome.report.regions.len();
+    let label = if outcome.dry_run { "[dry-run] " } else { "" };
+    format!(
+        "{label}{prefix}: {verb} {blocks} block{} across {regions} region{}",
+        if blocks == 1 { "" } else { "s" },
+        if regions == 1 { "" } else { "s" },
+    )
+}
+
+/// `set`'s result: the position and block written, plus what [`run_write`]
+/// did (or would do).
+#[derive(Debug)]
+pub struct SetResult {
+    pub save_name: String,
+    pub pos: IVec3,
+    pub state: BlockState,
+    pub outcome: WriteOutcome,
+}
+
+/// Runs `set`: one [`WorldEdit::set`] handed to [`run_write`].
+pub fn set(cli: &Cli, args: &SetArgs) -> Result<SetResult, CliError> {
+    let meta = resolve_save(cli)?;
+    let pos = args.pos.0;
+    let state = args.state.clone();
+
+    let outcome = run_write(&meta, args.dry_run, args.force, |_cache| {
+        let mut edit = WorldEdit::new();
+        edit.set(pos, state.clone());
+        Ok(edit)
+    })?;
+
+    Ok(SetResult {
+        save_name: meta.name,
+        pos,
+        state: args.state.clone(),
+        outcome,
+    })
+}
+
+impl Render for SetResult {
+    fn render_text(&self) -> String {
+        let prefix = format!("set {} = {} in {}", self.pos, self.state, self.save_name);
+        let mut lines = vec![outcome_summary(prefix, &self.outcome)];
+        if !self.outcome.dry_run {
+            lines.push(format!("  backup: {}", self.outcome.backup_dir.display()));
+        }
+        lines.join("\n")
+    }
+
+    fn render_json(&self) -> Value {
+        let mut map = serde_json::Map::new();
+        map.insert("save".to_string(), json!(self.save_name));
+        map.insert("pos".to_string(), json!([self.pos.x, self.pos.y, self.pos.z]));
+        map.insert("block".to_string(), json!(self.state.to_string()));
+        for (key, value) in outcome_json_fields(&self.outcome) {
+            map.insert(key.to_string(), value);
+        }
+        Value::Object(map)
+    }
+}
+
+/// `set-area`'s result: the box and block filled, plus what [`run_write`]
+/// did (or would do).
+#[derive(Debug)]
+pub struct SetAreaResult {
+    pub save_name: String,
+    pub from: IVec3,
+    pub to: IVec3,
+    pub state: BlockState,
+    pub outcome: WriteOutcome,
+}
+
+/// Runs `set-area`: [`WorldEdit::fill`] over `args.from`/`args.to` (either
+/// corner in either order — `from_corners` normalizes, same as
+/// [`super::block::get_area`]), handed to [`run_write`]. The box is capped
+/// at [`MAX_BLOCKS`], the same limit `get-area` enforces, before
+/// [`resolve_save`] even runs — a selection over the cap is a bad request
+/// regardless of which save it names.
+pub fn set_area(cli: &Cli, args: &SetAreaArgs) -> Result<SetAreaResult, CliError> {
+    let bounds = SelectionBounds::from_corners(args.from.0, args.from.0, args.to.0);
+
+    let volume = bounds.volume();
+    if volume > MAX_BLOCKS {
+        return Err(CliError::Usage(format!(
+            "selection ({}) to ({}) is {volume} blocks — over the {MAX_BLOCKS}-block set-area limit",
+            args.from.0, args.to.0
+        )));
+    }
+
+    let meta = resolve_save(cli)?;
+    let state = args.state.clone();
+
+    let outcome = run_write(&meta, args.dry_run, args.force, move |_cache| {
+        Ok(WorldEdit::fill(bounds, state))
+    })?;
+
+    Ok(SetAreaResult {
+        save_name: meta.name,
+        from: bounds.min,
+        to: bounds.max,
+        state: args.state.clone(),
+        outcome,
+    })
+}
+
+impl Render for SetAreaResult {
+    fn render_text(&self) -> String {
+        let prefix = format!(
+            "set-area {} to {} = {} in {}",
+            self.from, self.to, self.state, self.save_name
+        );
+        let mut lines = vec![outcome_summary(prefix, &self.outcome)];
+        if !self.outcome.dry_run {
+            lines.push(format!("  backup: {}", self.outcome.backup_dir.display()));
+        }
+        lines.join("\n")
+    }
+
+    fn render_json(&self) -> Value {
+        let mut map = serde_json::Map::new();
+        map.insert("save".to_string(), json!(self.save_name));
+        map.insert("from".to_string(), json!([self.from.x, self.from.y, self.from.z]));
+        map.insert("to".to_string(), json!([self.to.x, self.to.y, self.to.z]));
+        map.insert("block".to_string(), json!(self.state.to_string()));
+        for (key, value) in outcome_json_fields(&self.outcome) {
+            map.insert(key.to_string(), value);
+        }
+        Value::Object(map)
+    }
 }
 
 #[cfg(test)]
@@ -372,5 +543,262 @@ mod tests {
             CliError::Usage(message) => panic!("expected Data (exit 1), got Usage: {message}"),
         }
         assert_eq!(block_name_at(&fixture.meta, at), "minecraft:stone");
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // ---- set / set-area (ticket 095) ---------------------------------------------------------
+    // -----------------------------------------------------------------------------------------
+
+    use super::super::cli::{Command, SavesArgs};
+    use super::super::coords::BlockPos;
+    use super::super::format::OutputFormat;
+
+    fn dummy_cli(save: Option<String>) -> Cli {
+        Cli {
+            save,
+            instance: Some(PathBuf::from("does-not-exist")),
+            format: OutputFormat::Json,
+            command: Command::Saves(SavesArgs {}),
+        }
+    }
+
+    fn cli_for(fixture: &Fixture) -> Cli {
+        dummy_cli(Some(fixture.meta.path.to_string_lossy().to_string()))
+    }
+
+    fn oak_stairs() -> BlockState {
+        BlockState {
+            name: "minecraft:oak_stairs".to_string(),
+            properties: vec![
+                ("facing".to_string(), "east".to_string()),
+                ("half".to_string(), "top".to_string()),
+            ],
+        }
+    }
+
+    fn set_args(pos: IVec3, state: BlockState, dry_run: bool, force: bool) -> SetArgs {
+        SetArgs { pos: BlockPos(pos), state, dry_run, force }
+    }
+
+    fn set_area_args(from: IVec3, to: IVec3, state: BlockState, dry_run: bool, force: bool) -> SetAreaArgs {
+        SetAreaArgs { from: BlockPos(from), to: BlockPos(to), state, dry_run, force }
+    }
+
+    /// Like [`block_name_at`], but the whole [`BlockState`] (name plus
+    /// properties) — what a multi-property roundtrip (a stair's `facing`/
+    /// `half`) needs that a bare name can't confirm.
+    fn block_state_at(meta: &SaveMeta, at: IVec3) -> BlockState {
+        let address = crate::edit::address_of(at);
+        let mut cache = RegionCache::new(meta.clone(), 1);
+        let entry = cache
+            .get_or_load(address.region)
+            .expect("resident")
+            .get_block(address.local_x, address.y, address.local_z)
+            .expect("a populated chunk");
+        BlockState::from_palette_entry(entry).expect("valid palette entry")
+    }
+
+    /// The ticket's headline "Done when": `set` writes the block, and reading
+    /// it straight back (including a multi-property state's properties, not
+    /// just its name) matches exactly.
+    #[test]
+    fn set_writes_a_block_and_reads_back_identically_including_properties() {
+        let fixture = Fixture::new("set-roundtrip");
+        let at = IVec3::new(1, 5, 1);
+        let stairs = oak_stairs();
+
+        let result = set(&cli_for(&fixture), &set_args(at, stairs.clone(), false, false))
+            .expect("a valid set");
+
+        assert!(!result.outcome.dry_run);
+        assert_eq!(result.outcome.report.blocks_written, 1);
+        assert_eq!(result.outcome.regions_written, vec![(0, 0)]);
+        assert_eq!(block_state_at(&fixture.meta, at), stairs);
+    }
+
+    /// `set-area` over a small box fills exactly those positions and nothing
+    /// outside it — the same box `scan --block <name>` (093) would confirm
+    /// end to end.
+    #[test]
+    fn set_area_fills_exactly_the_box() {
+        let fixture = Fixture::new("set-area-fill");
+        let (from, to) = (IVec3::new(0, 0, 0), IVec3::new(2, 2, 2));
+        let target = dirt();
+
+        let result = set_area(&cli_for(&fixture), &set_area_args(from, to, target.clone(), false, false))
+            .expect("a valid set-area");
+
+        assert_eq!(result.outcome.report.blocks_written, 27);
+        for x in 0..3 {
+            for y in 0..3 {
+                for z in 0..3 {
+                    let pos = IVec3::new(x, y, z);
+                    assert_eq!(block_state_at(&fixture.meta, pos), target, "at {pos}");
+                }
+            }
+        }
+        // Just outside the box on every axis, the fixture's stone survives.
+        assert_eq!(block_name_at(&fixture.meta, IVec3::new(3, 0, 0)), "minecraft:stone");
+        assert_eq!(block_name_at(&fixture.meta, IVec3::new(0, 3, 0)), "minecraft:stone");
+        assert_eq!(block_name_at(&fixture.meta, IVec3::new(0, 0, 3)), "minecraft:stone");
+    }
+
+    /// `--dry-run` on `set` leaves the save's files byte-identical.
+    #[test]
+    fn set_dry_run_touches_nothing() {
+        let fixture = Fixture::new("set-dry-run");
+        let (before_bytes, before_mtime) = (fixture.bytes(), fixture.mtime());
+        let at = IVec3::new(2, 2, 2);
+
+        let result = set(&cli_for(&fixture), &set_args(at, dirt(), true, false)).expect("a valid plan");
+
+        assert!(result.outcome.dry_run);
+        assert_eq!(result.outcome.report.blocks_written, 1);
+        assert!(result.outcome.regions_written.is_empty());
+        assert_eq!(fixture.bytes(), before_bytes);
+        assert_eq!(fixture.mtime(), before_mtime);
+        assert_eq!(block_name_at(&fixture.meta, at), "minecraft:stone");
+    }
+
+    /// `--dry-run` on `set-area` leaves the save's files byte-identical.
+    #[test]
+    fn set_area_dry_run_touches_nothing() {
+        let fixture = Fixture::new("set-area-dry-run");
+        let (before_bytes, before_mtime) = (fixture.bytes(), fixture.mtime());
+        let (from, to) = (IVec3::new(0, 0, 0), IVec3::new(1, 1, 1));
+
+        let result = set_area(&cli_for(&fixture), &set_area_args(from, to, dirt(), true, false))
+            .expect("a valid plan");
+
+        assert!(result.outcome.dry_run);
+        assert_eq!(result.outcome.report.blocks_written, 8);
+        assert!(result.outcome.regions_written.is_empty());
+        assert_eq!(fixture.bytes(), before_bytes);
+        assert_eq!(fixture.mtime(), before_mtime);
+        assert_eq!(block_name_at(&fixture.meta, from), "minecraft:stone");
+    }
+
+    /// A `set` into a chunk the fixture never generated refuses with the same
+    /// [`crate::edit::EditRefusal`] message the game's own write path raises
+    /// — exit 1, not a panic or a silent write.
+    #[test]
+    fn set_into_an_ungenerated_chunk_refuses() {
+        let fixture = Fixture::new("set-ungenerated");
+        // Chunk index 0 (chunk (0, 0)) is the fixture's only populated chunk;
+        // x = 20 lands in chunk (1, 0), which the region never got a payload
+        // for.
+        let at = IVec3::new(20, 5, 0);
+
+        let err = set(&cli_for(&fixture), &set_args(at, dirt(), false, false)).unwrap_err();
+
+        match err {
+            CliError::Data(message) => assert!(message.contains("has not been generated"), "{message}"),
+            CliError::Usage(message) => panic!("expected Data (exit 1), got Usage: {message}"),
+        }
+    }
+
+    /// Same refusal, reached through `set-area` when any part of the box
+    /// spills into ungenerated territory.
+    #[test]
+    fn set_area_into_an_ungenerated_chunk_refuses() {
+        let fixture = Fixture::new("set-area-ungenerated");
+        let (from, to) = (IVec3::new(0, 5, 0), IVec3::new(20, 5, 0));
+
+        let err = set_area(&cli_for(&fixture), &set_area_args(from, to, dirt(), false, false)).unwrap_err();
+
+        match err {
+            CliError::Data(message) => assert!(message.contains("has not been generated"), "{message}"),
+            CliError::Usage(message) => panic!("expected Data (exit 1), got Usage: {message}"),
+        }
+    }
+
+    /// `set-area`'s own volume cap (mirrors `get-area`'s [`MAX_BLOCKS`]): a
+    /// box over the limit is a `Usage` error (exit 2) raised before
+    /// `resolve_save` even runs, same as `get-area`'s own test proves.
+    #[test]
+    fn set_area_over_max_blocks_is_a_usage_error_before_touching_a_save() {
+        let args = set_area_args(
+            IVec3::new(0, crate::selection::WORLD_MIN_Y, 0),
+            IVec3::new(9999, crate::selection::WORLD_MAX_Y, 9999),
+            dirt(),
+            false,
+            false,
+        );
+
+        let err = set_area(&dummy_cli(None), &args).unwrap_err();
+
+        match err {
+            CliError::Usage(message) => {
+                assert!(message.contains(&MAX_BLOCKS.to_string()), "{message}");
+                assert!(
+                    !message.contains("instance directory"),
+                    "should fail on the volume check, not on resolving a save: {message}"
+                );
+            }
+            CliError::Data(message) => panic!("expected Usage (exit 2), got Data: {message}"),
+        }
+    }
+
+    fn sample_outcome(dry_run: bool) -> WriteOutcome {
+        WriteOutcome {
+            report: EditReport {
+                blocks_written: 1,
+                chunks: vec![(0, 0)],
+                regions: vec![(0, 0)],
+                replaced: None,
+            },
+            dry_run,
+            backup_dir: PathBuf::from("backups/stamp"),
+            regions_written: if dry_run { Vec::new() } else { vec![(0, 0)] },
+            backups: if dry_run { Vec::new() } else { vec![PathBuf::from("backups/stamp/r.0.0.mca")] },
+        }
+    }
+
+    /// The ticket's own contract: a `--dry-run`'s JSON is shaped identically
+    /// to a real write's but labeled as a plan, so a script can't mistake one
+    /// for the other by skimming.
+    #[test]
+    fn set_render_json_labels_a_dry_run_as_a_plan_not_a_completed_write() {
+        let dry = SetResult {
+            save_name: "world".to_string(),
+            pos: IVec3::new(1, 2, 3),
+            state: dirt(),
+            outcome: sample_outcome(true),
+        };
+        let applied = SetResult {
+            save_name: "world".to_string(),
+            pos: IVec3::new(1, 2, 3),
+            state: dirt(),
+            outcome: sample_outcome(false),
+        };
+
+        assert_eq!(dry.render_json()["status"], json!("dry-run"));
+        assert_eq!(dry.render_json()["regions_written"], json!([]));
+        assert_eq!(applied.render_json()["status"], json!("applied"));
+        assert_eq!(applied.render_json()["regions_written"], json!([[0, 0]]));
+
+        // Same shape either way — every field present in both, not a
+        // dry-run-only or applied-only key that would make the two JSON
+        // documents structurally different.
+        let (dry_json, applied_json) = (dry.render_json(), applied.render_json());
+        let mut dry_keys: Vec<&String> = dry_json.as_object().unwrap().keys().collect();
+        let mut applied_keys: Vec<&String> = applied_json.as_object().unwrap().keys().collect();
+        dry_keys.sort();
+        applied_keys.sort();
+        assert_eq!(dry_keys, applied_keys);
+    }
+
+    /// The same labeling shows up in `text`, not just `json` — a human
+    /// skimming a terminal can't miss a dry run either.
+    #[test]
+    fn set_render_text_prefixes_dry_run_visibly() {
+        let dry = SetResult {
+            save_name: "world".to_string(),
+            pos: IVec3::new(1, 2, 3),
+            state: dirt(),
+            outcome: sample_outcome(true),
+        };
+        assert!(dry.render_text().starts_with("[dry-run]"), "{}", dry.render_text());
+        assert!(!dry.render_text().contains("backup:"), "dry-run has no real backup to report");
     }
 }

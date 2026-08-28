@@ -9,11 +9,12 @@
 //!
 //! [`chunk`] gained `chunk`/`chunks` in ticket 089; [`heightmap`] adds
 //! `heightmap` in ticket 090; [`block`] adds `get` in ticket 091, `get-area`
-//! in ticket 092, and `column`/`scan` in ticket 093. Ticket 094 gives
+//! in ticket 092, and `column`/`scan` in ticket 093. Ticket 094 gave
 //! [`edit`] the write substrate ([`edit::run_write`]) every write command
-//! (095–097) and `struct import` (099) will share — lock, backup, dry-run,
-//! force — but adds no subcommand of its own yet: no [`cli::Command`] variant
-//! routes to it until 095 exists to call it.
+//! (095–097) and `struct import` (099) shares — lock, backup, dry-run,
+//! force. Ticket 095 adds [`edit`]'s first two commands, `set`/`set-area`,
+//! thin builders over `run_write` around `WorldEdit::new().set`/
+//! `WorldEdit::fill` respectively.
 //! [`structure`] is still an empty stub — later tickets fill it in.
 
 use std::process::ExitCode;
@@ -111,6 +112,16 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
         }
         Command::Scan(args) => {
             let result = block::scan(cli, args)?;
+            print(&result, cli.format);
+            Ok(())
+        }
+        Command::Set(args) => {
+            let result = edit::set(cli, args)?;
+            print(&result, cli.format);
+            Ok(())
+        }
+        Command::SetArea(args) => {
+            let result = edit::set_area(cli, args)?;
             print(&result, cli.format);
             Ok(())
         }

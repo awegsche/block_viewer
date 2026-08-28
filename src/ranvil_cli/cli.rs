@@ -10,6 +10,8 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use mc_anvil::heightmap::HeightmapKind;
 
+use crate::blueprint::BlockState;
+
 use super::coords::{BlockPos, ChunkPos, ColumnPos};
 use super::format::OutputFormat;
 
@@ -53,7 +55,9 @@ pub struct Cli {
 /// `struct export` tickets reuse rather than growing their own. Ticket 093
 /// adds `Column`/`Scan`, both built on `get_area` rather than a fresh box
 /// walk — `column` reads a single-column box top-to-bottom, `scan` filters a
-/// box's blocks by name.
+/// box's blocks by name. Ticket 095 adds `Set`/`SetArea`, the first write
+/// commands — thin builders over [`super::edit::run_write`] (094's write
+/// substrate) around `WorldEdit::new().set`/`WorldEdit::fill` respectively.
 /// Every later `ranvil-cli` ticket adds one more, routing to its own
 /// submodule the same way.
 #[derive(Debug, Subcommand)]
@@ -84,6 +88,10 @@ pub enum Command {
     Column(ColumnArgs),
     /// Every position in a box whose block matches a given name.
     Scan(ScanArgs),
+    /// Write one block.
+    Set(SetArgs),
+    /// Fill a box with one block.
+    SetArea(SetAreaArgs),
 }
 
 /// `saves` takes no arguments of its own — the instance directory it lists
@@ -256,6 +264,56 @@ pub struct ScanArgs {
     /// positions.
     #[arg(long)]
     pub limit: Option<usize>,
+}
+
+/// `set <x>,<y>,<z> <blockstate> [--dry-run] [--force]` (ticket 095).
+/// `state` is parsed by [`BlockState`]'s own `FromStr` (ticket 035's
+/// paint-tool parser) — the same `name[key=value,...]` syntax `get` already
+/// prints back, so a `get`'s output pastes straight into this argument.
+#[derive(Debug, Args)]
+pub struct SetArgs {
+    /// Block coordinates, "x,y,z". See [`ChunkArgs::pos`] on why
+    /// `allow_hyphen_values`.
+    #[arg(allow_hyphen_values = true)]
+    pub pos: BlockPos,
+
+    /// The block to write, e.g. `minecraft:oak_stairs[facing=east,half=top]`.
+    pub state: BlockState,
+
+    /// Report the plan (blocks, regions touched) without writing anything —
+    /// see [`super::edit::run_write`].
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Write even though the save currently looks open in Minecraft — see
+    /// [`super::edit::run_write`].
+    #[arg(long)]
+    pub force: bool,
+}
+
+/// `set-area <x1>,<y1>,<z1> <x2>,<y2>,<z2> <blockstate> [--dry-run]
+/// [--force]` (ticket 095) — `WorldEdit::fill` over the box, the same
+/// function `viewer::paint` calls for the same job (ticket 035). Either
+/// corner may be given in either order, same as [`GetAreaArgs`].
+#[derive(Debug, Args)]
+pub struct SetAreaArgs {
+    /// One corner, "x,y,z". See [`ChunkArgs::pos`] on why `allow_hyphen_values`.
+    #[arg(allow_hyphen_values = true)]
+    pub from: BlockPos,
+    /// The opposite corner, "x,y,z".
+    #[arg(allow_hyphen_values = true)]
+    pub to: BlockPos,
+
+    /// The block to fill the box with.
+    pub state: BlockState,
+
+    /// Report the plan without writing anything — see [`super::edit::run_write`].
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Write even though the save currently looks open in Minecraft.
+    #[arg(long)]
+    pub force: bool,
 }
 
 impl HeightmapKindArg {
