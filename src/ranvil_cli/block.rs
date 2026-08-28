@@ -490,8 +490,10 @@ pub fn scan(cli: &Cli, args: &ScanArgs) -> Result<ScanResult, CliError> {
 ///
 /// Split out from [`scan`] so this — the actual match/cap logic — is
 /// testable against a synthetic [`GetAreaResult`] rather than only end to end
-/// against a real save.
-fn matching_positions(area: &GetAreaResult, block: &str, limit: usize) -> (Vec<IVec3>, bool) {
+/// against a real save. `pub(super)`: `replace` (ticket 096) reuses this
+/// exact match rule rather than growing a second "match by name, ignore
+/// properties" filter.
+pub(super) fn matching_positions(area: &GetAreaResult, block: &str, limit: usize) -> (Vec<IVec3>, bool) {
     let matching: HashSet<u16> = area
         .palette
         .iter()

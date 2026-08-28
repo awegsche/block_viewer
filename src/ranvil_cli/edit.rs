@@ -16,6 +16,7 @@
 //! citybuilder write path this wraps) — same name, different module path,
 //! no collision.
 
+use std::io::Read as _;
 use std::path::PathBuf;
 
 use bevy::math::IVec3;
@@ -27,7 +28,9 @@ use crate::edit::{EditPolicy, EditReport, WorldEdit, WriteSession};
 use crate::region_cache::RegionCache;
 use crate::selection::SelectionBounds;
 
-use super::cli::{Cli, SetAreaArgs, SetArgs};
+use super::block::{get_area, matching_positions};
+use super::cli::{Cli, GetAreaArgs, ReplaceArgs, SetAreaArgs, SetArgs, SetBatchArgs};
+use super::coords::BlockPos;
 use super::error::CliError;
 use super::format::Render;
 use super::save::resolve_save;
@@ -300,6 +303,242 @@ impl Render for SetAreaResult {
         map.insert("from".to_string(), json!([self.from.x, self.from.y, self.from.z]));
         map.insert("to".to_string(), json!([self.to.x, self.to.y, self.to.z]));
         map.insert("block".to_string(), json!(self.state.to_string()));
+        for (key, value) in outcome_json_fields(&self.outcome) {
+            map.insert(key.to_string(), value);
+        }
+        Value::Object(map)
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// ---- set-batch / replace (ticket 096) --------------------------------------------------------
+// -------------------------------------------------------------------------------------------------
+//
+// Both build on 094's `run_write` the same way `set`/`set-area` do, so they
+// get the same all-or-nothing guarantee across the whole batch/box rather
+// than per line or per position: one `WorldEdit`, one `run_write` call.
+
+/// Reads `set-batch`'s input: the file at `path`, or stdin when `path` is
+/// `-` — the shape an agent's own generated diff arrives in without needing
+/// a temp file.
+fn read_batch_input(path: &str) -> Result<String, CliError> {
+    if path == "-" {
+        let mut buf = String::new();
+        std::io::stdin()
+            .read_to_string(&mut buf)
+            .map_err(|e| CliError::Usage(format!("could not read stdin: {e}")))?;
+        Ok(buf)
+    } else {
+        std::fs::read_to_string(path)
+            .map_err(|e| CliError::Usage(format!("could not read \"{path}\": {e}")))
+    }
+}
+
+/// Parses `set-batch`'s line format: `x,y,z blockstate`, one edit per line.
+/// Blank lines and `#`-prefixed lines are skipped; every other line is
+/// `<position> <blockstate>`, split on the first run of whitespace so a
+/// blockstate's own `[key=value,...]` never gets mistaken for a second
+/// column.
+///
+/// Every line is parsed before any edit is attempted — the first malformed
+/// line anywhere in `input` aborts the whole batch with its 1-based line
+/// number (comments and blanks counted, so the number always points at the
+/// line the caller sees in their own file), matching `edit::route`'s "plan
+/// everything before applying anything" discipline. Duplicate positions are
+/// not rejected here: last write wins, the same as calling `WorldEdit::set`
+/// twice on one `WorldEdit` already behaves.
+fn parse_batch(input: &str) -> Result<Vec<(IVec3, BlockState)>, CliError> {
+    let mut edits = Vec::new();
+
+    for (index, raw_line) in input.lines().enumerate() {
+        let line_number = index + 1;
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        let mut parts = line.splitn(2, char::is_whitespace);
+        let (pos_part, state_part) = match (parts.next(), parts.next()) {
+            (Some(pos), Some(state)) if !state.trim().is_empty() => (pos, state.trim()),
+            _ => {
+                return Err(CliError::Usage(format!(
+                    "line {line_number}: expected \"x,y,z blockstate\", got \"{line}\""
+                )));
+            }
+        };
+
+        let pos: BlockPos = pos_part
+            .parse()
+            .map_err(|e| CliError::Usage(format!("line {line_number}: {e}")))?;
+        let state: BlockState = state_part
+            .parse()
+            .map_err(|e| CliError::Usage(format!("line {line_number}: {e}")))?;
+
+        edits.push((pos.0, state));
+    }
+
+    Ok(edits)
+}
+
+/// `set-batch`'s result: how many lines were applied, plus what
+/// [`run_write`] did (or would do).
+#[derive(Debug)]
+pub struct SetBatchResult {
+    pub save_name: String,
+    pub file: String,
+    /// Lines successfully parsed into an edit — a raw line count, not the
+    /// count of distinct positions written (a batch with a correction for
+    /// one position parses as two lines but writes one block).
+    pub lines_applied: usize,
+    pub outcome: WriteOutcome,
+}
+
+/// Runs `set-batch`: reads and [`parse_batch`]es every line of `args.file`
+/// (or stdin) into one [`WorldEdit`] before touching a save, then hands it
+/// to [`run_write`] — so a malformed line anywhere refuses the whole batch
+/// (nothing written) rather than applying a prefix of it.
+pub fn set_batch(cli: &Cli, args: &SetBatchArgs) -> Result<SetBatchResult, CliError> {
+    let input = read_batch_input(&args.file)?;
+    let edits = parse_batch(&input)?;
+    if edits.is_empty() {
+        return Err(CliError::Usage(format!(
+            "\"{}\" has no edits — every line is blank or a comment",
+            args.file
+        )));
+    }
+    let lines_applied = edits.len();
+
+    let meta = resolve_save(cli)?;
+
+    let outcome = run_write(&meta, args.dry_run, args.force, move |_cache| {
+        let mut edit = WorldEdit::new();
+        for (pos, state) in edits {
+            edit.set(pos, state);
+        }
+        Ok(edit)
+    })?;
+
+    Ok(SetBatchResult {
+        save_name: meta.name,
+        file: args.file.clone(),
+        lines_applied,
+        outcome,
+    })
+}
+
+impl Render for SetBatchResult {
+    fn render_text(&self) -> String {
+        let prefix = format!(
+            "set-batch {} ({} line{}) in {}",
+            self.file,
+            self.lines_applied,
+            if self.lines_applied == 1 { "" } else { "s" },
+            self.save_name
+        );
+        let mut lines = vec![outcome_summary(prefix, &self.outcome)];
+        if !self.outcome.dry_run {
+            lines.push(format!("  backup: {}", self.outcome.backup_dir.display()));
+        }
+        lines.join("\n")
+    }
+
+    fn render_json(&self) -> Value {
+        let mut map = serde_json::Map::new();
+        map.insert("save".to_string(), json!(self.save_name));
+        map.insert("file".to_string(), json!(self.file));
+        map.insert("lines_applied".to_string(), json!(self.lines_applied));
+        for (key, value) in outcome_json_fields(&self.outcome) {
+            map.insert(key.to_string(), value);
+        }
+        Value::Object(map)
+    }
+}
+
+/// `replace`'s result: the box, the match/replacement blocks, how many
+/// positions matched, plus what [`run_write`] did (or would do).
+#[derive(Debug)]
+pub struct ReplaceResult {
+    pub save_name: String,
+    pub from: IVec3,
+    pub to: IVec3,
+    pub from_block: String,
+    pub to_state: BlockState,
+    /// Positions in the box whose block matched `from_block` — distinct from
+    /// `set-area`'s "every position in the box" count, and (barring a
+    /// scan/write race on a live save) equal to `outcome.report.blocks_written`.
+    pub matched: usize,
+    pub outcome: WriteOutcome,
+}
+
+/// Runs `replace`: extracts the box via [`get_area`] (092's primitive),
+/// filters it down to positions whose block matches `args.from_block` via
+/// [`matching_positions`] (the same by-name-only rule `scan` uses), and
+/// writes `args.to_state` at each as one [`WorldEdit`] handed to
+/// [`run_write`].
+///
+/// The box is capped at [`MAX_BLOCKS`] before [`resolve_save`] even runs,
+/// same as `set-area`/`get-area`. A box with no matches reaches `run_write`
+/// with an empty `WorldEdit`, which surfaces the same
+/// [`crate::edit::EditRefusal::Empty`] refusal any other empty edit does —
+/// not a special-cased no-op, since "nothing matched" and "nothing to write"
+/// are the same fact here.
+pub fn replace(cli: &Cli, args: &ReplaceArgs) -> Result<ReplaceResult, CliError> {
+    let bounds = SelectionBounds::from_corners(args.corner1.0, args.corner1.0, args.corner2.0);
+
+    let volume = bounds.volume();
+    if volume > MAX_BLOCKS {
+        return Err(CliError::Usage(format!(
+            "selection ({}) to ({}) is {volume} blocks — over the {MAX_BLOCKS}-block replace limit",
+            args.corner1.0, args.corner2.0
+        )));
+    }
+
+    let area = get_area(cli, &GetAreaArgs { from: args.corner1, to: args.corner2 })?;
+    let (positions, _truncated) = matching_positions(&area, &args.from_block, usize::MAX);
+    let matched = positions.len();
+    let to_state = args.to_state.clone();
+
+    let meta = resolve_save(cli)?;
+    let outcome = run_write(&meta, args.dry_run, args.force, move |_cache| {
+        let mut edit = WorldEdit::new();
+        for pos in positions {
+            edit.set(pos, to_state.clone());
+        }
+        Ok(edit)
+    })?;
+
+    Ok(ReplaceResult {
+        save_name: meta.name,
+        from: bounds.min,
+        to: bounds.max,
+        from_block: args.from_block.clone(),
+        to_state: args.to_state.clone(),
+        matched,
+        outcome,
+    })
+}
+
+impl Render for ReplaceResult {
+    fn render_text(&self) -> String {
+        let prefix = format!(
+            "replace {} with {} in {} to {} in {}: {} matched",
+            self.from_block, self.to_state, self.from, self.to, self.save_name, self.matched
+        );
+        let mut lines = vec![outcome_summary(prefix, &self.outcome)];
+        if !self.outcome.dry_run {
+            lines.push(format!("  backup: {}", self.outcome.backup_dir.display()));
+        }
+        lines.join("\n")
+    }
+
+    fn render_json(&self) -> Value {
+        let mut map = serde_json::Map::new();
+        map.insert("save".to_string(), json!(self.save_name));
+        map.insert("from".to_string(), json!([self.from.x, self.from.y, self.from.z]));
+        map.insert("to".to_string(), json!([self.to.x, self.to.y, self.to.z]));
+        map.insert("from_block".to_string(), json!(self.from_block));
+        map.insert("to_block".to_string(), json!(self.to_state.to_string()));
+        map.insert("matched".to_string(), json!(self.matched));
         for (key, value) in outcome_json_fields(&self.outcome) {
             map.insert(key.to_string(), value);
         }
@@ -800,5 +1039,292 @@ mod tests {
         };
         assert!(dry.render_text().starts_with("[dry-run]"), "{}", dry.render_text());
         assert!(!dry.render_text().contains("backup:"), "dry-run has no real backup to report");
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // ---- set-batch / replace (ticket 096) -----------------------------------------------------
+    // -----------------------------------------------------------------------------------------
+
+    use super::super::cli::{ReplaceArgs, SetBatchArgs};
+
+    fn oak_slab_top() -> BlockState {
+        BlockState {
+            name: "minecraft:oak_slab".to_string(),
+            properties: vec![("type".to_string(), "top".to_string())],
+        }
+    }
+
+    #[test]
+    fn parse_batch_skips_blank_and_comment_lines() {
+        let edits = parse_batch(
+            "\n# a comment\n1,2,3 minecraft:dirt\n   \n# another\n4,5,6 minecraft:stone\n",
+        )
+        .expect("a valid batch");
+
+        assert_eq!(
+            edits,
+            vec![
+                (IVec3::new(1, 2, 3), BlockState { name: "minecraft:dirt".to_string(), properties: vec![] }),
+                (IVec3::new(4, 5, 6), BlockState { name: "minecraft:stone".to_string(), properties: vec![] }),
+            ]
+        );
+    }
+
+    /// Duplicate positions parse fine — not deduped, not rejected — so a
+    /// caller regenerating a batch that includes a correction never has to
+    /// dedupe first (last write wins downstream, in `WorldEdit`/`set_blocks`).
+    #[test]
+    fn parse_batch_keeps_duplicate_positions_in_order() {
+        let edits = parse_batch("1,1,1 minecraft:dirt\n1,1,1 minecraft:stone\n").expect("a valid batch");
+        assert_eq!(edits.len(), 2);
+        assert_eq!(edits[0].0, edits[1].0);
+        assert_eq!(edits[1].1.name, "minecraft:stone");
+    }
+
+    /// A blockstate carrying `[key=value,...]` still splits correctly on the
+    /// first run of whitespace — the bracket isn't mistaken for a second
+    /// column.
+    #[test]
+    fn parse_batch_reads_a_blockstate_with_properties() {
+        let edits = parse_batch("1,2,3 minecraft:oak_stairs[facing=east,half=top]\n").expect("a valid batch");
+        assert_eq!(edits, vec![(IVec3::new(1, 2, 3), oak_stairs())]);
+    }
+
+    /// The ticket's own contract: a malformed line is reported with its
+    /// 1-based line number, counting blank and comment lines too, so the
+    /// number always matches the line the caller sees in their own file.
+    #[test]
+    fn parse_batch_reports_the_malformed_lines_number() {
+        let err = parse_batch("# header\n1,2,3 minecraft:dirt\nnot a line\n").unwrap_err();
+        match err {
+            CliError::Usage(message) => assert!(message.contains("line 3"), "{message}"),
+            CliError::Data(message) => panic!("expected Usage (exit 2), got Data: {message}"),
+        }
+    }
+
+    /// A line with a position but no blockstate is malformed too, not
+    /// silently ignored.
+    #[test]
+    fn parse_batch_rejects_a_line_missing_its_blockstate() {
+        assert!(parse_batch("1,2,3\n").is_err());
+        assert!(parse_batch("1,2,3   \n").is_err());
+    }
+
+    fn write_batch_file(label: &str, contents: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("block_viewer-ranvil-cli-set-batch-{label}-{nanos}.txt"));
+        std::fs::write(&path, contents).expect("write batch file");
+        path
+    }
+
+    fn set_batch_args(file: String, dry_run: bool, force: bool) -> SetBatchArgs {
+        SetBatchArgs { file, dry_run, force }
+    }
+
+    /// The ticket's headline "Done when": every line of a small fixture batch
+    /// writes correctly and reads back via `get` (here, `block_state_at`).
+    #[test]
+    fn set_batch_writes_every_line_and_reads_back() {
+        let fixture = Fixture::new("set-batch-roundtrip");
+        let file = write_batch_file(
+            "roundtrip",
+            "# a batch\n\n1,5,1 minecraft:dirt\n2,5,1 minecraft:oak_stairs[facing=east,half=top]\n",
+        );
+
+        let result = set_batch(&cli_for(&fixture), &set_batch_args(file.to_string_lossy().to_string(), false, false))
+            .expect("a valid batch");
+        std::fs::remove_file(&file).ok();
+
+        assert_eq!(result.lines_applied, 2);
+        assert_eq!(result.outcome.report.blocks_written, 2);
+        assert_eq!(block_state_at(&fixture.meta, IVec3::new(1, 5, 1)), dirt());
+        assert_eq!(block_state_at(&fixture.meta, IVec3::new(2, 5, 1)), oak_stairs());
+    }
+
+    /// A correction in the batch (the same position written twice) leaves the
+    /// later line's block in place — last write wins, and the deduped
+    /// `blocks_written` count reflects one block in the world, not two lines.
+    #[test]
+    fn set_batch_last_write_wins_for_a_duplicate_position() {
+        let fixture = Fixture::new("set-batch-duplicate");
+        let file = write_batch_file(
+            "duplicate",
+            "1,5,1 minecraft:dirt\n1,5,1 minecraft:gold_block\n",
+        );
+
+        let result = set_batch(&cli_for(&fixture), &set_batch_args(file.to_string_lossy().to_string(), false, false))
+            .expect("a valid batch");
+        std::fs::remove_file(&file).ok();
+
+        assert_eq!(result.lines_applied, 2);
+        assert_eq!(result.outcome.report.blocks_written, 1);
+        assert_eq!(block_name_at(&fixture.meta, IVec3::new(1, 5, 1)), "minecraft:gold_block");
+    }
+
+    /// The ticket's other headline "Done when": a batch with one malformed
+    /// line writes nothing and reports the offending line number — parsed
+    /// (and refused) before `run_write` is even reached.
+    #[test]
+    fn set_batch_with_a_malformed_line_writes_nothing_and_reports_its_line_number() {
+        let fixture = Fixture::new("set-batch-malformed");
+        let (before_bytes, before_mtime) = (fixture.bytes(), fixture.mtime());
+        let file = write_batch_file(
+            "malformed",
+            "1,5,1 minecraft:dirt\nnot a valid line\n2,5,1 minecraft:stone\n",
+        );
+
+        let err = set_batch(&cli_for(&fixture), &set_batch_args(file.to_string_lossy().to_string(), false, false))
+            .unwrap_err();
+        std::fs::remove_file(&file).ok();
+
+        match err {
+            CliError::Usage(message) => assert!(message.contains("line 2"), "{message}"),
+            CliError::Data(message) => panic!("expected Usage (exit 2), got Data: {message}"),
+        }
+        assert_eq!(fixture.bytes(), before_bytes, "a malformed batch must not touch the region file's bytes");
+        assert_eq!(fixture.mtime(), before_mtime);
+        assert_eq!(block_name_at(&fixture.meta, IVec3::new(1, 5, 1)), "minecraft:stone");
+    }
+
+    /// A batch of only blank/comment lines is refused before `resolve_save`
+    /// even runs — an empty batch is a bad request regardless of which save
+    /// it names, the same reasoning `set-area`'s `MAX_BLOCKS` check uses.
+    #[test]
+    fn set_batch_with_no_edits_is_a_usage_error() {
+        let file = write_batch_file("empty", "# nothing here\n\n");
+
+        let err = set_batch(&dummy_cli(None), &set_batch_args(file.to_string_lossy().to_string(), false, false))
+            .unwrap_err();
+        std::fs::remove_file(&file).ok();
+
+        match err {
+            CliError::Usage(message) => assert!(
+                !message.contains("instance directory"),
+                "should fail on the empty-batch check, not on resolving a save: {message}"
+            ),
+            CliError::Data(message) => panic!("expected Usage (exit 2), got Data: {message}"),
+        }
+    }
+
+    fn replace_args(
+        corner1: IVec3,
+        corner2: IVec3,
+        from_block: &str,
+        to_state: BlockState,
+        dry_run: bool,
+        force: bool,
+    ) -> ReplaceArgs {
+        ReplaceArgs {
+            corner1: BlockPos(corner1),
+            corner2: BlockPos(corner2),
+            from_block: from_block.to_string(),
+            to_state,
+            dry_run,
+            force,
+        }
+    }
+
+    /// The ticket's own "Done when": `replace` over a box holding a mix of
+    /// blocks changes only the matching positions.
+    #[test]
+    fn replace_changes_only_the_matching_positions() {
+        let fixture = Fixture::new("replace-mix");
+        // The fixture is all stone; plant one dirt block and one stair inside
+        // the box `replace` will scan, so it's a real mix rather than
+        // uniform stone.
+        set(&cli_for(&fixture), &set_args(IVec3::new(1, 0, 0), dirt(), false, false)).expect("plant dirt");
+        set(&cli_for(&fixture), &set_args(IVec3::new(2, 0, 0), oak_stairs(), false, false))
+            .expect("plant a stair");
+
+        let result = replace(
+            &cli_for(&fixture),
+            &replace_args(
+                IVec3::new(0, 0, 0),
+                IVec3::new(2, 0, 0),
+                "minecraft:stone",
+                oak_slab_top(),
+                false,
+                false,
+            ),
+        )
+        .expect("a valid replace");
+
+        // Only (0, 0, 0) was stone; the dirt and the stair are untouched.
+        assert_eq!(result.matched, 1);
+        assert_eq!(result.outcome.report.blocks_written, 1);
+        assert_eq!(block_state_at(&fixture.meta, IVec3::new(0, 0, 0)), oak_slab_top());
+        assert_eq!(block_state_at(&fixture.meta, IVec3::new(1, 0, 0)), dirt());
+        assert_eq!(block_state_at(&fixture.meta, IVec3::new(2, 0, 0)), oak_stairs());
+    }
+
+    /// `replace` matches by name only — properties never factor in, same
+    /// convention `scan --block` uses (an oriented stair still counts as
+    /// `minecraft:oak_stairs`).
+    #[test]
+    fn replace_matches_by_name_ignoring_properties() {
+        let fixture = Fixture::new("replace-by-name");
+        set(&cli_for(&fixture), &set_args(IVec3::new(0, 0, 0), oak_stairs(), false, false))
+            .expect("plant a stair");
+
+        let result = replace(
+            &cli_for(&fixture),
+            &replace_args(IVec3::new(0, 0, 0), IVec3::new(0, 0, 0), "minecraft:oak_stairs", dirt(), false, false),
+        )
+        .expect("a valid replace");
+
+        assert_eq!(result.matched, 1);
+        assert_eq!(block_name_at(&fixture.meta, IVec3::new(0, 0, 0)), "minecraft:dirt");
+    }
+
+    /// `--dry-run` on `replace` leaves the save's files byte-identical, same
+    /// contract every other write command holds to.
+    #[test]
+    fn replace_dry_run_touches_nothing() {
+        let fixture = Fixture::new("replace-dry-run");
+        let (before_bytes, before_mtime) = (fixture.bytes(), fixture.mtime());
+
+        let result = replace(
+            &cli_for(&fixture),
+            &replace_args(IVec3::new(0, 0, 0), IVec3::new(1, 0, 0), "minecraft:stone", dirt(), true, false),
+        )
+        .expect("a valid plan");
+
+        assert!(result.outcome.dry_run);
+        assert_eq!(result.matched, 2);
+        assert_eq!(result.outcome.report.blocks_written, 2);
+        assert_eq!(fixture.bytes(), before_bytes);
+        assert_eq!(fixture.mtime(), before_mtime);
+        assert_eq!(block_name_at(&fixture.meta, IVec3::new(0, 0, 0)), "minecraft:stone");
+    }
+
+    /// `replace`'s own volume cap (mirrors `get-area`/`set-area`'s
+    /// [`MAX_BLOCKS`]): a box over the limit is a `Usage` error (exit 2)
+    /// raised before `resolve_save` even runs.
+    #[test]
+    fn replace_over_max_blocks_is_a_usage_error_before_touching_a_save() {
+        let args = replace_args(
+            IVec3::new(0, crate::selection::WORLD_MIN_Y, 0),
+            IVec3::new(9999, crate::selection::WORLD_MAX_Y, 9999),
+            "minecraft:stone",
+            dirt(),
+            false,
+            false,
+        );
+
+        let err = replace(&dummy_cli(None), &args).unwrap_err();
+
+        match err {
+            CliError::Usage(message) => {
+                assert!(message.contains(&MAX_BLOCKS.to_string()), "{message}");
+                assert!(
+                    !message.contains("instance directory"),
+                    "should fail on the volume check, not on resolving a save: {message}"
+                );
+            }
+            CliError::Data(message) => panic!("expected Usage (exit 2), got Data: {message}"),
+        }
     }
 }

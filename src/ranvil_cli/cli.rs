@@ -92,6 +92,11 @@ pub enum Command {
     Set(SetArgs),
     /// Fill a box with one block.
     SetArea(SetAreaArgs),
+    /// Apply many discrete `x,y,z blockstate` edits from a file or stdin as
+    /// one transaction.
+    SetBatch(SetBatchArgs),
+    /// Find-and-replace by block name within a box, in one transaction.
+    Replace(ReplaceArgs),
 }
 
 /// `saves` takes no arguments of its own — the instance directory it lists
@@ -306,6 +311,62 @@ pub struct SetAreaArgs {
 
     /// The block to fill the box with.
     pub state: BlockState,
+
+    /// Report the plan without writing anything — see [`super::edit::run_write`].
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Write even though the save currently looks open in Minecraft.
+    #[arg(long)]
+    pub force: bool,
+}
+
+/// `set-batch <file|-> [--dry-run] [--force]` (ticket 096): reads
+/// `x,y,z blockstate` lines (blank lines and `#`-prefixed lines ignored)
+/// from `file`, or from stdin when `file` is `-`, and applies every one as a
+/// single [`super::edit::run_write`] transaction — see
+/// [`super::edit::set_batch`].
+#[derive(Debug, Args)]
+pub struct SetBatchArgs {
+    /// A path to a file of "x,y,z blockstate" lines, or `-` to read from
+    /// stdin.
+    pub file: String,
+
+    /// Report the plan without writing anything — see [`super::edit::run_write`].
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Write even though the save currently looks open in Minecraft.
+    #[arg(long)]
+    pub force: bool,
+}
+
+/// `replace <x1,y1,z1> <x2,y2,z2> --from <name> --to <blockstate>
+/// [--dry-run] [--force]` (ticket 096): every position in the box whose
+/// block's name (properties ignored, same convention [`ScanArgs::block`]
+/// uses) matches `--from` gets written to `--to`, as one transaction — see
+/// [`super::edit::replace`]. The box corners are positional (either order,
+/// same as [`GetAreaArgs`]); `--from`/`--to` name the match/replacement
+/// block so they can't be confused with the box's own corners.
+#[derive(Debug, Args)]
+pub struct ReplaceArgs {
+    /// One corner of the box, "x,y,z". See [`ChunkArgs::pos`] on why
+    /// `allow_hyphen_values`.
+    #[arg(allow_hyphen_values = true)]
+    pub corner1: BlockPos,
+    /// The opposite corner, "x,y,z".
+    #[arg(allow_hyphen_values = true)]
+    pub corner2: BlockPos,
+
+    /// Exact namespaced block name to match, e.g. `minecraft:oak_log` —
+    /// matches every state of that block regardless of its properties, same
+    /// as `scan --block`.
+    #[arg(long = "from")]
+    pub from_block: String,
+
+    /// The block to write at every matched position.
+    #[arg(long = "to")]
+    pub to_state: BlockState,
 
     /// Report the plan without writing anything — see [`super::edit::run_write`].
     #[arg(long)]

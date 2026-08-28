@@ -14,7 +14,11 @@
 //! (095–097) and `struct import` (099) shares — lock, backup, dry-run,
 //! force. Ticket 095 adds [`edit`]'s first two commands, `set`/`set-area`,
 //! thin builders over `run_write` around `WorldEdit::new().set`/
-//! `WorldEdit::fill` respectively.
+//! `WorldEdit::fill` respectively. Ticket 096 adds `set-batch` (many
+//! `x,y,z blockstate` lines from a file or stdin, parsed into one
+//! `WorldEdit` before any of it is applied) and `replace` (a `get-area` scan
+//! for a block name, rewritten to a new one) — both still one `run_write`
+//! transaction, not a loop over 095's `set`.
 //! [`structure`] is still an empty stub — later tickets fill it in.
 
 use std::process::ExitCode;
@@ -122,6 +126,16 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
         }
         Command::SetArea(args) => {
             let result = edit::set_area(cli, args)?;
+            print(&result, cli.format);
+            Ok(())
+        }
+        Command::SetBatch(args) => {
+            let result = edit::set_batch(cli, args)?;
+            print(&result, cli.format);
+            Ok(())
+        }
+        Command::Replace(args) => {
+            let result = edit::replace(cli, args)?;
             print(&result, cli.format);
             Ok(())
         }
