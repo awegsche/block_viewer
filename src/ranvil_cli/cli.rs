@@ -137,6 +137,10 @@ pub enum StructCommand {
     Fill(StructFillArgs),
     /// Add or trim margin on any of the six faces of a structure file.
     Resize(StructResizeArgs),
+    /// Rotate a structure file about Y by 90/180/270 degrees.
+    Rotate(StructRotateArgs),
+    /// Per-position block differences between two same-size structure files.
+    Diff(StructDiffArgs),
 }
 
 /// `struct info <file.nbt>` (ticket 098).
@@ -421,6 +425,58 @@ pub struct StructResizeArgs {
     /// Overwrite `--out` if it already exists.
     #[arg(long)]
     pub force: bool,
+}
+
+/// `struct rotate <file.nbt> --by 90|180|270 --out <file2.nbt> [--force]`
+/// (ticket 102): a direct wrapper over [`crate::blueprint::rotate_blueprint`]
+/// (ticket 038's function, unchanged) — the CLI's job is argument parsing and
+/// error mapping, not rotation logic (see [`super::structure::rotate`]).
+/// Reuses [`RotateArg`] (already spelling `90`/`180`/`270` for `struct
+/// import --rotate`) rather than a second enum for the same three values.
+///
+/// See [`StructResizeArgs`] on why `--out` is required here too — rotation
+/// changes every block's coordinate (and, for 90°/270°, the structure's own
+/// X/Z extents), not a handful of positions, so there is no "in place"
+/// convenience worth a default.
+#[derive(Debug, Args)]
+pub struct StructRotateArgs {
+    /// Path to a gzipped vanilla structure file.
+    pub file: PathBuf,
+
+    /// How far to rotate about Y, clockwise viewed from above.
+    #[arg(long, value_enum)]
+    pub by: RotateArg,
+
+    /// Where to write the rotated structure file.
+    #[arg(long)]
+    pub out: PathBuf,
+
+    /// Overwrite `--out` if it already exists.
+    #[arg(long)]
+    pub force: bool,
+}
+
+/// `struct diff <a.nbt> <b.nbt> [--limit N]` (ticket 102): refuses
+/// (`Usage`, exit 2) if `a`/`b` have different `size`s — a per-position diff
+/// needs a shared coordinate space, so comparing two differently-sized
+/// buildings is `struct info a.nbt` and `struct info b.nbt` side by side, not
+/// this command's job. Otherwise walks every position and reports where the
+/// two disagree, properties included (unlike `scan`/`replace`'s name-only
+/// matching) — see [`super::structure::diff`].
+#[derive(Debug, Args)]
+pub struct StructDiffArgs {
+    /// Path to the first gzipped vanilla structure file.
+    pub a: PathBuf,
+    /// Path to the second gzipped vanilla structure file — must be the same
+    /// `size` as `a`.
+    pub b: PathBuf,
+
+    /// Caps how many differing positions `text`/`compact` list. `json`
+    /// always reports the full list regardless of this flag. Defaults to
+    /// [`super::block::DEFAULT_SCAN_LIMIT`], the same "a few hundred, never
+    /// unbounded" default `scan --limit` uses.
+    #[arg(long)]
+    pub limit: Option<usize>,
 }
 
 /// `saves` takes no arguments of its own — the instance directory it lists

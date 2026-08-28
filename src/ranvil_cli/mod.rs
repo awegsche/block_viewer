@@ -41,6 +41,11 @@
 //! freshly allocated block array rather than reusing `struct fill`'s
 //! in-place mutation — a resize changes the array's own shape, not just
 //! positions within it.
+//! Ticket 102 adds `struct rotate` (a thin wrapper over 038's
+//! `rotate_blueprint`, already called by `struct import --rotate`) and
+//! `struct diff` (the first `struct` command that only reads — two files in,
+//! a per-position comparison out, refusing up front when their `size`s
+//! disagree).
 
 use std::process::ExitCode;
 
@@ -202,6 +207,16 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
         }
         Command::Struct(StructCommand::Resize(args)) => {
             let result = structure::resize(args)?;
+            print(&result, cli.format);
+            Ok(())
+        }
+        Command::Struct(StructCommand::Rotate(args)) => {
+            let result = structure::rotate(args)?;
+            print(&result, cli.format);
+            Ok(())
+        }
+        Command::Struct(StructCommand::Diff(args)) => {
+            let result = structure::diff(args)?;
             print(&result, cli.format);
             Ok(())
         }

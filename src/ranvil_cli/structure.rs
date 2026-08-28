@@ -50,6 +50,17 @@
 //! `y=0` pushes the old `y=0` to `y=N`); the other three only change where
 //! the far face sits. Unlike `set`/`fill`, `--out` is required rather than
 //! defaulting to `file` itself (see [`super::cli::StructResizeArgs`]'s docs).
+//!
+//! `rotate`/`diff` (ticket 102) are unrelated to each other except sharing a
+//! module: `rotate` is a thin wrapper over [`rotate_blueprint`] (038's
+//! function — `struct import --rotate` already called it, so this is the
+//! CLI's first *direct* exposure of it, not new logic), while `diff` is the
+//! first `struct` command that reads two structure files and never writes
+//! one — a per-position [`BlockState`] comparison (properties included, not
+//! just names) that refuses up front when the two `size`s don't match, since
+//! there's no shared coordinate space to walk otherwise. `diff`'s `text`/
+//! `compact` cap their listing at `--limit` the same way `scan` does; `json`
+//! deliberately does not, per the ticket — see [`StructDiffResult`]'s docs.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -70,8 +81,9 @@ use crate::world::SECTION_SIZE;
 use super::block::position_of;
 use super::chunk::region_span;
 use super::cli::{
-    Cli, RotateArg, StructExportArgs, StructFillArgs, StructGetArgs, StructImportArgs,
-    StructInfoArgs, StructNewArgs, StructResizeArgs, StructSetArgs,
+    Cli, RotateArg, StructDiffArgs, StructExportArgs, StructFillArgs, StructGetArgs,
+    StructImportArgs, StructInfoArgs, StructNewArgs, StructResizeArgs, StructRotateArgs,
+    StructSetArgs,
 };
 use super::edit::{outcome_json_fields, outcome_summary, run_write, WriteOutcome};
 use super::error::CliError;
@@ -935,6 +947,236 @@ impl Render for StructResizeResult {
             "pad_z_pos": self.pad_z_pos,
             "fill": self.fill.to_string(),
         })
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// ---- rotate (ticket 102) ---------------------------------------------------------------------
+// -------------------------------------------------------------------------------------------------
+
+/// `struct rotate`'s result: the file, where the rotated copy landed, the
+/// rotation applied, and the size before/after (unchanged for 180°, X/Z
+/// swapped for 90°/270°).
+#[derive(Debug)]
+pub struct StructRotateResult {
+    pub file: PathBuf,
+    pub out: PathBuf,
+    pub by: RotateArg,
+    pub old_size: IVec3,
+    pub new_size: IVec3,
+}
+
+/// Runs `struct rotate`: [`read_structure_file`], [`rotate_blueprint`] (038's
+/// function — see the module docs on `struct import --rotate` calling the
+/// exact same one), then [`write_structure_file`] to `args.out`.
+///
+/// The `--out`-exists check happens before [`rotate_blueprint`] runs, same
+/// "before anything is touched" ordering [`new`]/[`export`] apply to their
+/// own `--out`. A [`RotationError::UnrotatableProperty`] surfaces as
+/// [`CliError::Data`] carrying that error's own `Display` — already naming
+/// the offending block, property key and value — rather than a generic
+/// message, per the ticket.
+pub fn rotate(args: &StructRotateArgs) -> Result<StructRotateResult, CliError> {
+    let blueprint = read_structure_file(&args.file)
+        .map_err(|err| CliError::Data(format!("{}: {err}", args.file.display())))?;
+
+    if args.out.exists() && !args.force {
+        return Err(CliError::Usage(format!(
+            "{} already exists — pass --force to overwrite",
+            args.out.display()
+        )));
+    }
+
+    let old_size = blueprint.size;
+    let rotated = rotate_blueprint(&blueprint, args.by.to_rotation())
+        .map_err(|err| CliError::Data(format!("{}: {err}", args.file.display())))?;
+    let new_size = rotated.size;
+
+    write_structure_file(&args.out, &rotated).map_err(|err| {
+        CliError::Data(format!("could not write {}: {err}", args.out.display()))
+    })?;
+
+    Ok(StructRotateResult { file: args.file.clone(), out: args.out.clone(), by: args.by, old_size, new_size })
+}
+
+impl StructRotateResult {
+    fn summary_line(&self) -> String {
+        format!(
+            "struct rotate {} by {} -> {}: size {}x{}x{} -> {}x{}x{}",
+            self.file.display(),
+            self.by.as_str(),
+            self.out.display(),
+            self.old_size.x,
+            self.old_size.y,
+            self.old_size.z,
+            self.new_size.x,
+            self.new_size.y,
+            self.new_size.z,
+        )
+    }
+}
+
+impl Render for StructRotateResult {
+    fn render_text(&self) -> String {
+        self.summary_line()
+    }
+
+    fn render_json(&self) -> Value {
+        json!({
+            "file": self.file.display().to_string(),
+            "out": self.out.display().to_string(),
+            "by": self.by.as_str(),
+            "old_size": [self.old_size.x, self.old_size.y, self.old_size.z],
+            "new_size": [self.new_size.x, self.new_size.y, self.new_size.z],
+        })
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// ---- diff (ticket 102) -----------------------------------------------------------------------
+// -------------------------------------------------------------------------------------------------
+
+/// One position where two structure files' blocks disagree — properties
+/// included, per the ticket ("a diff's whole purpose is catching exactly the
+/// kind of change name-only matching would hide, like a rotated door nobody
+/// noticed").
+#[derive(Debug, Clone)]
+pub struct StructDiffEntry {
+    pub pos: IVec3,
+    pub a: BlockState,
+    pub b: BlockState,
+}
+
+/// `struct diff`'s result: every differing position, in full — `text`/
+/// `compact` cap their own listing at [`Self::limit`] (see
+/// [`Render::render_text`]/[`Render::render_compact`] below), but
+/// [`Self::differences`] itself always holds the complete list, since
+/// `render_json` reports it uncapped per the ticket.
+#[derive(Debug)]
+pub struct StructDiffResult {
+    pub a_file: PathBuf,
+    pub b_file: PathBuf,
+    pub size: IVec3,
+    /// How many differences `text`/`compact` list before truncating —
+    /// `args.limit` or [`super::block::DEFAULT_SCAN_LIMIT`], the same default
+    /// `scan --limit` uses. Does not affect `render_json`.
+    pub limit: usize,
+    pub differences: Vec<StructDiffEntry>,
+}
+
+/// Runs `struct diff`: [`read_structure_file`] on both `a` and `b`, refuses
+/// (`Usage`, exit 2) if their `size`s differ — a per-position diff needs a
+/// shared coordinate space — then walks both blueprints' dense `blocks`
+/// arrays position-by-position (they're guaranteed the same length once
+/// `size` matches, since [`read_structure_file`] already rejects a `blocks`
+/// list that doesn't cover its own `size`), recording every position whose
+/// resolved [`BlockState`] (name and properties both) differs.
+pub fn diff(args: &StructDiffArgs) -> Result<StructDiffResult, CliError> {
+    let a = read_structure_file(&args.a)
+        .map_err(|err| CliError::Data(format!("{}: {err}", args.a.display())))?;
+    let b = read_structure_file(&args.b)
+        .map_err(|err| CliError::Data(format!("{}: {err}", args.b.display())))?;
+
+    if a.size != b.size {
+        return Err(CliError::Usage(format!(
+            "{} is {}x{}x{} but {} is {}x{}x{} — struct diff needs matching sizes \
+             (compare with struct info on each instead)",
+            args.a.display(),
+            a.size.x,
+            a.size.y,
+            a.size.z,
+            args.b.display(),
+            b.size.x,
+            b.size.y,
+            b.size.z,
+        )));
+    }
+
+    let size = a.size;
+    let limit = args.limit.unwrap_or(super::block::DEFAULT_SCAN_LIMIT);
+
+    let mut differences = Vec::new();
+    for (index, (&a_index, &b_index)) in a.blocks.iter().zip(b.blocks.iter()).enumerate() {
+        let state_a = &a.palette[a_index as usize];
+        let state_b = &b.palette[b_index as usize];
+        if state_a != state_b {
+            let pos = super::block::position_of(IVec3::ZERO, size, index);
+            differences.push(StructDiffEntry { pos, a: state_a.clone(), b: state_b.clone() });
+        }
+    }
+
+    Ok(StructDiffResult { a_file: args.a.clone(), b_file: args.b.clone(), size, limit, differences })
+}
+
+impl StructDiffResult {
+    fn summary_line(&self) -> String {
+        let count = self.differences.len();
+        format!(
+            "struct diff {} {}: size {}x{}x{}, {count} difference{}",
+            self.a_file.display(),
+            self.b_file.display(),
+            self.size.x,
+            self.size.y,
+            self.size.z,
+            if count == 1 { "" } else { "s" },
+        )
+    }
+
+    /// [`Self::differences`] capped at [`Self::limit`] — the sample `text`/
+    /// `compact` share, and how many were left out beyond it.
+    fn sample(&self) -> (&[StructDiffEntry], usize) {
+        let shown = self.differences.len().min(self.limit);
+        (&self.differences[..shown], self.differences.len() - shown)
+    }
+}
+
+impl Render for StructDiffResult {
+    /// The summary line plus one line per differing position, capped at
+    /// `limit` — same "count plus a capped sample list" convention
+    /// [`super::block::ScanResult::render_text`] follows for its own matches.
+    fn render_text(&self) -> String {
+        let (sample, rest) = self.sample();
+        let mut lines = vec![self.summary_line()];
+        for entry in sample {
+            lines.push(format!("  {}: {} -> {}", entry.pos, entry.a, entry.b));
+        }
+        if rest > 0 {
+            lines.push(format!("  ... and {rest} more (raise with --limit)"));
+        }
+        lines.join("\n")
+    }
+
+    /// The full, uncapped list — `"count"` reports the true total even when
+    /// it exceeds `limit`, since `limit` only bounds `text`/`compact` here.
+    fn render_json(&self) -> Value {
+        json!({
+            "a": self.a_file.display().to_string(),
+            "b": self.b_file.display().to_string(),
+            "size": [self.size.x, self.size.y, self.size.z],
+            "count": self.differences.len(),
+            "differences": self.differences.iter().map(|entry| json!({
+                "pos": [entry.pos.x, entry.pos.y, entry.pos.z],
+                "a": entry.a.to_string(),
+                "b": entry.b.to_string(),
+            })).collect::<Vec<_>>(),
+        })
+    }
+
+    /// One line: the summary plus the same capped sample `render_text` uses,
+    /// semicolon-separated — the same "pack the capped listing into one
+    /// line" shape [`super::block::ColumnResult::render_compact`] uses for
+    /// its own ranges.
+    fn render_compact(&self) -> String {
+        let (sample, rest) = self.sample();
+        if sample.is_empty() {
+            return self.summary_line();
+        }
+        let entries: Vec<String> = sample
+            .iter()
+            .map(|entry| format!("{}: {} -> {}", entry.pos, entry.a, entry.b))
+            .collect();
+        let trailer = if rest > 0 { format!("; ... and {rest} more") } else { String::new() };
+        format!("{}: {}{trailer}", self.summary_line(), entries.join("; "))
     }
 }
 
@@ -2154,5 +2396,228 @@ mod tests {
         let out = temp_path("resize-missing-out");
         let err = resize(&resize_args(path, out, 1, 0, 0, 0, 0, 0, BlockState::air(), false)).unwrap_err();
         assert!(matches!(err, CliError::Data(_)), "{err:?}");
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // ---- rotate / diff (ticket 102) --------------------------------------------------------
+    // -----------------------------------------------------------------------------------------
+
+    fn rotate_args(file: PathBuf, by: RotateArg, out: PathBuf, force: bool) -> StructRotateArgs {
+        StructRotateArgs { file, by, out, force }
+    }
+
+    fn diff_args(a: PathBuf, b: PathBuf, limit: Option<usize>) -> StructDiffArgs {
+        StructDiffArgs { a, b, limit }
+    }
+
+    /// A blueprint carrying a property `blueprint::rotate`'s table has no
+    /// rewrite rule for — the same fixture that module's own tests (and
+    /// `city::placement`'s) use to exercise `UnrotatableProperty`.
+    fn unrotatable_blueprint() -> Blueprint {
+        let unrotatable = BlockState {
+            name: "minecraft:made_up_block".to_string(),
+            properties: vec![("orientation".to_string(), "north_up".to_string())],
+        };
+        Blueprint {
+            size: IVec3::ONE,
+            origin: IVec3::ZERO,
+            palette: vec![unrotatable],
+            blocks: vec![0],
+            data_version: 3953,
+            failed_columns: 0,
+        }
+    }
+
+    /// The ticket's own "Done when": rotating 180° twice reproduces the
+    /// original — verified with `struct diff` reporting zero differences,
+    /// not just an eyeballed size match.
+    #[test]
+    fn rotating_180_twice_reproduces_the_original_per_struct_diff() {
+        let source = temp_path("rotate-180-twice-source");
+        write_structure_file(&source, &labeled_blueprint(IVec3::new(2, 1, 3))).expect("should write");
+
+        let once = temp_path("rotate-180-twice-once");
+        rotate(&rotate_args(source.clone(), RotateArg::Deg180, once.clone(), false)).expect("first rotation");
+        let twice = temp_path("rotate-180-twice-twice");
+        let result = rotate(&rotate_args(once.clone(), RotateArg::Deg180, twice.clone(), false))
+            .expect("second rotation");
+        std::fs::remove_file(&once).ok();
+
+        assert_eq!(result.new_size, IVec3::new(2, 1, 3), "180 degrees twice must restore the original size");
+
+        let diff_result = diff(&diff_args(source.clone(), twice.clone(), None)).expect("should diff");
+        std::fs::remove_file(&source).ok();
+        std::fs::remove_file(&twice).ok();
+
+        assert_eq!(diff_result.differences.len(), 0, "{:?}", diff_result.differences);
+    }
+
+    /// `struct rotate` on a blueprint carrying a property the rotation table
+    /// doesn't know is `CliError::Data` carrying that error's own message
+    /// (naming the block, property key and value), not a generic failure —
+    /// and no `--out` file is written.
+    #[test]
+    fn rotate_on_an_unrotatable_property_carries_the_errors_own_message() {
+        let source = temp_path("rotate-unrotatable-source");
+        write_structure_file(&source, &unrotatable_blueprint()).expect("should write");
+
+        let out = temp_path("rotate-unrotatable-out");
+        let err = rotate(&rotate_args(source.clone(), RotateArg::Deg90, out.clone(), false)).unwrap_err();
+        std::fs::remove_file(&source).ok();
+
+        match err {
+            CliError::Data(message) => {
+                assert!(message.contains("minecraft:made_up_block"), "{message}");
+                assert!(message.contains("orientation"), "{message}");
+                assert!(message.contains("north_up"), "{message}");
+            }
+            CliError::Usage(message) => panic!("expected Data (exit 1), got Usage: {message}"),
+        }
+        assert!(!out.exists(), "a refused rotation must not write a file");
+    }
+
+    /// `struct rotate --out` refuses to overwrite an existing file without
+    /// `--force`, same convention every other file-writing `struct` command
+    /// follows.
+    #[test]
+    fn rotate_onto_an_existing_out_without_force_refuses() {
+        let source = temp_path("rotate-no-force-source");
+        write_structure_file(&source, &labeled_blueprint(IVec3::new(2, 1, 2))).expect("should write");
+
+        let out = temp_path("rotate-no-force-out");
+        std::fs::write(&out, b"not a structure file").expect("seed an existing file");
+
+        let err = rotate(&rotate_args(source.clone(), RotateArg::Deg90, out.clone(), false)).unwrap_err();
+        std::fs::remove_file(&source).ok();
+
+        match err {
+            CliError::Usage(message) => assert!(message.contains("--force"), "{message}"),
+            CliError::Data(message) => panic!("expected Usage (exit 2), got Data: {message}"),
+        }
+        assert_eq!(
+            std::fs::read(&out).expect("still readable"),
+            b"not a structure file",
+            "must not have overwritten"
+        );
+        std::fs::remove_file(&out).ok();
+    }
+
+    /// `struct rotate` on a missing file is a `Data` error (exit 1), same as
+    /// every other `struct` command's own missing-file test.
+    #[test]
+    fn rotate_on_a_missing_file_is_a_data_error() {
+        let path = temp_path("rotate-missing");
+        let out = temp_path("rotate-missing-out");
+        let err = rotate(&rotate_args(path, RotateArg::Deg90, out, false)).unwrap_err();
+        assert!(matches!(err, CliError::Data(_)), "{err:?}");
+    }
+
+    /// The ticket's own "Done when": a copy of a file with exactly one block
+    /// changed reports exactly one difference, with the correct position and
+    /// before/after values.
+    #[test]
+    fn diff_between_a_file_and_a_one_block_edit_reports_exactly_one_difference() {
+        let a = temp_path("diff-one-block-a");
+        write_structure_file(&a, &labeled_blueprint(IVec3::new(2, 1, 2))).expect("should write a");
+
+        let b = temp_path("diff-one-block-b");
+        let changed_pos = IVec3::new(1, 0, 0);
+        set(&set_args(a.clone(), changed_pos, state("minecraft:glass"), Some(b.clone()), false))
+            .expect("should write b as an edited copy");
+
+        let result = diff(&diff_args(a.clone(), b.clone(), None)).expect("should diff");
+        std::fs::remove_file(&a).ok();
+        std::fs::remove_file(&b).ok();
+
+        assert_eq!(result.differences.len(), 1, "{:?}", result.differences);
+        let entry = &result.differences[0];
+        assert_eq!(entry.pos, changed_pos);
+        assert_eq!(entry.a.name, "minecraft:pos_1_0_0");
+        assert_eq!(entry.b.name, "minecraft:glass");
+    }
+
+    /// Two structure files with no differences at all report zero, not a
+    /// missing/empty-list ambiguity.
+    #[test]
+    fn diff_between_identical_files_reports_zero_differences() {
+        let a = temp_path("diff-identical-a");
+        write_structure_file(&a, &labeled_blueprint(IVec3::new(2, 2, 2))).expect("should write a");
+        let b = temp_path("diff-identical-b");
+        write_structure_file(&b, &labeled_blueprint(IVec3::new(2, 2, 2))).expect("should write b");
+
+        let result = diff(&diff_args(a.clone(), b.clone(), None)).expect("should diff");
+        std::fs::remove_file(&a).ok();
+        std::fs::remove_file(&b).ok();
+
+        assert_eq!(result.differences.len(), 0);
+        assert!(!result.render_text().contains("more"));
+    }
+
+    /// The ticket's own refusal case: differently-sized files exit 2 rather
+    /// than attempting a partial comparison.
+    #[test]
+    fn diff_between_differently_sized_files_is_a_usage_error() {
+        let a = temp_path("diff-size-mismatch-a");
+        write_structure_file(&a, &labeled_blueprint(IVec3::new(2, 1, 1))).expect("should write a");
+        let b = temp_path("diff-size-mismatch-b");
+        write_structure_file(&b, &labeled_blueprint(IVec3::new(3, 1, 1))).expect("should write b");
+
+        let err = diff(&diff_args(a.clone(), b.clone(), None)).unwrap_err();
+        std::fs::remove_file(&a).ok();
+        std::fs::remove_file(&b).ok();
+
+        match err {
+            CliError::Usage(message) => {
+                assert!(message.contains("2x1x1"), "{message}");
+                assert!(message.contains("3x1x1"), "{message}");
+            }
+            CliError::Data(message) => panic!("expected Usage (exit 2), got Data: {message}"),
+        }
+    }
+
+    /// `struct diff` on a missing file is a `Data` error (exit 1), same as
+    /// every other `struct` command's own missing-file test.
+    #[test]
+    fn diff_on_a_missing_file_is_a_data_error() {
+        let a = temp_path("diff-missing-a");
+        let b = temp_path("diff-missing-b");
+        write_structure_file(&b, &labeled_blueprint(IVec3::ONE)).expect("should write b");
+
+        let err = diff(&diff_args(a, b.clone(), None)).unwrap_err();
+        std::fs::remove_file(&b).ok();
+        assert!(matches!(err, CliError::Data(_)), "{err:?}");
+    }
+
+    /// `text`/`compact` cap their listing at `--limit`, but `render_json`
+    /// always reports the full, uncapped list — the ticket's own split
+    /// between the two.
+    #[test]
+    fn text_and_compact_cap_the_listing_but_json_stays_full() {
+        let a = temp_path("diff-limit-a");
+        write_structure_file(&a, &labeled_blueprint(IVec3::new(4, 1, 1))).expect("should write a");
+        let b = temp_path("diff-limit-b");
+        set(&set_args(a.clone(), IVec3::new(0, 0, 0), state("minecraft:changed_0"), Some(b.clone()), false))
+            .expect("should seed b as an edited copy");
+        for x in 1..4 {
+            set(&set_args(b.clone(), IVec3::new(x, 0, 0), state(&format!("minecraft:changed_{x}")), None, true))
+                .expect("should edit b in place");
+        }
+
+        let result = diff(&diff_args(a.clone(), b.clone(), Some(2))).expect("should diff");
+        std::fs::remove_file(&a).ok();
+        std::fs::remove_file(&b).ok();
+
+        assert_eq!(result.differences.len(), 4, "the full list is always collected");
+
+        let text = result.render_text();
+        assert!(text.contains("4 differences"), "{text}");
+        assert!(text.contains("... and 2 more"), "{text}");
+
+        let compact = result.render_compact();
+        assert!(compact.contains("... and 2 more"), "{compact}");
+
+        let json = result.render_json();
+        assert_eq!(json["count"], 4);
+        assert_eq!(json["differences"].as_array().expect("array").len(), 4, "json is never capped by --limit");
     }
 }
