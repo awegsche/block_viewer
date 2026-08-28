@@ -57,5 +57,20 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
             print(&result, cli.format);
             Ok(())
         }
+        Command::Info(args) => {
+            let result = save::info(cli, args)?;
+            print(&result, cli.format);
+            Ok(())
+        }
+        Command::Regions(args) => {
+            let result = save::regions(cli, args)?;
+            print(&result, cli.format);
+            Ok(())
+        }
+        Command::Lock(args) => {
+            let result = save::lock(cli, args)?;
+            print(&result, cli.format);
+            Ok(())
+        }
     }
 }

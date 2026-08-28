@@ -7,7 +7,7 @@
 
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use super::format::OutputFormat;
 
@@ -36,13 +36,22 @@ pub struct Cli {
     pub command: Command,
 }
 
-/// One variant per subcommand. This ticket adds exactly one (`Saves`);
-/// every later `ranvil-cli` ticket adds one more, routing to its own
+/// One variant per subcommand. Ticket 087 added `Saves`; ticket 088 adds
+/// `Info`/`Regions`/`Lock`, the first three commands that need `--save`
+/// resolved (see `save::resolve_save`) rather than listing every save.
+/// Every later `ranvil-cli` ticket adds one more, routing to its own
 /// submodule the same way.
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// List Minecraft saves under an instance directory.
     Saves(SavesArgs),
+    /// Save-level summary: DataVersion, dimensions present, region count,
+    /// locked.
+    Info(InfoArgs),
+    /// Region files present: coordinates, file size, chunk count.
+    Regions(RegionsArgs),
+    /// Whether Minecraft is holding this save's `session.lock` right now.
+    Lock(LockArgs),
 }
 
 /// `saves` takes no arguments of its own — the instance directory it lists
@@ -50,3 +59,32 @@ pub enum Command {
 /// every later command that needs one too.
 #[derive(Debug, Args)]
 pub struct SavesArgs {}
+
+/// `info` takes no arguments of its own — the save it summarizes comes from
+/// the global `--save`/`--instance` above, resolved by `save::resolve_save`.
+#[derive(Debug, Args)]
+pub struct InfoArgs {}
+
+/// `lock` takes no arguments of its own, same reason as [`InfoArgs`].
+#[derive(Debug, Args)]
+pub struct LockArgs {}
+
+#[derive(Debug, Args)]
+pub struct RegionsArgs {
+    /// Rendering layout for `text`/`compact` output: `list` (default, one
+    /// line per region, sorted by `(x, z)`) or `grid`
+    /// (`SaveMeta::get_grid_view`'s ASCII map). `Option` rather than a
+    /// defaulted value so `regions::regions` can tell "not given" (compatible
+    /// with any `--format`) apart from an explicit `--layout grid`
+    /// (incompatible with `--format json`, which is always the list shape as
+    /// an array of objects) — see the roadmap's note on why `grid` is a
+    /// `--layout` value rather than a fourth [`super::format::OutputFormat`].
+    #[arg(long, value_enum)]
+    pub layout: Option<RegionLayout>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum RegionLayout {
+    List,
+    Grid,
+}
