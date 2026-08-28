@@ -23,7 +23,10 @@
 //! and applied as one `run_write` transaction — the extraction finishes
 //! before the write session opens, so an overlapping source/destination
 //! reads the original blocks throughout.
-//! [`structure`] is still an empty stub — later tickets fill it in.
+//! Ticket 098 gives [`structure`] its first two commands, `struct info`/
+//! `struct new` — the first `ranvil-cli` commands that read or write a
+//! [`crate::blueprint::Blueprint`] on disk rather than a live save, so
+//! unlike every command above they take no `--save`/`--instance` at all.
 
 use std::process::ExitCode;
 
@@ -40,7 +43,7 @@ pub mod heightmap;
 pub mod save;
 pub mod structure;
 
-use cli::{Cli, Command};
+use cli::{Cli, Command, StructCommand};
 use error::CliError;
 use format::print;
 
@@ -145,6 +148,16 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
         }
         Command::Copy(args) => {
             let result = edit::copy(cli, args)?;
+            print(&result, cli.format);
+            Ok(())
+        }
+        Command::Struct(StructCommand::Info(args)) => {
+            let result = structure::info(args)?;
+            print(&result, cli.format);
+            Ok(())
+        }
+        Command::Struct(StructCommand::New(args)) => {
+            let result = structure::new(args)?;
             print(&result, cli.format);
             Ok(())
         }

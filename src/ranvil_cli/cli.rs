@@ -102,6 +102,56 @@ pub enum Command {
     Replace(ReplaceArgs),
     /// Extract a box and re-apply it translated elsewhere in the same save.
     Copy(CopyArgs),
+    /// Structure-file (`.nbt`) inspection and authoring — reads or writes a
+    /// [`crate::blueprint::Blueprint`] on disk and, except `export`/`import`
+    /// (099), never opens a save at all. Ticket 098 adds `info`/`new`; later
+    /// tickets add `export`/`import`/`get`/`set`/`fill`/`resize`/`rotate`/
+    /// `diff`/`validate` to [`StructCommand`].
+    #[command(subcommand)]
+    Struct(StructCommand),
+}
+
+/// `struct <cmd>` (tickets 098–103): one variant per structure-file
+/// subcommand, routed the same way [`Command`] routes its own top-level
+/// variants — see [`super::structure`].
+#[derive(Debug, Subcommand)]
+pub enum StructCommand {
+    /// A structure file's own shape: size, origin, block count,
+    /// `DataVersion`, palette.
+    Info(StructInfoArgs),
+    /// A blank structure file from scratch — air, or one state throughout.
+    New(StructNewArgs),
+}
+
+/// `struct info <file.nbt>` (ticket 098).
+#[derive(Debug, Args)]
+pub struct StructInfoArgs {
+    /// Path to a gzipped vanilla structure file.
+    pub file: PathBuf,
+}
+
+/// `struct new --size <x,y,z> --out <file.nbt> [--fill <blockstate>]
+/// [--force]` (ticket 098).
+#[derive(Debug, Args)]
+pub struct StructNewArgs {
+    /// The new structure's size, "x,y,z". Reuses [`BlockPos`]'s "x,y,z"
+    /// parser rather than growing a second one — `struct new` validates each
+    /// component (at least 1, at most [`crate::blueprint::STRUCTURE_BLOCK_MAX_SIZE`])
+    /// itself, the same way [`super::structure::new`] documents.
+    #[arg(long, allow_hyphen_values = true)]
+    pub size: BlockPos,
+
+    /// Where to write the new structure file.
+    #[arg(long)]
+    pub out: PathBuf,
+
+    /// The block every position is filled with.
+    #[arg(long, default_value = "minecraft:air")]
+    pub fill: BlockState,
+
+    /// Overwrite `--out` if it already exists.
+    #[arg(long)]
+    pub force: bool,
 }
 
 /// `saves` takes no arguments of its own — the instance directory it lists

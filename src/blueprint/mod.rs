@@ -48,9 +48,13 @@ use crate::selection::SelectionBounds;
 // yet — it's the type ticket 023's writer serializes, and re-exporting it
 // here is what makes `extract` an implementation detail rather than
 // something 023 has to reach into. Same call as `world/mod.rs`'s re-exports.
+// `FALLBACK_DATA_VERSION` is exported for the same reason: `ranvil-cli
+// struct new` (ticket 098) needs the same "no real chunk to sample" default
+// extraction itself falls back to, rather than picking a second number.
 #[allow(unused_imports)]
 pub use extract::{
-    extract_blueprint, BlockState, Blueprint, ExtractError, ExtractProgress, MAX_BLOCKS,
+    extract_blueprint, BlockState, Blueprint, ExtractError, ExtractProgress, FALLBACK_DATA_VERSION,
+    MAX_BLOCKS,
 };
 
 pub use export::{BlueprintExport, ExportState};
@@ -90,7 +94,10 @@ pub use catalogue::{load_catalogue_dir, BuildingCatalogue, CatalogueEntry, Catal
 /// summarising the rest. Long enough to see a structure's whole palette,
 /// short enough not to bury the console for a selection covering half a
 /// biome.
-const LOGGED_PALETTE_ENTRIES: usize = 64;
+///
+/// `pub(crate)`: `ranvil-cli struct info` (ticket 098) caps its own palette
+/// listing the same way, rather than picking a second number.
+pub(crate) const LOGGED_PALETTE_ENTRIES: usize = 64;
 
 /// The one extraction slot: a request waiting to start, the task running, and
 /// the last finished outcome for the panel to report.
