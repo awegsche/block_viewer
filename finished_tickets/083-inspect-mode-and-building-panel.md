@@ -1,7 +1,15 @@
 # 083 - Inspect mode: default tool, per-building panel
 
 ## Status
-Open — next up after 082.
+Done — `cargo test --bin citybuilder --lib` green (456 `city::` tests, 0
+failed). Landed as designed below; one implementation choice worth naming:
+[`building_name`](../src/city/ui/inspect_panel.rs) reads through
+`City::definition_of` rather than `PlacedBuilding::definition_id` directly,
+which finally gives that lookup (dead code since ticket 076) a real caller.
+
+Manual/visual verification (window opens, click-to-select actually feels
+right) is a to-do in `../todo.md` — see CLAUDE.md's "Manual/visual
+verification".
 
 ## Depends on
 082 (the menu this wires into; not a hard code blocker).
@@ -62,4 +70,5 @@ shown when `SelectedBuilding` is `None`. Otherwise, for the selected
   something to rip out later rather than fill in; revisit when I4 lands.
 
 Doesn't add the "Place Farm Tile" button — that's 084, since it needs the
-hub schema this ticket has no reason to touch.
+hub schema this ticket has no reason to touch. (084 landed ahead of this
+ticket and left that button as an open gap between the two — still open.)

@@ -1293,3 +1293,56 @@ Y=0 in the world and won't be cleaned up by this fix — see the ticket.
   camera entered chunk ...`, and every placement/road/save message — those
   were deliberately left alone, so if any of *those* went missing something
   is wrong.
+- [ ] **084 farm tiles: the Lumberjack's Hut actually scales with its
+  fields.** `cargo run --bin citybuilder` against a real save. Build a
+  `Lumberjack's Hut` (Production tier 1) — its build-menu row should read
+  `Scales with Lumberjack's Farm Tile nearby (3 needed, within 16 tiles)`,
+  and both buildings should mesh as real geometry, not `house01`'s
+  placeholder box. With no farm tile placed, the City panel's production
+  line should read `lumber: running, 0/256, 0/3 tiles — unserved` (0 tiles
+  means 0 output, not starved). Place one `Lumberjack's Farm Tile` within 16
+  blocks of the hut and confirm the tile count climbs to `1/3` and the
+  buffer actually starts filling; place two more (3/3) and confirm it's
+  running at the full listed rate rather than continuing to climb past it.
+  Place a fourth tile well outside 16 blocks and confirm it does *not* bump
+  the count. If two hubs' catchments overlap, confirm a tile between them
+  counts toward only the nearer one (check both hubs' panel lines, not just
+  one). Also worth an eyeball: the ghost preview and placed mesh for both
+  `lumber.nbt` and `lumber_farm_01.nbt` look like actual structures, not
+  reused geometry.
+- [ ] **083 inspect mode: default tool, per-building panel.** `cargo run
+  --bin citybuilder` against a real save. On launch, before touching
+  anything, left-click a patch of empty ground and confirm nothing happens
+  (no ghost, no placement) — the resting tool is now Inspect, not Building.
+  Click a placed building (or place one first via the build menu, which
+  should still switch into Building mode on its own) and confirm an
+  "Inspect" window appears naming it, its position, and its rotation; for a
+  producer (e.g. a Lumberjack's Hut with fields nearby) confirm it also
+  shows a running/starved/buffer-full state and a buffer line per item
+  against the shared cap. Click a road tile, then empty ground, and confirm
+  the Inspect window disappears both times; click nowhere (miss the world
+  entirely, e.g. click over an egui panel) and confirm whatever was selected
+  stays selected. Press `T` from the resting state and confirm it enters
+  Building (not a fourth stop before it); press `Escape` while something is
+  selected/placing and confirm the game falls back to Inspect (left-click
+  goes back to selecting rather than placing). Demolish a selected building
+  and confirm its Inspect window disappears rather than showing stale data.
+- [ ] **085 ground_level: the lumberjack's hut sinks into the terrain instead
+  of poking up above it.** The automated suite covers the arithmetic
+  directly (`resolve_placement`'s subtraction, `load_entry`'s range check) —
+  what it can't cover is whether `lumber.ron`'s `ground_level: 2` actually
+  reads right against real terrain.
+
+  `cargo run --bin citybuilder` against a real save. Select the Lumberjack's
+  Hut and aim the ghost at reasonably flat ground: confirm its two dirt
+  layers now sit *at and below* the surrounding terrain's own surface — the
+  hut's grass/dirt-path floor (blueprint `y=2`) should read level with the
+  ground around it, not one block above where a house (`ground_level: 0`)
+  would sit at the same spot. Place it and confirm the same thing in the
+  placed mesh, then open the save in Minecraft and check there's no visible
+  gap or floating foundation underneath it. Also place a `house01`/
+  `warehouse01`/`farm01` next to it and confirm those are unaffected —
+  still flush with the ground exactly as before this ticket. Finally, try
+  `Page Up`/`Page Down` on the hut's ghost and confirm the manual offset
+  still nudges it up/down from the now-correct base height, rather than
+  fighting the ground_level shift.

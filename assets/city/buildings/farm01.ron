@@ -9,6 +9,8 @@ Building(
     requires: [],
     category: Production,
     footprint: Explicit(x: 9, z: 9),
+    // Ticket 085: placeholder geometry — see house01.ron.
+    ground_level: 0,
     cost: [
         (block: "minecraft:oak_planks", count: 24),
         (block: "minecraft:dirt", count: 64),

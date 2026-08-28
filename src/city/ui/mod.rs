@@ -1,6 +1,8 @@
 //! The citybuilder's own egui UI (ticket 050, roadmap G): a build menu
 //! ([`build_menu`]) and a city panel ([`city_panel`]) — the group `city::mod`'s
-//! own docs have named as missing since the game's first commit.
+//! own docs have named as missing since the game's first commit. Ticket 083
+//! (roadmap G3) added a third window, [`inspect_panel`] — what a left-click
+//! means once [`super::tool::ActiveTool::Inspect`] is the resting state.
 //!
 //! ## Why a second `UiPlugin`, not [`crate::viewer::ui::UiPlugin`]
 //!
@@ -29,6 +31,7 @@
 mod build_menu;
 mod city_panel;
 mod definition_errors;
+mod inspect_panel;
 
 use bevy::prelude::*;
 use bevy_egui::{EguiContexts, EguiPlugin};
@@ -48,7 +51,12 @@ impl Plugin for UiPlugin {
         app.add_plugins(EguiPlugin)
             .add_systems(
                 Update,
-                (build_menu::build_menu_panel, city_panel::city_panel, definition_errors::definition_errors_panel)
+                (
+                    build_menu::build_menu_panel,
+                    city_panel::city_panel,
+                    definition_errors::definition_errors_panel,
+                    inspect_panel::inspect_panel,
+                )
                     .in_set(UiPanelSet),
             )
             .add_systems(Update, sync_egui_input_capture.after(UiPanelSet));

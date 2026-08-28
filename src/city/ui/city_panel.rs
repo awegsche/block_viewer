@@ -41,6 +41,7 @@ use super::super::clock::{GameClock, GameSpeed};
 use super::super::inventory::{short_name, Stock};
 use super::super::definition::BuildingDefinitions;
 use super::super::economy::EconomyConfig;
+use super::super::farm::FarmCoverage;
 use super::super::journal::Journal;
 use super::super::production::{buffer_capacity, ProductionState};
 use super::super::warehouse::{Coverage, StorageCapacity};
@@ -260,21 +261,29 @@ fn producer_lines(
     definitions: &BuildingDefinitions,
     economy: &EconomyConfig,
     coverage: &Coverage,
+    farm_coverage: &FarmCoverage,
 ) -> Vec<String> {
     let mut lines: Vec<String> = production
         .iter()
         .filter_map(|(id, producer)| {
             let placed = city.building(id)?;
             let name = placed.definition_id.as_deref().unwrap_or(&placed.catalogue_id);
-            let capacity = definitions
-                .get(name)
+            let definition = definitions.get(name);
+            let capacity = definition
                 .and_then(|definition| definition.building.production.as_ref())
                 .map(|spec| buffer_capacity(spec, economy))
                 .unwrap_or(0);
-            let state = match &producer.short_of {
+            let mut state = match &producer.short_of {
                 Some(item) => format!("{} (needs {})", producer.state.label(), short_name(item)),
                 None => producer.state.label().to_string(),
             };
+            // Ticket 084: a hub's own tile count is the whole diagnostic for
+            // "why is this producing less than its listed rate" — the same
+            // reason `short_of` names what a starved producer is missing
+            // rather than leaving "starved" to send the player looking.
+            if let Some(farm) = definition.and_then(|definition| definition.building.farm.as_ref()) {
+                state.push_str(&format!(", {}/{} tiles", farm_coverage.tiles_near(id), farm.tiles_for_full_rate));
+            }
             // Ticket 079: which warehouse is coming for this, and how far
             // away it is — or `unserved`, which is the whole diagnostic for
             // "why has my farm stopped".
@@ -314,6 +323,7 @@ pub(super) struct EconomyPanel<'w> {
     storage: Res<'w, StorageCapacity>,
     definitions: Res<'w, BuildingDefinitions>,
     economy: Res<'w, EconomyConfig>,
+    farm_coverage: Res<'w, FarmCoverage>,
 }
 
 /// One line per warehouse: how much of its haulage capacity is in use, and
@@ -385,8 +395,14 @@ pub(super) fn city_panel(
 
         ui.separator();
         ui.heading("Production");
-        let producers =
-            producer_lines(&city, &economy.production, &economy.definitions, &economy.economy, &economy.coverage);
+        let producers = producer_lines(
+            &city,
+            &economy.production,
+            &economy.definitions,
+            &economy.economy,
+            &economy.coverage,
+            &economy.farm_coverage,
+        );
         if producers.is_empty() {
             ui.label("(nothing producing)");
         } else {
@@ -470,6 +486,101 @@ mod tests {
         stock.add("minecraft:cobblestone", 20);
 
         assert_eq!(stock_lines(&stock), vec!["  20x cobblestone".to_string(), "  40x oak_planks".to_string()]);
+    }
+
+    // --- producer_lines' farm-tile fragment (ticket 084) --------------------
+
+    use crate::city::definition::{Building, Category, Farm, FootprintSpec, Integrity, LoadedBuilding, Production, ProductionItem};
+    use crate::city::production::{Producer, ProducerState};
+    use std::path::PathBuf;
+
+    fn hub_definitions() -> BuildingDefinitions {
+        let building = Building {
+            name: "hut".to_string(),
+            blueprint: "hut.nbt".to_string(),
+            tier: 1,
+            requires: Vec::new(),
+            footprint: FootprintSpec::FromBlueprint,
+            production: Some(Production {
+                outputs: vec![ProductionItem { item: "minecraft:oak_log".to_string(), per_minute: 8.0 }],
+                inputs: Vec::new(),
+                radius: None,
+                buffer_stacks: 4,
+            }),
+            cost: Vec::new(),
+            warehouse: None,
+            farm: Some(Farm { tile: "tile".to_string(), radius_blocks: 16, tiles_for_full_rate: 3 }),
+            category: Category::Production,
+            ground_level: 0,
+            integrity: Integrity { pristine_above: 0.95, ruined_below: 0.6 },
+        };
+        BuildingDefinitions::from_entries(vec![LoadedBuilding {
+            id: "hut".to_string(),
+            path: PathBuf::from("hut.ron"),
+            building,
+            footprint: IVec2::ONE,
+            catalogue_id: "hut".to_string(),
+        }])
+    }
+
+    #[test]
+    fn a_farm_hubs_line_names_its_tile_count() {
+        let mut city = state::City::default();
+        let id = city.place_building("hut", Some("hut".to_string()), IVec3::ZERO, Rotation::Deg0, IVec2::ONE).unwrap();
+
+        let mut production = ProductionState::default();
+        production.insert(id, Producer { state: ProducerState::Running, ..Producer::default() });
+
+        let mut farm_coverage = FarmCoverage::default();
+        farm_coverage.set_tiles_near(id, 1);
+
+        let lines =
+            producer_lines(&city, &production, &hub_definitions(), &EconomyConfig::default(), &Coverage::default(), &farm_coverage);
+
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("1/3 tiles"), "{}", lines[0]);
+    }
+
+    #[test]
+    fn a_non_farm_producer_gets_no_tile_fragment() {
+        let mut city = state::City::default();
+        let id = city.place_building("farm01", Some("farm01".to_string()), IVec3::ZERO, Rotation::Deg0, IVec2::ONE).unwrap();
+
+        let building = Building {
+            name: "farm01".to_string(),
+            blueprint: "farm01.nbt".to_string(),
+            tier: 1,
+            requires: Vec::new(),
+            footprint: FootprintSpec::FromBlueprint,
+            production: Some(Production {
+                outputs: vec![ProductionItem { item: "minecraft:wheat".to_string(), per_minute: 12.0 }],
+                inputs: Vec::new(),
+                radius: None,
+                buffer_stacks: 4,
+            }),
+            cost: Vec::new(),
+            warehouse: None,
+            farm: None,
+            category: Category::Production,
+            ground_level: 0,
+            integrity: Integrity { pristine_above: 0.95, ruined_below: 0.6 },
+        };
+        let definitions = BuildingDefinitions::from_entries(vec![LoadedBuilding {
+            id: "farm01".to_string(),
+            path: PathBuf::from("farm01.ron"),
+            building,
+            footprint: IVec2::ONE,
+            catalogue_id: "farm01".to_string(),
+        }]);
+
+        let mut production = ProductionState::default();
+        production.insert(id, Producer { state: ProducerState::Running, ..Producer::default() });
+
+        let lines =
+            producer_lines(&city, &production, &definitions, &EconomyConfig::default(), &Coverage::default(), &FarmCoverage::default());
+
+        assert_eq!(lines.len(), 1);
+        assert!(!lines[0].contains("tiles"), "{}", lines[0]);
     }
 
     #[test]

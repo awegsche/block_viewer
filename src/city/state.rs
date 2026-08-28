@@ -398,7 +398,9 @@ impl City {
     /// Every caller so far treats them the same — no definition, no game
     /// data, no production — and [`building`](Self::building) is right there
     /// for anything that needs to tell them apart.
-    #[allow(dead_code)] // ticket 078's production tick is the first caller
+    ///
+    /// `city::ui::inspect_panel` (ticket 083, roadmap G3) is the real
+    /// caller: the selected building's own name, off its definition.
     pub fn definition_of(&self, id: BuildingId) -> Option<&str> {
         self.buildings.get(&id)?.definition_id.as_deref()
     }

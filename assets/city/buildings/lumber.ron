@@ -1,16 +1,14 @@
-// Real geometry (unlike farm01/warehouse01/02, which still point at
-// house01.nbt as a placeholder) — the lumberjack's hut, main building only.
-// The tree farm this belongs to isn't designed yet:
-//   - whether the footprint stays FromBlueprint or widens to reserve ground
-//     for Anno-style farm tiles placed around it (working radius, tile
-//     count -> production %) is still open;
-//   - `production` is left out entirely rather than stubbed, since output
-//     here is meant to land in an in-world chest rather than an abstract
-//     buffer (078's model), and nothing scans a blueprint for chest
-//     positions yet. The exported .nbt now has chests in it for exactly
-//     that; the catalogue/definition loaders don't read block entities at
-//     all yet (roadmap: block entities are dropped on write).
-// Both come back once the tree-farm mechanic itself is settled.
+// Real geometry (unlike warehouse01/02, which still point at house01.nbt as
+// a placeholder) — the lumberjack's hut, main building only. Ticket 084
+// settles the open question this file used to carry: whether the tree farm
+// widens the hut's own footprint (Anno-style tiles reserved around it) or is
+// separate farm-tile buildings placed near it. It's the latter — see
+// `lumber_farm_01.ron` and roadmap C1/H2's "Farm tiles" section. An
+// in-world-chest output (scanning the blueprint's chests for what to credit,
+// rather than 078's abstract per-building buffer) was the other idea on the
+// table when this file only had geometry; it's superseded, not merely
+// deferred — output goes through the ordinary `production` buffer below like
+// every other producer, and the exported .nbt's chests are set dressing.
 Building(
     name: "Lumberjack's Hut",
     blueprint: "lumber.nbt",
@@ -18,10 +16,27 @@ Building(
     requires: [],
     category: Production,
     footprint: FromBlueprint,
+    // Ticket 085: two solid dirt layers (y=0, y=1) sit under the hut's own
+    // grass/dirt-path floor at y=2 — that's the layer terrain height should
+    // line up with, not the blueprint's y=0.
+    ground_level: 2,
     cost: [
         (block: "minecraft:oak_planks", count: 20),
         (block: "minecraft:oak_log", count: 10),
     ],
+    production: Some(Production(
+        outputs: [(item: "minecraft:oak_log", per_minute: 8.0)],
+        buffer_stacks: 4,
+    )),
+    // Zero output until at least one lumber_farm_01 tile stands nearby, full
+    // rate (the 8.0/min above) once three do — see `city::farm`'s own docs
+    // for why the radius is plain straight-line distance rather than routed
+    // through the road network the way a warehouse's is.
+    farm: Some(Farm(
+        tile: "lumber_farm_01",
+        radius_blocks: 16,
+        tiles_for_full_rate: 3,
+    )),
     integrity: Integrity(
         pristine_above: 0.95,
         ruined_below: 0.60,

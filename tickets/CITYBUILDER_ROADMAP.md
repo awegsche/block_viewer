@@ -2,7 +2,7 @@
 
 Not a work item: the design document for the citybuilder game and the shared
 world-edit infrastructure it uses. High-level tasks here get split into
-numbered tickets in this directory when picked up (**next free number: 085**).
+numbered tickets in this directory when picked up (**next free number: 086**).
 Companion to `ROADMAP.md`, which covers the viewer 001–029.
 
 ## The goal
@@ -203,6 +203,20 @@ Building(
 )                                       // linearly. Named curves later.
 ```
 
+- **`ground_level`** (ticket 085, `#[serde(default)]` -> `0`) — which
+  0-indexed Y layer of the blueprint is its own ground surface. Without it, a
+  placement always lines terrain height up against the blueprint's `y=0`,
+  which is wrong for a building whose blueprint buries a foundation below
+  its visible surface (`lumber.ron`'s two solid dirt layers before its
+  grass/path at `y=2`, hence `ground_level: 2`). Validated against the
+  matched blueprint's own height in `load_entry`, not `validate` — a
+  file-only check can't know how tall the blueprint it names actually is.
+  `placement::resolve_placement` subtracts it from `grid::fit_footprint`'s
+  `base_y` before `y_offset`'s manual nudge, and `BuildingDefinitions::
+  ground_level` is how both the ghost preview and `commit` read it off the
+  selected *definition* — a keyboard-stand-in selection with no
+  `definition_id` behind it reads as `0`, the same gap `cost`/`requires`/
+  `production` already leave one in.
 - **`resolve_requirements`** — tiers and tech tree. A **loop** (not a single
   pass) alternating a dangling-reference check with DFS cycle detection
   (`find_cycle`) until a pass removes nothing: removing one bad entry can
@@ -441,7 +455,7 @@ Building(
 ## G — UI (`city::ui`)
 
 `UiPlugin` registers its **own** `EguiPlugin`, separate from the viewer's —
-this game doesn't use `crate::selection`-based panels. Three windows:
+this game doesn't use `crate::selection`-based panels. Four windows:
 
 - **Build menu** — catalogue grouped by tier, locked entries visible but
   disabled and showing what unlocks them, plus each row's cost and production
@@ -454,6 +468,26 @@ this game doesn't use `crate::selection`-based panels. Three windows:
   commit/demolish/road_build), the "Save world" button, and an Undo button via
   `city::undo` (`Journal::undo_last`'s caller).
 - **Definition errors** — see C above.
+- **Inspect panel** (ticket 083, roadmap G3) — the reason `ActiveTool::Inspect`
+  can be `#[default]` at all: a left-click that no longer commits a placement
+  needs something else to mean, and selecting a placed building to see what
+  it's doing is that something. `city::picking::SelectedBuilding` is where the
+  click lands (`City::occupant_at`, the same lookup `city::demolish` uses for
+  `Delete`'s target; a road tile or empty ground clears the selection, a
+  missed click leaves it alone — ticket 020's own "a missed click does
+  nothing" precedent). The panel itself draws nothing at all with nothing
+  selected, rather than every other panel's placeholder-line-in-an-empty-window
+  shape — a resting-state panel visible constantly would be exactly the
+  clutter making `Inspect` the default was trying to avoid. Shows the
+  building's name (falling back to its catalogue id the same way
+  `requirement_label` does), position, rotation, and — if it has a
+  `ProductionState` entry — its running/starved/buffer-full state and buffer
+  contents, one line per item against the buffer's shared cap. **No health
+  field**: Group I doesn't exist yet, and a stub number now is something to
+  rip out later rather than fill in — it lands when I4 does. `T` still cycles
+  the other three tools; `Inspect` isn't a stop on that cycle, entered instead
+  by clearing a placement (`Escape`, which now also resets `*tool`) or, at
+  first, by never having left it.
 
 **Which save it opens** (ticket 064): up to two positional CLI arguments,
 parsed in the crate root (`resolve_selection_in`/`pick_named_save`) so
@@ -734,14 +768,64 @@ world is made of are the economy's own units.
   - `logistics.ron` -> **2**, carrying in-flight stacks across a quit with
     their `remaining` intact: a stack does not teleport home because the
     player closed the window, and does not evaporate either.
+- **Farm tiles (ticket 084, done)** — closes the open design question
+  `lumber.ron` carried since it landed: whether a producer's footprint widens
+  to reserve ground for Anno-style tiles placed around it, or those tiles are
+  separate buildings placed near it. It's the latter, per 084's own design.
+  `definition::Farm` (`Building::farm`) names another building by its
+  *definition* id — the same keyspace `requires` uses — plus a search
+  `radius_blocks` and `tiles_for_full_rate`. `city::farm::FarmCoverage`
+  counts, per placed hub, how many placed instances of that tile are both
+  within `radius_blocks` and *nearest* to it: **plain straight-line distance
+  between the two buildings' own footprint rectangles, not the road
+  network** — unlike a warehouse's `radius_cells`, a field doesn't need a
+  road to reach its farmhouse, so the count is a Chebyshev gap (0 when the
+  rectangles touch or overlap) rather than a road-cell BFS. Two overlapping
+  catchments don't double-spend a tile: 084 calls for **nearest hub wins**,
+  ties broken by the lower `BuildingId` — the same kind of arbitrary-but-
+  deterministic tie-break `warehouse::compute_coverage` already uses for a
+  producer equidistant from two warehouses. `production::tick` reads the
+  count and scales *every* rate — outputs **and inputs alike** — by
+  `tiles / tiles_for_full_rate` (clamped to `1.0`) before handing the spec to
+  `advance_producer`: a half-tiled hub runs its whole recipe at half
+  throughput rather than producing less while still paying full price for
+  what it consumes. Zero tiles is zero rate, not a starved/stalled state,
+  since nothing is owed and nothing is missing; the building simply has
+  nothing to scale yet. A tile is placed through the *exact same* catalogue,
+  footprint, occupancy, ghost-preview, commit, journal, undo and demolish
+  machinery every other building already uses; nothing about placement
+  changed to add this. `FarmCoverage` is derived every frame from `City` and
+  `BuildingDefinitions`, never stored, the same rule `warehouse::Coverage`
+  follows and for the same reason. Surfaced in both UI panels: the build
+  menu's catalogue row for a farm-linked hub names what it needs before a
+  player commits to building one (`Scales with <tile name> nearby (N needed,
+  within R blocks)`), and the city panel's per-producer line appends its
+  live `count/needed` tile fraction next to its running/starved/buffer-full
+  state — 084's own "Place Farm Tile" inspect-panel button is still not
+  built: it waited on inspect mode existing at all, and 083 (which shipped
+  that) deliberately didn't add it either, since it needs the hub schema 084
+  owns — a gap between the two tickets, open for whichever picks it up; the
+  build menu's ordinary row already places one once the hub unlocks it.
+  Shipped as the first real farm-tile
+  pair: `lumber.ron`'s Lumberjack's Hut (now producing `minecraft:oak_log`,
+  `farm.tile: "lumber_farm_01"`, radius 16 blocks, 3 tiles for the full rate)
+  and `lumber_farm_01.ron`/`lumber_farm_01.nbt` (`requires: ["lumber"]`, no
+  production of its own). The chest-based-output idea `lumber.ron`'s comment
+  used to float — scanning a blueprint's chests directly rather than going
+  through 078's abstract per-building buffer — is superseded, not merely
+  deferred: this building's output goes through the ordinary `production`
+  buffer like every other producer, and its blueprint's chests are set
+  dressing.
 - **Still open in H2**: production *chains* have never been played — the
-  shipped set is one farm with no inputs, so `Production::inputs`, the
-  starved state and `resolve_requirements`' tier tree are all implemented and
+  shipped set is farms with no inputs, so `Production::inputs`, the starved
+  state and `resolve_requirements`' tier tree are all implemented and
   untested against a real recipe graph. Balance is a guess throughout.
-  `Production::radius` is still inert (078 had no use for it). And all three
-  shipped economy buildings run on **placeholder geometry** — `house01.nbt`
-  is the only structure export on disk — so a city with two warehouses and a
-  farm currently looks like three identical houses; see `../todo.md`.
+  `Production::radius` is still inert (078 had no use for it). Warehouses and
+  the wheat farm still run on **placeholder geometry** — `house01.nbt` is the
+  only *other* structure export on disk, now that lumber and its farm tile
+  are real — so a city with two warehouses and a wheat farm looks like three
+  identical houses next to a genuinely distinct lumberjack's hut and its
+  fields; see `../todo.md`.
 
 ## I — Damage: the world diffing back (iteration 2, except I1)
 

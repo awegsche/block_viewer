@@ -189,6 +189,23 @@
 //! paths that credit the stock. See [`warehouse`]'s own docs for how that
 //! squares with ticket 072's unbounded pile.
 //!
+//! ## Farm tiles (ticket 084, roadmap C1/H2)
+//!
+//! [`farm::FarmPlugin`] closes the open half of `lumber.ron`'s original
+//! design note — whether a lumberjack-style producer's footprint widens to
+//! reserve ground for Anno-style farm tiles, or those tiles are separate
+//! buildings placed near it. The answer is separate buildings:
+//! [`definition::Farm`] names another building by its definition id, and
+//! [`farm::FarmCoverage`] counts how many placed instances of it are both in
+//! straight-line range and *nearest* to each hub (not the road network, and
+//! not double-counted toward two overlapping catchments — see [`farm`]'s own
+//! docs). `production::tick` reads that count and scales the hub's
+//! `production` outputs *and inputs* by it — zero tiles is zero rate,
+//! `tiles_for_full_rate` or more is the full listed rate. Placement, the
+//! ghost preview, commit, journalling, undo and demolish are all untouched: a
+//! tile is placed through the exact same machinery every other building
+//! already uses.
+//!
 //! ## Haulage (ticket 080, roadmap H2)
 //!
 //! The last of H2's "still open". A producer's buffer is emptied by a
@@ -333,6 +350,7 @@ mod definition;
 mod demolish;
 mod drops;
 mod economy;
+mod farm;
 mod grid;
 mod hot_reload;
 mod inventory;
@@ -466,6 +484,7 @@ pub fn run() {
         .add_plugins(hot_reload::DefinitionHotReloadPlugin)
         .add_plugins(clock::ClockPlugin)
         .add_plugins(warehouse::WarehousePlugin)
+        .add_plugins(farm::FarmPlugin)
         .add_plugins(production::ProductionPlugin)
         .add_plugins(tool::ToolPlugin)
         .add_plugins(picking::PickingPlugin)

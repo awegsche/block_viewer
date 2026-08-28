@@ -93,6 +93,20 @@ fn production_line(production: &Production) -> Option<String> {
     Some(production.outputs.iter().map(|item| format!("{} {:.1}/min", item.item, item.per_minute)).collect::<Vec<_>>().join(", "))
 }
 
+/// [`Building::farm`]'s numbers as one line, for a row whose `production` is
+/// scaled rather than fixed (ticket 084) — "Scales with Lumberjack's Farm
+/// Tile nearby (3 needed, within 16 tiles)". Shown on the catalogue row
+/// itself rather than only once placed: a player deciding whether to build
+/// the hub at all needs to know it does nothing without fields around it,
+/// before they've committed the tile it costs.
+fn farm_line(farm: &super::super::definition::Farm, definitions: &BuildingDefinitions) -> String {
+    let tile_name = definitions.get(&farm.tile).map(|entry| entry.building.name.clone()).unwrap_or_else(|| farm.tile.clone());
+    format!(
+        "  Scales with {tile_name} nearby ({} needed, within {} tiles)",
+        farm.tiles_for_full_rate, farm.radius_blocks,
+    )
+}
+
 /// Every `requires` id `building` names that no placed building's own
 /// definition currently satisfies — empty means unlocked. See the module
 /// docs' "Unlocking, defined for the first time here". A plain function, not
@@ -214,6 +228,9 @@ fn entry_row(
         if let Some(line) = production_line(production) {
             ui.label(format!("  Produces: {line}"));
         }
+    }
+    if let Some(farm) = &entry.building.farm {
+        ui.colored_label(egui::Color32::from_rgb(150, 190, 220), farm_line(farm, definitions));
     }
     if !unlocked {
         ui.colored_label(egui::Color32::from_rgb(220, 160, 90), format!("  Locked — requires {}", missing_names()));
@@ -396,7 +413,9 @@ mod tests {
             production: None,
             cost: Vec::new(),
             warehouse: None,
+            farm: None,
             category: Category::Production,
+            ground_level: 0,
             integrity: Integrity { pristine_above: 0.95, ruined_below: 0.6 },
         }
     }
@@ -542,5 +561,28 @@ mod tests {
             buffer_stacks: 4,
         };
         assert_eq!(production_line(&production), Some("wood 4.0/min, planks 2.5/min".to_string()));
+    }
+
+    // --- farm_line (ticket 084) ---------------------------------------------
+
+    #[test]
+    fn a_farm_line_names_the_tiles_building_by_its_loaded_name() {
+        let mut tile = building("tile", 1, vec![]);
+        tile.name = "Lumberjack's Farm Tile".to_string();
+        let defs = BuildingDefinitions::from_entries(vec![loaded("tile", tile)]);
+        let farm = crate::city::definition::Farm { tile: "tile".to_string(), radius_blocks: 16, tiles_for_full_rate: 3 };
+
+        assert_eq!(
+            farm_line(&farm, &defs),
+            "  Scales with Lumberjack's Farm Tile nearby (3 needed, within 16 tiles)".to_string()
+        );
+    }
+
+    #[test]
+    fn a_farm_line_falls_back_to_the_raw_id_when_the_tile_definition_is_missing() {
+        let defs = BuildingDefinitions::default();
+        let farm = crate::city::definition::Farm { tile: "ghost_tile".to_string(), radius_blocks: 4, tiles_for_full_rate: 1 };
+
+        assert_eq!(farm_line(&farm, &defs), "  Scales with ghost_tile nearby (1 needed, within 4 tiles)".to_string());
     }
 }

@@ -380,7 +380,9 @@ mod tests {
             production,
             cost: Vec::new(),
             warehouse,
+            farm: None,
             category: Category::Production,
+            ground_level: 0,
             integrity: Integrity { pristine_above: 0.95, ruined_below: 0.6 },
         }
     }

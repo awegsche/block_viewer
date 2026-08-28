@@ -11,6 +11,8 @@ Building(
     requires: ["warehouse01"],
     category: Production,
     footprint: Explicit(x: 11, z: 11),
+    // Ticket 085: placeholder geometry — see house01.ron.
+    ground_level: 0,
     cost: [
         (block: "minecraft:oak_planks", count: 128),
         (block: "minecraft:cobblestone", count: 192),

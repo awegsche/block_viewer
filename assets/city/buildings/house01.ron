@@ -8,6 +8,9 @@ Building(
     requires: [],
     category: Residential,
     footprint: FromBlueprint,
+    // Ticket 085: house01.nbt's own y=0 (grass/dirt) is already its ground
+    // surface — no below-grade layers to sink.
+    ground_level: 0,
     cost: [
         (block: "minecraft:oak_planks", count: 40),
         (block: "minecraft:cobblestone", count: 20),

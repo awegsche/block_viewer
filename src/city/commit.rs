@@ -280,8 +280,20 @@ fn try_commit_placement(
     let Some(entry) = catalogue.get(&id) else { return };
     let Some(hovered) = hovered.0 else { return };
 
-    let GhostPlacement { origin, valid } =
-        placement::resolve_placement(hovered, entry.footprint, selection.rotation, selection.y_offset, &world, &city);
+    // Ticket 085: the same lookup the ghost preview makes off
+    // `selection.definition_id` — see `BuildingDefinitions::ground_level`'s
+    // own docs for why a keyboard-stand-in selection (no definition) reads
+    // as `0`, unshifted.
+    let ground_level = definitions.ground_level(selection.definition_id.as_deref());
+    let GhostPlacement { origin, valid } = placement::resolve_placement(
+        hovered,
+        entry.footprint,
+        selection.rotation,
+        selection.y_offset,
+        ground_level,
+        &world,
+        &city,
+    );
     if !valid {
         return;
     }

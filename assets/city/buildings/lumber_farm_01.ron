@@ -1,0 +1,25 @@
+// Ticket 084, roadmap C1/H2: a farm tile for `lumber.ron`'s Lumberjack's Hut
+// — no production or footprint override of its own, since all it does is
+// count toward the hub's `farm.tiles_for_full_output` (`city::farm`'s own
+// docs have the mechanism). Requires the hut itself: an unplanted grove with
+// nothing to feed doesn't belong in the menu until a player has built the
+// thing it feeds.
+Building(
+    name: "Lumberjack's Farm Tile",
+    blueprint: "lumber_farm_01.nbt",
+    tier: 1,
+    requires: ["lumber"],
+    category: Production,
+    footprint: FromBlueprint,
+    // Ticket 085: one solid dirt layer (y=0) under the field's own grass at
+    // y=1.
+    ground_level: 1,
+    cost: [
+        (block: "minecraft:oak_log", count: 4),
+        (block: "minecraft:dirt", count: 16),
+    ],
+    integrity: Integrity(
+        pristine_above: 0.95,
+        ruined_below: 0.60,
+    ),
+)

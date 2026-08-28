@@ -74,6 +74,7 @@ use crate::chunk_pipeline::{SharedAtlasIndex, SharedColorMaps, TerrainMaterial};
 use crate::world::{self, BiomeColors};
 use crate::DecodedWorld;
 
+use super::definition::BuildingDefinitions;
 use super::grid::{self, FootprintFit};
 use super::picking::{HoveredBlock, PickingSet};
 use super::state;
@@ -207,6 +208,7 @@ fn cycle_selection(
     egui_input: Res<camera::EguiInputCapture>,
     catalogue: Option<Res<BuildingCatalogue>>,
     mut selection: ResMut<PlacementSelection>,
+    mut tool: Option<ResMut<ActiveTool>>,
 ) {
     // Same guard `camera.rs`'s own input systems use — a keystroke egui is
     // already handling (typing into a panel, say) shouldn't also drive the
@@ -219,6 +221,11 @@ fn cycle_selection(
         selection.catalogue_id = None;
         selection.definition_id = None;
         selection.y_offset = 0;
+        // Ticket 083: clearing a placement is one of the two ways back to
+        // the resting state — see `tool`'s own module docs.
+        if let Some(tool) = tool.as_deref_mut() {
+            *tool = ActiveTool::Inspect;
+        }
     }
     if keys.just_pressed(KeyCode::KeyR) {
         selection.rotation = rotate_clockwise(selection.rotation);
@@ -359,12 +366,20 @@ pub(super) struct GhostPlacement {
 /// ANDs E2's terrain fit and D1's occupancy check for `footprint`/`rotation`
 /// at `hovered` (the solid block the cursor is over — one below where a
 /// building's floor would sit, the same `+1` [`grid::ground_height_at`]
-/// already applies), then applies `y_offset` (ticket 048) to whichever
-/// height that produced. A refused fit still returns a placement — at
-/// `hovered`'s height (plus the offset), invalid — so the caller always has
-/// *something* to show; see the module docs. `saturating_add` rather than
-/// `+`: an offset built purely from key-press counts can't itself overflow
-/// in a real session, but nothing here should panic if it somehow did.
+/// already applies), then shifts down by `ground_level` (ticket 085) and
+/// applies `y_offset` (ticket 048) on top of that. A refused fit still
+/// returns a placement — at `hovered`'s height (shifted and offset the same
+/// way), invalid — so the caller always has *something* to show; see the
+/// module docs. `saturating_sub`/`saturating_add` rather than plain
+/// arithmetic: neither a definition's `ground_level` nor an offset built
+/// purely from key-press counts can overflow in a real session, but nothing
+/// here should panic if either somehow did.
+///
+/// `ground_level` shifts where the blueprint's own `y=0` lands, not where the
+/// player's cursor is: a fit's `base_y` is one above the *terrain's* topmost
+/// block, which is where the blueprint's ground-level layer (not
+/// necessarily its `y=0`) belongs — see [`BuildingDefinitions::ground_level`]
+/// for where the value itself comes from.
 ///
 /// `pub(super)`: `city::commit` (ticket 048) is a second caller, on a click
 /// rather than every frame — see [`GhostPlacement`]'s own docs.
@@ -373,6 +388,7 @@ pub(super) fn resolve_placement(
     footprint: IVec2,
     rotation: Rotation,
     y_offset: i32,
+    ground_level: i32,
     world: &DecodedWorld,
     city: &state::City,
 ) -> GhostPlacement {
@@ -381,7 +397,7 @@ pub(super) fn resolve_placement(
         FootprintFit::Fits { base_y } => (IVec3::new(hovered.x, base_y, hovered.z), true),
         FootprintFit::Refused(_) => (probe, false),
     };
-    origin.y = origin.y.saturating_add(y_offset);
+    origin.y = origin.y.saturating_sub(ground_level).saturating_add(y_offset);
     let occupancy_ok = state::footprint_tiles(origin, footprint, rotation).all(|tile| city.is_tile_free(tile));
     GhostPlacement { origin, valid: terrain_ok && occupancy_ok }
 }
@@ -415,6 +431,7 @@ fn resolve_ghost(
     ghost: &mut GhostState,
     selection: &PlacementSelection,
     catalogue: Option<&BuildingCatalogue>,
+    definitions: Option<&BuildingDefinitions>,
     hovered: Option<IVec3>,
     world: &DecodedWorld,
     color_maps: &world::ColorMaps,
@@ -437,7 +454,13 @@ fn resolve_ghost(
         return GhostUpdate::Hidden;
     };
 
-    let placement = resolve_placement(hovered, entry.footprint, selection.rotation, selection.y_offset, world, city);
+    // Ticket 085: `0` with no `BuildingDefinitions` resource at all — the
+    // same tolerant default every other optional resource in this module
+    // falls back to, so a minimal test `App` without one still previews at
+    // the old, unshifted height.
+    let ground_level = definitions.map(|defs| defs.ground_level(selection.definition_id.as_deref())).unwrap_or(0);
+    let placement =
+        resolve_placement(hovered, entry.footprint, selection.rotation, selection.y_offset, ground_level, world, city);
     let ghost_materials = ensure_materials(ghost, terrain_material, materials);
     let material = if placement.valid { ghost_materials.valid.clone() } else { ghost_materials.invalid.clone() };
 
@@ -499,6 +522,7 @@ fn update_ghost_preview(
     hovered: Res<HoveredBlock>,
     selection: Res<PlacementSelection>,
     catalogue: Option<Res<BuildingCatalogue>>,
+    definitions: Option<Res<BuildingDefinitions>>,
     world: Res<DecodedWorld>,
     city: Res<state::City>,
     atlas: Option<Res<SharedAtlasIndex>>,
@@ -519,6 +543,7 @@ fn update_ghost_preview(
         &mut ghost,
         &selection,
         catalogue.as_deref(),
+        definitions.as_deref(),
         hovered.0,
         &world,
         &color_maps.0,
@@ -647,7 +672,7 @@ mod tests {
     fn resolve_placement_is_valid_on_flat_free_ground() {
         let world = flat_world(63);
         let city = state::City::default();
-        let placement = resolve_placement(IVec3::new(2, 63, 2), IVec2::new(3, 3), Rotation::Deg0, 0, &world, &city);
+        let placement = resolve_placement(IVec3::new(2, 63, 2), IVec2::new(3, 3), Rotation::Deg0, 0, 0, &world, &city);
         assert!(placement.valid);
         assert_eq!(placement.origin, IVec3::new(2, 64, 2));
     }
@@ -658,7 +683,7 @@ mod tests {
         let mut city = state::City::default();
         city.place_building("house01", None, IVec3::new(2, 64, 2), Rotation::Deg0, IVec2::new(1, 1)).unwrap();
 
-        let placement = resolve_placement(IVec3::new(2, 63, 2), IVec2::new(3, 3), Rotation::Deg0, 0, &world, &city);
+        let placement = resolve_placement(IVec3::new(2, 63, 2), IVec2::new(3, 3), Rotation::Deg0, 0, 0, &world, &city);
         assert!(!placement.valid, "the footprint overlaps an already-placed building");
     }
 
@@ -667,7 +692,7 @@ mod tests {
         // No ground at all under this tile — every sample is `NotLoaded`.
         let world = flat_world(63);
         let city = state::City::default();
-        let placement = resolve_placement(IVec3::new(500, 63, 500), IVec2::new(3, 3), Rotation::Deg0, 0, &world, &city);
+        let placement = resolve_placement(IVec3::new(500, 63, 500), IVec2::new(3, 3), Rotation::Deg0, 0, 0, &world, &city);
         assert!(!placement.valid);
         assert_eq!(placement.origin, IVec3::new(500, 64, 500), "still places the ghost somewhere, one above the hovered block");
     }
@@ -676,7 +701,7 @@ mod tests {
     fn resolve_placement_applies_a_positive_y_offset_on_a_fitting_placement() {
         let world = flat_world(63);
         let city = state::City::default();
-        let placement = resolve_placement(IVec3::new(2, 63, 2), IVec2::new(3, 3), Rotation::Deg0, 5, &world, &city);
+        let placement = resolve_placement(IVec3::new(2, 63, 2), IVec2::new(3, 3), Rotation::Deg0, 5, 0, &world, &city);
         assert!(placement.valid, "the offset moves the building, it doesn't touch terrain/occupancy validity");
         assert_eq!(placement.origin, IVec3::new(2, 69, 2), "base_y (64) + the offset (5)");
     }
@@ -685,9 +710,43 @@ mod tests {
     fn resolve_placement_applies_a_negative_y_offset_on_the_refused_fallback() {
         let world = flat_world(63);
         let city = state::City::default();
-        let placement = resolve_placement(IVec3::new(500, 63, 500), IVec2::new(3, 3), Rotation::Deg0, -3, &world, &city);
+        let placement = resolve_placement(IVec3::new(500, 63, 500), IVec2::new(3, 3), Rotation::Deg0, -3, 0, &world, &city);
         assert!(!placement.valid);
         assert_eq!(placement.origin, IVec3::new(500, 61, 500), "the hovered-height fallback (64) minus the offset (3)");
+    }
+
+    // --- resolve_placement + ground_level (ticket 085) ------------------
+
+    #[test]
+    fn resolve_placement_sinks_the_origin_by_ground_level_on_a_fitting_placement() {
+        // lumber.ron's own shape: two below-grade layers (ground_level: 2)
+        // under an otherwise-ordinary fit. base_y is still 64 (one above the
+        // terrain at 63); the origin (the blueprint's y=0) has to land two
+        // below that so the blueprint's own y=2 layer is what sits on the
+        // terrain.
+        let world = flat_world(63);
+        let city = state::City::default();
+        let placement = resolve_placement(IVec3::new(2, 63, 2), IVec2::new(3, 3), Rotation::Deg0, 0, 2, &world, &city);
+        assert!(placement.valid);
+        assert_eq!(placement.origin, IVec3::new(2, 62, 2), "base_y (64) - ground_level (2)");
+    }
+
+    #[test]
+    fn resolve_placement_applies_ground_level_before_the_manual_y_offset() {
+        let world = flat_world(63);
+        let city = state::City::default();
+        let placement = resolve_placement(IVec3::new(2, 63, 2), IVec2::new(3, 3), Rotation::Deg0, 5, 2, &world, &city);
+        assert!(placement.valid);
+        assert_eq!(placement.origin, IVec3::new(2, 67, 2), "base_y (64) - ground_level (2) + y_offset (5)");
+    }
+
+    #[test]
+    fn resolve_placement_applies_ground_level_on_the_refused_fallback_too() {
+        let world = flat_world(63);
+        let city = state::City::default();
+        let placement = resolve_placement(IVec3::new(500, 63, 500), IVec2::new(3, 3), Rotation::Deg0, 0, 2, &world, &city);
+        assert!(!placement.valid);
+        assert_eq!(placement.origin, IVec3::new(500, 62, 500), "hovered fallback (64) - ground_level (2), same as a fitting placement");
     }
 
     // --- ghost_mesh ------------------------------------------------------
@@ -761,6 +820,7 @@ mod tests {
             &mut ghost,
             &selection,
             Some(&catalogue),
+            None,
             Some(IVec3::new(2, 63, 2)),
             &world,
             &maps,
@@ -789,7 +849,7 @@ mod tests {
         let terrain_material = materials.add(StandardMaterial::default());
 
         let update = resolve_ghost(
-            &mut ghost, &selection, Some(&catalogue), None, &world, &maps, &city, &atlas, &terrain_material, &mut meshes, &mut materials,
+            &mut ghost, &selection, Some(&catalogue), None, None, &world, &maps, &city, &atlas, &terrain_material, &mut meshes, &mut materials,
             ActiveTool::Building,
         );
         assert!(matches!(update, GhostUpdate::Hidden));
@@ -815,6 +875,7 @@ mod tests {
             &mut ghost,
             &selection,
             Some(&catalogue),
+            None,
             Some(IVec3::new(2, 63, 2)),
             &world,
             &maps,
@@ -846,6 +907,7 @@ mod tests {
             &mut ghost,
             &selection,
             Some(&catalogue),
+            None,
             Some(IVec3::new(2, 63, 2)),
             &world,
             &maps,
@@ -878,6 +940,7 @@ mod tests {
             &mut ghost,
             &selection,
             Some(&catalogue),
+            None,
             Some(IVec3::new(2, 63, 2)),
             &world,
             &maps,
@@ -943,6 +1006,26 @@ mod tests {
     fn pressing_escape_clears_the_selection() {
         let mut app = selection_test_app();
         app.world_mut().resource_mut::<PlacementSelection>().catalogue_id = Some("house01".to_string());
+        press(&mut app, KeyCode::Escape);
+        assert_eq!(app.world().resource::<PlacementSelection>().catalogue_id, None);
+    }
+
+    /// Ticket 083: clearing a placement is one of the two ways back to the
+    /// resting state.
+    #[test]
+    fn pressing_escape_resets_the_tool_to_inspect() {
+        let mut app = selection_test_app();
+        app.insert_resource(ActiveTool::Building);
+        press(&mut app, KeyCode::Escape);
+        assert_eq!(*app.world().resource::<ActiveTool>(), ActiveTool::Inspect);
+    }
+
+    /// The same tolerant shape every other optional resource in this module
+    /// gets: a minimal test `App` that never adds `ToolPlugin` (like
+    /// [`selection_test_app`] itself) must not panic on `Escape`.
+    #[test]
+    fn pressing_escape_without_a_tool_resource_does_not_panic() {
+        let mut app = selection_test_app();
         press(&mut app, KeyCode::Escape);
         assert_eq!(app.world().resource::<PlacementSelection>().catalogue_id, None);
     }

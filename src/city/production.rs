@@ -48,6 +48,20 @@
 //! the passage of time; an "Undo" that clawed back a farm's output would be a
 //! different mechanic wearing the same button.
 //!
+//! ## Farm-tile scaling (ticket 084)
+//!
+//! A building with a `farm` link (see [`super::definition::Farm`] and
+//! [`super::farm`]) doesn't run at its listed rate outright: [`tick`] looks
+//! up [`super::farm::FarmCoverage::tiles_near`] and multiplies **every**
+//! rate — outputs *and* inputs alike — by `tiles / tiles_for_full_rate`,
+//! clamped to `1.0`, before handing the (possibly scaled) spec to
+//! [`advance_producer`]. Both scale together because a hub running at 40%
+//! is running at 40% *throughput*, not producing at 40% while still paying
+//! full price for the inputs that made it — see [`scale_production`] for the
+//! full argument. Zero tiles is zero rate — not [`ProducerState::Starved`],
+//! since nothing is owed and nothing is missing, the building just has
+//! nothing to scale yet.
+//!
 //! ## Haulage (ticket 080)
 //!
 //! A buffer is emptied by a [`Shipment`]: one stack of one item, dispatched
@@ -99,8 +113,9 @@ use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use super::clock::GameClock;
-use super::definition::{BuildingDefinitions, Production};
+use super::definition::{BuildingDefinitions, Farm, Production};
 use super::economy::EconomyConfig;
+use super::farm::{FarmCoverage, FarmCoverageSet};
 use super::inventory::{Parcel, Stock};
 use super::state::{BuildingId, City};
 use super::warehouse::{self, Coverage, CoverageSet, StorageCapacity};
@@ -277,8 +292,9 @@ impl Plugin for ProductionPlugin {
     fn build(&self, app: &mut App) {
         // After `CoverageSet`, so a haul is never dispatched against last
         // frame's coverage — a road built this frame should be usable this
-        // frame, not next.
-        app.init_resource::<ProductionState>().add_systems(Update, tick.after(CoverageSet));
+        // frame, not next. After `FarmCoverageSet` for the same reason: a
+        // tile placed this frame should count toward this frame's output.
+        app.init_resource::<ProductionState>().add_systems(Update, tick.after(CoverageSet).after(FarmCoverageSet));
     }
 }
 
@@ -292,6 +308,7 @@ fn tick(
     economy: Res<EconomyConfig>,
     coverage: Option<Res<Coverage>>,
     capacity: Option<Res<StorageCapacity>>,
+    farm_coverage: Option<Res<FarmCoverage>>,
     mut stock: ResMut<Stock>,
     mut production: ResMut<ProductionState>,
 ) {
@@ -310,8 +327,9 @@ fn tick(
         let Some(definition) = placed.definition_id.as_deref().and_then(|id| definitions.get(id)) else { continue };
         let Some(spec) = &definition.building.production else { continue };
 
+        let scaled = scale_production(spec, definition.building.farm.as_ref(), id, farm_coverage.as_deref());
         let mut producer = production.producers.remove(&id).unwrap_or_default();
-        advance_producer(&mut producer, spec, economy.as_ref(), &mut stock, minutes);
+        advance_producer(&mut producer, &scaled, economy.as_ref(), &mut stock, minutes);
         production.producers.insert(id, producer);
     }
 
@@ -412,6 +430,37 @@ fn ready_stack(producer: &Producer, stack_size: u64) -> Option<(String, u64)> {
     } else {
         None
     }
+}
+
+/// Applies a `farm` link's tile-count scaling (ticket 084) to `spec` —
+/// `spec.clone()` unscaled when `farm` is `None`, or `farm` names a hub with
+/// no tiles in range yet and [`FarmCoverage`] is missing entirely (a minimal
+/// test `App` that never adds [`super::farm::FarmPlugin`], the same tolerant
+/// `Option<Res<..>>` shape [`storage_capacity`](warehouse::storage_capacity)
+/// documents its own reason for).
+///
+/// Returns an owned [`Production`] rather than taking `spec` by value or
+/// mutating it in place: `spec` is borrowed out of [`BuildingDefinitions`],
+/// which every other building's tick this frame is still reading.
+///
+/// **Both outputs and inputs scale, by the same ratio** (ticket 084's own
+/// design) — an under-tiled hub runs at a fraction of its whole recipe
+/// rather than paying full price for inputs it's only using part of. This
+/// composes with `advance_producer`'s own "a full buffer stops everything"
+/// rule rather than fighting it: at ratio 0 both lists are 0/min, so a
+/// tile-less hub touches neither the stock nor its own buffer, the same
+/// "genuinely idle" state a `production: None` building is already in.
+fn scale_production(spec: &Production, farm: Option<&Farm>, hub: BuildingId, coverage: Option<&FarmCoverage>) -> Production {
+    let Some(farm) = farm else { return spec.clone() };
+
+    let tiles = coverage.map(|coverage| coverage.tiles_near(hub)).unwrap_or(0);
+    let ratio = (tiles as f32 / farm.tiles_for_full_rate.max(1) as f32).min(1.0);
+
+    let mut scaled = spec.clone();
+    for item in scaled.outputs.iter_mut().chain(scaled.inputs.iter_mut()) {
+        item.per_minute *= ratio;
+    }
+    scaled
 }
 
 /// The tick for one producer, split out of [`tick`] so it can be tested
@@ -667,6 +716,113 @@ mod tests {
         }
     }
 
+    // --- farm-tile scaling (ticket 084) -------------------------------------
+
+    fn farm_link(radius_blocks: u32, tiles_for_full_rate: u32) -> Farm {
+        Farm { tile: "tile".to_string(), radius_blocks, tiles_for_full_rate }
+    }
+
+    #[test]
+    fn no_farm_link_leaves_the_spec_unscaled() {
+        let spec = spec(&[("minecraft:oak_log", 8.0)], &[], 4);
+        let scaled = scale_production(&spec, None, BuildingId::from_u64(0), None);
+        assert_eq!(scaled.outputs[0].per_minute, 8.0);
+    }
+
+    #[test]
+    fn zero_tiles_scales_output_to_zero() {
+        let spec = spec(&[("minecraft:oak_log", 8.0)], &[], 4);
+        let farm = farm_link(16, 3);
+        let mut coverage = FarmCoverage::default();
+        coverage.set_tiles_near(BuildingId::from_u64(0), 0);
+
+        let scaled = scale_production(&spec, Some(&farm), BuildingId::from_u64(0), Some(&coverage));
+        assert_eq!(scaled.outputs[0].per_minute, 0.0);
+    }
+
+    #[test]
+    fn a_farm_link_with_no_coverage_resource_scales_to_zero() {
+        // The tolerant `Option<Res<FarmCoverage>>` shape: a minimal test App
+        // that never adds `FarmPlugin` must not panic or silently give full
+        // output to a building that declares a farm link.
+        let spec = spec(&[("minecraft:oak_log", 8.0)], &[], 4);
+        let farm = farm_link(16, 3);
+        let scaled = scale_production(&spec, Some(&farm), BuildingId::from_u64(0), None);
+        assert_eq!(scaled.outputs[0].per_minute, 0.0);
+    }
+
+    #[test]
+    fn a_partial_tile_count_scales_output_linearly() {
+        let spec = spec(&[("minecraft:oak_log", 9.0)], &[], 4);
+        let farm = farm_link(16, 3);
+        let mut coverage = FarmCoverage::default();
+        coverage.set_tiles_near(BuildingId::from_u64(0), 1);
+
+        let scaled = scale_production(&spec, Some(&farm), BuildingId::from_u64(0), Some(&coverage));
+        assert!((scaled.outputs[0].per_minute - 3.0).abs() < 1e-5, "1 of 3 tiles is a third of the rate");
+    }
+
+    #[test]
+    fn a_full_tile_count_scales_output_to_the_full_rate() {
+        let spec = spec(&[("minecraft:oak_log", 8.0)], &[], 4);
+        let farm = farm_link(16, 3);
+        let mut coverage = FarmCoverage::default();
+        coverage.set_tiles_near(BuildingId::from_u64(0), 3);
+
+        let scaled = scale_production(&spec, Some(&farm), BuildingId::from_u64(0), Some(&coverage));
+        assert_eq!(scaled.outputs[0].per_minute, 8.0);
+    }
+
+    #[test]
+    fn tiles_beyond_the_cap_do_not_scale_output_past_the_full_rate() {
+        let spec = spec(&[("minecraft:oak_log", 8.0)], &[], 4);
+        let farm = farm_link(16, 3);
+        let mut coverage = FarmCoverage::default();
+        coverage.set_tiles_near(BuildingId::from_u64(0), 50);
+
+        let scaled = scale_production(&spec, Some(&farm), BuildingId::from_u64(0), Some(&coverage));
+        assert_eq!(scaled.outputs[0].per_minute, 8.0, "more tiles than needed must not exceed 100%");
+    }
+
+    #[test]
+    fn scaling_applies_the_same_ratio_to_inputs_as_outputs() {
+        let spec = spec(&[("minecraft:bread", 1.0)], &[("minecraft:wheat", 3.0)], 4);
+        let farm = farm_link(16, 3);
+        let mut coverage = FarmCoverage::default();
+        coverage.set_tiles_near(BuildingId::from_u64(0), 1);
+
+        let scaled = scale_production(&spec, Some(&farm), BuildingId::from_u64(0), Some(&coverage));
+        assert!(
+            (scaled.inputs[0].per_minute - 1.0).abs() < 1e-5,
+            "1 of 3 tiles scales the input rate the same way it scales output"
+        );
+    }
+
+    #[test]
+    fn zero_tiles_scales_inputs_to_zero_too() {
+        let spec = spec(&[("minecraft:bread", 1.0)], &[("minecraft:wheat", 3.0)], 4);
+        let farm = farm_link(16, 3);
+        let mut coverage = FarmCoverage::default();
+        coverage.set_tiles_near(BuildingId::from_u64(0), 0);
+
+        let scaled = scale_production(&spec, Some(&farm), BuildingId::from_u64(0), Some(&coverage));
+        assert_eq!(scaled.inputs[0].per_minute, 0.0, "an idle hub touches neither the stock nor its own buffer");
+    }
+
+    /// End-to-end through [`advance_producer`]: a hub with no tiles nearby
+    /// accrues nothing, even though its `spec` still lists a positive rate.
+    #[test]
+    fn a_scaled_zero_rate_advances_the_producer_to_nothing() {
+        let spec = spec(&[("minecraft:oak_log", 8.0)], &[], 4);
+        let farm = farm_link(16, 3);
+        let scaled = scale_production(&spec, Some(&farm), BuildingId::from_u64(0), None);
+
+        let mut producer = Producer::default();
+        advance_producer(&mut producer, &scaled, &economy(), &mut Stock::default(), 1.0);
+        assert_eq!(producer.buffer.get("minecraft:oak_log"), 0);
+        assert_eq!(producer.state, ProducerState::Running, "zero tiles is not a stall, it's nothing to scale yet");
+    }
+
     /// A minute of a 12/min farm is 12 wheat, whether it arrives in one tick
     /// or sixty — the property the fractional carry exists for.
     #[test]
@@ -893,7 +1049,9 @@ mod tests {
                 production,
                 cost: Vec::new(),
                 warehouse,
+                farm: None,
                 category: Category::Production,
+                ground_level: 0,
                 integrity: Integrity { pristine_above: 0.95, ruined_below: 0.6 },
             },
             footprint: IVec2::ONE,

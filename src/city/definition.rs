@@ -120,6 +120,13 @@ pub struct Building {
     /// implement. A tier-2 warehouse is a second `.ron` with bigger numbers.
     #[serde(default)]
     pub warehouse: Option<Warehouse>,
+    /// `Some` makes this building's `production` rates scale with how many
+    /// of another building sit near it — ticket 084's Anno-style tile
+    /// mechanic, the open half of `lumber.ron`'s original design note. `None`
+    /// for a producer whose rate is just its listed numbers. See [`Farm`] and
+    /// [`super::farm`].
+    #[serde(default)]
+    pub farm: Option<Farm>,
     /// Which section of the build menu (ticket 082, roadmap G1) this
     /// building lists under. `#[serde(default)]` rather than required —
     /// unlike `blueprint`/`footprint` this gates no real validation, only
@@ -130,6 +137,20 @@ pub struct Building {
     /// produce" faster than it reads as "house that doesn't house anyone".
     #[serde(default)]
     pub category: Category,
+    /// Which 0-indexed Y layer of the blueprint is its own ground surface —
+    /// ticket 085. `grid::fit_footprint`'s `base_y` is one above the
+    /// *terrain's* topmost block; without this, a placement always lines
+    /// that height up against the blueprint's `y=0`, which is wrong for a
+    /// building whose blueprint buries a foundation below its visible
+    /// surface (`lumber.nbt`'s two solid dirt layers before its grass/path
+    /// at `y=2`). `#[serde(default)]` (`0`) matches every blueprint whose
+    /// bottom layer already *is* its ground surface — every fixture but
+    /// `lumber.ron`/`lumber_farm_01.ron` as of this ticket — so this costs
+    /// them nothing. Validated against the matched blueprint's own height in
+    /// [`load_entry`], not here: `validate` only ever sees the file, not the
+    /// catalogue it's checked against.
+    #[serde(default)]
+    pub ground_level: u32,
     pub integrity: Integrity,
 }
 
@@ -171,6 +192,32 @@ pub struct Warehouse {
     /// (`economy.base_storage` is the floor under it). Not per-warehouse
     /// storage: the pile stays global — see [`super::inventory::Stock`].
     pub storage: u64,
+}
+
+/// See [`Building::farm`] — the tile that counts, how far it can be, and how
+/// many are needed for `production`'s rates to run at their full listed
+/// value. Named and shaped per ticket 084's own design (`radius_blocks`,
+/// `tiles_for_full_rate`, `tile`), not invented fresh here.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Farm {
+    /// Definition id — a `.ron` filename stem, the same keyspace
+    /// [`Building::requires`] names, not a catalogue/blueprint id — of the
+    /// building that counts toward this one's rate.
+    pub tile: String,
+    /// How far a placed `tile` instance can be and still count, in blocks:
+    /// straight-line (Chebyshev — see [`super::farm::rect_distance`]) gap
+    /// between the two buildings' own footprint rectangles, 0 when they touch
+    /// or overlap. Not routed through the road network the way
+    /// [`Warehouse::radius_cells`] is; a field doesn't need a road to reach
+    /// its farmhouse.
+    pub radius_blocks: u32,
+    /// How many `tile` instances within [`radius_blocks`](Self::radius_blocks)
+    /// produce `production`'s full listed rate. Short of this, every output
+    /// *and input* rate scales down linearly — an under-tiled hub slows down
+    /// rather than stalling outright the way a full buffer does; at zero
+    /// tiles, the rate is zero, same as Anno's own farmhouses. Placing more
+    /// than this many doesn't push the rate past 100%.
+    pub tiles_for_full_rate: u32,
 }
 
 /// How a building's horizontal footprint is determined. `FromBlueprint` (the
@@ -258,8 +305,20 @@ pub enum DefinitionError {
     /// (ticket 079) — carries the rule it broke, since there are three and
     /// they read the same way in a panel.
     InvalidWarehouse(&'static str),
+    /// A `farm` block with a value nothing downstream could use (ticket
+    /// 084) — same shape as [`InvalidWarehouse`](Self::InvalidWarehouse).
+    InvalidFarm(&'static str),
+    /// `farm.tile` names an id that isn't in the final loaded set — the
+    /// [`resolve_requirements`] pass catches this the same way it catches a
+    /// dangling `requires` edge, since both name a building id that has to
+    /// actually exist.
+    DanglingFarmTile(String),
     /// `footprint: Explicit { x, z }` has a non-positive axis.
     InvalidFootprint { x: i32, z: i32 },
+    /// `ground_level` isn't a real index into the matched blueprint's Y
+    /// extent (ticket 085) — needs the catalogue lookup, so it's caught in
+    /// [`load_entry`] rather than [`validate`].
+    InvalidGroundLevel { ground_level: u32, blueprint_height: i32 },
     /// The filename has nothing usable before its extension.
     NoFilenameStem,
     /// Another file in the same directory already claimed this id.
@@ -292,6 +351,10 @@ impl std::fmt::Display for DefinitionError {
             }
             DefinitionError::ZeroBufferStacks => write!(f, "production.buffer_stacks must be > 0"),
             DefinitionError::InvalidWarehouse(rule) => write!(f, "warehouse.{rule}"),
+            DefinitionError::InvalidFarm(rule) => write!(f, "farm.{rule}"),
+            DefinitionError::DanglingFarmTile(missing) => {
+                write!(f, "farm.tile names {missing:?}, which is not a loaded building")
+            }
             DefinitionError::InvalidProduction { item, per_minute } => write!(
                 f,
                 "production entry for {item:?} has negative per_minute {per_minute}"
@@ -299,6 +362,10 @@ impl std::fmt::Display for DefinitionError {
             DefinitionError::InvalidFootprint { x, z } => {
                 write!(f, "explicit footprint {x}x{z} must have both axes > 0")
             }
+            DefinitionError::InvalidGroundLevel { ground_level, blueprint_height } => write!(
+                f,
+                "ground_level {ground_level} is not a valid layer of a {blueprint_height}-tall blueprint"
+            ),
             DefinitionError::NoFilenameStem => write!(f, "filename has no usable stem"),
             DefinitionError::DuplicateId { id, other } => {
                 write!(f, "id {id:?} already claimed by {}", other.display())
@@ -379,6 +446,21 @@ impl BuildingDefinitions {
     pub fn iter(&self) -> impl Iterator<Item = &LoadedBuilding> {
         self.entries.values()
     }
+
+    /// The `ground_level` of the definition `definition_id` names, or `0`
+    /// when there's no id at all or it doesn't resolve to a loaded
+    /// definition — the same gap `cost`/`requires`/`production` already
+    /// leave a selection with no `definition_id` behind it (ticket 085):
+    /// `city::placement`'s keyboard stand-in places at the old, unshifted
+    /// height. `city::placement::resolve_placement` and `city::commit` are
+    /// the two callers, so the ghost and the actual write can never disagree
+    /// about which layer of the blueprint sits at terrain height.
+    pub fn ground_level(&self, definition_id: Option<&str>) -> i32 {
+        definition_id
+            .and_then(|id| self.entries.get(id))
+            .map(|entry| entry.building.ground_level as i32)
+            .unwrap_or(0)
+    }
 }
 
 /// The range/sign checks described in the module docs, tested directly
@@ -440,6 +522,20 @@ fn validate(building: &Building) -> Result<(), DefinitionError> {
             return Err(DefinitionError::InvalidFootprint { x, z });
         }
     }
+    // Ticket 084: a farm link with nothing to scale, or a search radius
+    // that could never find anything, is a mistake in the file for the same
+    // reason a zero-radius/zero-carry warehouse is.
+    if let Some(farm) = &building.farm {
+        if farm.radius_blocks == 0 {
+            return Err(DefinitionError::InvalidFarm("radius_blocks must be > 0"));
+        }
+        if farm.tiles_for_full_rate == 0 {
+            return Err(DefinitionError::InvalidFarm("tiles_for_full_rate must be > 0"));
+        }
+        if building.production.is_none() {
+            return Err(DefinitionError::InvalidFarm("needs a production block to scale"));
+        }
+    }
     Ok(())
 }
 
@@ -473,6 +569,14 @@ fn load_entry(
     let catalogue_entry = blueprint_stem
         .and_then(|stem| catalogue.get(stem))
         .ok_or_else(|| DefinitionError::UnknownBlueprint(building.blueprint.clone()))?;
+
+    // Ticket 085: needs the matched blueprint's own height, so this check
+    // lives here rather than in `validate` — a file-only check can't know
+    // how tall the blueprint it names actually is.
+    let blueprint_height = catalogue_entry.blueprint.size.y;
+    if building.ground_level as i32 >= blueprint_height {
+        return Err(DefinitionError::InvalidGroundLevel { ground_level: building.ground_level, blueprint_height });
+    }
 
     let footprint = resolve_footprint(building.footprint, catalogue_entry.footprint);
     // `blueprint_stem` is `Some` by construction: `catalogue_entry` above
@@ -565,22 +669,29 @@ fn resolve_requirements(
 
     loop {
         let ids: HashSet<&str> = entries.keys().map(String::as_str).collect();
-        let dangling: Vec<(String, String)> = entries
+        // Ticket 084: `farm.tile` is checked in the same pass as `requires` —
+        // both name a building id that has to actually exist, and both can
+        // cascade the same way (removing a dangling tile's own hub can dangle
+        // whatever *that* hub was a `requires` prerequisite for).
+        let dangling: Vec<(String, DefinitionError)> = entries
             .iter()
             .filter_map(|(id, entry)| {
-                entry
-                    .building
-                    .requires
-                    .iter()
-                    .find(|req| !ids.contains(req.as_str()))
-                    .map(|missing| (id.clone(), missing.clone()))
+                if let Some(missing) = entry.building.requires.iter().find(|req| !ids.contains(req.as_str())) {
+                    return Some((id.clone(), DefinitionError::DanglingRequirement(missing.clone())));
+                }
+                if let Some(farm) = &entry.building.farm {
+                    if !ids.contains(farm.tile.as_str()) {
+                        return Some((id.clone(), DefinitionError::DanglingFarmTile(farm.tile.clone())));
+                    }
+                }
+                None
             })
             .collect();
 
         if !dangling.is_empty() {
-            for (id, missing) in dangling {
+            for (id, err) in dangling {
                 let entry = entries.remove(&id).expect("id came from entries.iter() above");
-                skipped.push((entry.path, DefinitionError::DanglingRequirement(missing)));
+                skipped.push((entry.path, err));
             }
             continue;
         }
@@ -976,6 +1087,242 @@ Building(
         assert!(definitions.is_empty());
         assert_eq!(skipped.len(), 1);
         assert!(matches!(skipped[0].1, DefinitionError::InvalidFootprint { .. }));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- ground_level (ticket 085) --------------------------------------
+
+    /// [`BuildingDefinitions::ground_level`] is `placement`/`commit`'s only
+    /// way to reach a selected building's `ground_level` — covers a real
+    /// hit, an id that isn't loaded, and no id at all (the keyboard
+    /// stand-in's own selection, per [`ground_level`](BuildingDefinitions::ground_level)'s docs).
+    #[test]
+    fn building_definitions_ground_level_looks_up_by_definition_id() {
+        let catalogue = catalogue_with_house01();
+        let dir = temp_dir("ground_level_lookup");
+        fs::write(
+            dir.join("lumber.ron"),
+            r#"Building(
+                name: "Lumberjack's Hut",
+                blueprint: "house01.nbt",
+                tier: 1,
+                ground_level: 2,
+                integrity: Integrity(pristine_above: 0.9, ruined_below: 0.5),
+            )"#,
+        )
+        .unwrap();
+
+        let (definitions, skipped) = load_definitions_dir(&dir, &catalogue);
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert_eq!(definitions.ground_level(Some("lumber")), 2);
+        assert_eq!(definitions.ground_level(Some("does_not_exist")), 0);
+        assert_eq!(definitions.ground_level(None), 0);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// [`catalogue_with_house01`]'s fixture blueprint is `IVec3::new(3, 4, 5)`
+    /// — `ground_level: 3` is its topmost valid layer.
+    #[test]
+    fn a_ground_level_within_the_blueprints_height_is_carried() {
+        let catalogue = catalogue_with_house01();
+        let dir = temp_dir("ground_level_valid");
+        fs::write(
+            dir.join("house01.ron"),
+            r#"Building(
+                name: "House",
+                blueprint: "house01.nbt",
+                tier: 1,
+                ground_level: 3,
+                integrity: Integrity(pristine_above: 0.9, ruined_below: 0.5),
+            )"#,
+        )
+        .unwrap();
+
+        let (definitions, skipped) = load_definitions_dir(&dir, &catalogue);
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert_eq!(definitions.get("house01").unwrap().building.ground_level, 3);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_missing_ground_level_defaults_to_zero() {
+        let catalogue = catalogue_with_house01();
+        let dir = temp_dir("ground_level_default");
+        fs::write(dir.join("house01.ron"), VALID_RON).unwrap();
+
+        let (definitions, skipped) = load_definitions_dir(&dir, &catalogue);
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert_eq!(definitions.get("house01").unwrap().building.ground_level, 0);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `ground_level: 4` is one layer past the fixture's `size.y == 4`
+    /// (valid indices are `0..=3`) — needs the matched blueprint's own
+    /// height, so this is [`load_entry`], not [`validate`], catching it.
+    #[test]
+    fn a_ground_level_at_or_past_the_blueprints_height_is_skipped() {
+        let catalogue = catalogue_with_house01();
+        let dir = temp_dir("ground_level_out_of_range");
+        fs::write(
+            dir.join("house01.ron"),
+            r#"Building(
+                name: "House",
+                blueprint: "house01.nbt",
+                tier: 1,
+                ground_level: 4,
+                integrity: Integrity(pristine_above: 0.9, ruined_below: 0.5),
+            )"#,
+        )
+        .unwrap();
+
+        let (definitions, skipped) = load_definitions_dir(&dir, &catalogue);
+        assert!(definitions.is_empty());
+        assert_eq!(skipped.len(), 1);
+        assert!(matches!(
+            skipped[0].1,
+            DefinitionError::InvalidGroundLevel { ground_level: 4, blueprint_height: 4 }
+        ));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- farm links (ticket 084) ---------------------------------------------
+
+    #[test]
+    fn a_farm_link_with_no_production_block_is_skipped() {
+        let catalogue = catalogue_with_house01();
+        let dir = temp_dir("farm_no_production");
+        fs::write(
+            dir.join("house01.ron"),
+            r#"Building(
+                name: "House",
+                blueprint: "house01.nbt",
+                tier: 1,
+                farm: Some(Farm(tile: "house01", radius_blocks: 8, tiles_for_full_rate: 2)),
+                integrity: Integrity(pristine_above: 0.9, ruined_below: 0.5),
+            )"#,
+        )
+        .unwrap();
+
+        let (definitions, skipped) = load_definitions_dir(&dir, &catalogue);
+        assert!(definitions.is_empty());
+        assert_eq!(skipped.len(), 1);
+        assert!(matches!(skipped[0].1, DefinitionError::InvalidFarm(_)));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_zero_farm_radius_blocks_is_skipped() {
+        let catalogue = catalogue_with_house01();
+        let dir = temp_dir("farm_zero_radius");
+        fs::write(
+            dir.join("house01.ron"),
+            r#"Building(
+                name: "House",
+                blueprint: "house01.nbt",
+                tier: 1,
+                production: Some(Production(outputs: [(item: "minecraft:wheat", per_minute: 1.0)])),
+                farm: Some(Farm(tile: "house01", radius_blocks: 0, tiles_for_full_rate: 2)),
+                integrity: Integrity(pristine_above: 0.9, ruined_below: 0.5),
+            )"#,
+        )
+        .unwrap();
+
+        let (definitions, skipped) = load_definitions_dir(&dir, &catalogue);
+        assert!(definitions.is_empty());
+        assert_eq!(skipped.len(), 1);
+        assert!(matches!(skipped[0].1, DefinitionError::InvalidFarm(_)));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_zero_tiles_for_full_rate_is_skipped() {
+        let catalogue = catalogue_with_house01();
+        let dir = temp_dir("farm_zero_tiles");
+        fs::write(
+            dir.join("house01.ron"),
+            r#"Building(
+                name: "House",
+                blueprint: "house01.nbt",
+                tier: 1,
+                production: Some(Production(outputs: [(item: "minecraft:wheat", per_minute: 1.0)])),
+                farm: Some(Farm(tile: "house01", radius_blocks: 8, tiles_for_full_rate: 0)),
+                integrity: Integrity(pristine_above: 0.9, ruined_below: 0.5),
+            )"#,
+        )
+        .unwrap();
+
+        let (definitions, skipped) = load_definitions_dir(&dir, &catalogue);
+        assert!(definitions.is_empty());
+        assert_eq!(skipped.len(), 1);
+        assert!(matches!(skipped[0].1, DefinitionError::InvalidFarm(_)));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `farm.tile` names a keyspace-appropriate id (a `.ron` stem) the same
+    /// way `requires` does — a typo or a removed tile definition must not
+    /// silently leave a hub that can never reach 100% output.
+    #[test]
+    fn a_dangling_farm_tile_reference_is_skipped() {
+        let catalogue = catalogue_with_house01();
+        let dir = temp_dir("farm_dangling_tile");
+        fs::write(
+            dir.join("house01.ron"),
+            r#"Building(
+                name: "House",
+                blueprint: "house01.nbt",
+                tier: 1,
+                production: Some(Production(outputs: [(item: "minecraft:wheat", per_minute: 1.0)])),
+                farm: Some(Farm(tile: "does_not_exist", radius_blocks: 8, tiles_for_full_rate: 2)),
+                integrity: Integrity(pristine_above: 0.9, ruined_below: 0.5),
+            )"#,
+        )
+        .unwrap();
+
+        let (definitions, skipped) = load_definitions_dir(&dir, &catalogue);
+        assert!(definitions.is_empty());
+        assert_eq!(skipped.len(), 1);
+        assert!(matches!(
+            &skipped[0].1,
+            DefinitionError::DanglingFarmTile(missing) if missing == "does_not_exist"
+        ));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A well-formed farm link survives and is read back with its fields
+    /// intact — the positive case the four skip tests above all assume.
+    #[test]
+    fn a_valid_farm_link_is_carried() {
+        let catalogue = catalogue_with_house01();
+        let dir = temp_dir("farm_valid");
+        fs::write(dir.join("tile.ron"), VALID_RON).unwrap();
+        fs::write(
+            dir.join("house01.ron"),
+            r#"Building(
+                name: "House",
+                blueprint: "house01.nbt",
+                tier: 1,
+                production: Some(Production(outputs: [(item: "minecraft:wheat", per_minute: 12.0)])),
+                farm: Some(Farm(tile: "tile", radius_blocks: 16, tiles_for_full_rate: 3)),
+                integrity: Integrity(pristine_above: 0.9, ruined_below: 0.5),
+            )"#,
+        )
+        .unwrap();
+
+        let (definitions, skipped) = load_definitions_dir(&dir, &catalogue);
+        assert!(skipped.is_empty(), "{skipped:?}");
+        let farm = definitions.get("house01").unwrap().building.farm.as_ref().expect("farm link should have loaded");
+        assert_eq!(farm.tile, "tile");
+        assert_eq!(farm.radius_blocks, 16);
+        assert_eq!(farm.tiles_for_full_rate, 3);
 
         fs::remove_dir_all(&dir).ok();
     }
