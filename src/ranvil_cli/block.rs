@@ -526,7 +526,11 @@ pub(super) fn matching_positions(area: &GetAreaResult, block: &str, limit: usize
 /// at dense-array `index` within a box of `size` blocks starting at `origin`,
 /// in the same Y-outer/Z-middle/X-inner order [`SelectionBounds::iter_blocks`]
 /// documents.
-fn position_of(origin: IVec3, size: IVec3, index: usize) -> IVec3 {
+///
+/// `pub(super)`: `copy` (ticket 097) reuses this to translate a source box's
+/// dense-array index straight into a destination position, rather than
+/// growing a second index-to-position conversion.
+pub(super) fn position_of(origin: IVec3, size: IVec3, index: usize) -> IVec3 {
     let (width, depth) = (size.x as usize, size.z as usize);
     let plane = width * depth;
     let y = index / plane;

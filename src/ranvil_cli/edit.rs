@@ -28,8 +28,8 @@ use crate::edit::{EditPolicy, EditReport, WorldEdit, WriteSession};
 use crate::region_cache::RegionCache;
 use crate::selection::SelectionBounds;
 
-use super::block::{get_area, matching_positions};
-use super::cli::{Cli, GetAreaArgs, ReplaceArgs, SetAreaArgs, SetArgs, SetBatchArgs};
+use super::block::{get_area, matching_positions, position_of};
+use super::cli::{Cli, CopyArgs, GetAreaArgs, ReplaceArgs, SetAreaArgs, SetArgs, SetBatchArgs};
 use super::coords::BlockPos;
 use super::error::CliError;
 use super::format::Render;
@@ -539,6 +539,121 @@ impl Render for ReplaceResult {
         map.insert("from_block".to_string(), json!(self.from_block));
         map.insert("to_block".to_string(), json!(self.to_state.to_string()));
         map.insert("matched".to_string(), json!(self.matched));
+        for (key, value) in outcome_json_fields(&self.outcome) {
+            map.insert(key.to_string(), value);
+        }
+        Value::Object(map)
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// ---- copy (ticket 097) -----------------------------------------------------------------------
+// -------------------------------------------------------------------------------------------------
+//
+// `copy` composes 092's read primitive ([`get_area`]) with 094's write
+// substrate ([`run_write`]) rather than adding a second box-walking loop.
+// The whole source box is read into `area` — via `get_area`'s own
+// `Arc<Mutex<RegionCache>>`, unrelated to the one `run_write` opens — before
+// `run_write` is even called, which is what makes an overlapping
+// source/destination safe: the read finishes in full before a session or a
+// write-side cache is opened, so an overlap always sees the *original*
+// blocks, never a partially-copied one.
+
+/// `copy`'s result: the source box, the destination's min corner, whether
+/// air was included, how many positions were written, plus what
+/// [`run_write`] did (or would do).
+#[derive(Debug)]
+pub struct CopyResult {
+    pub save_name: String,
+    pub from: IVec3,
+    pub to: IVec3,
+    pub dest: IVec3,
+    pub include_air: bool,
+    /// Positions written: every source position with `--include-air`, or
+    /// only the non-air ones without it.
+    pub copied: usize,
+    pub outcome: WriteOutcome,
+}
+
+/// Runs `copy`: [`get_area`]'s extraction over `args.corner1`/`args.corner2`
+/// (finished in full before [`run_write`] is even called — see the module
+/// note above), translated so the source box's min corner lands at
+/// `args.dest.0`, and handed to [`run_write`] as one [`WorldEdit`].
+///
+/// Air positions inside the source box are skipped by default — copying a
+/// tree-shaped selection shouldn't punch an air-shaped hole through whatever
+/// already stands at the destination — unless `args.include_air` asks for an
+/// exact clone, blank spots included.
+pub fn copy(cli: &Cli, args: &CopyArgs) -> Result<CopyResult, CliError> {
+    let bounds = SelectionBounds::from_corners(args.corner1.0, args.corner1.0, args.corner2.0);
+
+    let volume = bounds.volume();
+    if volume > MAX_BLOCKS {
+        return Err(CliError::Usage(format!(
+            "selection ({}) to ({}) is {volume} blocks — over the {MAX_BLOCKS}-block copy limit",
+            args.corner1.0, args.corner2.0
+        )));
+    }
+
+    let area = get_area(cli, &GetAreaArgs { from: args.corner1, to: args.corner2 })?;
+    let include_air = args.include_air;
+    let dest_min = args.dest.0;
+    let size = area.size;
+
+    // Built entirely from `area` — already a finished read — before
+    // `run_write` opens anything, so nothing here re-reads the destination.
+    let mut edit = WorldEdit::new();
+    for (index, &palette_index) in area.blocks.iter().enumerate() {
+        let state = &area.palette[palette_index as usize];
+        if !include_air && state.name == BlockState::AIR {
+            continue;
+        }
+        let local = position_of(IVec3::ZERO, size, index);
+        edit.set(dest_min + local, state.clone());
+    }
+    let copied = edit.len();
+
+    let meta = resolve_save(cli)?;
+    let outcome = run_write(&meta, args.dry_run, args.force, move |_cache| Ok(edit))?;
+
+    Ok(CopyResult {
+        save_name: meta.name,
+        from: bounds.min,
+        to: bounds.max,
+        dest: dest_min,
+        include_air,
+        copied,
+        outcome,
+    })
+}
+
+impl Render for CopyResult {
+    fn render_text(&self) -> String {
+        let prefix = format!(
+            "copy {} to {} -> {} in {}{}: {} block{} copied",
+            self.from,
+            self.to,
+            self.dest,
+            self.save_name,
+            if self.include_air { " (including air)" } else { "" },
+            self.copied,
+            if self.copied == 1 { "" } else { "s" },
+        );
+        let mut lines = vec![outcome_summary(prefix, &self.outcome)];
+        if !self.outcome.dry_run {
+            lines.push(format!("  backup: {}", self.outcome.backup_dir.display()));
+        }
+        lines.join("\n")
+    }
+
+    fn render_json(&self) -> Value {
+        let mut map = serde_json::Map::new();
+        map.insert("save".to_string(), json!(self.save_name));
+        map.insert("from".to_string(), json!([self.from.x, self.from.y, self.from.z]));
+        map.insert("to".to_string(), json!([self.to.x, self.to.y, self.to.z]));
+        map.insert("dest".to_string(), json!([self.dest.x, self.dest.y, self.dest.z]));
+        map.insert("include_air".to_string(), json!(self.include_air));
+        map.insert("copied".to_string(), json!(self.copied));
         for (key, value) in outcome_json_fields(&self.outcome) {
             map.insert(key.to_string(), value);
         }
@@ -1326,5 +1441,208 @@ mod tests {
             }
             CliError::Data(message) => panic!("expected Usage (exit 2), got Data: {message}"),
         }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // ---- copy (ticket 097) -----------------------------------------------------------------------
+    // -----------------------------------------------------------------------------------------
+
+    use super::super::cli::CopyArgs;
+
+    fn copy_args(
+        corner1: IVec3,
+        corner2: IVec3,
+        dest: IVec3,
+        include_air: bool,
+        dry_run: bool,
+        force: bool,
+    ) -> CopyArgs {
+        CopyArgs {
+            corner1: BlockPos(corner1),
+            corner2: BlockPos(corner2),
+            dest: BlockPos(dest),
+            include_air,
+            dry_run,
+            force,
+        }
+    }
+
+    /// The ticket's headline "Done when": a small structure with a few
+    /// distinct blocks (one with properties) reproduces exactly at the
+    /// destination, confirmed the same way the ticket asks — reading each
+    /// position back and comparing it to its source, the same
+    /// [`block_state_at`] every other write test's roundtrip check uses.
+    #[test]
+    fn copy_reproduces_a_small_structure_exactly_at_the_destination() {
+        let fixture = Fixture::new("copy-roundtrip");
+        let cli = cli_for(&fixture);
+        set(&cli, &set_args(IVec3::new(0, 0, 0), dirt(), false, false)).expect("plant dirt");
+        set(&cli, &set_args(IVec3::new(1, 0, 0), oak_stairs(), false, false)).expect("plant a stair");
+        // (2, 0, 0) is left as the fixture's own stone.
+
+        let result = copy(
+            &cli,
+            &copy_args(IVec3::new(0, 0, 0), IVec3::new(2, 0, 0), IVec3::new(5, 0, 0), false, false, false),
+        )
+        .expect("a valid copy");
+
+        assert_eq!(result.copied, 3);
+        assert_eq!(result.outcome.report.blocks_written, 3);
+        for dx in 0..3 {
+            let src = IVec3::new(dx, 0, 0);
+            let dest = IVec3::new(5 + dx, 0, 0);
+            assert_eq!(block_state_at(&fixture.meta, dest), block_state_at(&fixture.meta, src), "at offset {dx}");
+        }
+    }
+
+    /// The ticket's other headline "Done when": an overlapping
+    /// source/destination — a checkerboard shifted by one — reads the
+    /// *original* blocks throughout, not a partially-copied one.
+    #[test]
+    fn copy_with_an_overlapping_destination_reads_the_original_blocks() {
+        let fixture = Fixture::new("copy-overlap");
+        let cli = cli_for(&fixture);
+        let pattern = [dirt(), oak_slab_top(), dirt(), oak_slab_top()];
+        for (dx, state) in pattern.iter().enumerate() {
+            set(&cli, &set_args(IVec3::new(dx as i32, 5, 0), state.clone(), false, false))
+                .expect("plant the checkerboard");
+        }
+
+        let result = copy(
+            &cli,
+            &copy_args(IVec3::new(0, 5, 0), IVec3::new(3, 5, 0), IVec3::new(1, 5, 0), false, false, false),
+        )
+        .expect("a valid overlapping copy");
+
+        assert_eq!(result.copied, 4);
+        for (dx, state) in pattern.iter().enumerate() {
+            let dest = IVec3::new(1 + dx as i32, 5, 0);
+            assert_eq!(block_state_at(&fixture.meta, dest), *state, "at dest offset {dx}");
+        }
+    }
+
+    /// `--include-air` overwrites the destination where the source was air;
+    /// without it, that position is untouched.
+    #[test]
+    fn include_air_controls_whether_air_overwrites_the_destination() {
+        let fixture = Fixture::new("copy-include-air");
+        let cli = cli_for(&fixture);
+        set(&cli, &set_args(IVec3::new(0, 0, 0), BlockState::air(), false, false)).expect("plant air");
+        set(&cli, &set_args(IVec3::new(1, 0, 0), dirt(), false, false)).expect("plant dirt");
+        // A distinctive prior state at the destination, so "untouched" is
+        // unambiguous.
+        set(&cli, &set_args(IVec3::new(5, 0, 0), oak_stairs(), false, false)).expect("prefill dest");
+
+        let without = copy(
+            &cli,
+            &copy_args(IVec3::new(0, 0, 0), IVec3::new(1, 0, 0), IVec3::new(5, 0, 0), false, false, false),
+        )
+        .expect("a valid copy");
+        assert_eq!(without.copied, 1, "only the non-air source position is copied");
+        assert_eq!(
+            block_state_at(&fixture.meta, IVec3::new(5, 0, 0)),
+            oak_stairs(),
+            "the air source position leaves the destination untouched"
+        );
+        assert_eq!(block_state_at(&fixture.meta, IVec3::new(6, 0, 0)), dirt());
+
+        // Re-prefill for a clean "with `--include-air`" comparison.
+        set(&cli, &set_args(IVec3::new(5, 0, 0), oak_stairs(), false, false)).expect("prefill dest again");
+
+        let with = copy(
+            &cli,
+            &copy_args(IVec3::new(0, 0, 0), IVec3::new(1, 0, 0), IVec3::new(5, 0, 0), true, false, false),
+        )
+        .expect("a valid copy");
+        assert_eq!(with.copied, 2);
+        assert_eq!(block_name_at(&fixture.meta, IVec3::new(5, 0, 0)), "minecraft:air");
+    }
+
+    /// `--dry-run` on `copy` leaves the save's files byte-identical, same
+    /// contract every other write command holds to.
+    #[test]
+    fn copy_dry_run_touches_nothing() {
+        let fixture = Fixture::new("copy-dry-run");
+        let cli = cli_for(&fixture);
+        set(&cli, &set_args(IVec3::new(0, 0, 0), dirt(), false, false)).expect("plant dirt");
+        let (before_bytes, before_mtime) = (fixture.bytes(), fixture.mtime());
+
+        let result = copy(
+            &cli,
+            &copy_args(IVec3::new(0, 0, 0), IVec3::new(0, 0, 0), IVec3::new(5, 0, 0), false, true, false),
+        )
+        .expect("a valid plan");
+
+        assert!(result.outcome.dry_run);
+        assert_eq!(result.copied, 1);
+        assert_eq!(fixture.bytes(), before_bytes);
+        assert_eq!(fixture.mtime(), before_mtime);
+        assert_eq!(block_name_at(&fixture.meta, IVec3::new(5, 0, 0)), "minecraft:stone");
+    }
+
+    /// `copy`'s own volume cap (mirrors `get-area`/`set-area`/`replace`'s
+    /// [`MAX_BLOCKS`]): a box over the limit is a `Usage` error (exit 2)
+    /// raised before `resolve_save` even runs.
+    #[test]
+    fn copy_over_max_blocks_is_a_usage_error_before_touching_a_save() {
+        let args = copy_args(
+            IVec3::new(0, crate::selection::WORLD_MIN_Y, 0),
+            IVec3::new(9999, crate::selection::WORLD_MAX_Y, 9999),
+            IVec3::new(0, 0, 0),
+            false,
+            false,
+            false,
+        );
+
+        let err = copy(&dummy_cli(None), &args).unwrap_err();
+
+        match err {
+            CliError::Usage(message) => {
+                assert!(message.contains(&MAX_BLOCKS.to_string()), "{message}");
+                assert!(
+                    !message.contains("instance directory"),
+                    "should fail on the volume check, not on resolving a save: {message}"
+                );
+            }
+            CliError::Data(message) => panic!("expected Usage (exit 2), got Data: {message}"),
+        }
+    }
+
+    #[test]
+    fn copy_render_json_matches_the_documented_shape() {
+        let result = CopyResult {
+            save_name: "world".to_string(),
+            from: IVec3::new(0, 60, 0),
+            to: IVec3::new(1, 60, 0),
+            dest: IVec3::new(10, 60, 0),
+            include_air: false,
+            copied: 2,
+            outcome: sample_outcome(false),
+        };
+
+        let json = result.render_json();
+        assert_eq!(json["save"], json!("world"));
+        assert_eq!(json["from"], json!([0, 60, 0]));
+        assert_eq!(json["to"], json!([1, 60, 0]));
+        assert_eq!(json["dest"], json!([10, 60, 0]));
+        assert_eq!(json["include_air"], json!(false));
+        assert_eq!(json["copied"], json!(2));
+        assert_eq!(json["status"], json!("applied"));
+    }
+
+    /// The dry-run label shows up in `text` too, same as every other write
+    /// command.
+    #[test]
+    fn copy_render_text_prefixes_dry_run_visibly() {
+        let dry = CopyResult {
+            save_name: "world".to_string(),
+            from: IVec3::new(0, 60, 0),
+            to: IVec3::new(1, 60, 0),
+            dest: IVec3::new(10, 60, 0),
+            include_air: false,
+            copied: 2,
+            outcome: sample_outcome(true),
+        };
+        assert!(dry.render_text().starts_with("[dry-run]"), "{}", dry.render_text());
     }
 }

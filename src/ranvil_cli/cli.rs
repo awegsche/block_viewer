@@ -58,6 +58,9 @@ pub struct Cli {
 /// box's blocks by name. Ticket 095 adds `Set`/`SetArea`, the first write
 /// commands — thin builders over [`super::edit::run_write`] (094's write
 /// substrate) around `WorldEdit::new().set`/`WorldEdit::fill` respectively.
+/// Ticket 097 adds `Copy`, composing `get_area`'s read with `run_write`'s
+/// write substrate — extract the source box, translate it, apply as one
+/// transaction — rather than growing a third box-walking loop.
 /// Every later `ranvil-cli` ticket adds one more, routing to its own
 /// submodule the same way.
 #[derive(Debug, Subcommand)]
@@ -97,6 +100,8 @@ pub enum Command {
     SetBatch(SetBatchArgs),
     /// Find-and-replace by block name within a box, in one transaction.
     Replace(ReplaceArgs),
+    /// Extract a box and re-apply it translated elsewhere in the same save.
+    Copy(CopyArgs),
 }
 
 /// `saves` takes no arguments of its own — the instance directory it lists
@@ -367,6 +372,53 @@ pub struct ReplaceArgs {
     /// The block to write at every matched position.
     #[arg(long = "to")]
     pub to_state: BlockState,
+
+    /// Report the plan without writing anything — see [`super::edit::run_write`].
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Write even though the save currently looks open in Minecraft.
+    #[arg(long)]
+    pub force: bool,
+}
+
+/// `copy <x1>,<y1>,<z1> <x2>,<y2>,<z2> --to <x>,<y>,<z> [--include-air]
+/// [--dry-run] [--force]` (ticket 097): extracts the source box via
+/// [`super::block::get_area`] (092's primitive — the same read `scan`/
+/// `replace` reuse rather than growing a fresh box walk) and re-applies it
+/// translated so its min corner lands at `--to`, as one
+/// [`super::edit::run_write`] transaction — see [`super::edit::copy`].
+///
+/// Source and destination may overlap (a same-region nudge is a legitimate
+/// use): the whole source box is read before `run_write` opens a session or
+/// touches the destination, so an overlap always reads the *original*
+/// blocks, never a partially-copied one.
+///
+/// There is no `--rotate` here — `struct rotate` (ticket 102) is the one
+/// place rotation logic lives. A rotated in-place copy is `struct export`
+/// the source, `struct rotate` it, then `struct import` at the destination.
+#[derive(Debug, Args)]
+pub struct CopyArgs {
+    /// One corner of the source box, "x,y,z". See [`ChunkArgs::pos`] on why
+    /// `allow_hyphen_values`.
+    #[arg(allow_hyphen_values = true)]
+    pub corner1: BlockPos,
+    /// The opposite corner, "x,y,z".
+    #[arg(allow_hyphen_values = true)]
+    pub corner2: BlockPos,
+
+    /// The destination's minimum corner, "x,y,z" — matching how the source
+    /// box's own minimum corner is read (`SelectionBounds::from_corners`'s
+    /// existing convention).
+    #[arg(long = "to", allow_hyphen_values = true)]
+    pub dest: BlockPos,
+
+    /// Also write the source's air at the destination, overwriting whatever
+    /// stands there. Without this flag, air positions inside the source box
+    /// are skipped — copying a tree-shaped selection shouldn't punch an
+    /// air-shaped hole through whatever already stands at the destination.
+    #[arg(long)]
+    pub include_air: bool,
 
     /// Report the plan without writing anything — see [`super::edit::run_write`].
     #[arg(long)]

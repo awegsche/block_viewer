@@ -18,7 +18,11 @@
 //! `x,y,z blockstate` lines from a file or stdin, parsed into one
 //! `WorldEdit` before any of it is applied) and `replace` (a `get-area` scan
 //! for a block name, rewritten to a new one) — both still one `run_write`
-//! transaction, not a loop over 095's `set`.
+//! transaction, not a loop over 095's `set`. Ticket 097 adds `copy`:
+//! `get_area`'s extraction over the source box, translated to a destination
+//! and applied as one `run_write` transaction — the extraction finishes
+//! before the write session opens, so an overlapping source/destination
+//! reads the original blocks throughout.
 //! [`structure`] is still an empty stub — later tickets fill it in.
 
 use std::process::ExitCode;
@@ -136,6 +140,11 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
         }
         Command::Replace(args) => {
             let result = edit::replace(cli, args)?;
+            print(&result, cli.format);
+            Ok(())
+        }
+        Command::Copy(args) => {
+            let result = edit::copy(cli, args)?;
             print(&result, cli.format);
             Ok(())
         }
