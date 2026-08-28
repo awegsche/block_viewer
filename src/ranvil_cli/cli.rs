@@ -9,6 +9,7 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
+use super::coords::ChunkPos;
 use super::format::OutputFormat;
 
 #[derive(Debug, Parser)]
@@ -39,6 +40,8 @@ pub struct Cli {
 /// One variant per subcommand. Ticket 087 added `Saves`; ticket 088 adds
 /// `Info`/`Regions`/`Lock`, the first three commands that need `--save`
 /// resolved (see `save::resolve_save`) rather than listing every save.
+/// Ticket 089 adds `Chunk`/`Chunks`, the first commands that decode a
+/// chunk's own NBT rather than just a region's metadata.
 /// Every later `ranvil-cli` ticket adds one more, routing to its own
 /// submodule the same way.
 #[derive(Debug, Subcommand)]
@@ -52,6 +55,12 @@ pub enum Command {
     Regions(RegionsArgs),
     /// Whether Minecraft is holding this save's `session.lock` right now.
     Lock(LockArgs),
+    /// One chunk: Status, DataVersion, section Y-range, inhabited time,
+    /// block-entity/entity counts, biome list, a heightmap peek.
+    Chunk(ChunkArgs),
+    /// Bulk survey over a rectangle of chunk coordinates: counts by
+    /// `Status`, ungenerated chunks, aggregate block-entity/entity counts.
+    Chunks(ChunksArgs),
 }
 
 /// `saves` takes no arguments of its own — the instance directory it lists
@@ -87,4 +96,36 @@ pub struct RegionsArgs {
 pub enum RegionLayout {
     List,
     Grid,
+}
+
+/// `chunk <cx>,<cz> [--print]` (ticket 089).
+#[derive(Debug, Args)]
+pub struct ChunkArgs {
+    /// Chunk coordinates, "cx,cz". `allow_hyphen_values`: clap's own
+    /// negative-number heuristic doesn't fire for `-2,-2` (it isn't a bare
+    /// negative integer), and the roadmap's own example invocations use
+    /// negative chunk coordinates without a `--` separator.
+    #[arg(allow_hyphen_values = true)]
+    pub pos: ChunkPos,
+
+    /// Accepted for compatibility with the invocation the roadmap and
+    /// earlier planning discussion spelled (`chunk 0,0 --print --format
+    /// json`) — it changes nothing. `chunk` always prints its result; this
+    /// flag is a no-op kept so that exact invocation keeps working.
+    #[arg(long)]
+    pub print: bool,
+}
+
+/// `chunks <cx1>,<cz1> <cx2>,<cz2>` (ticket 089): a rectangle of chunk
+/// coordinates, inclusive both ends, matching 019's inclusive-bounds
+/// convention. Either corner may be given in either order — `chunk::chunks`
+/// sorts them into min/max before walking.
+#[derive(Debug, Args)]
+pub struct ChunksArgs {
+    /// One corner, "cx,cz". See [`ChunkArgs::pos`] on why `allow_hyphen_values`.
+    #[arg(allow_hyphen_values = true)]
+    pub from: ChunkPos,
+    /// The opposite corner, "cx,cz".
+    #[arg(allow_hyphen_values = true)]
+    pub to: ChunkPos,
 }

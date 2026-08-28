@@ -7,8 +7,8 @@
 //! proving all four end to end. Every later ticket adds one more
 //! subcommand to [`cli::Command`] and one more arm to [`run`]'s dispatch.
 //!
-//! [`chunk`], [`block`], [`edit`], [`structure`] are empty stubs for now —
-//! tickets 089+ fill them in.
+//! [`chunk`] gained `chunk`/`chunks` in ticket 089. [`block`], [`edit`],
+//! [`structure`] are still empty stubs — later tickets fill them in.
 
 use std::process::ExitCode;
 
@@ -69,6 +69,16 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
         }
         Command::Lock(args) => {
             let result = save::lock(cli, args)?;
+            print(&result, cli.format);
+            Ok(())
+        }
+        Command::Chunk(args) => {
+            let result = chunk::chunk(cli, args)?;
+            print(&result, cli.format);
+            Ok(())
+        }
+        Command::Chunks(args) => {
+            let result = chunk::chunks(cli, args)?;
             print(&result, cli.format);
             Ok(())
         }
