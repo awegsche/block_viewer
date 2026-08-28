@@ -27,6 +27,11 @@
 //! `struct new` — the first `ranvil-cli` commands that read or write a
 //! [`crate::blueprint::Blueprint`] on disk rather than a live save, so
 //! unlike every command above they take no `--save`/`--instance` at all.
+//! Ticket 099 adds `struct export`/`struct import`, the bridge back to a
+//! live save: `export` is `get_area`'s box read written out through
+//! `write_structure_file`; `import` is `read_structure_file` (optionally
+//! rotated) turned into a `WorldEdit` and run through `run_write` — so
+//! unlike `info`/`new` these two *do* take `--save`/`--instance`.
 
 use std::process::ExitCode;
 
@@ -158,6 +163,16 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
         }
         Command::Struct(StructCommand::New(args)) => {
             let result = structure::new(args)?;
+            print(&result, cli.format);
+            Ok(())
+        }
+        Command::Struct(StructCommand::Export(args)) => {
+            let result = structure::export(cli, args)?;
+            print(&result, cli.format);
+            Ok(())
+        }
+        Command::Struct(StructCommand::Import(args)) => {
+            let result = structure::import(cli, args)?;
             print(&result, cli.format);
             Ok(())
         }

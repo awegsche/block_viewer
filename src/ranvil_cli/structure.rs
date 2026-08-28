@@ -13,20 +13,40 @@
 //! warning inside [`write_structure_file`] (see that module's docs), but a
 //! file `struct new` builds from scratch has no data worth keeping past that
 //! cap, so it refuses outright instead.
+//!
+//! `export`/`import` (ticket 099) are the bridge to a live save — the only
+//! two commands in this module that take `--save`/`--instance` at all.
+//! `export` is [`super::block::get_area`]'s box read
+//! ([`crate::blueprint::extract_blueprint`], 092's primitive) written out
+//! through [`write_structure_file`] instead of `get-area`'s stdout
+//! formatting; `import` is [`read_structure_file`] followed by a
+//! [`crate::edit::WorldEdit`] run through [`super::edit::run_write`] (094's
+//! write substrate) — the same read-then-write shape [`super::edit::copy`]
+//! (097) uses, just with a file instead of a second box as the source.
 
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use bevy::math::IVec3;
 use serde_json::{json, Value};
 
 use crate::blueprint::{
-    read_structure_file, write_structure_file, BlockState, Blueprint, FALLBACK_DATA_VERSION,
-    LOGGED_PALETTE_ENTRIES, STRUCTURE_BLOCK_MAX_SIZE,
+    extract_blueprint, read_structure_file, rotate_blueprint, write_structure_file, BlockState,
+    Blueprint, ExtractProgress, FALLBACK_DATA_VERSION, LOGGED_PALETTE_ENTRIES, MAX_BLOCKS,
+    STRUCTURE_BLOCK_MAX_SIZE,
 };
+use crate::edit::WorldEdit;
+use crate::region_cache::RegionCache;
+use crate::selection::SelectionBounds;
+use crate::world::SECTION_SIZE;
 
-use super::cli::{StructInfoArgs, StructNewArgs};
+use super::block::position_of;
+use super::chunk::region_span;
+use super::cli::{Cli, RotateArg, StructExportArgs, StructImportArgs, StructInfoArgs, StructNewArgs};
+use super::edit::{outcome_json_fields, outcome_summary, run_write, WriteOutcome};
 use super::error::CliError;
 use super::format::Render;
+use super::save::resolve_save;
 
 // -------------------------------------------------------------------------------------------------
 // ---- info -----------------------------------------------------------------------------------------
@@ -203,6 +223,244 @@ impl Render for StructNewResult {
             "size": [self.size.x, self.size.y, self.size.z],
             "fill": self.fill.to_string(),
         })
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// ---- export -----------------------------------------------------------------------------------
+// -------------------------------------------------------------------------------------------------
+
+/// `struct export`'s result: the source box, where the file went, plus
+/// everything [`StructInfoResult`] would report on it — size, block count,
+/// `DataVersion`, palette — and the box read's own [`Blueprint::failed_columns`],
+/// which a structure file never carries but a live-save read can produce.
+#[derive(Debug)]
+pub struct StructExportResult {
+    pub save_name: String,
+    pub from: IVec3,
+    pub to: IVec3,
+    pub out: PathBuf,
+    pub size: IVec3,
+    pub blocks: usize,
+    pub data_version: i32,
+    pub palette: Vec<BlockState>,
+    pub failed_columns: usize,
+}
+
+/// Runs `struct export`: [`extract_blueprint`] over `args.from`/`args.to`
+/// (the same [`SelectionBounds`]/region-cache-sizing shape
+/// [`super::block::get_area`] builds — see that function's docs), then
+/// [`write_structure_file`] instead of `get-area`'s stdout formatting.
+///
+/// The [`MAX_BLOCKS`] check and the `out`-exists check both happen before
+/// [`resolve_save`] runs, same reasoning [`super::block::get_area`]'s own
+/// volume check uses: a bad request is caught before anything is touched,
+/// regardless of which save it names.
+pub fn export(cli: &Cli, args: &StructExportArgs) -> Result<StructExportResult, CliError> {
+    let bounds = SelectionBounds::from_corners(args.from.0, args.from.0, args.to.0);
+
+    let volume = bounds.volume();
+    if volume > MAX_BLOCKS {
+        return Err(CliError::Usage(format!(
+            "selection ({}) to ({}) is {volume} blocks — over the {MAX_BLOCKS}-block struct export limit",
+            args.from.0, args.to.0
+        )));
+    }
+
+    if args.out.exists() && !args.force {
+        return Err(CliError::Usage(format!(
+            "{} already exists — pass --force to overwrite",
+            args.out.display()
+        )));
+    }
+
+    let meta = resolve_save(cli)?;
+
+    // Sized the same way `get_area` sizes its own cache: exactly the regions
+    // this box's chunk columns span.
+    let size = SECTION_SIZE as i32;
+    let (min_cx, min_cz) = (bounds.min.x.div_euclid(size), bounds.min.z.div_euclid(size));
+    let (max_cx, max_cz) = (bounds.max.x.div_euclid(size), bounds.max.z.div_euclid(size));
+    let capacity = region_span(min_cx, max_cx, min_cz, max_cz);
+
+    let cache = Arc::new(Mutex::new(RegionCache::new(meta.clone(), capacity)));
+    let progress = ExtractProgress::default();
+    let blueprint = extract_blueprint(bounds, &cache, &progress).map_err(|e| {
+        CliError::Data(format!(
+            "could not extract ({}) to ({}): {e}",
+            args.from.0, args.to.0
+        ))
+    })?;
+
+    write_structure_file(&args.out, &blueprint).map_err(|err| {
+        CliError::Data(format!("could not write {}: {err}", args.out.display()))
+    })?;
+
+    Ok(StructExportResult {
+        save_name: meta.name,
+        from: bounds.min,
+        to: bounds.max,
+        out: args.out.clone(),
+        size: blueprint.size,
+        blocks: blueprint.volume(),
+        data_version: blueprint.data_version,
+        palette: blueprint.palette,
+        failed_columns: blueprint.failed_columns,
+    })
+}
+
+impl StructExportResult {
+    fn summary_line(&self) -> String {
+        format!(
+            "struct export {} to {} in {} -> {}: size {}x{}x{} ({} blocks), DataVersion {}, \
+             {} distinct states, {} failed columns",
+            self.from,
+            self.to,
+            self.save_name,
+            self.out.display(),
+            self.size.x,
+            self.size.y,
+            self.size.z,
+            self.blocks,
+            self.data_version,
+            self.palette.len(),
+            self.failed_columns,
+        )
+    }
+}
+
+impl Render for StructExportResult {
+    /// The summary line plus the palette listing, capped the same way
+    /// [`StructInfoResult::render_text`] caps its own.
+    fn render_text(&self) -> String {
+        let mut lines = vec![self.summary_line()];
+        for (index, state) in self.palette.iter().take(LOGGED_PALETTE_ENTRIES).enumerate() {
+            lines.push(format!("  [{index}] {state}"));
+        }
+        let rest = self.palette.len().saturating_sub(LOGGED_PALETTE_ENTRIES);
+        if rest > 0 {
+            lines.push(format!("  ... and {rest} more"));
+        }
+        lines.join("\n")
+    }
+
+    fn render_json(&self) -> Value {
+        json!({
+            "save": self.save_name,
+            "from": [self.from.x, self.from.y, self.from.z],
+            "to": [self.to.x, self.to.y, self.to.z],
+            "out": self.out.display().to_string(),
+            "size": [self.size.x, self.size.y, self.size.z],
+            "blocks": self.blocks,
+            "data_version": self.data_version,
+            "palette_size": self.palette.len(),
+            "palette": self.palette.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "failed_columns": self.failed_columns,
+        })
+    }
+
+    fn render_compact(&self) -> String {
+        self.summary_line()
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// ---- import -----------------------------------------------------------------------------------
+// -------------------------------------------------------------------------------------------------
+
+/// `struct import`'s result: the file, where it landed, whether it was
+/// rotated first, plus what [`run_write`] did (or would do).
+#[derive(Debug)]
+pub struct StructImportResult {
+    pub save_name: String,
+    pub file: PathBuf,
+    pub at: IVec3,
+    pub rotate: Option<RotateArg>,
+    pub size: IVec3,
+    pub outcome: WriteOutcome,
+}
+
+/// Runs `struct import`: [`read_structure_file`], then (if `args.rotate` is
+/// given) [`rotate_blueprint`] — 102's function, called rather than
+/// reimplemented, since it already exists (ticket 038) even though `struct
+/// rotate` the CLI command doesn't yet — then a [`WorldEdit`] writing every
+/// position (air included, matching `city::commit`'s own `blueprint_edit`
+/// convention — see that module's docs on why a placement writes air rather
+/// than skipping it) offset by `args.at`, run through [`run_write`].
+///
+/// `size` is the *rotated* blueprint's size (when `--rotate` was given) —
+/// what actually gets written, not the file's own on-disk size.
+pub fn import(cli: &Cli, args: &StructImportArgs) -> Result<StructImportResult, CliError> {
+    let blueprint = read_structure_file(&args.file)
+        .map_err(|err| CliError::Data(format!("{}: {err}", args.file.display())))?;
+
+    let blueprint = match args.rotate {
+        None => blueprint,
+        Some(rotate) => rotate_blueprint(&blueprint, rotate.to_rotation())
+            .map_err(|err| CliError::Data(format!("{}: {err}", args.file.display())))?,
+    };
+
+    let at = args.at.0;
+    let size = blueprint.size;
+    let data_version = blueprint.data_version;
+    let palette = blueprint.palette;
+    let blocks = blueprint.blocks;
+
+    let meta = resolve_save(cli)?;
+
+    let outcome = run_write(&meta, args.dry_run, args.force, move |_cache| {
+        let mut edit = WorldEdit::new().with_data_version(data_version);
+        for (index, &palette_index) in blocks.iter().enumerate() {
+            let state = palette[palette_index as usize].clone();
+            let local = position_of(IVec3::ZERO, size, index);
+            edit.set(at + local, state);
+        }
+        Ok(edit)
+    })?;
+
+    Ok(StructImportResult {
+        save_name: meta.name,
+        file: args.file.clone(),
+        at,
+        rotate: args.rotate,
+        size,
+        outcome,
+    })
+}
+
+impl Render for StructImportResult {
+    fn render_text(&self) -> String {
+        let rotate_suffix = self
+            .rotate
+            .map(|r| format!(" rotated {}", r.as_str()))
+            .unwrap_or_default();
+        let prefix = format!(
+            "struct import {} ({}x{}x{}) at {} in {}{rotate_suffix}",
+            self.file.display(),
+            self.size.x,
+            self.size.y,
+            self.size.z,
+            self.at,
+            self.save_name,
+        );
+        let mut lines = vec![outcome_summary(prefix, &self.outcome)];
+        if !self.outcome.dry_run {
+            lines.push(format!("  backup: {}", self.outcome.backup_dir.display()));
+        }
+        lines.join("\n")
+    }
+
+    fn render_json(&self) -> Value {
+        let mut map = serde_json::Map::new();
+        map.insert("save".to_string(), json!(self.save_name));
+        map.insert("file".to_string(), json!(self.file.display().to_string()));
+        map.insert("at".to_string(), json!([self.at.x, self.at.y, self.at.z]));
+        map.insert("rotate".to_string(), json!(self.rotate.map(RotateArg::as_str)));
+        map.insert("size".to_string(), json!([self.size.x, self.size.y, self.size.z]));
+        for (key, value) in outcome_json_fields(&self.outcome) {
+            map.insert(key.to_string(), value);
+        }
+        Value::Object(map)
     }
 }
 
@@ -463,5 +721,367 @@ mod tests {
             assert!(matches!(err, CliError::Usage(_)), "size {size} should be rejected");
             assert!(!path.exists());
         }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // ---- export / import (ticket 099) ----------------------------------------------------------
+    // -----------------------------------------------------------------------------------------
+
+    use mc_anvil::region::{ChunkPayload, Region, CHUNKS_PER_REGION};
+    use mc_anvil::SaveMeta;
+    use rnbt::{NbtField, NbtList, NbtValue};
+
+    use super::super::cli::{Command, SavesArgs};
+    use super::super::format::OutputFormat;
+
+    /// The `DataVersion` the fixture's one chunk claims — a 1.21 release,
+    /// same as [`super::super::edit::tests`]'s own fixture.
+    const FIXTURE_DATA_VERSION: i32 = 4438;
+
+    /// A finished chunk: one all-stone section at `Y = 0`, `Status =
+    /// minecraft:full`, the given `DataVersion` — the same shape
+    /// [`super::super::edit::tests::Fixture`] builds, copied rather than
+    /// shared since it's private to that module.
+    fn full_chunk(data_version: i32) -> NbtField {
+        let palette = NbtList::Compound(vec![NbtField::new_compound(
+            "",
+            vec![NbtField::new_string("Name", "minecraft:stone")],
+        )]);
+        let section = NbtField::new_compound(
+            "",
+            vec![
+                NbtField { name: "Y".to_string(), value: NbtValue::Byte(0) },
+                NbtField::new_compound("block_states", vec![NbtField::new_list("palette", palette)]),
+            ],
+        );
+        NbtField::new_compound(
+            "",
+            vec![
+                NbtField::new_list("sections", NbtList::Compound(vec![section])),
+                NbtField::new_i32("xPos", 0),
+                NbtField::new_i32("zPos", 0),
+                NbtField::new_i32("yPos", -4),
+                NbtField::new_i32("DataVersion", data_version),
+                NbtField::new_string("Status", "minecraft:full"),
+                NbtField { name: "isLightOn".to_string(), value: NbtValue::Byte(1) },
+            ],
+        )
+    }
+
+    /// A single-region, single-chunk fixture save in a temp directory,
+    /// removed on drop.
+    struct Fixture {
+        dir: PathBuf,
+        meta: SaveMeta,
+    }
+
+    impl Fixture {
+        fn new(label: &str) -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let dir = std::env::temp_dir()
+                .join(format!("block_viewer-ranvil-cli-struct-export-import-{label}-{nanos}"));
+            let region_dir = dir.join("region");
+            std::fs::create_dir_all(&region_dir).expect("create temp dir");
+
+            let mut payloads: Vec<Option<ChunkPayload>> = vec![None; CHUNKS_PER_REGION];
+            payloads[0] = Some(ChunkPayload::Nbt(full_chunk(FIXTURE_DATA_VERSION)));
+            let path = region_dir.join("r.0.0.mca");
+            Region::new(0, 0, &path).write(&payloads).expect("write the fixture region");
+
+            let meta = SaveMeta {
+                name: "struct-fixture".to_string(),
+                path: dir.clone(),
+                region_dir,
+                regions: vec![(0, 0)],
+            };
+            Self { dir, meta }
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn cli_for(fixture: &Fixture) -> Cli {
+        Cli {
+            save: Some(fixture.meta.path.to_string_lossy().to_string()),
+            instance: Some(PathBuf::from("does-not-exist")),
+            format: OutputFormat::Json,
+            command: Command::Saves(SavesArgs {}),
+        }
+    }
+
+    fn block_state_at(meta: &SaveMeta, at: IVec3) -> BlockState {
+        let address = crate::edit::address_of(at);
+        let mut cache = RegionCache::new(meta.clone(), 1);
+        let entry = cache
+            .get_or_load(address.region)
+            .expect("resident")
+            .get_block(address.local_x, address.y, address.local_z)
+            .expect("a populated chunk");
+        BlockState::from_palette_entry(entry).expect("valid palette entry")
+    }
+
+    /// Plants a small, non-uniform pattern at `origin`/`origin + (1, 0, 1)`
+    /// on top of the fixture's all-stone background: a multi-property
+    /// stairs, a dirt, and an explicit air, leaving one corner as the
+    /// fixture's own stone — four distinct states across a 2x1x2 box.
+    fn plant_pattern(meta: &SaveMeta, origin: IVec3) {
+        let stairs = BlockState {
+            name: "minecraft:oak_stairs".to_string(),
+            properties: vec![
+                ("facing".to_string(), "east".to_string()),
+                ("half".to_string(), "top".to_string()),
+            ],
+        };
+        let dirt = BlockState { name: "minecraft:dirt".to_string(), properties: Vec::new() };
+
+        run_write(meta, false, false, move |_cache| {
+            let mut edit = WorldEdit::new();
+            edit.set(origin, stairs.clone());
+            edit.set(origin + IVec3::new(1, 0, 0), dirt.clone());
+            edit.set(origin + IVec3::new(0, 0, 1), BlockState::air());
+            Ok(edit)
+        })
+        .expect("planting the fixture pattern should succeed");
+    }
+
+    fn export_args(from: IVec3, to: IVec3, out: PathBuf, force: bool) -> StructExportArgs {
+        StructExportArgs { from: BlockPos(from), to: BlockPos(to), out, force }
+    }
+
+    fn import_args(
+        file: PathBuf,
+        at: IVec3,
+        rotate: Option<RotateArg>,
+        dry_run: bool,
+        force: bool,
+    ) -> StructImportArgs {
+        StructImportArgs { file, at: BlockPos(at), rotate, dry_run, force }
+    }
+
+    /// The ticket's headline round trip: `struct export` over a box,
+    /// followed by `struct import` of the resulting file back at the *same*
+    /// coordinates on a separate fixture save (standing in for "a copy of
+    /// the fixture save"), reproduces the original blocks exactly.
+    #[test]
+    fn export_then_import_at_the_same_coordinates_reproduces_the_original_blocks() {
+        let source = Fixture::new("roundtrip-source");
+        let origin = IVec3::new(1, 5, 1);
+        plant_pattern(&source.meta, origin);
+        let far = origin + IVec3::new(1, 0, 1);
+
+        let out = temp_path("export-roundtrip");
+        let export_result = export(&cli_for(&source), &export_args(origin, far, out.clone(), false))
+            .expect("export should succeed");
+        assert_eq!(export_result.size, IVec3::new(2, 1, 2));
+        assert_eq!(export_result.blocks, 4);
+        assert_eq!(export_result.data_version, FIXTURE_DATA_VERSION);
+        assert_eq!(export_result.failed_columns, 0);
+
+        let dest = Fixture::new("roundtrip-dest");
+        let import_result = import(&cli_for(&dest), &import_args(out.clone(), origin, None, false, false))
+            .expect("import should succeed");
+        std::fs::remove_file(&out).ok();
+
+        assert!(!import_result.outcome.dry_run);
+        assert_eq!(import_result.outcome.report.blocks_written, 4);
+
+        for dx in 0..2 {
+            for dz in 0..2 {
+                let pos = origin + IVec3::new(dx, 0, dz);
+                assert_eq!(
+                    block_state_at(&dest.meta, pos),
+                    block_state_at(&source.meta, pos),
+                    "at {pos}"
+                );
+            }
+        }
+    }
+
+    /// `struct import --at <elsewhere>` places the structure at the new
+    /// location only, leaving the coordinates it was exported from
+    /// untouched (the destination save never had that pattern to begin
+    /// with — it's still the fixture's own stone).
+    #[test]
+    fn import_at_elsewhere_places_only_the_new_location() {
+        let source = Fixture::new("elsewhere-source");
+        let origin = IVec3::new(1, 5, 1);
+        plant_pattern(&source.meta, origin);
+        let far = origin + IVec3::new(1, 0, 1);
+
+        let out = temp_path("import-elsewhere");
+        export(&cli_for(&source), &export_args(origin, far, out.clone(), false)).expect("export");
+
+        let dest = Fixture::new("elsewhere-dest");
+        let elsewhere = IVec3::new(8, 5, 8);
+        import(&cli_for(&dest), &import_args(out.clone(), elsewhere, None, false, false))
+            .expect("import should succeed");
+        std::fs::remove_file(&out).ok();
+
+        for dx in 0..2 {
+            for dz in 0..2 {
+                let offset = IVec3::new(dx, 0, dz);
+                assert_eq!(
+                    block_state_at(&dest.meta, elsewhere + offset),
+                    block_state_at(&source.meta, origin + offset),
+                    "at the destination, offset {offset}"
+                );
+                assert_eq!(
+                    block_state_at(&dest.meta, origin + offset).name,
+                    "minecraft:stone",
+                    "the coordinates the structure was exported from must stay untouched"
+                );
+            }
+        }
+    }
+
+    /// `--dry-run` on `struct import` leaves the destination save
+    /// byte-identical.
+    #[test]
+    fn import_dry_run_leaves_the_destination_untouched() {
+        let source = Fixture::new("dry-run-source");
+        let origin = IVec3::new(1, 5, 1);
+        plant_pattern(&source.meta, origin);
+        let far = origin + IVec3::new(1, 0, 1);
+
+        let out = temp_path("import-dry-run");
+        export(&cli_for(&source), &export_args(origin, far, out.clone(), false)).expect("export");
+
+        let dest = Fixture::new("dry-run-dest");
+        let region_path = dest.meta.get_region_path(0, 0);
+        let before_bytes = std::fs::read(&region_path).expect("read the fixture region");
+
+        let result = import(&cli_for(&dest), &import_args(out.clone(), origin, None, true, false))
+            .expect("a valid plan");
+        std::fs::remove_file(&out).ok();
+
+        assert!(result.outcome.dry_run);
+        assert_eq!(result.outcome.report.blocks_written, 4);
+        assert_eq!(
+            std::fs::read(&region_path).expect("read the fixture region"),
+            before_bytes,
+            "dry-run must not touch the region file's bytes"
+        );
+        assert_eq!(block_state_at(&dest.meta, origin).name, "minecraft:stone");
+    }
+
+    /// `struct import --rotate 90` agrees with rotating the same blueprint
+    /// by hand through [`rotate_blueprint`] — the function `struct rotate`
+    /// (ticket 102) will itself call once it exists, so this is the "the two
+    /// paths agree" cross-check the ticket asks for, without depending on
+    /// that command's own CLI surface landing first.
+    #[test]
+    fn import_rotate_90_agrees_with_rotating_the_blueprint_by_hand() {
+        let source = Fixture::new("rotate-source");
+        let origin = IVec3::new(1, 5, 1);
+        plant_pattern(&source.meta, origin);
+        let far = origin + IVec3::new(1, 0, 1);
+
+        let out = temp_path("import-rotate");
+        export(&cli_for(&source), &export_args(origin, far, out.clone(), false)).expect("export");
+
+        let at = IVec3::new(8, 5, 8);
+
+        // The path `struct import --rotate` itself takes.
+        let dest_a = Fixture::new("rotate-dest-a");
+        let result = import(
+            &cli_for(&dest_a),
+            &import_args(out.clone(), at, Some(RotateArg::Deg90), false, false),
+        )
+        .expect("rotated import should succeed");
+
+        // The same rotation, done by hand against a second, independent
+        // destination.
+        let blueprint = read_structure_file(&out).expect("should read back");
+        std::fs::remove_file(&out).ok();
+        let rotated = rotate_blueprint(&blueprint, crate::blueprint::Rotation::Deg90).expect("should rotate");
+        assert_eq!(rotated.size, result.size, "import's own rotation should agree on the resulting size");
+        let size = rotated.size;
+
+        let dest_b = Fixture::new("rotate-dest-b");
+        run_write(&dest_b.meta, false, false, move |_cache| {
+            let mut edit = WorldEdit::new().with_data_version(rotated.data_version);
+            for (index, &palette_index) in rotated.blocks.iter().enumerate() {
+                let state = rotated.palette[palette_index as usize].clone();
+                let local = position_of(IVec3::ZERO, rotated.size, index);
+                edit.set(at + local, state);
+            }
+            Ok(edit)
+        })
+        .expect("manual rotated write should succeed");
+
+        for dx in 0..size.x {
+            for dz in 0..size.z {
+                let pos = at + IVec3::new(dx, 0, dz);
+                assert_eq!(
+                    block_state_at(&dest_a.meta, pos),
+                    block_state_at(&dest_b.meta, pos),
+                    "at {pos}"
+                );
+            }
+        }
+    }
+
+    /// `struct export` over `MAX_BLOCKS` is a `Usage` error (exit 2), raised
+    /// before `resolve_save` runs — same convention `get-area`/`set-area`'s
+    /// own volume checks follow.
+    #[test]
+    fn export_over_max_blocks_is_a_usage_error_before_touching_a_save() {
+        let cli = Cli {
+            save: None,
+            instance: Some(PathBuf::from("does-not-exist")),
+            format: OutputFormat::Json,
+            command: Command::Saves(SavesArgs {}),
+        };
+        let args = export_args(
+            IVec3::new(0, crate::selection::WORLD_MIN_Y, 0),
+            IVec3::new(9999, crate::selection::WORLD_MAX_Y, 9999),
+            temp_path("export-too-big"),
+            false,
+        );
+
+        let err = export(&cli, &args).unwrap_err();
+        match err {
+            CliError::Usage(message) => {
+                assert!(message.contains(&MAX_BLOCKS.to_string()), "{message}");
+                assert!(
+                    !message.contains("instance directory"),
+                    "should fail on the volume check, not on resolving a save: {message}"
+                );
+            }
+            CliError::Data(message) => panic!("expected Usage (exit 2), got Data: {message}"),
+        }
+    }
+
+    /// `struct export --out` refuses to overwrite an existing file without
+    /// `--force`, and touches nothing — same convention `struct new`'s own
+    /// `out`-exists check follows.
+    #[test]
+    fn export_onto_an_existing_path_without_force_refuses() {
+        let source = Fixture::new("export-no-force-source");
+        let origin = IVec3::new(1, 5, 1);
+        plant_pattern(&source.meta, origin);
+        let far = origin + IVec3::new(1, 0, 1);
+
+        let out = temp_path("export-no-force");
+        std::fs::write(&out, b"not a structure file").expect("seed an existing file");
+
+        let err = export(&cli_for(&source), &export_args(origin, far, out.clone(), false)).unwrap_err();
+        match err {
+            CliError::Usage(message) => assert!(message.contains("--force"), "{message}"),
+            CliError::Data(message) => panic!("expected Usage (exit 2), got Data: {message}"),
+        }
+        assert_eq!(
+            std::fs::read(&out).expect("still readable"),
+            b"not a structure file",
+            "must not have overwritten"
+        );
+        std::fs::remove_file(&out).ok();
     }
 }

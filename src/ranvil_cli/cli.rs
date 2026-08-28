@@ -104,9 +104,10 @@ pub enum Command {
     Copy(CopyArgs),
     /// Structure-file (`.nbt`) inspection and authoring — reads or writes a
     /// [`crate::blueprint::Blueprint`] on disk and, except `export`/`import`
-    /// (099), never opens a save at all. Ticket 098 adds `info`/`new`; later
-    /// tickets add `export`/`import`/`get`/`set`/`fill`/`resize`/`rotate`/
-    /// `diff`/`validate` to [`StructCommand`].
+    /// (099), never opens a save at all. Ticket 098 adds `info`/`new`;
+    /// ticket 099 adds `export`/`import`, the bridge between a live save and
+    /// a structure file; later tickets add `get`/`set`/`fill`/`resize`/
+    /// `rotate`/`diff`/`validate` to [`StructCommand`].
     #[command(subcommand)]
     Struct(StructCommand),
 }
@@ -121,6 +122,10 @@ pub enum StructCommand {
     Info(StructInfoArgs),
     /// A blank structure file from scratch — air, or one state throughout.
     New(StructNewArgs),
+    /// Extract a box out of a live save into a structure file.
+    Export(StructExportArgs),
+    /// Place a structure file's blocks into a live save.
+    Import(StructImportArgs),
 }
 
 /// `struct info <file.nbt>` (ticket 098).
@@ -152,6 +157,106 @@ pub struct StructNewArgs {
     /// Overwrite `--out` if it already exists.
     #[arg(long)]
     pub force: bool,
+}
+
+/// `struct export <x1>,<y1>,<z1> <x2>,<y2>,<z2> --out <file.nbt> [--force]`
+/// (ticket 099) — [`super::block::get_area`]'s box read (092's primitive),
+/// written to `out` via [`crate::blueprint::write_structure_file`] instead
+/// of `get-area`'s stdout formatting. Reports the same summary `struct info`
+/// would report on the freshly-written file, so a caller gets "extract this
+/// building and tell me about it" in one command rather than `struct export`
+/// followed by a separate `struct info` call.
+#[derive(Debug, Args)]
+pub struct StructExportArgs {
+    /// One corner of the box, "x,y,z". See [`ChunkArgs::pos`] on why
+    /// `allow_hyphen_values`.
+    #[arg(allow_hyphen_values = true)]
+    pub from: BlockPos,
+    /// The opposite corner, "x,y,z".
+    #[arg(allow_hyphen_values = true)]
+    pub to: BlockPos,
+
+    /// Where to write the extracted structure file.
+    #[arg(long)]
+    pub out: PathBuf,
+
+    /// Overwrite `--out` if it already exists.
+    #[arg(long)]
+    pub force: bool,
+}
+
+/// `struct import <file.nbt> --at <x,y,z> [--rotate 90|180|270] [--dry-run]
+/// [--force]` (ticket 099) — [`crate::blueprint::read_structure_file`],
+/// optionally [`crate::blueprint::rotate_blueprint`], then a [`crate::edit::WorldEdit`]
+/// writing every position (including air, matching `city::commit`'s own
+/// `blueprint_edit` convention — a placement clears whatever terrain poked
+/// into the footprint) offset by `--at`, run through
+/// [`super::edit::run_write`].
+///
+/// `--at` names the structure's own origin (always `IVec3::ZERO`) mapped to
+/// that world position — position `p` inside the structure lands at
+/// `--at + p`, the same convention [`CopyArgs::dest`] uses for its source's
+/// minimum corner.
+#[derive(Debug, Args)]
+pub struct StructImportArgs {
+    /// Path to a gzipped vanilla structure file.
+    pub file: PathBuf,
+
+    /// The world position the structure's own `(0, 0, 0)` lands at, "x,y,z".
+    #[arg(long, allow_hyphen_values = true)]
+    pub at: BlockPos,
+
+    /// Rotate the structure about Y before placing it. `struct rotate`
+    /// (ticket 102) is the one place rotation logic itself lives — this
+    /// flag just calls it before building the write.
+    #[arg(long, value_enum)]
+    pub rotate: Option<RotateArg>,
+
+    /// Report the plan without writing anything — see [`super::edit::run_write`].
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Write even though the save currently looks open in Minecraft.
+    #[arg(long)]
+    pub force: bool,
+}
+
+/// The `--rotate` values `struct import` accepts — a CLI-facing mirror of
+/// [`crate::blueprint::Rotation`]'s three non-identity variants. `Deg0` isn't
+/// offered here: omitting `--rotate` already means "no rotation", so a
+/// fourth value that means the same thing would just be a second spelling of
+/// "not given".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum RotateArg {
+    #[value(name = "90")]
+    Deg90,
+    #[value(name = "180")]
+    Deg180,
+    #[value(name = "270")]
+    Deg270,
+}
+
+impl RotateArg {
+    /// The exact string this variant parses from on the command line —
+    /// reused for `--format json`'s `"rotate"` field, same convention
+    /// [`HeightmapKindArg::as_str`] follows.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RotateArg::Deg90 => "90",
+            RotateArg::Deg180 => "180",
+            RotateArg::Deg270 => "270",
+        }
+    }
+
+    /// The [`crate::blueprint::Rotation`] this CLI value maps to — the one
+    /// place that mapping is spelled out.
+    pub fn to_rotation(self) -> crate::blueprint::Rotation {
+        match self {
+            RotateArg::Deg90 => crate::blueprint::Rotation::Deg90,
+            RotateArg::Deg180 => crate::blueprint::Rotation::Deg180,
+            RotateArg::Deg270 => crate::blueprint::Rotation::Deg270,
+        }
+    }
 }
 
 /// `saves` takes no arguments of its own — the instance directory it lists

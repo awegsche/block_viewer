@@ -154,7 +154,10 @@ pub fn run_write(
 /// `status` first and unconditionally, so a `--dry-run`'s JSON reads
 /// unmistakably as a plan rather than a completed write even on a skim, per
 /// the ticket ("a script can't mistake a dry run's JSON for a real one").
-fn outcome_json_fields(outcome: &WriteOutcome) -> Vec<(&'static str, Value)> {
+///
+/// `pub(super)`: `struct import` (ticket 099) shares this rather than
+/// growing a second `WriteOutcome`-to-JSON mapping.
+pub(super) fn outcome_json_fields(outcome: &WriteOutcome) -> Vec<(&'static str, Value)> {
     let region_json = |coords: &[(i32, i32)]| {
         json!(coords.iter().map(|&(x, z)| json!([x, z])).collect::<Vec<_>>())
     };
@@ -176,7 +179,9 @@ fn outcome_json_fields(outcome: &WriteOutcome) -> Vec<(&'static str, Value)> {
 /// The one summary line every write command's `text`/`compact` rendering
 /// shares: `[dry-run]` up front when nothing was actually written — visible
 /// in *every* format, not just `json`, per the ticket.
-fn outcome_summary(prefix: String, outcome: &WriteOutcome) -> String {
+///
+/// `pub(super)`: same reuse as [`outcome_json_fields`], for `struct import`.
+pub(super) fn outcome_summary(prefix: String, outcome: &WriteOutcome) -> String {
     let verb = if outcome.dry_run { "would write" } else { "wrote" };
     let blocks = outcome.report.blocks_written;
     let regions = outcome.report.regions.len();
