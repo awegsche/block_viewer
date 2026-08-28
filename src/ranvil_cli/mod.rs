@@ -9,9 +9,12 @@
 //!
 //! [`chunk`] gained `chunk`/`chunks` in ticket 089; [`heightmap`] adds
 //! `heightmap` in ticket 090; [`block`] adds `get` in ticket 091, `get-area`
-//! in ticket 092, and `column`/`scan` in ticket 093.
-//! [`edit`], [`structure`] are still empty stubs — later tickets fill them
-//! in.
+//! in ticket 092, and `column`/`scan` in ticket 093. Ticket 094 gives
+//! [`edit`] the write substrate ([`edit::run_write`]) every write command
+//! (095–097) and `struct import` (099) will share — lock, backup, dry-run,
+//! force — but adds no subcommand of its own yet: no [`cli::Command`] variant
+//! routes to it until 095 exists to call it.
+//! [`structure`] is still an empty stub — later tickets fill it in.
 
 use std::process::ExitCode;
 
