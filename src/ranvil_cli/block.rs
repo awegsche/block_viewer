@@ -10,9 +10,14 @@
 //! [`SelectionBounds`] directly (no `App`, no plugin — see the ticket and
 //! `crate::selection`'s module docs on why that's safe) and hands it to
 //! [`extract_blueprint`], the same walk the viewer's structure export uses.
-//! Reserved for `column`/`scan` (ticket 093), which reuse [`get`]'s
-//! coordinate-resolution shape for a column rather than a point or a box.
+//!
+//! `column` and `scan` (ticket 093) are both built on [`get_area`] rather
+//! than a fresh box walk: `column` is a single-column `get_area` call (`x1 ==
+//! x2`, `z1 == z2`) whose per-Y results get collapsed into ranges; `scan`
+//! runs `get_area` over the given box and filters its palette for the
+//! requested block name.
 
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use bevy::math::IVec3;
@@ -24,11 +29,12 @@ use crate::blueprint::{
 };
 use crate::edit::address_of;
 use crate::region_cache::RegionCache;
-use crate::selection::SelectionBounds;
+use crate::selection::{SelectionBounds, WORLD_MAX_Y, WORLD_MIN_Y};
 use crate::world::SECTION_SIZE;
 
 use super::chunk::region_span;
-use super::cli::{Cli, GetAreaArgs, GetArgs};
+use super::cli::{Cli, ColumnArgs, GetAreaArgs, GetArgs, ScanArgs};
+use super::coords::BlockPos;
 use super::error::CliError;
 use super::format::Render;
 use super::save::resolve_save;
@@ -236,6 +242,344 @@ impl Render for GetAreaResult {
     /// The summary line alone, no palette listing — what an agent asks for
     /// when it only needs "how big / how many distinct blocks" before
     /// deciding whether to pull the full `--format json`.
+    fn render_compact(&self) -> String {
+        self.summary_line()
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// ---- column (ticket 093) -------------------------------------------------------------------------
+// -------------------------------------------------------------------------------------------------
+
+/// One Y in a column's read: the block that occupies it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ColumnEntry {
+    pub y: i32,
+    pub state: AreaBlockState,
+}
+
+/// A run of consecutive Y values holding the same block — what `text`/
+/// `compact` print instead of one line per Y (see [`collapse_ranges`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ColumnRange {
+    pub from: i32,
+    pub to: i32,
+    pub state: AreaBlockState,
+}
+
+pub struct ColumnResult {
+    pub save_name: String,
+    pub x: i32,
+    pub z: i32,
+    /// Requested Y bounds, normalized `from <= to` — independent of
+    /// `top_down`, which only reorders how [`Self::entries`]/[`Self::ranges`]
+    /// are displayed.
+    pub from: i32,
+    pub to: i32,
+    pub top_down: bool,
+    /// Always ascending-Y order (`from` to `to`) regardless of `top_down` —
+    /// the canonical order [`collapse_ranges`] and every renderer read
+    /// through [`Self::display_entries`]/[`Self::display_ranges`] instead of
+    /// re-deriving it.
+    pub entries: Vec<ColumnEntry>,
+    pub ranges: Vec<ColumnRange>,
+}
+
+/// Runs `column`: a single-column [`get_area`] (`x1 == x2`, `z1 == z2`),
+/// defaulting `--from`/`--to` to [`WORLD_MIN_Y`]/[`WORLD_MAX_Y`] — the same
+/// bounds [`SelectionBounds`] itself clamps Y to, reused rather than a
+/// hardcoded `-64`/`320` (see the ticket).
+pub fn column(cli: &Cli, args: &ColumnArgs) -> Result<ColumnResult, CliError> {
+    let (x, z) = (args.pos.0.x, args.pos.0.y);
+    let requested_from = args.from.unwrap_or(WORLD_MIN_Y);
+    let requested_to = args.to.unwrap_or(WORLD_MAX_Y);
+    let (y_lo, y_hi) = (requested_from.min(requested_to), requested_from.max(requested_to));
+
+    let area = get_area(
+        cli,
+        &GetAreaArgs {
+            from: BlockPos(IVec3::new(x, y_lo, z)),
+            to: BlockPos(IVec3::new(x, y_hi, z)),
+        },
+    )?;
+
+    // `size.x == size.z == 1`, so `get_area`'s Y-outer/Z-middle/X-inner
+    // dense index for row `dy` (0-based from `area.origin.y`) is just `dy` —
+    // no need to go through `SelectionBounds::index_of` for a column.
+    let entries: Vec<ColumnEntry> = (0..area.size.y as usize)
+        .map(|dy| ColumnEntry {
+            y: area.origin.y + dy as i32,
+            state: area.palette[area.blocks[dy] as usize].clone(),
+        })
+        .collect();
+    let ranges = collapse_ranges(&entries);
+
+    Ok(ColumnResult {
+        save_name: area.save_name,
+        x,
+        z,
+        from: y_lo,
+        to: y_hi,
+        top_down: args.top_down,
+        entries,
+        ranges,
+    })
+}
+
+/// Merges consecutive entries with an identical [`AreaBlockState`] into
+/// [`ColumnRange`]s — three distinct runs in, three ranges out, regardless
+/// of how many Y values each run spans.
+fn collapse_ranges(entries: &[ColumnEntry]) -> Vec<ColumnRange> {
+    let mut ranges: Vec<ColumnRange> = Vec::new();
+    for entry in entries {
+        match ranges.last_mut() {
+            Some(last) if last.state == entry.state => last.to = entry.y,
+            _ => ranges.push(ColumnRange {
+                from: entry.y,
+                to: entry.y,
+                state: entry.state.clone(),
+            }),
+        }
+    }
+    ranges
+}
+
+impl ColumnResult {
+    /// [`Self::entries`] in display order: ascending Y, or descending when
+    /// `--top-down` was given.
+    fn display_entries(&self) -> Box<dyn Iterator<Item = &ColumnEntry> + '_> {
+        if self.top_down {
+            Box::new(self.entries.iter().rev())
+        } else {
+            Box::new(self.entries.iter())
+        }
+    }
+
+    /// [`Self::ranges`] in the same display order as [`Self::display_entries`].
+    /// Each range's own `from..=to` stays ascending either way — `top_down`
+    /// only reorders *which range comes first*, not which end of a range is
+    /// which.
+    fn display_ranges(&self) -> Box<dyn Iterator<Item = &ColumnRange> + '_> {
+        if self.top_down {
+            Box::new(self.ranges.iter().rev())
+        } else {
+            Box::new(self.ranges.iter())
+        }
+    }
+
+    fn summary_line(&self) -> String {
+        format!(
+            "column ({}, {}) in {}: Y {}..{} ({} blocks), {} ranges",
+            self.x,
+            self.z,
+            self.save_name,
+            self.from,
+            self.to,
+            self.entries.len(),
+            self.ranges.len(),
+        )
+    }
+}
+
+fn properties_json(state: &AreaBlockState) -> Value {
+    let mut properties = serde_json::Map::new();
+    for (key, value) in &state.properties {
+        properties.insert(key.clone(), json!(value));
+    }
+    Value::Object(properties)
+}
+
+impl Render for ColumnResult {
+    /// A summary line plus one range line per run, in display order — never
+    /// the naive one-line-per-Y listing (see the ticket: a 379-block stone
+    /// run is one line, not 379).
+    fn render_text(&self) -> String {
+        let mut lines = vec![self.summary_line()];
+        for range in self.display_ranges() {
+            lines.push(format!("  {}..{} {}", range.from, range.to, range.state));
+        }
+        lines.join("\n")
+    }
+
+    /// `{"blocks": [...]}` the full per-Y array, plus `"ranges"` alongside it
+    /// (not instead of it) for a caller wanting the collapsed form in
+    /// machine form. Both follow `top_down`'s display order.
+    fn render_json(&self) -> Value {
+        json!({
+            "save": self.save_name,
+            "x": self.x,
+            "z": self.z,
+            "from": self.from,
+            "to": self.to,
+            "top_down": self.top_down,
+            "blocks": self.display_entries().map(|entry| json!({
+                "y": entry.y,
+                "name": entry.state.name,
+                "properties": properties_json(&entry.state),
+            })).collect::<Vec<_>>(),
+            "ranges": self.display_ranges().map(|range| json!({
+                "from": range.from,
+                "to": range.to,
+                "block": range.state.to_string(),
+            })).collect::<Vec<_>>(),
+        })
+    }
+
+    /// One line: the summary plus every range, semicolon-separated. This is
+    /// the one command in the block-read group where `compact` isn't just a
+    /// shorter summary of `text` — both carry the full range list, `text` as
+    /// multiple lines and `compact` packed into one.
+    fn render_compact(&self) -> String {
+        let ranges: Vec<String> = self
+            .display_ranges()
+            .map(|range| format!("{}..{} {}", range.from, range.to, range.state))
+            .collect();
+        format!("{}: {}", self.summary_line(), ranges.join("; "))
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// ---- scan (ticket 093) -----------------------------------------------------------------------------
+// -------------------------------------------------------------------------------------------------
+
+/// `scan`'s `--limit` default when none is given — "a few hundred", per the
+/// ticket: enough for most finds, never unbounded (an unbounded scan for
+/// `minecraft:air` over a loaded region would print millions of positions).
+pub const DEFAULT_SCAN_LIMIT: usize = 500;
+
+pub struct ScanResult {
+    pub save_name: String,
+    pub block: String,
+    pub from: IVec3,
+    pub to: IVec3,
+    pub limit: usize,
+    pub positions: Vec<IVec3>,
+    /// Whether more matches existed than `limit` allowed reporting — set at
+    /// the boundary (limit exactly met is `false`; exceeded by even one is
+    /// `true`), never inferred from `positions.len() == limit` alone (a scan
+    /// that happens to find exactly `limit` matches and no more must not
+    /// look truncated).
+    pub truncated: bool,
+}
+
+/// Runs `scan`: [`get_area`]'s extraction over `args.from`/`args.to`, filtered
+/// by [`matching_positions`].
+pub fn scan(cli: &Cli, args: &ScanArgs) -> Result<ScanResult, CliError> {
+    let limit = args.limit.unwrap_or(DEFAULT_SCAN_LIMIT);
+    let area = get_area(cli, &GetAreaArgs { from: args.from, to: args.to })?;
+    let (positions, truncated) = matching_positions(&area, &args.block, limit);
+
+    Ok(ScanResult {
+        save_name: area.save_name,
+        block: args.block.clone(),
+        from: area.origin,
+        to: area.origin + area.size - IVec3::ONE,
+        limit,
+        positions,
+        truncated,
+    })
+}
+
+/// Filters `area`'s blocks for positions whose palette entry's `name`
+/// matches `block` exactly (properties are not part of the match — see the
+/// ticket's `oak_door` example: `scan --block minecraft:oak_door` finds every
+/// door regardless of open/closed/hinge). Positions are the `Blueprint`'s
+/// dense-array order translated back to absolute world coordinates via
+/// [`position_of`], capped at `limit` with `truncated` set exactly at the
+/// boundary (limit met exactly is `false`; exceeded by even one is `true`).
+///
+/// Split out from [`scan`] so this — the actual match/cap logic — is
+/// testable against a synthetic [`GetAreaResult`] rather than only end to end
+/// against a real save.
+fn matching_positions(area: &GetAreaResult, block: &str, limit: usize) -> (Vec<IVec3>, bool) {
+    let matching: HashSet<u16> = area
+        .palette
+        .iter()
+        .enumerate()
+        .filter(|(_, state)| state.name == block)
+        .map(|(index, _)| index as u16)
+        .collect();
+
+    if matching.is_empty() {
+        return (Vec::new(), false);
+    }
+
+    let mut positions = Vec::new();
+    let mut truncated = false;
+    for (index, &palette_index) in area.blocks.iter().enumerate() {
+        if !matching.contains(&palette_index) {
+            continue;
+        }
+        if positions.len() >= limit {
+            truncated = true;
+            break;
+        }
+        positions.push(position_of(area.origin, area.size, index));
+    }
+
+    (positions, truncated)
+}
+
+/// The inverse of [`SelectionBounds::index_of`]: the absolute world position
+/// at dense-array `index` within a box of `size` blocks starting at `origin`,
+/// in the same Y-outer/Z-middle/X-inner order [`SelectionBounds::iter_blocks`]
+/// documents.
+fn position_of(origin: IVec3, size: IVec3, index: usize) -> IVec3 {
+    let (width, depth) = (size.x as usize, size.z as usize);
+    let plane = width * depth;
+    let y = index / plane;
+    let remainder = index % plane;
+    let z = remainder / width;
+    let x = remainder % width;
+    origin + IVec3::new(x as i32, y as i32, z as i32)
+}
+
+impl ScanResult {
+    fn summary_line(&self) -> String {
+        let count = self.positions.len();
+        let suffix = if self.truncated {
+            format!(" (truncated at limit {})", self.limit)
+        } else {
+            String::new()
+        };
+        format!(
+            "scan {} in {}: {} to {}, {count} match{}{suffix}",
+            self.block,
+            self.save_name,
+            self.from,
+            self.to,
+            if count == 1 { "" } else { "es" },
+        )
+    }
+}
+
+impl Render for ScanResult {
+    /// The summary line plus one position per line — the full listing,
+    /// capped at `limit` the way [`ScanResult::positions`] already is.
+    fn render_text(&self) -> String {
+        let mut lines = vec![self.summary_line()];
+        for pos in &self.positions {
+            lines.push(format!("  {pos}"));
+        }
+        lines.join("\n")
+    }
+
+    fn render_json(&self) -> Value {
+        json!({
+            "save": self.save_name,
+            "block": self.block,
+            "from": [self.from.x, self.from.y, self.from.z],
+            "to": [self.to.x, self.to.y, self.to.z],
+            "limit": self.limit,
+            "truncated": self.truncated,
+            "positions": self.positions.iter()
+                .map(|p| json!([p.x, p.y, p.z]))
+                .collect::<Vec<_>>(),
+        })
+    }
+
+    /// The summary line alone, no position listing — same "how many /
+    /// truncated or not" role `get-area`'s compact plays for its palette.
     fn render_compact(&self) -> String {
         self.summary_line()
     }
@@ -550,6 +894,295 @@ mod tests {
                 single.state.to_string(),
                 "at {corner}"
             );
+        }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // ---- column (ticket 093) ------------------------------------------------------------------
+    // -----------------------------------------------------------------------------------------
+
+    use super::super::cli::{ColumnArgs, ScanArgs};
+    use super::super::coords::ColumnPos;
+    use bevy::math::IVec2;
+
+    fn state(name: &str) -> AreaBlockState {
+        AreaBlockState { name: name.to_string(), properties: vec![] }
+    }
+
+    fn entries(pairs: &[(i32, &str)]) -> Vec<ColumnEntry> {
+        pairs.iter().map(|&(y, name)| ColumnEntry { y, state: state(name) }).collect()
+    }
+
+    /// The ticket's own "Done when": a synthetic column with three distinct
+    /// runs collapses to exactly three ranges, each spanning its whole run.
+    #[test]
+    fn collapse_ranges_merges_three_runs_into_three_ranges() {
+        let column = entries(&[
+            (-64, "minecraft:bedrock"),
+            (-63, "minecraft:stone"),
+            (-62, "minecraft:stone"),
+            (-61, "minecraft:stone"),
+            (-60, "minecraft:air"),
+            (-59, "minecraft:air"),
+        ]);
+
+        let ranges = collapse_ranges(&column);
+
+        assert_eq!(
+            ranges,
+            vec![
+                ColumnRange { from: -64, to: -64, state: state("minecraft:bedrock") },
+                ColumnRange { from: -63, to: -61, state: state("minecraft:stone") },
+                ColumnRange { from: -60, to: -59, state: state("minecraft:air") },
+            ]
+        );
+    }
+
+    /// The same three runs, read through `render_text`: exactly three range
+    /// lines, not one line per Y.
+    #[test]
+    fn render_text_prints_exactly_one_line_per_range() {
+        let column = entries(&[
+            (0, "minecraft:stone"),
+            (1, "minecraft:stone"),
+            (2, "minecraft:dirt"),
+            (3, "minecraft:air"),
+        ]);
+        let result = ColumnResult {
+            save_name: "world".to_string(),
+            x: 5,
+            z: 9,
+            from: 0,
+            to: 3,
+            top_down: false,
+            ranges: collapse_ranges(&column),
+            entries: column,
+        };
+
+        let text = result.render_text();
+        let range_lines: Vec<&str> = text.lines().skip(1).collect();
+        assert_eq!(range_lines.len(), 3, "{text}");
+        assert_eq!(range_lines[0], "  0..1 minecraft:stone");
+        assert_eq!(range_lines[1], "  2..2 minecraft:dirt");
+        assert_eq!(range_lines[2], "  3..3 minecraft:air");
+    }
+
+    /// `--top-down` reverses which range is listed first, but never which
+    /// end of a range is `from` vs `to` — a range's own extent doesn't
+    /// depend on the direction it's read in.
+    #[test]
+    fn top_down_reverses_range_order_not_range_direction() {
+        let column = entries(&[(0, "minecraft:stone"), (1, "minecraft:air")]);
+        let ranges = collapse_ranges(&column);
+        let result = ColumnResult {
+            save_name: "world".to_string(),
+            x: 0,
+            z: 0,
+            from: 0,
+            to: 1,
+            top_down: true,
+            ranges,
+            entries: column,
+        };
+
+        let displayed: Vec<&ColumnRange> = result.display_ranges().collect();
+        assert_eq!(displayed[0].state.name, "minecraft:air");
+        assert_eq!(displayed[1].state.name, "minecraft:stone");
+        // Each range's own from/to is unaffected by display order.
+        assert!(displayed.iter().all(|r| r.from <= r.to));
+    }
+
+    /// `render_json`'s documented shape: the full per-Y `blocks` array
+    /// alongside (not instead of) the collapsed `ranges` array.
+    #[test]
+    fn column_render_json_carries_both_blocks_and_ranges() {
+        let column = entries(&[(10, "minecraft:stone"), (11, "minecraft:stone")]);
+        let result = ColumnResult {
+            save_name: "world".to_string(),
+            x: 1,
+            z: 2,
+            from: 10,
+            to: 11,
+            top_down: false,
+            ranges: collapse_ranges(&column),
+            entries: column,
+        };
+
+        let json = result.render_json();
+        assert_eq!(json["blocks"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            json["ranges"],
+            serde_json::json!([{"from": 10, "to": 11, "block": "minecraft:stone"}])
+        );
+    }
+
+    /// `column`'s CLI args parse into the same `x`/`z` a hand-built
+    /// `ColumnArgs` would — cheap smoke test that `ColumnPos`'s field order
+    /// (`x`, then `z`) lines up with how `column()` reads it.
+    #[test]
+    fn column_args_pos_reads_as_x_then_z() {
+        let args = ColumnArgs {
+            pos: ColumnPos(IVec2::new(7, -3)),
+            from: None,
+            to: None,
+            top_down: false,
+        };
+        assert_eq!((args.pos.0.x, args.pos.0.y), (7, -3));
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // ---- scan (ticket 093) --------------------------------------------------------------------
+    // -----------------------------------------------------------------------------------------
+
+    fn area_with_blocks(palette: Vec<&str>, blocks: Vec<u16>, size: IVec3) -> GetAreaResult {
+        GetAreaResult {
+            save_name: "world".to_string(),
+            origin: IVec3::ZERO,
+            size,
+            palette: palette.into_iter().map(state).collect(),
+            blocks,
+            failed_columns: 0,
+        }
+    }
+
+    #[test]
+    fn matching_positions_finds_every_block_by_name_ignoring_properties() {
+        let mut chest_with_props = state("minecraft:chest");
+        chest_with_props.properties = vec![("facing".to_string(), "north".to_string())];
+        let area = GetAreaResult {
+            save_name: "world".to_string(),
+            origin: IVec3::new(100, 60, 100),
+            size: IVec3::new(2, 1, 2),
+            palette: vec![state("minecraft:air"), chest_with_props],
+            blocks: vec![0, 1, 1, 0],
+            failed_columns: 0,
+        };
+
+        let (positions, truncated) = matching_positions(&area, "minecraft:chest", 10);
+
+        assert!(!truncated);
+        assert_eq!(
+            positions,
+            vec![IVec3::new(101, 60, 100), IVec3::new(100, 60, 101)]
+        );
+    }
+
+    #[test]
+    fn matching_positions_is_empty_when_the_block_never_appears() {
+        let area = area_with_blocks(vec!["minecraft:air", "minecraft:stone"], vec![0, 1, 0], IVec3::new(3, 1, 1));
+        let (positions, truncated) = matching_positions(&area, "minecraft:diamond_block", 10);
+        assert!(positions.is_empty());
+        assert!(!truncated);
+    }
+
+    /// The ticket's own "Done when": limit exactly met is not truncated,
+    /// exceeded by one is.
+    #[test]
+    fn matching_positions_sets_truncated_exactly_at_the_boundary() {
+        // Four matching blocks in a row.
+        let area = area_with_blocks(
+            vec!["minecraft:air", "minecraft:stone"],
+            vec![1, 1, 1, 1],
+            IVec3::new(4, 1, 1),
+        );
+
+        let (met, met_truncated) = matching_positions(&area, "minecraft:stone", 4);
+        assert_eq!(met.len(), 4);
+        assert!(!met_truncated, "limit exactly met must not be truncated");
+
+        let (exceeded, exceeded_truncated) = matching_positions(&area, "minecraft:stone", 3);
+        assert_eq!(exceeded.len(), 3);
+        assert!(exceeded_truncated, "limit exceeded by one must be truncated");
+    }
+
+    #[test]
+    fn scan_render_json_matches_the_documented_shape() {
+        let result = ScanResult {
+            save_name: "world".to_string(),
+            block: "minecraft:chest".to_string(),
+            from: IVec3::new(0, 60, 0),
+            to: IVec3::new(1, 60, 1),
+            limit: 500,
+            positions: vec![IVec3::new(0, 60, 0)],
+            truncated: false,
+        };
+
+        assert_eq!(
+            result.render_json(),
+            serde_json::json!({
+                "save": "world",
+                "block": "minecraft:chest",
+                "from": [0, 60, 0],
+                "to": [1, 60, 1],
+                "limit": 500,
+                "truncated": false,
+                "positions": [[0, 60, 0]],
+            })
+        );
+    }
+
+    /// `position_of` is the inverse of `SelectionBounds::index_of` — cross
+    /// checked against it directly rather than trusted on its own arithmetic.
+    #[test]
+    fn position_of_is_the_inverse_of_selection_bounds_index_of() {
+        let origin = IVec3::new(-4, 60, 8);
+        let bounds = SelectionBounds::from_corners(origin, origin, origin + IVec3::new(2, 3, 4) - IVec3::ONE);
+        let size = bounds.size();
+        for block in bounds.iter_blocks() {
+            let index = bounds.index_of(block).unwrap();
+            assert_eq!(position_of(origin, size, index), block, "index {index}");
+        }
+    }
+
+    /// End to end against a real save, `scan`'s own "Done when": every
+    /// reported position is inside the box, and `get` at that position really
+    /// is the block scanned for.
+    #[test]
+    fn scan_matches_agree_with_get_on_a_real_save() {
+        let saves = mc_anvil::get_saves().expect("could not read the Minecraft saves directory");
+        let meta = saves
+            .into_iter()
+            .find(|s| !s.regions.is_empty())
+            .expect("need a save with at least one region");
+        let (rx, rz) = meta.regions[0];
+
+        let region_width =
+            mc_anvil::region::REGION_WIDTH_IN_CHUNKS as i32 * crate::world::SECTION_SIZE as i32;
+        let origin = IVec3::new(
+            rx * region_width + region_width / 2,
+            60,
+            rz * region_width + region_width / 2,
+        );
+        let far_corner = origin + IVec3::new(7, 7, 7);
+
+        let cli = dummy_cli(Some(meta.path.to_string_lossy().to_string()));
+        // Whatever sits at the box's own corner is guaranteed to be found —
+        // no fixture with a known planted block is available yet (095 hasn't
+        // landed), so scan for that corner's own block name instead.
+        let corner_block = get(&cli, &GetArgs { pos: BlockPos(origin) })
+            .expect("get should resolve")
+            .state
+            .name()
+            .to_string();
+
+        let result = scan(
+            &cli,
+            &ScanArgs {
+                from: BlockPos(origin),
+                to: BlockPos(far_corner),
+                block: corner_block.clone(),
+                limit: Some(500),
+            },
+        )
+        .expect("scan should resolve");
+
+        assert!(
+            result.positions.contains(&origin),
+            "the box's own corner should be among the matches for its own block"
+        );
+        for pos in &result.positions {
+            let single = get(&cli, &GetArgs { pos: BlockPos(*pos) }).expect("get should resolve");
+            assert_eq!(single.state.name(), corner_block, "at {pos}");
         }
     }
 }

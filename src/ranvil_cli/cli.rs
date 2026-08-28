@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use mc_anvil::heightmap::HeightmapKind;
 
-use super::coords::{BlockPos, ChunkPos};
+use super::coords::{BlockPos, ChunkPos, ColumnPos};
 use super::format::OutputFormat;
 
 #[derive(Debug, Parser)]
@@ -50,7 +50,10 @@ pub struct Cli {
 /// adds `GetArea`, the same read over a box rather than one block — a
 /// `SelectionBounds`/`extract_blueprint` call under a CLI wrapper (see
 /// `block::get_area`), and the shared box-scan primitive later `copy`/
-/// `struct export` tickets reuse rather than growing their own.
+/// `struct export` tickets reuse rather than growing their own. Ticket 093
+/// adds `Column`/`Scan`, both built on `get_area` rather than a fresh box
+/// walk — `column` reads a single-column box top-to-bottom, `scan` filters a
+/// box's blocks by name.
 /// Every later `ranvil-cli` ticket adds one more, routing to its own
 /// submodule the same way.
 #[derive(Debug, Subcommand)]
@@ -76,6 +79,11 @@ pub enum Command {
     Get(GetArgs),
     /// A box of blocks, as a palette + dense index array.
     GetArea(GetAreaArgs),
+    /// One column's blocks, bottom-to-top by default, with consecutive
+    /// identical blocks collapsed into ranges.
+    Column(ColumnArgs),
+    /// Every position in a box whose block matches a given name.
+    Scan(ScanArgs),
 }
 
 /// `saves` takes no arguments of its own — the instance directory it lists
@@ -195,6 +203,59 @@ pub struct GetAreaArgs {
     /// The opposite corner, "x,y,z".
     #[arg(allow_hyphen_values = true)]
     pub to: BlockPos,
+}
+
+/// `column <x>,<z> [--from <y>] [--to <y>] [--top-down]` (ticket 093): every
+/// block in one column, read via [`super::block::column`]. `--from`/`--to`
+/// default to the world's build limits
+/// ([`crate::selection::WORLD_MIN_Y`]/[`crate::selection::WORLD_MAX_Y`])
+/// rather than a hardcoded `-64`/`320` — see the ticket on why that stopped
+/// being universal.
+#[derive(Debug, Args)]
+pub struct ColumnArgs {
+    /// The column, "x,z" — block coordinates, not a chunk position (see
+    /// [`ColumnPos`]).
+    #[arg(allow_hyphen_values = true)]
+    pub pos: ColumnPos,
+
+    /// Lowest Y to read. Defaults to the world's build-limit floor.
+    #[arg(long, allow_hyphen_values = true)]
+    pub from: Option<i32>,
+
+    /// Highest Y to read. Defaults to the world's build-limit ceiling.
+    #[arg(long, allow_hyphen_values = true)]
+    pub to: Option<i32>,
+
+    /// List from the highest Y down to the lowest instead of the default
+    /// bottom-to-top order (the way a player reads a cave profile).
+    #[arg(long)]
+    pub top_down: bool,
+}
+
+/// `scan <x1,y1,z1> <x2,y2,z2> --block <name> [--limit N]` (ticket 093):
+/// every position in the box whose block matches `--block` by exact
+/// namespaced name (properties are not part of the match — see
+/// [`super::block::scan`]).
+#[derive(Debug, Args)]
+pub struct ScanArgs {
+    /// One corner, "x,y,z". See [`ChunkArgs::pos`] on why `allow_hyphen_values`.
+    #[arg(allow_hyphen_values = true)]
+    pub from: BlockPos,
+    /// The opposite corner, "x,y,z".
+    #[arg(allow_hyphen_values = true)]
+    pub to: BlockPos,
+
+    /// Exact namespaced block name to match, e.g. `minecraft:oak_door` —
+    /// matches every state of that block regardless of its properties.
+    #[arg(long)]
+    pub block: String,
+
+    /// Caps how many matching positions are reported. Defaults to
+    /// [`super::block::DEFAULT_SCAN_LIMIT`] — never unbounded, since a scan
+    /// for a common block over a large box could otherwise print millions of
+    /// positions.
+    #[arg(long)]
+    pub limit: Option<usize>,
 }
 
 impl HeightmapKindArg {

@@ -20,6 +20,13 @@ pub struct BlockPos(pub IVec3);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChunkPos(pub IVec2);
 
+/// An `(x, z)` **block**-coordinate pair — `column`'s target column (ticket
+/// 093). Kept distinct from [`ChunkPos`] (same shape, different unit) so a
+/// caller reading either type's name never has to guess which coordinate
+/// space it parses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColumnPos(pub IVec2);
+
 impl FromStr for BlockPos {
     type Err = String;
 
@@ -42,6 +49,17 @@ impl FromStr for ChunkPos {
         match components(s).as_slice() {
             [x, z] => Ok(ChunkPos(IVec2::new(parse(x, "x")?, parse(z, "z")?))),
             _ => Err(format!("expected a chunk position \"x,z\", got \"{s}\"")),
+        }
+    }
+}
+
+impl FromStr for ColumnPos {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match components(s).as_slice() {
+            [x, z] => Ok(ColumnPos(IVec2::new(parse(x, "x")?, parse(z, "z")?))),
+            _ => Err(format!("expected a column position \"x,z\", got \"{s}\"")),
         }
     }
 }
@@ -124,5 +142,15 @@ mod tests {
     #[test]
     fn chunk_pos_rejects_non_integer_component() {
         assert!("4,z".parse::<ChunkPos>().is_err());
+    }
+
+    #[test]
+    fn column_pos_parses_two_components() {
+        assert_eq!("4,-5".parse(), Ok(ColumnPos(IVec2::new(4, -5))));
+    }
+
+    #[test]
+    fn column_pos_rejects_missing_component() {
+        assert!("4".parse::<ColumnPos>().is_err());
     }
 }
