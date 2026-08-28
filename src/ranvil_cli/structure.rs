@@ -38,6 +38,18 @@
 //! performs for a live section: `Blueprint`'s dense `Vec<u16>` and a
 //! section's packed-bits array are different representations of the same
 //! idea.
+//!
+//! `resize` (ticket 101) is the first command that changes a [`Blueprint`]'s
+//! own `size` rather than editing positions within a fixed one: six
+//! independent per-face pads (positive adds margin filled with `--fill`,
+//! negative crops that face) computed into a new size up front, then one
+//! pass copying every source position that still lands inside it into a
+//! freshly allocated block array — a crop simply never copies the part that
+//! falls outside. `--pad-y-bottom`/`--pad-x-neg`/`--pad-z-neg` are the three
+//! pads that shift every remaining block's coordinate (a new bottom layer at
+//! `y=0` pushes the old `y=0` to `y=N`); the other three only change where
+//! the far face sits. Unlike `set`/`fill`, `--out` is required rather than
+//! defaulting to `file` itself (see [`super::cli::StructResizeArgs`]'s docs).
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -59,7 +71,7 @@ use super::block::position_of;
 use super::chunk::region_span;
 use super::cli::{
     Cli, RotateArg, StructExportArgs, StructFillArgs, StructGetArgs, StructImportArgs,
-    StructInfoArgs, StructNewArgs, StructSetArgs,
+    StructInfoArgs, StructNewArgs, StructResizeArgs, StructSetArgs,
 };
 use super::edit::{outcome_json_fields, outcome_summary, run_write, WriteOutcome};
 use super::error::CliError;
@@ -754,6 +766,174 @@ impl Render for StructFillResult {
             "block": self.state.to_string(),
             "blocks_filled": self.blocks_filled,
             "palette_grew": self.palette_grew,
+        })
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// ---- resize (ticket 101) ---------------------------------------------------------------------
+// -------------------------------------------------------------------------------------------------
+
+/// `struct resize`'s result: the six pads applied, the size before and
+/// after, and where the resized file landed.
+#[derive(Debug)]
+pub struct StructResizeResult {
+    pub file: PathBuf,
+    pub out: PathBuf,
+    pub old_size: IVec3,
+    pub new_size: IVec3,
+    pub pad_y_top: i32,
+    pub pad_y_bottom: i32,
+    pub pad_x_neg: i32,
+    pub pad_x_pos: i32,
+    pub pad_z_neg: i32,
+    pub pad_z_pos: i32,
+    pub fill: BlockState,
+}
+
+/// Runs `struct resize`: [`read_structure_file`], computes `new_size` from
+/// the six independent pads, refuses (before writing anything) if any axis
+/// would collapse to zero or less, then allocates a fresh block array of
+/// `new_size` pre-filled with `args.fill` and copies every source position
+/// that still lands inside it at its shifted coordinate — a crop simply
+/// never copies the part that falls outside.
+///
+/// `--pad-y-bottom`/`--pad-x-neg`/`--pad-z-neg` are the only three pads that
+/// shift a copied position's coordinate (`shift` below); `--pad-y-top`/
+/// `--pad-x-pos`/`--pad-z-pos` only change where the far face of `new_size`
+/// sits, so they never appear in `shift` at all. That split is what makes
+/// the six pads independent of each other and of application order — see
+/// the ticket's own order-independence test.
+///
+/// The output palette is rebuilt from scratch (starting with `args.fill` at
+/// index 0, same as [`new`]) rather than reusing the source's palette
+/// verbatim: a crop can drop every position of a source palette entry, and
+/// starting fresh means the resized file's palette only ever lists states
+/// that actually still appear in it.
+pub fn resize(args: &StructResizeArgs) -> Result<StructResizeResult, CliError> {
+    let blueprint = read_structure_file(&args.file)
+        .map_err(|err| CliError::Data(format!("{}: {err}", args.file.display())))?;
+
+    let old_size = blueprint.size;
+    let new_size = IVec3::new(
+        old_size.x + args.pad_x_neg + args.pad_x_pos,
+        old_size.y + args.pad_y_bottom + args.pad_y_top,
+        old_size.z + args.pad_z_neg + args.pad_z_pos,
+    );
+
+    for (component, axis) in [(new_size.x, 'x'), (new_size.y, 'y'), (new_size.z, 'z')] {
+        if component < 1 {
+            return Err(CliError::Usage(format!(
+                "resulting {axis} size would be {component} — the pads on that axis crop away the whole structure"
+            )));
+        }
+    }
+
+    if args.out.exists() && !args.force {
+        return Err(CliError::Usage(format!(
+            "{} already exists — pass --force to overwrite",
+            args.out.display()
+        )));
+    }
+
+    // Where a source position's coordinate lands in `new_size`'s space —
+    // only the three pads that grow/shrink the *min* corner of an axis
+    // shift anything; the three that grow/shrink the *max* corner leave a
+    // surviving position's coordinate exactly where it was.
+    let shift = IVec3::new(args.pad_x_neg, args.pad_y_bottom, args.pad_z_neg);
+
+    let volume = new_size.x as usize * new_size.y as usize * new_size.z as usize;
+    let mut palette = vec![args.fill.clone()];
+    let mut blocks = vec![0u16; volume];
+
+    for z in 0..old_size.z {
+        for y in 0..old_size.y {
+            for x in 0..old_size.x {
+                let old_pos = IVec3::new(x, y, z);
+                let new_pos = old_pos + shift;
+                if new_pos.cmplt(IVec3::ZERO).any() || new_pos.cmpge(new_size).any() {
+                    continue; // cropped away
+                }
+                let old_index = flat_index(old_size, old_pos);
+                let state = blueprint.palette[blueprint.blocks[old_index] as usize].clone();
+                let palette_index = palette_index_for(&mut palette, state);
+                blocks[flat_index(new_size, new_pos)] = palette_index;
+            }
+        }
+    }
+
+    let resized = Blueprint {
+        size: new_size,
+        origin: IVec3::ZERO,
+        palette,
+        blocks,
+        data_version: blueprint.data_version,
+        // A resize is one in-memory transform, all-or-nothing, same as
+        // `struct import`'s read — there's no partial result to count
+        // failures against (see `Blueprint::failed_columns`'s own docs).
+        failed_columns: 0,
+    };
+
+    write_structure_file(&args.out, &resized).map_err(|err| {
+        CliError::Data(format!("could not write {}: {err}", args.out.display()))
+    })?;
+
+    Ok(StructResizeResult {
+        file: args.file.clone(),
+        out: args.out.clone(),
+        old_size,
+        new_size,
+        pad_y_top: args.pad_y_top,
+        pad_y_bottom: args.pad_y_bottom,
+        pad_x_neg: args.pad_x_neg,
+        pad_x_pos: args.pad_x_pos,
+        pad_z_neg: args.pad_z_neg,
+        pad_z_pos: args.pad_z_pos,
+        fill: args.fill.clone(),
+    })
+}
+
+impl StructResizeResult {
+    fn summary_line(&self) -> String {
+        format!(
+            "struct resize {} ({}x{}x{}) -> {} ({}x{}x{}): pad y[{}..{}] x[{}..{}] z[{}..{}], fill {}",
+            self.file.display(),
+            self.old_size.x,
+            self.old_size.y,
+            self.old_size.z,
+            self.out.display(),
+            self.new_size.x,
+            self.new_size.y,
+            self.new_size.z,
+            self.pad_y_bottom,
+            self.pad_y_top,
+            self.pad_x_neg,
+            self.pad_x_pos,
+            self.pad_z_neg,
+            self.pad_z_pos,
+            self.fill,
+        )
+    }
+}
+
+impl Render for StructResizeResult {
+    fn render_text(&self) -> String {
+        self.summary_line()
+    }
+
+    fn render_json(&self) -> Value {
+        json!({
+            "file": self.file.display().to_string(),
+            "out": self.out.display().to_string(),
+            "old_size": [self.old_size.x, self.old_size.y, self.old_size.z],
+            "new_size": [self.new_size.x, self.new_size.y, self.new_size.z],
+            "pad_y_top": self.pad_y_top,
+            "pad_y_bottom": self.pad_y_bottom,
+            "pad_x_neg": self.pad_x_neg,
+            "pad_x_pos": self.pad_x_pos,
+            "pad_z_neg": self.pad_z_neg,
+            "pad_z_pos": self.pad_z_pos,
+            "fill": self.fill.to_string(),
         })
     }
 }
@@ -1687,5 +1867,292 @@ mod tests {
         let fill_err = fill(&fill_args(path, IVec3::ZERO, IVec3::ZERO, state("minecraft:dirt"), None, true))
             .unwrap_err();
         assert!(matches!(fill_err, CliError::Data(_)), "fill: {fill_err:?}");
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // ---- resize (ticket 101) ---------------------------------------------------------------
+    // -----------------------------------------------------------------------------------------
+
+    #[allow(clippy::too_many_arguments)]
+    fn resize_args(
+        file: PathBuf,
+        out: PathBuf,
+        pad_y_top: i32,
+        pad_y_bottom: i32,
+        pad_x_neg: i32,
+        pad_x_pos: i32,
+        pad_z_neg: i32,
+        pad_z_pos: i32,
+        fill: BlockState,
+        force: bool,
+    ) -> StructResizeArgs {
+        StructResizeArgs {
+            file,
+            out,
+            pad_y_top,
+            pad_y_bottom,
+            pad_x_neg,
+            pad_x_pos,
+            pad_z_neg,
+            pad_z_pos,
+            fill,
+            force,
+        }
+    }
+
+    /// A structure whose every position holds a distinct, coordinate-named
+    /// block state — precise enough to check "everything below is identical
+    /// to the source" and "every remaining block shifted by exactly N"
+    /// against concrete positions, rather than just a block count.
+    fn labeled_blueprint(size: IVec3) -> Blueprint {
+        let mut palette = Vec::new();
+        let mut blocks = Vec::new();
+        for y in 0..size.y {
+            for z in 0..size.z {
+                for x in 0..size.x {
+                    palette.push(state(&format!("minecraft:pos_{x}_{y}_{z}")));
+                    blocks.push((palette.len() - 1) as u16);
+                }
+            }
+        }
+        Blueprint { size, origin: IVec3::ZERO, palette, blocks, data_version: 3953, failed_columns: 0 }
+    }
+
+    /// Every block state in `file` (which must be exactly `size`-shaped), in
+    /// a fixed scan order — used to compare two resized files position by
+    /// position without depending on their (independently rebuilt) palette
+    /// orders.
+    fn block_names(file: &PathBuf, size: IVec3) -> Vec<String> {
+        let mut names = Vec::new();
+        for y in 0..size.y {
+            for z in 0..size.z {
+                for x in 0..size.x {
+                    let got = get(&get_args(file.clone(), IVec3::new(x, y, z))).expect("in bounds").state;
+                    names.push(got.to_string());
+                }
+            }
+        }
+        names
+    }
+
+    /// The ticket's own "Done when": `--pad-y-top 3` on a known structure
+    /// produces a file 3 taller, with the top 3 layers filled per `--fill`
+    /// and everything below identical to the source.
+    #[test]
+    fn pad_y_top_adds_height_at_the_top_and_leaves_everything_below_identical() {
+        let path = temp_path("resize-pad-y-top-source");
+        write_structure_file(&path, &labeled_blueprint(IVec3::new(2, 2, 2))).expect("should write");
+
+        let out = temp_path("resize-pad-y-top-dest");
+        let fill_state = state("minecraft:glass");
+        let result = resize(&resize_args(path.clone(), out.clone(), 3, 0, 0, 0, 0, 0, fill_state.clone(), false))
+            .expect("valid resize");
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(result.old_size, IVec3::new(2, 2, 2));
+        assert_eq!(result.new_size, IVec3::new(2, 5, 2));
+
+        for y in 0..2 {
+            for z in 0..2 {
+                for x in 0..2 {
+                    let got = get(&get_args(out.clone(), IVec3::new(x, y, z))).expect("in bounds").state;
+                    assert_eq!(got.name, format!("minecraft:pos_{x}_{y}_{z}"), "at ({x},{y},{z})");
+                }
+            }
+        }
+        for y in 2..5 {
+            for z in 0..2 {
+                for x in 0..2 {
+                    let got = get(&get_args(out.clone(), IVec3::new(x, y, z))).expect("in bounds").state;
+                    assert_eq!(got, fill_state, "at ({x},{y},{z})");
+                }
+            }
+        }
+        std::fs::remove_file(&out).ok();
+    }
+
+    /// The ticket's other "Done when": `--pad-y-bottom 2` shifts every
+    /// existing block up by 2 and fills the new bottom 2 layers.
+    #[test]
+    fn pad_y_bottom_shifts_existing_blocks_up_and_fills_the_new_bottom_layers() {
+        let path = temp_path("resize-pad-y-bottom-source");
+        write_structure_file(&path, &labeled_blueprint(IVec3::new(2, 2, 2))).expect("should write");
+
+        let out = temp_path("resize-pad-y-bottom-dest");
+        let fill_state = state("minecraft:glass");
+        let result = resize(&resize_args(path.clone(), out.clone(), 0, 2, 0, 0, 0, 0, fill_state.clone(), false))
+            .expect("valid resize");
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(result.new_size, IVec3::new(2, 4, 2));
+
+        for y in 0..2 {
+            for z in 0..2 {
+                for x in 0..2 {
+                    let got = get(&get_args(out.clone(), IVec3::new(x, y, z))).expect("in bounds").state;
+                    assert_eq!(got, fill_state, "at ({x},{y},{z})");
+                }
+            }
+        }
+        for y in 0..2 {
+            for z in 0..2 {
+                for x in 0..2 {
+                    let got = get(&get_args(out.clone(), IVec3::new(x, y + 2, z))).expect("in bounds").state;
+                    assert_eq!(got.name, format!("minecraft:pos_{x}_{y}_{z}"), "at ({x},{y},{z}) shifted up by 2");
+                }
+            }
+        }
+        std::fs::remove_file(&out).ok();
+    }
+
+    /// A negative pad crops correctly, including cropping away part of a
+    /// non-air region — data loss is allowed, this is a deliberate crop.
+    #[test]
+    fn negative_pad_crops_and_allows_dropping_non_air_data() {
+        let path = temp_path("resize-crop-source");
+        write_structure_file(&path, &labeled_blueprint(IVec3::new(4, 1, 1))).expect("should write");
+
+        let out = temp_path("resize-crop-dest");
+        let result = resize(&resize_args(path.clone(), out.clone(), 0, 0, 0, -2, 0, 0, BlockState::air(), false))
+            .expect("valid crop");
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(result.new_size, IVec3::new(2, 1, 1));
+        for x in 0..2 {
+            let got = get(&get_args(out.clone(), IVec3::new(x, 0, 0))).expect("in bounds").state;
+            assert_eq!(got.name, format!("minecraft:pos_{x}_0_0"), "at ({x},0,0)");
+        }
+        std::fs::remove_file(&out).ok();
+    }
+
+    /// The ticket's own refusal case: a crop that removes every block on
+    /// some axis is a `Usage` error naming the resulting non-positive
+    /// dimension, refused before writing anything.
+    #[test]
+    fn a_crop_that_collapses_an_axis_is_a_usage_error_and_touches_nothing() {
+        let path = temp_path("resize-collapse-source");
+        write_structure_file(&path, &labeled_blueprint(IVec3::new(3, 1, 1))).expect("should write");
+
+        let out = temp_path("resize-collapse-dest");
+        let err = resize(&resize_args(path.clone(), out.clone(), 0, 0, 0, -3, 0, 0, BlockState::air(), false))
+            .unwrap_err();
+        std::fs::remove_file(&path).ok();
+
+        match err {
+            CliError::Usage(message) => assert!(message.contains("x size would be 0"), "{message}"),
+            CliError::Data(message) => panic!("expected Usage (exit 2), got Data: {message}"),
+        }
+        assert!(!out.exists(), "a refused resize must not write a file");
+    }
+
+    /// The ticket's own order-independence test: combining pads on multiple
+    /// faces in one call produces the same result as applying them one at a
+    /// time, in an order different from how the flags are listed — the six
+    /// pads must not interact.
+    #[test]
+    fn combining_pads_in_one_call_matches_applying_them_one_at_a_time_in_a_different_order() {
+        let source = temp_path("resize-order-source");
+        write_structure_file(&source, &labeled_blueprint(IVec3::new(3, 3, 3))).expect("should write");
+        let fill_state = state("minecraft:glass");
+
+        // All six pads in one call: +2 top, +1 bottom, +1 x-neg, -1 x-pos
+        // (crop), -1 z-neg (crop), +2 z-pos.
+        let combined = temp_path("resize-order-combined");
+        let combined_result = resize(&resize_args(
+            source.clone(),
+            combined.clone(),
+            2,
+            1,
+            1,
+            -1,
+            -1,
+            2,
+            fill_state.clone(),
+            false,
+        ))
+        .expect("combined resize");
+
+        // The same six pads, applied one at a time, deliberately in a
+        // different order (z-pos, x-neg, y-bottom, x-pos, z-neg, y-top).
+        let step1 = temp_path("resize-order-step1");
+        resize(&resize_args(source.clone(), step1.clone(), 0, 0, 0, 0, 0, 2, fill_state.clone(), false))
+            .expect("step 1: pad-z-pos");
+        let step2 = temp_path("resize-order-step2");
+        resize(&resize_args(step1.clone(), step2.clone(), 0, 0, 1, 0, 0, 0, fill_state.clone(), false))
+            .expect("step 2: pad-x-neg");
+        let step3 = temp_path("resize-order-step3");
+        resize(&resize_args(step2.clone(), step3.clone(), 0, 1, 0, 0, 0, 0, fill_state.clone(), false))
+            .expect("step 3: pad-y-bottom");
+        let step4 = temp_path("resize-order-step4");
+        resize(&resize_args(step3.clone(), step4.clone(), 0, 0, 0, -1, 0, 0, fill_state.clone(), false))
+            .expect("step 4: pad-x-pos crop");
+        let step5 = temp_path("resize-order-step5");
+        resize(&resize_args(step4.clone(), step5.clone(), 0, 0, 0, 0, -1, 0, fill_state.clone(), false))
+            .expect("step 5: pad-z-neg crop");
+        let sequential = temp_path("resize-order-sequential");
+        let sequential_result = resize(&resize_args(
+            step5.clone(),
+            sequential.clone(),
+            2,
+            0,
+            0,
+            0,
+            0,
+            0,
+            fill_state.clone(),
+            false,
+        ))
+        .expect("step 6: pad-y-top");
+
+        for path in [&source, &step1, &step2, &step3, &step4, &step5] {
+            std::fs::remove_file(path).ok();
+        }
+
+        assert_eq!(combined_result.new_size, sequential_result.new_size, "the two paths must agree on the resulting size");
+        let size = combined_result.new_size;
+
+        let combined_names = block_names(&combined, size);
+        let sequential_names = block_names(&sequential, size);
+        std::fs::remove_file(&combined).ok();
+        std::fs::remove_file(&sequential).ok();
+
+        assert_eq!(combined_names, sequential_names, "the six pads must not interact");
+    }
+
+    /// `struct resize --out` refuses to overwrite an existing file without
+    /// `--force`, and touches nothing — same convention every other
+    /// file-writing `struct` command follows.
+    #[test]
+    fn resize_onto_an_existing_out_without_force_refuses() {
+        let path = temp_path("resize-no-force-source");
+        write_structure_file(&path, &labeled_blueprint(IVec3::new(2, 2, 2))).expect("should write");
+
+        let out = temp_path("resize-no-force-dest");
+        std::fs::write(&out, b"not a structure file").expect("seed an existing file");
+
+        let err = resize(&resize_args(path.clone(), out.clone(), 1, 0, 0, 0, 0, 0, BlockState::air(), false))
+            .unwrap_err();
+
+        match err {
+            CliError::Usage(message) => assert!(message.contains("--force"), "{message}"),
+            CliError::Data(message) => panic!("expected Usage (exit 2), got Data: {message}"),
+        }
+        assert_eq!(
+            std::fs::read(&out).expect("still readable"),
+            b"not a structure file",
+            "must not have overwritten"
+        );
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&out).ok();
+    }
+
+    /// `struct resize` on a missing file is a `Data` error (exit 1), same as
+    /// every other `struct` command's own missing-file test.
+    #[test]
+    fn resize_on_a_missing_file_is_a_data_error() {
+        let path = temp_path("resize-missing");
+        let out = temp_path("resize-missing-out");
+        let err = resize(&resize_args(path, out, 1, 0, 0, 0, 0, 0, BlockState::air(), false)).unwrap_err();
+        assert!(matches!(err, CliError::Data(_)), "{err:?}");
     }
 }

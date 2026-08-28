@@ -36,6 +36,11 @@
 //! commands that edit a [`crate::blueprint::Blueprint`] in memory outside of
 //! extraction and rotation — no `--save`/`--instance` either, like `info`/
 //! `new`, since everything they touch is a file on disk.
+//! Ticket 101 adds `struct resize`: six independent per-face pads (positive
+//! adds margin, negative crops), computed and applied in one pass over a
+//! freshly allocated block array rather than reusing `struct fill`'s
+//! in-place mutation — a resize changes the array's own shape, not just
+//! positions within it.
 
 use std::process::ExitCode;
 
@@ -192,6 +197,11 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
         }
         Command::Struct(StructCommand::Fill(args)) => {
             let result = structure::fill(args)?;
+            print(&result, cli.format);
+            Ok(())
+        }
+        Command::Struct(StructCommand::Resize(args)) => {
+            let result = structure::resize(args)?;
             print(&result, cli.format);
             Ok(())
         }

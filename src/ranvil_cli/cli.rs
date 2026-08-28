@@ -135,6 +135,8 @@ pub enum StructCommand {
     Set(StructSetArgs),
     /// Fill a sub-box inside a structure file with one block.
     Fill(StructFillArgs),
+    /// Add or trim margin on any of the six faces of a structure file.
+    Resize(StructResizeArgs),
 }
 
 /// `struct info <file.nbt>` (ticket 098).
@@ -343,6 +345,80 @@ pub struct StructFillArgs {
     pub out: Option<PathBuf>,
 
     /// Overwrite the output path if it already exists.
+    #[arg(long)]
+    pub force: bool,
+}
+
+/// `struct resize <file.nbt> --out <file2.nbt> [--pad-y-top N]
+/// [--pad-y-bottom N] [--pad-x-neg N] [--pad-x-pos N] [--pad-z-neg N]
+/// [--pad-z-pos N] [--fill <blockstate>] [--force]` (ticket 101): adds or
+/// trims margin on each of the six faces of the bounding box independently.
+/// A positive pad on a face adds margin there, filled with `--fill`; a
+/// negative pad crops that face instead — one command for both directions,
+/// since a caller reaching for "make this 2 blocks shorter" shouldn't have
+/// to know it's a different command from "make this 2 blocks taller". See
+/// [`super::structure::resize`] for the mechanics and
+/// [`super::structure::StructResizeArgs`]'s field docs for which face each
+/// flag controls.
+///
+/// Unlike `struct set`/`struct fill`, `--out` is required rather than
+/// defaulting to `file` itself — a resize changes the structure's own size
+/// and every block's coordinate within it, not just a handful of positions,
+/// so there is no "in place" convenience worth a default here.
+///
+/// `--pad-y-bottom`/`--pad-x-neg`/`--pad-z-neg` shift every remaining
+/// block's coordinate by the pad amount (a new bottom layer at `y=0` pushes
+/// the old `y=0` to `y=N`). A building's own `.ron` `ground_level`
+/// (`city::definition`'s field) is **not** touched by this command — a
+/// structure file carries no such field itself — so `--pad-y-bottom` on a
+/// building already in `assets/city/buildings` likely needs its companion
+/// `.ron`'s `ground_level` bumped by the same amount by hand, same as any
+/// other structural edit to a building's blueprint would.
+#[derive(Debug, Args)]
+pub struct StructResizeArgs {
+    /// Path to a gzipped vanilla structure file.
+    pub file: PathBuf,
+
+    /// Where to write the resized structure file.
+    #[arg(long)]
+    pub out: PathBuf,
+
+    /// Margin added above the structure's top layer (`+Y`). Negative crops
+    /// that many layers off the top instead.
+    #[arg(long, allow_hyphen_values = true, default_value_t = 0)]
+    pub pad_y_top: i32,
+
+    /// Margin added below the structure's bottom layer (`-Y`). Every
+    /// existing block shifts up by this amount to make room. Negative crops
+    /// that many layers off the bottom instead (shifting every remaining
+    /// block down).
+    #[arg(long, allow_hyphen_values = true, default_value_t = 0)]
+    pub pad_y_bottom: i32,
+
+    /// Margin added on the `-X` face. Every existing block shifts by this
+    /// amount on X to make room. Negative crops that face instead.
+    #[arg(long, allow_hyphen_values = true, default_value_t = 0)]
+    pub pad_x_neg: i32,
+
+    /// Margin added on the `+X` face. Negative crops that face instead.
+    #[arg(long, allow_hyphen_values = true, default_value_t = 0)]
+    pub pad_x_pos: i32,
+
+    /// Margin added on the `-Z` face. Every existing block shifts by this
+    /// amount on Z to make room. Negative crops that face instead.
+    #[arg(long, allow_hyphen_values = true, default_value_t = 0)]
+    pub pad_z_neg: i32,
+
+    /// Margin added on the `+Z` face. Negative crops that face instead.
+    #[arg(long, allow_hyphen_values = true, default_value_t = 0)]
+    pub pad_z_pos: i32,
+
+    /// The block newly added margin is filled with. Irrelevant on an axis
+    /// that only crops.
+    #[arg(long, default_value = "minecraft:air")]
+    pub fill: BlockState,
+
+    /// Overwrite `--out` if it already exists.
     #[arg(long)]
     pub force: bool,
 }
