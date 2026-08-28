@@ -46,6 +46,12 @@
 //! `struct diff` (the first `struct` command that only reads — two files in,
 //! a per-position comparison out, refusing up front when their `size`s
 //! disagree).
+//! Ticket 103 (last in the plan) adds `struct validate`: the same checks
+//! `blueprint::catalogue`'s loader applies silently to every building it
+//! scans, run against one named file and reported per-check. It's also the
+//! first command whose own success (the file parsed) doesn't always mean
+//! exit `0` — see [`dispatch`]'s docs on why it returns an [`ExitCode`]
+//! rather than `()`.
 
 use std::process::ExitCode;
 
@@ -79,7 +85,7 @@ pub fn run() -> ExitCode {
     let format = cli.format;
 
     match dispatch(&cli) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(err) => error::report(&err, format),
     }
 }
@@ -88,137 +94,154 @@ pub fn run() -> ExitCode {
 /// Resolution of `--save` against `--instance` happens lazily, inside each
 /// command that actually needs a resolved save — `saves` doesn't, which is
 /// deliberately why it's this ticket's only variant (see `save.rs`).
-fn dispatch(cli: &Cli) -> Result<(), CliError> {
+///
+/// Returns the process's exit code rather than plain `()` (ticket 103):
+/// every command but `struct validate` always succeeds with
+/// [`ExitCode::SUCCESS`] once it gets this far (a genuine failure is a
+/// [`CliError`], routed to [`error::report`] by [`run`] instead) — `struct
+/// validate` is the one command whose own successful result (the file
+/// parsed) can still mean "exit 1", since failing one of its checks is a
+/// real, printable answer about the file rather than a [`CliError::Data`]
+/// that would replace that answer with an error envelope.
+fn dispatch(cli: &Cli) -> Result<ExitCode, CliError> {
     match &cli.command {
         Command::Saves(args) => {
             let result = save::saves(cli, args)?;
             print(&result, cli.format);
-            Ok(())
+            Ok(ExitCode::SUCCESS)
         }
         Command::Info(args) => {
             let result = save::info(cli, args)?;
             print(&result, cli.format);
-            Ok(())
+            Ok(ExitCode::SUCCESS)
         }
         Command::Regions(args) => {
             let result = save::regions(cli, args)?;
             print(&result, cli.format);
-            Ok(())
+            Ok(ExitCode::SUCCESS)
         }
         Command::Lock(args) => {
             let result = save::lock(cli, args)?;
             print(&result, cli.format);
-            Ok(())
+            Ok(ExitCode::SUCCESS)
         }
         Command::Chunk(args) => {
             let result = chunk::chunk(cli, args)?;
             print(&result, cli.format);
-            Ok(())
+            Ok(ExitCode::SUCCESS)
         }
         Command::Chunks(args) => {
             let result = chunk::chunks(cli, args)?;
             print(&result, cli.format);
-            Ok(())
+            Ok(ExitCode::SUCCESS)
         }
         Command::Heightmap(args) => {
             let result = heightmap::heightmap(cli, args)?;
             print(&result, cli.format);
-            Ok(())
+            Ok(ExitCode::SUCCESS)
         }
         Command::Get(args) => {
             let result = block::get(cli, args)?;
             print(&result, cli.format);
-            Ok(())
+            Ok(ExitCode::SUCCESS)
         }
         Command::GetArea(args) => {
             let result = block::get_area(cli, args)?;
             print(&result, cli.format);
-            Ok(())
+            Ok(ExitCode::SUCCESS)
         }
         Command::Column(args) => {
             let result = block::column(cli, args)?;
             print(&result, cli.format);
-            Ok(())
+            Ok(ExitCode::SUCCESS)
         }
         Command::Scan(args) => {
             let result = block::scan(cli, args)?;
             print(&result, cli.format);
-            Ok(())
+            Ok(ExitCode::SUCCESS)
         }
         Command::Set(args) => {
             let result = edit::set(cli, args)?;
             print(&result, cli.format);
-            Ok(())
+            Ok(ExitCode::SUCCESS)
         }
         Command::SetArea(args) => {
             let result = edit::set_area(cli, args)?;
             print(&result, cli.format);
-            Ok(())
+            Ok(ExitCode::SUCCESS)
         }
         Command::SetBatch(args) => {
             let result = edit::set_batch(cli, args)?;
             print(&result, cli.format);
-            Ok(())
+            Ok(ExitCode::SUCCESS)
         }
         Command::Replace(args) => {
             let result = edit::replace(cli, args)?;
             print(&result, cli.format);
-            Ok(())
+            Ok(ExitCode::SUCCESS)
         }
         Command::Copy(args) => {
             let result = edit::copy(cli, args)?;
             print(&result, cli.format);
-            Ok(())
+            Ok(ExitCode::SUCCESS)
         }
         Command::Struct(StructCommand::Info(args)) => {
             let result = structure::info(args)?;
             print(&result, cli.format);
-            Ok(())
+            Ok(ExitCode::SUCCESS)
         }
         Command::Struct(StructCommand::New(args)) => {
             let result = structure::new(args)?;
             print(&result, cli.format);
-            Ok(())
+            Ok(ExitCode::SUCCESS)
         }
         Command::Struct(StructCommand::Export(args)) => {
             let result = structure::export(cli, args)?;
             print(&result, cli.format);
-            Ok(())
+            Ok(ExitCode::SUCCESS)
         }
         Command::Struct(StructCommand::Import(args)) => {
             let result = structure::import(cli, args)?;
             print(&result, cli.format);
-            Ok(())
+            Ok(ExitCode::SUCCESS)
         }
         Command::Struct(StructCommand::Get(args)) => {
             let result = structure::get(args)?;
             print(&result, cli.format);
-            Ok(())
+            Ok(ExitCode::SUCCESS)
         }
         Command::Struct(StructCommand::Set(args)) => {
             let result = structure::set(args)?;
             print(&result, cli.format);
-            Ok(())
+            Ok(ExitCode::SUCCESS)
         }
         Command::Struct(StructCommand::Fill(args)) => {
             let result = structure::fill(args)?;
             print(&result, cli.format);
-            Ok(())
+            Ok(ExitCode::SUCCESS)
         }
         Command::Struct(StructCommand::Resize(args)) => {
             let result = structure::resize(args)?;
             print(&result, cli.format);
-            Ok(())
+            Ok(ExitCode::SUCCESS)
         }
         Command::Struct(StructCommand::Rotate(args)) => {
             let result = structure::rotate(args)?;
             print(&result, cli.format);
-            Ok(())
+            Ok(ExitCode::SUCCESS)
         }
         Command::Struct(StructCommand::Diff(args)) => {
             let result = structure::diff(args)?;
             print(&result, cli.format);
-            Ok(())
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Struct(StructCommand::Validate(args)) => {
+            let result = structure::validate(args)?;
+            print(&result, cli.format);
+            // Exit 1 (not a `CliError`) when the file parsed but failed a
+            // check — see `dispatch`'s own docs on why this is the one arm
+            // that doesn't always return `SUCCESS`.
+            Ok(if result.all_passed() { ExitCode::SUCCESS } else { ExitCode::from(1) })
         }
     }
 }

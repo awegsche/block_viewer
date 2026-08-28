@@ -89,6 +89,10 @@ pub use rotate::{rotate_blueprint, Rotation, RotationError};
 // at startup. Re-exported for the same reason as everything above:
 // `blueprint` is the module a caller reaches for.
 pub use catalogue::{load_catalogue_dir, BuildingCatalogue, CatalogueEntry, CatalogueError};
+// Ticket 103: `ranvil-cli struct validate` runs the exact same per-check
+// list `load_catalogue_dir` applies silently, made explicit and runnable on
+// demand — see `catalogue::run_checks`'s own docs.
+pub use catalogue::{run_checks, BlueprintCheck};
 
 /// How many palette entries the finished-extraction log prints before
 /// summarising the rest. Long enough to see a structure's whole palette,

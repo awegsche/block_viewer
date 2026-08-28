@@ -141,6 +141,10 @@ pub enum StructCommand {
     Rotate(StructRotateArgs),
     /// Per-position block differences between two same-size structure files.
     Diff(StructDiffArgs),
+    /// The same checks `blueprint::catalogue::load_catalogue_dir` applies
+    /// silently to every building it scans, run on demand and reported
+    /// per-check rather than as a single pass/fail.
+    Validate(StructValidateArgs),
 }
 
 /// `struct info <file.nbt>` (ticket 098).
@@ -477,6 +481,30 @@ pub struct StructDiffArgs {
     /// unbounded" default `scan --limit` uses.
     #[arg(long)]
     pub limit: Option<usize>,
+}
+
+/// `struct validate <file.nbt> [--max-size <x,y,z>]` (ticket 103): the exact
+/// checks [`crate::blueprint::catalogue::load_catalogue_dir`] applies to
+/// every building it scans (size within limit, palette not air-only), run
+/// against one named file and reported per-check. Lets an agent authoring a
+/// building model self-check a file before dropping it into
+/// `assets/city/blueprints`, where a failing file is otherwise just skipped
+/// and logged rather than explained.
+#[derive(Debug, Args)]
+pub struct StructValidateArgs {
+    /// Path to a gzipped vanilla structure file.
+    pub file: PathBuf,
+
+    /// Per-axis size ceiling, "x,y,z" — reuses [`BlockPos`]'s parser the same
+    /// way [`StructNewArgs::size`] does for a triple that isn't really a
+    /// position. Defaults to [`crate::blueprint::STRUCTURE_BLOCK_MAX_SIZE`]
+    /// splatted across all three axes, the same limit
+    /// `blueprint::catalogue`'s loader enforces; overriding it is what lets
+    /// this command validate a non-building structure (a different size
+    /// budget, or an asymmetric one) rather than only ever checking against
+    /// the building catalogue's own cap.
+    #[arg(long, allow_hyphen_values = true)]
+    pub max_size: Option<BlockPos>,
 }
 
 /// `saves` takes no arguments of its own — the instance directory it lists

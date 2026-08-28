@@ -131,20 +131,79 @@ fn footprint_of(size: IVec3) -> IVec2 {
     IVec2::new(size.x, size.z)
 }
 
-/// The size/palette checks described in the module docs. Split from
-/// [`load_entry`] so the geometry and palette rules are each one `if`,
-/// tested directly against a hand-built [`Blueprint`] rather than only
-/// through a real file on disk.
-fn validate(blueprint: &Blueprint) -> Result<(), CatalogueError> {
+/// One named check from [`run_checks`], with a human-readable detail either
+/// way — `ranvil-cli struct validate` (ticket 103) reports one of these per
+/// check rather than just an overall verdict, and this module's own
+/// [`validate`] reduces the same list to its first failure.
+#[derive(Debug, Clone)]
+pub struct BlueprintCheck {
+    /// A stable, `snake_case` identifier — `struct validate --format json`'s
+    /// `"checks": [{"name": ..., ...}]` entries key on this, so it's not
+    /// derived from `detail`'s prose.
+    pub name: &'static str,
+    pub pass: bool,
+    pub detail: String,
+}
+
+/// The size/palette checks described in the module docs, against `max_size`
+/// (per-axis, so a caller with an asymmetric limit — e.g. a fixed footprint
+/// but a generous height — doesn't have to fake a cube). [`validate`] always
+/// calls this with `max_size` splatted from [`STRUCTURE_BLOCK_MAX_SIZE`];
+/// `ranvil-cli struct validate`'s `--max-size` (ticket 103) is the one other
+/// caller, letting an agent check a non-building structure against different
+/// limits without this module growing a second copy of either rule.
+///
+/// Order is size then palette, matching [`validate`]'s own precedence (a
+/// size failure is reported over a palette failure when both are true).
+pub fn run_checks(blueprint: &Blueprint, max_size: IVec3) -> Vec<BlueprintCheck> {
     let size = blueprint.size;
-    if size.min_element() <= 0 || size.max_element() > STRUCTURE_BLOCK_MAX_SIZE {
-        return Err(CatalogueError::InvalidSize(size));
-    }
+    let size_pass = size.min_element() > 0
+        && size.x <= max_size.x
+        && size.y <= max_size.y
+        && size.z <= max_size.z;
+    let size_detail = if size_pass {
+        format!(
+            "{}x{}x{} is within 1..={},1..={},1..={}",
+            size.x, size.y, size.z, max_size.x, max_size.y, max_size.z
+        )
+    } else {
+        format!(
+            "{}x{}x{} is out of range: must be at least 1 and at most {}x{}x{} on each axis",
+            size.x, size.y, size.z, max_size.x, max_size.y, max_size.z
+        )
+    };
+
     // Index 0 is always `minecraft:air` (`Accumulator::new`); anything past
     // it is a real block. A single-entry palette means there's nothing else
-    // in it.
-    if blueprint.palette.len() <= 1 {
-        return Err(CatalogueError::Empty);
+    // in it — the shape an all-air, failed/empty extraction leaves behind.
+    let non_air_pass = blueprint.palette.len() > 1;
+    let non_air_detail = if non_air_pass {
+        format!("{} non-air block state(s) in the palette", blueprint.palette.len() - 1)
+    } else {
+        "palette has no blocks besides air".to_string()
+    };
+
+    vec![
+        BlueprintCheck { name: "size_limit", pass: size_pass, detail: size_detail },
+        BlueprintCheck { name: "non_air", pass: non_air_pass, detail: non_air_detail },
+    ]
+}
+
+/// The size/palette checks described in the module docs, reduced to
+/// [`load_entry`]'s existing all-or-nothing [`CatalogueError`] — the first
+/// failing check in [`run_checks`]'s list (size before palette) decides
+/// which variant comes back, matching this function's own pre-103 behavior
+/// exactly.
+fn validate(blueprint: &Blueprint) -> Result<(), CatalogueError> {
+    for check in run_checks(blueprint, IVec3::splat(STRUCTURE_BLOCK_MAX_SIZE)) {
+        if check.pass {
+            continue;
+        }
+        return Err(match check.name {
+            "size_limit" => CatalogueError::InvalidSize(blueprint.size),
+            "non_air" => CatalogueError::Empty,
+            other => unreachable!("run_checks added a check {other:?} validate() doesn't know"),
+        });
     }
     Ok(())
 }

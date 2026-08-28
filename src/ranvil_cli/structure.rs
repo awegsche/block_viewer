@@ -61,6 +61,18 @@
 //! there's no shared coordinate space to walk otherwise. `diff`'s `text`/
 //! `compact` cap their listing at `--limit` the same way `scan` does; `json`
 //! deliberately does not, per the ticket — see [`StructDiffResult`]'s docs.
+//!
+//! `validate` (ticket 103, last in the plan) runs
+//! [`crate::blueprint::run_checks`] — the exact size/palette checks
+//! `blueprint::catalogue`'s loader already applies silently to every file it
+//! scans, pulled out so this command and that loader share one
+//! implementation rather than two copies of the same numeric limits (see
+//! that function's own docs). Unlike every other `struct` command, a file
+//! that parses but fails a check is not an error: [`StructValidateResult`]
+//! is `Ok` either way, and [`StructValidateResult::all_passed`] is what
+//! [`super::run`]'s dispatch reads to choose exit `1` over `0`, since the
+//! per-check listing is the answer the ticket asked for, not something to
+//! discard in favor of an error envelope.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -69,9 +81,9 @@ use bevy::math::IVec3;
 use serde_json::{json, Value};
 
 use crate::blueprint::{
-    extract_blueprint, read_structure_file, rotate_blueprint, write_structure_file, BlockState,
-    Blueprint, ExtractProgress, FALLBACK_DATA_VERSION, LOGGED_PALETTE_ENTRIES, MAX_BLOCKS,
-    STRUCTURE_BLOCK_MAX_SIZE,
+    extract_blueprint, read_structure_file, rotate_blueprint, run_checks, write_structure_file,
+    BlockState, Blueprint, BlueprintCheck, ExtractProgress, FALLBACK_DATA_VERSION,
+    LOGGED_PALETTE_ENTRIES, MAX_BLOCKS, STRUCTURE_BLOCK_MAX_SIZE,
 };
 use crate::edit::WorldEdit;
 use crate::region_cache::RegionCache;
@@ -83,7 +95,7 @@ use super::chunk::region_span;
 use super::cli::{
     Cli, RotateArg, StructDiffArgs, StructExportArgs, StructFillArgs, StructGetArgs,
     StructImportArgs, StructInfoArgs, StructNewArgs, StructResizeArgs, StructRotateArgs,
-    StructSetArgs,
+    StructSetArgs, StructValidateArgs,
 };
 use super::edit::{outcome_json_fields, outcome_summary, run_write, WriteOutcome};
 use super::error::CliError;
@@ -1177,6 +1189,126 @@ impl Render for StructDiffResult {
             .collect();
         let trailer = if rest > 0 { format!("; ... and {rest} more") } else { String::new() };
         format!("{}: {}{trailer}", self.summary_line(), entries.join("; "))
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// ---- validate (ticket 103) --------------------------------------------------------------------
+// -------------------------------------------------------------------------------------------------
+
+/// `struct validate`'s result: every named check [`run_checks`] ran, in
+/// order, against the size ceiling actually used (whichever `--max-size`
+/// resolved to). Reaching this struct at all already means `args.file`
+/// parsed as a structure — a parse failure never gets this far, see
+/// [`validate`]'s own docs on why that's a different, earlier error instead.
+#[derive(Debug)]
+pub struct StructValidateResult {
+    pub file: PathBuf,
+    pub max_size: IVec3,
+    pub checks: Vec<BlueprintCheck>,
+}
+
+impl StructValidateResult {
+    /// Whether every check passed. [`super::run`]'s dispatch reads this to
+    /// choose exit `0` vs `1` per the ticket's contract, rather than folding
+    /// that choice into a `CliError` the way every other `struct` command's
+    /// failure path does — see [`validate`]'s docs on why this one result is
+    /// always `Ok`.
+    pub fn all_passed(&self) -> bool {
+        self.checks.iter().all(|check| check.pass)
+    }
+}
+
+/// Runs `struct validate`: [`read_structure_file`] on `args.file`, then
+/// [`run_checks`] — the exact per-file checks
+/// [`crate::blueprint::catalogue::load_catalogue_dir`] (ticket 039) applies
+/// silently to every building it scans, against `args.max_size` (or
+/// [`STRUCTURE_BLOCK_MAX_SIZE`] splatted across all three axes when not
+/// given, the same limit the catalogue loader enforces).
+///
+/// A file that doesn't parse as a structure at all is [`CliError::Usage`]
+/// (exit `2`), not [`CliError::Data`] (exit `1`, every other `struct`
+/// command's convention for a read failure) — per the ticket, there's no
+/// file here to run checks against and report on, so this is closer to a
+/// bad request than a well-formed one that came back with a real, negative
+/// answer. A file that *does* parse but fails one or more checks is always
+/// `Ok`: the per-check listing in [`Self::checks`] is itself the answer, not
+/// a error to replace with one, so [`Self::all_passed`] — read by
+/// [`super::run`]'s dispatch — is what picks exit `1` over `0`, not this
+/// `Result`.
+pub fn validate(args: &StructValidateArgs) -> Result<StructValidateResult, CliError> {
+    let blueprint = read_structure_file(&args.file)
+        .map_err(|err| CliError::Usage(format!("{}: {err}", args.file.display())))?;
+
+    let max_size = args
+        .max_size
+        .map(|pos| pos.0)
+        .unwrap_or(IVec3::splat(STRUCTURE_BLOCK_MAX_SIZE));
+    let checks = run_checks(&blueprint, max_size);
+
+    Ok(StructValidateResult { file: args.file.clone(), max_size, checks })
+}
+
+impl StructValidateResult {
+    fn summary_line(&self) -> String {
+        let passed = self.checks.iter().filter(|check| check.pass).count();
+        format!(
+            "struct validate {}: {}/{} checks passed",
+            self.file.display(),
+            passed,
+            self.checks.len(),
+        )
+    }
+}
+
+impl Render for StructValidateResult {
+    /// The summary line plus one `pass`/`FAIL` line per check, in
+    /// [`run_checks`]'s own order.
+    fn render_text(&self) -> String {
+        let mut lines = vec![self.summary_line()];
+        for check in &self.checks {
+            lines.push(format!(
+                "  [{}] {}: {}",
+                if check.pass { "pass" } else { "FAIL" },
+                check.name,
+                check.detail,
+            ));
+        }
+        lines.join("\n")
+    }
+
+    /// `"checks"` lists every check's `name`/`pass`/`detail` — per the
+    /// ticket, so an agent can see *which* check failed rather than
+    /// re-deriving it from `"pass"` alone. `"pass"` at the top level is
+    /// [`Self::all_passed`], the same overall verdict the exit code encodes.
+    fn render_json(&self) -> Value {
+        json!({
+            "file": self.file.display().to_string(),
+            "max_size": [self.max_size.x, self.max_size.y, self.max_size.z],
+            "pass": self.all_passed(),
+            "checks": self.checks.iter().map(|check| json!({
+                "name": check.name,
+                "pass": check.pass,
+                "detail": check.detail,
+            })).collect::<Vec<_>>(),
+        })
+    }
+
+    /// The summary line, plus the names of any failing checks — a passing
+    /// file is one line with nothing more to say, mirroring
+    /// [`StructDiffResult::render_compact`]'s "nothing to list" case.
+    fn render_compact(&self) -> String {
+        let failing: Vec<&str> = self
+            .checks
+            .iter()
+            .filter(|check| !check.pass)
+            .map(|check| check.name)
+            .collect();
+        if failing.is_empty() {
+            self.summary_line()
+        } else {
+            format!("{}: failed {}", self.summary_line(), failing.join(", "))
+        }
     }
 }
 
@@ -2619,5 +2751,155 @@ mod tests {
         let json = result.render_json();
         assert_eq!(json["count"], 4);
         assert_eq!(json["differences"].as_array().expect("array").len(), 4, "json is never capped by --limit");
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // ---- validate (ticket 103) ---------------------------------------------------------------
+    // -----------------------------------------------------------------------------------------
+
+    fn validate_args(file: PathBuf, max_size: Option<IVec3>) -> StructValidateArgs {
+        StructValidateArgs { file, max_size: max_size.map(BlockPos) }
+    }
+
+    /// An all-air structure — what a failed/empty extraction looks like, per
+    /// the `non_air` check's own docs. Mirrors `catalogue.rs`'s own
+    /// `air_only` test fixture.
+    fn air_only(size: IVec3) -> Blueprint {
+        let volume = (size.x * size.y * size.z) as usize;
+        Blueprint {
+            size,
+            origin: IVec3::ZERO,
+            palette: vec![BlockState::air()],
+            blocks: vec![0; volume],
+            data_version: 3953,
+            failed_columns: 0,
+        }
+    }
+
+    /// A structure with exactly one non-air block — enough to pass the
+    /// `non_air` check on its own, so a test built on this fixture is only
+    /// ever exercising the `size_limit` check.
+    fn one_stone(size: IVec3) -> Blueprint {
+        let volume = (size.x * size.y * size.z) as usize;
+        let mut blocks = vec![0u16; volume];
+        blocks[0] = 1;
+        Blueprint {
+            size,
+            origin: IVec3::ZERO,
+            palette: vec![BlockState::air(), state("minecraft:stone")],
+            blocks,
+            data_version: 3953,
+            failed_columns: 0,
+        }
+    }
+
+    fn check<'a>(result: &'a StructValidateResult, name: &str) -> &'a BlueprintCheck {
+        result
+            .checks
+            .iter()
+            .find(|check| check.name == name)
+            .unwrap_or_else(|| panic!("no {name:?} check in {:?}", result.checks))
+    }
+
+    /// The ticket's own "Done when": a real shipped blueprint passes every
+    /// check.
+    #[test]
+    fn validate_against_the_real_house01_fixture_passes_every_check() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/city/blueprints/house01.nbt");
+        let result = validate(&validate_args(path, None)).expect("house01.nbt should parse");
+        assert!(result.all_passed(), "{:?}", result.checks);
+        assert!(result.checks.iter().all(|check| check.pass), "{:?}", result.checks);
+    }
+
+    /// The ticket's own "Done when": an all-air structure (`struct new`'s
+    /// default fill) fails the `non_air` check specifically, leaving
+    /// `size_limit` unaffected.
+    #[test]
+    fn an_all_air_structure_fails_non_air_only() {
+        let path = temp_path("validate-all-air");
+        write_structure_file(&path, &air_only(IVec3::new(4, 4, 4))).expect("should write");
+
+        let result = validate(&validate_args(path.clone(), None)).expect("should parse");
+        std::fs::remove_file(&path).ok();
+
+        assert!(!result.all_passed());
+        assert!(!check(&result, "non_air").pass);
+        assert!(check(&result, "size_limit").pass);
+    }
+
+    /// The ticket's own "Done when": a structure built past the catalogue's
+    /// real size limit fails `size_limit`, with the actual and allowed sizes
+    /// both in the message. `write_structure_file` (unlike `struct new`,
+    /// which refuses outright — see the module docs) only warns on an
+    /// oversized blueprint, so writing one directly is how this fixture
+    /// exists at all.
+    #[test]
+    fn an_oversized_structure_fails_size_limit_with_actual_and_allowed_sizes_in_the_message() {
+        let side = STRUCTURE_BLOCK_MAX_SIZE + 1;
+        let path = temp_path("validate-oversized");
+        write_structure_file(&path, &one_stone(IVec3::splat(side))).expect("should write");
+
+        let result = validate(&validate_args(path.clone(), None)).expect("should parse");
+        std::fs::remove_file(&path).ok();
+
+        assert!(!result.all_passed());
+        let size_check = check(&result, "size_limit");
+        assert!(!size_check.pass);
+        assert!(size_check.detail.contains(&side.to_string()), "{}", size_check.detail);
+        assert!(
+            size_check.detail.contains(&STRUCTURE_BLOCK_MAX_SIZE.to_string()),
+            "{}",
+            size_check.detail
+        );
+        assert!(check(&result, "non_air").pass);
+    }
+
+    /// `--max-size` overrides the default cap — a structure well inside
+    /// [`STRUCTURE_BLOCK_MAX_SIZE`] still fails `size_limit` when validated
+    /// against a smaller ceiling, and the reported `max_size` reflects the
+    /// override rather than the default.
+    #[test]
+    fn max_size_overrides_the_default_cap() {
+        let path = temp_path("validate-max-size-override");
+        write_structure_file(&path, &one_stone(IVec3::new(4, 4, 4))).expect("should write");
+
+        let result = validate(&validate_args(path.clone(), Some(IVec3::new(2, 2, 2))))
+            .expect("should parse");
+        std::fs::remove_file(&path).ok();
+
+        assert!(!result.all_passed());
+        assert!(!check(&result, "size_limit").pass);
+        assert_eq!(result.max_size, IVec3::new(2, 2, 2));
+    }
+
+    /// A file that doesn't parse at all is a `Usage` error (exit `2`), not a
+    /// `Data` error (exit `1`, every other `struct` command's convention) —
+    /// per the ticket, there's no file to report per-check results about.
+    #[test]
+    fn a_file_that_does_not_parse_is_a_usage_error() {
+        let path = temp_path("validate-missing");
+        let err = validate(&validate_args(path, None)).unwrap_err();
+        match err {
+            CliError::Usage(_) => {}
+            CliError::Data(message) => panic!("expected Usage (exit 2), got Data: {message}"),
+        }
+    }
+
+    /// `render_json`'s shape: `"pass"` mirrors [`StructValidateResult::all_passed`],
+    /// and `"checks"` names every check individually, per the ticket's own
+    /// spelled-out example.
+    #[test]
+    fn render_json_reports_pass_and_every_named_check() {
+        let path = temp_path("validate-json-shape");
+        write_structure_file(&path, &air_only(IVec3::new(2, 2, 2))).expect("should write");
+
+        let result = validate(&validate_args(path.clone(), None)).expect("should parse");
+        std::fs::remove_file(&path).ok();
+
+        let json = result.render_json();
+        assert_eq!(json["pass"], false);
+        let checks = json["checks"].as_array().expect("array");
+        assert!(checks.iter().any(|c| c["name"] == "size_limit" && c["pass"] == true));
+        assert!(checks.iter().any(|c| c["name"] == "non_air" && c["pass"] == false));
     }
 }
