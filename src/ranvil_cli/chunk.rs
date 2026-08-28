@@ -137,7 +137,12 @@ fn build_chunk_result(
 /// no region there (ungenerated terrain, per [`MCLoadError::PathNotFoundError`])
 /// or the region has no NBT in this chunk's slot (an ungenerated chunk
 /// inside a region the save does have).
-fn load_chunk_nbt(cache: &mut RegionCache, (cx, cz): (i32, i32)) -> Result<Option<NbtField>, MCLoadError> {
+///
+/// `pub(crate)`: `heightmap` (ticket 090) reuses this rather than re-deriving
+/// its own chunk-load path — the "no new decode logic" rule the roadmap sets
+/// for read-only commands applies to *this* module's own code too, not just
+/// to `ranvil`'s.
+pub(crate) fn load_chunk_nbt(cache: &mut RegionCache, (cx, cz): (i32, i32)) -> Result<Option<NbtField>, MCLoadError> {
     let region_coord = chunk_to_region_coord((cx, cz));
     match cache.get_or_load(region_coord) {
         Ok(region) => {

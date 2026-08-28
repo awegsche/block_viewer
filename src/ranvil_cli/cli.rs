@@ -8,6 +8,7 @@
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use mc_anvil::heightmap::HeightmapKind;
 
 use super::coords::ChunkPos;
 use super::format::OutputFormat;
@@ -41,7 +42,9 @@ pub struct Cli {
 /// `Info`/`Regions`/`Lock`, the first three commands that need `--save`
 /// resolved (see `save::resolve_save`) rather than listing every save.
 /// Ticket 089 adds `Chunk`/`Chunks`, the first commands that decode a
-/// chunk's own NBT rather than just a region's metadata.
+/// chunk's own NBT rather than just a region's metadata. Ticket 090 adds
+/// `Heightmap`, the first command that returns a per-column (rather than
+/// per-chunk-summary) grid.
 /// Every later `ranvil-cli` ticket adds one more, routing to its own
 /// submodule the same way.
 #[derive(Debug, Subcommand)]
@@ -61,6 +64,8 @@ pub enum Command {
     /// Bulk survey over a rectangle of chunk coordinates: counts by
     /// `Status`, ungenerated chunks, aggregate block-entity/entity counts.
     Chunks(ChunksArgs),
+    /// One chunk's full 16×16 heightmap grid, for one of the four kinds.
+    Heightmap(HeightmapArgs),
 }
 
 /// `saves` takes no arguments of its own — the instance directory it lists
@@ -128,4 +133,59 @@ pub struct ChunksArgs {
     /// The opposite corner, "cx,cz".
     #[arg(allow_hyphen_values = true)]
     pub to: ChunkPos,
+}
+
+/// `heightmap <cx>,<cz> [--kind world-surface|motion-blocking|
+/// motion-blocking-no-leaves|ocean-floor]` (ticket 090, default `world-surface`).
+#[derive(Debug, Args)]
+pub struct HeightmapArgs {
+    /// Chunk coordinates, "cx,cz". See [`ChunkArgs::pos`] on why
+    /// `allow_hyphen_values`.
+    #[arg(allow_hyphen_values = true)]
+    pub pos: ChunkPos,
+
+    /// Which of the four heightmaps to read.
+    #[arg(long, value_enum, default_value = "world-surface")]
+    pub kind: HeightmapKindArg,
+}
+
+/// The `--kind` values `heightmap` accepts — a CLI-facing mirror of
+/// [`HeightmapKind`], kept separate rather than making `HeightmapKind` itself
+/// a `ValueEnum` since `ranvil` has no `clap` dependency of its own (the
+/// architectural rule the roadmap sets: format-crate types don't grow
+/// CLI-only derives). `ValueEnum`'s default `kebab-case` rename gives exactly
+/// the roadmap's spelling (`world-surface`, `motion-blocking-no-leaves`, ...)
+/// with no `#[value(rename_all = ...)]` needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum HeightmapKindArg {
+    WorldSurface,
+    MotionBlocking,
+    MotionBlockingNoLeaves,
+    OceanFloor,
+}
+
+impl HeightmapKindArg {
+    /// The exact string this variant parses from on the command line —
+    /// reused (rather than re-spelled) for `--format json`'s `"kind"` field
+    /// and for error messages, so a caller never sees a name that doesn't
+    /// round-trip back into `--kind`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HeightmapKindArg::WorldSurface => "world-surface",
+            HeightmapKindArg::MotionBlocking => "motion-blocking",
+            HeightmapKindArg::MotionBlockingNoLeaves => "motion-blocking-no-leaves",
+            HeightmapKindArg::OceanFloor => "ocean-floor",
+        }
+    }
+
+    /// The `ranvil` type this CLI value maps to — the one place that mapping
+    /// is spelled out.
+    pub fn to_kind(self) -> HeightmapKind {
+        match self {
+            HeightmapKindArg::WorldSurface => HeightmapKind::WorldSurface,
+            HeightmapKindArg::MotionBlocking => HeightmapKind::MotionBlocking,
+            HeightmapKindArg::MotionBlockingNoLeaves => HeightmapKind::MotionBlockingNoLeaves,
+            HeightmapKindArg::OceanFloor => HeightmapKind::OceanFloor,
+        }
+    }
 }

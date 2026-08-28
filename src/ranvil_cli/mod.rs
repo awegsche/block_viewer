@@ -7,8 +7,9 @@
 //! proving all four end to end. Every later ticket adds one more
 //! subcommand to [`cli::Command`] and one more arm to [`run`]'s dispatch.
 //!
-//! [`chunk`] gained `chunk`/`chunks` in ticket 089. [`block`], [`edit`],
-//! [`structure`] are still empty stubs — later tickets fill them in.
+//! [`chunk`] gained `chunk`/`chunks` in ticket 089; [`heightmap`] adds
+//! `heightmap` in ticket 090. [`block`], [`edit`], [`structure`] are still
+//! empty stubs — later tickets fill them in.
 
 use std::process::ExitCode;
 
@@ -21,6 +22,7 @@ pub mod coords;
 pub mod edit;
 pub mod error;
 pub mod format;
+pub mod heightmap;
 pub mod save;
 pub mod structure;
 
@@ -79,6 +81,11 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
         }
         Command::Chunks(args) => {
             let result = chunk::chunks(cli, args)?;
+            print(&result, cli.format);
+            Ok(())
+        }
+        Command::Heightmap(args) => {
+            let result = heightmap::heightmap(cli, args)?;
             print(&result, cli.format);
             Ok(())
         }
