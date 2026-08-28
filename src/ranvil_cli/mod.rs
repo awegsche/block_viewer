@@ -8,8 +8,9 @@
 //! subcommand to [`cli::Command`] and one more arm to [`run`]'s dispatch.
 //!
 //! [`chunk`] gained `chunk`/`chunks` in ticket 089; [`heightmap`] adds
-//! `heightmap` in ticket 090. [`block`], [`edit`], [`structure`] are still
-//! empty stubs — later tickets fill them in.
+//! `heightmap` in ticket 090; [`block`] adds `get` in ticket 091.
+//! [`edit`], [`structure`] are still empty stubs — later tickets fill them
+//! in.
 
 use std::process::ExitCode;
 
@@ -86,6 +87,11 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
         }
         Command::Heightmap(args) => {
             let result = heightmap::heightmap(cli, args)?;
+            print(&result, cli.format);
+            Ok(())
+        }
+        Command::Get(args) => {
+            let result = block::get(cli, args)?;
             print(&result, cli.format);
             Ok(())
         }

@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use mc_anvil::heightmap::HeightmapKind;
 
-use super::coords::ChunkPos;
+use super::coords::{BlockPos, ChunkPos};
 use super::format::OutputFormat;
 
 #[derive(Debug, Parser)]
@@ -45,6 +45,8 @@ pub struct Cli {
 /// chunk's own NBT rather than just a region's metadata. Ticket 090 adds
 /// `Heightmap`, the first command that returns a per-column (rather than
 /// per-chunk-summary) grid.
+/// Ticket 091 adds `Get`, the first command that decodes a section's packed
+/// block-state indices rather than just chunk/heightmap metadata.
 /// Every later `ranvil-cli` ticket adds one more, routing to its own
 /// submodule the same way.
 #[derive(Debug, Subcommand)]
@@ -66,6 +68,8 @@ pub enum Command {
     Chunks(ChunksArgs),
     /// One chunk's full 16×16 heightmap grid, for one of the four kinds.
     Heightmap(HeightmapArgs),
+    /// One block's name + properties.
+    Get(GetArgs),
 }
 
 /// `saves` takes no arguments of its own — the instance directory it lists
@@ -162,6 +166,15 @@ pub enum HeightmapKindArg {
     MotionBlocking,
     MotionBlockingNoLeaves,
     OceanFloor,
+}
+
+/// `get <x>,<y>,<z>` (ticket 091).
+#[derive(Debug, Args)]
+pub struct GetArgs {
+    /// Block coordinates, "x,y,z". See [`ChunkArgs::pos`] on why
+    /// `allow_hyphen_values`.
+    #[arg(allow_hyphen_values = true)]
+    pub pos: BlockPos,
 }
 
 impl HeightmapKindArg {
