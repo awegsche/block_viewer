@@ -1,17 +1,22 @@
-//! Shared core for the two games in this package (ticket 027): the
-//! `block_viewer` explorer and the `citybuilder` built on top of it. Both
-//! live *inside* this lib rather than in separate crates, so `pub(crate)`
-//! keeps working across every shared module and no visibility churn was
-//! needed to grow the second entry point. The workspace split
-//! (`mc_core` / `block_viewer` / `citybuilder`) stays available as a later
-//! move, once the shared core stops changing shape.
+//! Shared core for the two games in this package (ticket 027) plus the
+//! headless `ranvil-cli` (ticket 087): the `block_viewer` explorer, the
+//! `citybuilder` built on top of it, and a third, windowless entry point for
+//! agent-driven save/structure inspection and editing. All three live
+//! *inside* this lib rather than in separate crates, so `pub(crate)` keeps
+//! working across every shared module and no visibility churn was needed to
+//! grow a second or third entry point. The workspace split (`mc_core` /
+//! `block_viewer` / `citybuilder`) stays available as a later move, once the
+//! shared core stops changing shape.
 //!
 //! ## The module tree
 //!
-//! Everything above [`viewer`] and [`city`] is shared: [`world`] (decode,
-//! mesh, atlas, tint, biome, block), [`blueprint`], [`selection`]'s
-//! coordinate rules, [`region_cache`], [`streaming`], [`chunk_pipeline`],
-//! [`unload`], [`sky`] and [`camera`]. The two games are the leaves.
+//! Everything above [`viewer`], [`city`] and [`ranvil_cli`] is shared:
+//! [`world`] (decode, mesh, atlas, tint, biome, block), [`blueprint`],
+//! [`selection`]'s coordinate rules, [`region_cache`], [`streaming`],
+//! [`chunk_pipeline`], [`unload`], [`sky`] and [`camera`]. The three
+//! entry points are the leaves — [`ranvil_cli`] never touches Bevy ECS at
+//! all, unlike the other two, since it calls straight into the shared
+//! save/blueprint/edit logic without an `App`.
 //!
 //! [`selection`] is shared rather than viewer-only — the roadmap's sketch
 //! put it under `viewer`, but `blueprint::extract` already takes a
@@ -51,6 +56,7 @@ pub mod camera;
 pub mod chunk_pipeline;
 pub mod city;
 pub mod edit;
+pub mod ranvil_cli;
 pub mod region_cache;
 pub mod selection;
 pub mod sky;

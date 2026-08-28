@@ -20,9 +20,17 @@ path = "src/bin/block_viewer.rs"
 name = "citybuilder"
 path = "src/bin/citybuilder.rs"
 
+[[bin]]
+name = "ranvil-cli"
+path = "src/bin/ranvil_cli.rs"
+
 [dependencies]
 bevy = "0.15.0"
 bevy_egui = "0.31.1"
+# Argument parsing for the ranvil-cli binary (ticket 087). The only new
+# dependency this whole executable adds — everything else it calls into
+# already exists in the lib.
+clap = { version = "4", features = ["derive"] }
 dirs = "5.0.1"
 # Gzip for the structure files ticket 023 writes. Already in `Cargo.lock` —
 # `ranvil` pulls it in for region decompression — so naming it here costs no
@@ -45,6 +53,10 @@ ron = "0.8.1"
 rfd = "0.17.2"
 rnbt = { version = "0.1.0", path = "../rnbt" }
 serde = { version = "1.0.217", features = ["derive"] }
+# `ranvil_cli::format`'s JSON output (ticket 087). Already in `Cargo.lock` —
+# bevy pulls it in transitively — so this names an existing version rather
+# than adding a new download, same as `flate2`/`ron` above.
+serde_json = "1.0.134"
 
 # Enable a small amount of optimization in the dev profile.
 [profile.dev]
