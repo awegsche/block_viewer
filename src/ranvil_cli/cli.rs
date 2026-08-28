@@ -114,7 +114,9 @@ pub enum Command {
 
 /// `struct <cmd>` (tickets 098–103): one variant per structure-file
 /// subcommand, routed the same way [`Command`] routes its own top-level
-/// variants — see [`super::structure`].
+/// variants — see [`super::structure`]. Ticket 100 adds `get`/`set`/`fill`,
+/// the first commands that edit a [`crate::blueprint::Blueprint`] in memory
+/// outside of extraction and rotation.
 #[derive(Debug, Subcommand)]
 pub enum StructCommand {
     /// A structure file's own shape: size, origin, block count,
@@ -126,6 +128,13 @@ pub enum StructCommand {
     Export(StructExportArgs),
     /// Place a structure file's blocks into a live save.
     Import(StructImportArgs),
+    /// Read one block inside a structure file, at a position relative to the
+    /// structure's own `0..size` space.
+    Get(StructGetArgs),
+    /// Edit one block inside a structure file, in place or to a new file.
+    Set(StructSetArgs),
+    /// Fill a sub-box inside a structure file with one block.
+    Fill(StructFillArgs),
 }
 
 /// `struct info <file.nbt>` (ticket 098).
@@ -257,6 +266,85 @@ impl RotateArg {
             RotateArg::Deg270 => crate::blueprint::Rotation::Deg270,
         }
     }
+}
+
+/// `struct get <file.nbt> <x,y,z>` (ticket 100) — [`crate::blueprint::Blueprint::block_at`]'s
+/// job, but with an in-bounds check that refuses instead of quietly reading
+/// `None`. `pos` is relative to the structure's own `0..size` space, **not**
+/// a world coordinate — the one exception among every other `get`-shaped
+/// command in this CLI, per the ticket.
+#[derive(Debug, Args)]
+pub struct StructGetArgs {
+    /// Path to a gzipped vanilla structure file.
+    pub file: PathBuf,
+
+    /// Position inside the structure, "x,y,z" — `0..size` on each axis, not
+    /// a world coordinate. See [`ChunkArgs::pos`] on why `allow_hyphen_values`.
+    #[arg(allow_hyphen_values = true)]
+    pub pos: BlockPos,
+}
+
+/// `struct set <file.nbt> <x,y,z> <blockstate> [--out <file2.nbt>]
+/// [--force]` (ticket 100): sets one position's palette index, inserting a
+/// new palette entry if `state` isn't already in it. `pos` is relative to the
+/// structure's own `0..size` space, same as [`StructGetArgs::pos`].
+///
+/// Without `--out`, overwrites `file` in place — refused without `--force`,
+/// the same "editing a file in place is destructive too" gate `struct new`/
+/// `struct export` apply to their own `--out`. With `--out`, the original is
+/// untouched; `--out` pointing at an existing path follows the identical
+/// `--force` gate rather than a special case, so the same rule covers both
+/// "overwrite the source" and "overwrite something else already there".
+#[derive(Debug, Args)]
+pub struct StructSetArgs {
+    /// Path to a gzipped vanilla structure file.
+    pub file: PathBuf,
+
+    /// Position inside the structure, "x,y,z". See [`StructGetArgs::pos`].
+    #[arg(allow_hyphen_values = true)]
+    pub pos: BlockPos,
+
+    /// The block to write, e.g. `minecraft:oak_stairs[facing=east,half=top]`.
+    pub state: BlockState,
+
+    /// Write the edited structure to a new file instead of `file` itself.
+    #[arg(long)]
+    pub out: Option<PathBuf>,
+
+    /// Overwrite the output path if it already exists.
+    #[arg(long)]
+    pub force: bool,
+}
+
+/// `struct fill <file.nbt> <x1,y1,z1> <x2,y2,z2> <blockstate> [--out
+/// <file2.nbt>] [--force]` (ticket 100): the same in-bounds box-fill as
+/// `struct set`, batched — one palette-growth pass rather than one per block,
+/// same reason [`ranvil::chunkregion::ChunkRegion::set_blocks`] exists over
+/// calling `set_block` in a loop. Either corner may be given in either order,
+/// same as [`GetAreaArgs`]. See [`StructSetArgs`] on `--out`/`--force`.
+#[derive(Debug, Args)]
+pub struct StructFillArgs {
+    /// Path to a gzipped vanilla structure file.
+    pub file: PathBuf,
+
+    /// One corner of the box, "x,y,z" — inside the structure's own `0..size`
+    /// space, same as [`StructGetArgs::pos`].
+    #[arg(allow_hyphen_values = true)]
+    pub from: BlockPos,
+    /// The opposite corner, "x,y,z".
+    #[arg(allow_hyphen_values = true)]
+    pub to: BlockPos,
+
+    /// The block to fill the box with.
+    pub state: BlockState,
+
+    /// Write the edited structure to a new file instead of `file` itself.
+    #[arg(long)]
+    pub out: Option<PathBuf>,
+
+    /// Overwrite the output path if it already exists.
+    #[arg(long)]
+    pub force: bool,
 }
 
 /// `saves` takes no arguments of its own — the instance directory it lists

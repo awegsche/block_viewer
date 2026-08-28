@@ -32,6 +32,10 @@
 //! `write_structure_file`; `import` is `read_structure_file` (optionally
 //! rotated) turned into a `WorldEdit` and run through `run_write` — so
 //! unlike `info`/`new` these two *do* take `--save`/`--instance`.
+//! Ticket 100 adds `struct get`/`struct set`/`struct fill`, the first
+//! commands that edit a [`crate::blueprint::Blueprint`] in memory outside of
+//! extraction and rotation — no `--save`/`--instance` either, like `info`/
+//! `new`, since everything they touch is a file on disk.
 
 use std::process::ExitCode;
 
@@ -173,6 +177,21 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
         }
         Command::Struct(StructCommand::Import(args)) => {
             let result = structure::import(cli, args)?;
+            print(&result, cli.format);
+            Ok(())
+        }
+        Command::Struct(StructCommand::Get(args)) => {
+            let result = structure::get(args)?;
+            print(&result, cli.format);
+            Ok(())
+        }
+        Command::Struct(StructCommand::Set(args)) => {
+            let result = structure::set(args)?;
+            print(&result, cli.format);
+            Ok(())
+        }
+        Command::Struct(StructCommand::Fill(args)) => {
+            let result = structure::fill(args)?;
             print(&result, cli.format);
             Ok(())
         }

@@ -23,6 +23,21 @@
 //! [`crate::edit::WorldEdit`] run through [`super::edit::run_write`] (094's
 //! write substrate) — the same read-then-write shape [`super::edit::copy`]
 //! (097) uses, just with a file instead of a second box as the source.
+//!
+//! `get`/`set`/`fill` (ticket 100) are the first commands that edit a
+//! [`Blueprint`] in memory outside of extraction and rotation, scoped
+//! tightly to their world-side `get`/`set`/`set-area` equivalents: no
+//! `--save`/`--instance` (a structure file is the whole story), positions
+//! relative to the structure's own `0..size` space rather than a world
+//! coordinate, and out-of-bounds is [`CliError::Usage`] rather than
+//! [`CliError::Data`] — a structure file's extent is fully known up front
+//! from its own `size`, unlike a live save's "maybe it's just ungenerated"
+//! ambiguity. `set`/`fill` share one palette-growth rule
+//! ([`palette_index_for`]), mirroring — rather than reusing — the "does the
+//! palette need to grow" logic [`ranvil::chunkregion::ChunkRegion::set_blocks`]
+//! performs for a live section: `Blueprint`'s dense `Vec<u16>` and a
+//! section's packed-bits array are different representations of the same
+//! idea.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -42,7 +57,10 @@ use crate::world::SECTION_SIZE;
 
 use super::block::position_of;
 use super::chunk::region_span;
-use super::cli::{Cli, RotateArg, StructExportArgs, StructImportArgs, StructInfoArgs, StructNewArgs};
+use super::cli::{
+    Cli, RotateArg, StructExportArgs, StructFillArgs, StructGetArgs, StructImportArgs,
+    StructInfoArgs, StructNewArgs, StructSetArgs,
+};
 use super::edit::{outcome_json_fields, outcome_summary, run_write, WriteOutcome};
 use super::error::CliError;
 use super::format::Render;
@@ -461,6 +479,282 @@ impl Render for StructImportResult {
             map.insert(key.to_string(), value);
         }
         Value::Object(map)
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// ---- get / set / fill (ticket 100) ----------------------------------------------------------
+// -------------------------------------------------------------------------------------------------
+
+/// The flat index into [`Blueprint::blocks`] for a position already known to
+/// be in `0..size` on every axis — [`SelectionBounds::index_of`]'s Y-outer/
+/// Z-middle/X-inner order with an implicit min corner of [`IVec3::ZERO`],
+/// spelled out here rather than routed through [`SelectionBounds`]: that
+/// type's own [`SelectionBounds::from_corners`] clamps Y into the world's
+/// build limits, which is the wrong bound for a structure's own
+/// `0..size`-tall space (bounded instead by [`STRUCTURE_BLOCK_MAX_SIZE`],
+/// comfortably inside the world's own Y range but a different constraint
+/// with a different owner).
+fn flat_index(size: IVec3, pos: IVec3) -> usize {
+    (pos.y as usize) * (size.z as usize) * (size.x as usize)
+        + (pos.z as usize) * (size.x as usize)
+        + (pos.x as usize)
+}
+
+/// Bounds-checks `pos` against `size`'s `0..size` structure-local space and
+/// returns its [`flat_index`]. Out of bounds is [`CliError::Usage`] naming
+/// the file's actual size — the ticket's own call: unlike a live save, a
+/// structure file's extent is fully known up front (from `struct info`),
+/// so there's no "maybe it's just ungenerated" ambiguity worth preserving
+/// with a [`CliError::Data`] here.
+fn index_in_blueprint(size: IVec3, pos: IVec3) -> Result<usize, CliError> {
+    if pos.cmplt(IVec3::ZERO).any() || pos.cmpge(size).any() {
+        return Err(CliError::Usage(format!(
+            "{pos} is outside this structure's bounds (size {}x{}x{})",
+            size.x, size.y, size.z
+        )));
+    }
+    Ok(flat_index(size, pos))
+}
+
+/// Where `struct set`/`struct fill` write: `file` itself when `out` is
+/// `None`, refused without `force` — the same "editing a file in place is
+/// destructive too" gate `struct new`/`struct export` apply to their own
+/// `--out`, applied here to the *default* output path instead. A given
+/// `--out` that already names an existing file follows the identical gate
+/// rather than a special case, so "overwrite the source" and "overwrite
+/// something else already sitting at `--out`" are one rule, not two.
+fn resolve_struct_out(file: &std::path::Path, out: &Option<PathBuf>, force: bool) -> Result<PathBuf, CliError> {
+    let target = out.clone().unwrap_or_else(|| file.to_path_buf());
+    if target.exists() && !force {
+        return Err(CliError::Usage(format!(
+            "{} already exists — pass --force to overwrite",
+            target.display()
+        )));
+    }
+    Ok(target)
+}
+
+/// Finds `state`'s index in `palette`, inserting it as a new entry if it
+/// isn't already present — the palette-growth question [`ranvil::chunkregion::ChunkRegion::set_blocks`]
+/// answers for a live section's packed palette (see the module docs),
+/// mirrored here for `Blueprint`'s plain `Vec<BlockState>`. Growth is capped
+/// at exactly one entry per distinct new state, never a duplicate: an
+/// already-present state (matched by `PartialEq`, i.e. name plus its already-
+/// sorted properties — see [`BlockState`]'s own docs on why the sort makes
+/// this comparison correct) reuses its existing index.
+fn palette_index_for(palette: &mut Vec<BlockState>, state: BlockState) -> u16 {
+    match palette.iter().position(|entry| entry == &state) {
+        Some(index) => index as u16,
+        None => {
+            palette.push(state);
+            (palette.len() - 1) as u16
+        }
+    }
+}
+
+/// `struct get`'s result: the block at one position inside a structure file.
+#[derive(Debug)]
+pub struct StructGetResult {
+    pub file: PathBuf,
+    /// Relative to the structure's own `0..size` space — see
+    /// [`StructGetArgs::pos`].
+    pub pos: IVec3,
+    pub state: BlockState,
+}
+
+/// Runs `struct get`: [`read_structure_file`], then [`index_in_blueprint`]
+/// against `args.pos` — the same lookup [`Blueprint::block_at`] performs,
+/// except a position outside the structure refuses with
+/// [`CliError::Usage`] rather than `block_at`'s silent `None`, per the
+/// ticket.
+pub fn get(args: &StructGetArgs) -> Result<StructGetResult, CliError> {
+    let blueprint = read_structure_file(&args.file)
+        .map_err(|err| CliError::Data(format!("{}: {err}", args.file.display())))?;
+
+    let pos = args.pos.0;
+    let index = index_in_blueprint(blueprint.size, pos)?;
+    let state = blueprint.palette[blueprint.blocks[index] as usize].clone();
+
+    Ok(StructGetResult { file: args.file.clone(), pos, state })
+}
+
+impl Render for StructGetResult {
+    /// The same copy-pasteable block-state string [`super::block::GetResult::render_text`]
+    /// prints for the world-side `get` — straight into `struct set`'s own
+    /// `state` argument.
+    fn render_text(&self) -> String {
+        self.state.to_string()
+    }
+
+    fn render_json(&self) -> Value {
+        let mut properties = serde_json::Map::new();
+        for (key, value) in &self.state.properties {
+            properties.insert(key.clone(), json!(value));
+        }
+        json!({
+            "file": self.file.display().to_string(),
+            "pos": [self.pos.x, self.pos.y, self.pos.z],
+            "name": self.state.name,
+            "properties": properties,
+        })
+    }
+}
+
+/// `struct set`'s result: the position and block written, where it landed,
+/// and whether the palette grew to hold it.
+#[derive(Debug)]
+pub struct StructSetResult {
+    pub file: PathBuf,
+    pub out: PathBuf,
+    pub pos: IVec3,
+    pub state: BlockState,
+    pub palette_grew: bool,
+}
+
+/// Runs `struct set`: [`read_structure_file`], [`index_in_blueprint`] on
+/// `args.pos`, [`palette_index_for`] to find or grow the palette entry for
+/// `args.state`, then [`write_structure_file`] to [`resolve_struct_out`]'s
+/// target.
+///
+/// Every check — the position's bounds, the output path's `--force` gate —
+/// happens before the in-memory [`Blueprint`] is touched, so a refused call
+/// leaves both `args.file` and any existing `--out` exactly as they were.
+pub fn set(args: &StructSetArgs) -> Result<StructSetResult, CliError> {
+    let mut blueprint = read_structure_file(&args.file)
+        .map_err(|err| CliError::Data(format!("{}: {err}", args.file.display())))?;
+
+    let pos = args.pos.0;
+    let index = index_in_blueprint(blueprint.size, pos)?;
+    let out = resolve_struct_out(&args.file, &args.out, args.force)?;
+
+    let before = blueprint.palette.len();
+    let palette_index = palette_index_for(&mut blueprint.palette, args.state.clone());
+    blueprint.blocks[index] = palette_index;
+    let palette_grew = blueprint.palette.len() > before;
+
+    write_structure_file(&out, &blueprint)
+        .map_err(|err| CliError::Data(format!("could not write {}: {err}", out.display())))?;
+
+    Ok(StructSetResult { file: args.file.clone(), out, pos, state: args.state.clone(), palette_grew })
+}
+
+impl StructSetResult {
+    fn summary_line(&self) -> String {
+        format!(
+            "struct set {} {} = {} -> {}{}",
+            self.file.display(),
+            self.pos,
+            self.state,
+            self.out.display(),
+            if self.palette_grew { " (new palette entry)" } else { "" },
+        )
+    }
+}
+
+impl Render for StructSetResult {
+    fn render_text(&self) -> String {
+        self.summary_line()
+    }
+
+    fn render_json(&self) -> Value {
+        json!({
+            "file": self.file.display().to_string(),
+            "out": self.out.display().to_string(),
+            "pos": [self.pos.x, self.pos.y, self.pos.z],
+            "block": self.state.to_string(),
+            "palette_grew": self.palette_grew,
+        })
+    }
+}
+
+/// `struct fill`'s result: the box and block filled, where it landed, how
+/// many positions were rewritten, and whether the palette grew.
+#[derive(Debug)]
+pub struct StructFillResult {
+    pub file: PathBuf,
+    pub out: PathBuf,
+    /// The box's min/max corners, already normalized — either order in
+    /// `args.from`/`args.to` lands here the same way.
+    pub from: IVec3,
+    pub to: IVec3,
+    pub state: BlockState,
+    pub blocks_filled: usize,
+    pub palette_grew: bool,
+}
+
+/// Runs `struct fill`: [`read_structure_file`], normalizes `args.from`/
+/// `args.to` into a min/max box and bounds-checks both corners via
+/// [`index_in_blueprint`] (sufficient for an axis-aligned box: every position
+/// between two in-bounds corners is itself in bounds), [`palette_index_for`]
+/// once for `args.state` — one palette-growth pass rather than one per
+/// block, mirroring why [`ranvil::chunkregion::ChunkRegion::set_blocks`]
+/// exists over calling `set_block` in a loop — then writes every position in
+/// the box to that one index before a single [`write_structure_file`].
+pub fn fill(args: &StructFillArgs) -> Result<StructFillResult, CliError> {
+    let mut blueprint = read_structure_file(&args.file)
+        .map_err(|err| CliError::Data(format!("{}: {err}", args.file.display())))?;
+
+    let min = args.from.0.min(args.to.0);
+    let max = args.from.0.max(args.to.0);
+    index_in_blueprint(blueprint.size, min)?;
+    index_in_blueprint(blueprint.size, max)?;
+
+    let out = resolve_struct_out(&args.file, &args.out, args.force)?;
+
+    let before = blueprint.palette.len();
+    let palette_index = palette_index_for(&mut blueprint.palette, args.state.clone());
+    let size = blueprint.size;
+
+    let mut blocks_filled = 0usize;
+    for y in min.y..=max.y {
+        for z in min.z..=max.z {
+            for x in min.x..=max.x {
+                let index = flat_index(size, IVec3::new(x, y, z));
+                blueprint.blocks[index] = palette_index;
+                blocks_filled += 1;
+            }
+        }
+    }
+    let palette_grew = blueprint.palette.len() > before;
+
+    write_structure_file(&out, &blueprint)
+        .map_err(|err| CliError::Data(format!("could not write {}: {err}", out.display())))?;
+
+    Ok(StructFillResult { file: args.file.clone(), out, from: min, to: max, state: args.state.clone(), blocks_filled, palette_grew })
+}
+
+impl StructFillResult {
+    fn summary_line(&self) -> String {
+        format!(
+            "struct fill {} {} to {} = {} -> {}: {} block{} filled{}",
+            self.file.display(),
+            self.from,
+            self.to,
+            self.state,
+            self.out.display(),
+            self.blocks_filled,
+            if self.blocks_filled == 1 { "" } else { "s" },
+            if self.palette_grew { " (new palette entry)" } else { "" },
+        )
+    }
+}
+
+impl Render for StructFillResult {
+    fn render_text(&self) -> String {
+        self.summary_line()
+    }
+
+    fn render_json(&self) -> Value {
+        json!({
+            "file": self.file.display().to_string(),
+            "out": self.out.display().to_string(),
+            "from": [self.from.x, self.from.y, self.from.z],
+            "to": [self.to.x, self.to.y, self.to.z],
+            "block": self.state.to_string(),
+            "blocks_filled": self.blocks_filled,
+            "palette_grew": self.palette_grew,
+        })
     }
 }
 
@@ -1083,5 +1377,315 @@ mod tests {
             "must not have overwritten"
         );
         std::fs::remove_file(&out).ok();
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // ---- get / set / fill (ticket 100) -----------------------------------------------------
+    // -----------------------------------------------------------------------------------------
+
+    fn write_sample(label: &str) -> PathBuf {
+        let path = temp_path(label);
+        write_structure_file(&path, &sample_blueprint()).expect("should write");
+        path
+    }
+
+    fn get_args(file: PathBuf, pos: IVec3) -> StructGetArgs {
+        StructGetArgs { file, pos: BlockPos(pos) }
+    }
+
+    fn set_args(file: PathBuf, pos: IVec3, state: BlockState, out: Option<PathBuf>, force: bool) -> StructSetArgs {
+        StructSetArgs { file, pos: BlockPos(pos), state, out, force }
+    }
+
+    fn fill_args(
+        file: PathBuf,
+        from: IVec3,
+        to: IVec3,
+        state: BlockState,
+        out: Option<PathBuf>,
+        force: bool,
+    ) -> StructFillArgs {
+        StructFillArgs { file, from: BlockPos(from), to: BlockPos(to), state, out, force }
+    }
+
+    /// `struct get` reads back exactly what [`sample_blueprint`] put at each
+    /// of its two positions.
+    #[test]
+    fn get_reads_the_blueprints_own_blocks() {
+        let path = write_sample("get-basic");
+
+        let air = get(&get_args(path.clone(), IVec3::new(0, 0, 0))).expect("in bounds").state;
+        let stone = get(&get_args(path.clone(), IVec3::new(1, 0, 0))).expect("in bounds").state;
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(air, BlockState::air());
+        assert_eq!(stone, state("minecraft:stone"));
+    }
+
+    /// The ticket's own "Done when": `struct set` then `struct get` on the
+    /// same file agree.
+    #[test]
+    fn set_then_get_on_the_same_file_round_trips() {
+        let path = write_sample("set-roundtrip-same-file");
+        let stairs = state("minecraft:oak_stairs");
+
+        set(&set_args(path.clone(), IVec3::new(0, 0, 0), stairs.clone(), None, true))
+            .expect("in-place set with --force");
+
+        let read_back = get(&get_args(path.clone(), IVec3::new(0, 0, 0))).expect("in bounds").state;
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(read_back, stairs);
+    }
+
+    /// The same round trip via `--out`: the original is untouched, and the
+    /// new file carries the edit.
+    #[test]
+    fn set_with_out_leaves_the_original_untouched_and_writes_the_edit_to_the_new_file() {
+        let path = write_sample("set-roundtrip-out-source");
+        let out = temp_path("set-roundtrip-out-dest");
+        let stairs = state("minecraft:oak_stairs");
+
+        set(&set_args(path.clone(), IVec3::new(0, 0, 0), stairs.clone(), Some(out.clone()), false))
+            .expect("a fresh --out path needs no --force");
+
+        let original_at_zero = get(&get_args(path.clone(), IVec3::new(0, 0, 0))).expect("in bounds").state;
+        let edited_at_zero = get(&get_args(out.clone(), IVec3::new(0, 0, 0))).expect("in bounds").state;
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&out).ok();
+
+        assert_eq!(original_at_zero, BlockState::air(), "the source file must be untouched");
+        assert_eq!(edited_at_zero, stairs);
+    }
+
+    /// The ticket's own "Done when": a blockstate not already in the palette
+    /// grows it by exactly one entry.
+    #[test]
+    fn set_with_a_new_blockstate_grows_the_palette_by_exactly_one() {
+        let path = write_sample("set-grows-palette");
+        let before = info(&StructInfoArgs { file: path.clone() }).expect("read").palette.len();
+
+        let result = set(&set_args(path.clone(), IVec3::new(0, 0, 0), state("minecraft:dirt"), None, true))
+            .expect("in-place set");
+        let after = info(&StructInfoArgs { file: path.clone() }).expect("read").palette.len();
+        std::fs::remove_file(&path).ok();
+
+        assert!(result.palette_grew);
+        assert_eq!(after, before + 1);
+    }
+
+    /// The ticket's other "Done when": setting to a state already present
+    /// does not duplicate it.
+    #[test]
+    fn set_with_an_existing_blockstate_does_not_duplicate_it() {
+        let path = write_sample("set-no-duplicate");
+        let before = info(&StructInfoArgs { file: path.clone() }).expect("read").palette.len();
+
+        // Position (0, 0, 0) is already air; setting it to the *other*
+        // existing entry (stone) should still not grow the palette.
+        let result = set(&set_args(path.clone(), IVec3::new(0, 0, 0), state("minecraft:stone"), None, true))
+            .expect("in-place set");
+        let after = info(&StructInfoArgs { file: path.clone() }).expect("read").palette.len();
+        std::fs::remove_file(&path).ok();
+
+        assert!(!result.palette_grew);
+        assert_eq!(after, before);
+    }
+
+    /// `struct set` without `--out` and without `--force` refuses, and
+    /// touches nothing — the "editing in place is destructive too" gate.
+    #[test]
+    fn set_in_place_without_force_refuses_and_touches_nothing() {
+        let path = write_sample("set-no-force");
+        let before = std::fs::read(&path).expect("read the original");
+
+        let err = set(&set_args(path.clone(), IVec3::new(0, 0, 0), state("minecraft:dirt"), None, false))
+            .unwrap_err();
+
+        match err {
+            CliError::Usage(message) => assert!(message.contains("--force"), "{message}"),
+            CliError::Data(message) => panic!("expected Usage (exit 2), got Data: {message}"),
+        }
+        assert_eq!(std::fs::read(&path).expect("still readable"), before, "must not have overwritten");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// `struct set --out` onto an existing path without `--force` refuses the
+    /// same way — the gate covers "overwrite the source" and "overwrite
+    /// something else at `--out`" identically.
+    #[test]
+    fn set_with_out_onto_an_existing_path_without_force_refuses() {
+        let path = write_sample("set-out-no-force-source");
+        let out = temp_path("set-out-no-force-dest");
+        std::fs::write(&out, b"not a structure file").expect("seed an existing file");
+
+        let err = set(&set_args(path.clone(), IVec3::new(0, 0, 0), state("minecraft:dirt"), Some(out.clone()), false))
+            .unwrap_err();
+
+        match err {
+            CliError::Usage(message) => assert!(message.contains("--force"), "{message}"),
+            CliError::Data(message) => panic!("expected Usage (exit 2), got Data: {message}"),
+        }
+        assert_eq!(
+            std::fs::read(&out).expect("still readable"),
+            b"not a structure file",
+            "must not have overwritten"
+        );
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&out).ok();
+    }
+
+    /// The ticket's own "Done when" for `struct fill`: a fill over a sub-box
+    /// changes only that sub-box — verified against `struct info`'s block
+    /// count before/after (unchanged, fill replaces rather than adds) and
+    /// sampled `struct get` calls both inside and outside the filled box.
+    #[test]
+    fn fill_changes_only_the_sub_box() {
+        let path = temp_path("fill-sub-box");
+        let blueprint = Blueprint {
+            size: IVec3::new(4, 1, 4),
+            origin: IVec3::ZERO,
+            palette: vec![BlockState::air()],
+            blocks: vec![0u16; 16],
+            data_version: 3953,
+            failed_columns: 0,
+        };
+        write_structure_file(&path, &blueprint).expect("should write");
+        let before_blocks = info(&StructInfoArgs { file: path.clone() }).expect("read").blocks;
+
+        let result = fill(&fill_args(
+            path.clone(),
+            IVec3::new(1, 0, 1),
+            IVec3::new(2, 0, 2),
+            state("minecraft:stone"),
+            None,
+            true,
+        ))
+        .expect("in-bounds fill");
+
+        let after_info = info(&StructInfoArgs { file: path.clone() }).expect("read");
+
+        assert_eq!(result.blocks_filled, 4);
+        assert!(result.palette_grew);
+        assert_eq!(after_info.blocks, before_blocks, "fill replaces, never adds blocks");
+
+        // Inside the filled sub-box: stone everywhere.
+        for (x, z) in [(1, 1), (2, 1), (1, 2), (2, 2)] {
+            let got = get(&get_args(path.clone(), IVec3::new(x, 0, z))).expect("in bounds").state;
+            assert_eq!(got, state("minecraft:stone"), "at ({x}, 0, {z})");
+        }
+        // Outside the filled sub-box: still air.
+        for (x, z) in [(0, 0), (3, 0), (0, 3), (3, 3)] {
+            let got = get(&get_args(path.clone(), IVec3::new(x, 0, z))).expect("in bounds").state;
+            assert_eq!(got, BlockState::air(), "at ({x}, 0, {z})");
+        }
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A corner given in the opposite order (`from` greater than `to` on
+    /// every axis) still fills the same box — corners normalize like every
+    /// other box command in this CLI.
+    #[test]
+    fn fill_normalizes_reversed_corners() {
+        let path = temp_path("fill-reversed");
+        let blueprint = Blueprint {
+            size: IVec3::new(3, 1, 3),
+            origin: IVec3::ZERO,
+            palette: vec![BlockState::air()],
+            blocks: vec![0u16; 9],
+            data_version: 3953,
+            failed_columns: 0,
+        };
+        write_structure_file(&path, &blueprint).expect("should write");
+
+        let result = fill(&fill_args(
+            path.clone(),
+            IVec3::new(2, 0, 2),
+            IVec3::new(0, 0, 0),
+            state("minecraft:stone"),
+            None,
+            true,
+        ))
+        .expect("reversed corners should normalize");
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(result.blocks_filled, 9);
+        assert_eq!(result.from, IVec3::ZERO);
+        assert_eq!(result.to, IVec3::new(2, 0, 2));
+    }
+
+    /// The ticket's own "Done when": out-of-bounds coordinates on `struct
+    /// get` exit 2 (`Usage`) with the file's actual size named.
+    #[test]
+    fn get_out_of_bounds_is_a_usage_error_naming_the_actual_size() {
+        let path = write_sample("get-out-of-bounds");
+        let err = get(&get_args(path.clone(), IVec3::new(5, 0, 0))).unwrap_err();
+        std::fs::remove_file(&path).ok();
+
+        match err {
+            CliError::Usage(message) => assert!(message.contains("2x1x1"), "{message}"),
+            CliError::Data(message) => panic!("expected Usage (exit 2), got Data: {message}"),
+        }
+    }
+
+    /// Same contract for `struct set` — refused before anything is written.
+    #[test]
+    fn set_out_of_bounds_is_a_usage_error_and_touches_nothing() {
+        let path = write_sample("set-out-of-bounds");
+        let before = std::fs::read(&path).expect("read the original");
+
+        let err = set(&set_args(path.clone(), IVec3::new(-1, 0, 0), state("minecraft:dirt"), None, true))
+            .unwrap_err();
+
+        match err {
+            CliError::Usage(message) => assert!(message.contains("2x1x1"), "{message}"),
+            CliError::Data(message) => panic!("expected Usage (exit 2), got Data: {message}"),
+        }
+        assert_eq!(std::fs::read(&path).expect("still readable"), before, "must not have written");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Same contract for `struct fill` — a box that partly spills outside
+    /// the structure is refused in full, not partially applied.
+    #[test]
+    fn fill_out_of_bounds_is_a_usage_error_and_touches_nothing() {
+        let path = write_sample("fill-out-of-bounds");
+        let before = std::fs::read(&path).expect("read the original");
+
+        let err = fill(&fill_args(
+            path.clone(),
+            IVec3::new(0, 0, 0),
+            IVec3::new(5, 0, 0),
+            state("minecraft:dirt"),
+            None,
+            true,
+        ))
+        .unwrap_err();
+
+        match err {
+            CliError::Usage(message) => assert!(message.contains("2x1x1"), "{message}"),
+            CliError::Data(message) => panic!("expected Usage (exit 2), got Data: {message}"),
+        }
+        assert_eq!(std::fs::read(&path).expect("still readable"), before, "must not have written");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// `struct get`/`struct set`/`struct fill` on a missing file are `Data`
+    /// errors (exit 1), same as `struct info`'s own missing-file test — the
+    /// path was well-formed, it's the read that failed.
+    #[test]
+    fn missing_file_is_a_data_error_for_get_set_and_fill() {
+        let path = temp_path("missing-for-get-set-fill");
+
+        let get_err = get(&get_args(path.clone(), IVec3::ZERO)).unwrap_err();
+        assert!(matches!(get_err, CliError::Data(_)), "get: {get_err:?}");
+
+        let set_err = set(&set_args(path.clone(), IVec3::ZERO, state("minecraft:dirt"), None, true)).unwrap_err();
+        assert!(matches!(set_err, CliError::Data(_)), "set: {set_err:?}");
+
+        let fill_err = fill(&fill_args(path, IVec3::ZERO, IVec3::ZERO, state("minecraft:dirt"), None, true))
+            .unwrap_err();
+        assert!(matches!(fill_err, CliError::Data(_)), "fill: {fill_err:?}");
     }
 }
