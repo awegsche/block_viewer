@@ -33,20 +33,22 @@
 //! the same "not actually empty" rule 039 already applies. Unchanged from
 //! 054; styles don't loosen or tighten it.
 //!
-//! ## Surface and tunnel: a second key, not a second catalogue (ticket 071)
+//! ## Surface, tunnel and connected: a second key, not a second catalogue
 //!
-//! Each kind ships **twice** — `<kind>.nbt` and `<kind>-tunnel.nbt` — for a
-//! cell the terrain closes over. The pair is the same shape at the same
-//! canonical orientation; only the roof differs, so it's a
+//! Each kind can ship up to **three** files — `<kind>.nbt`, `<kind>-tunnel.nbt`
+//! (ticket 071, for a cell the terrain closes over) and `<kind>-connected.nbt`
+//! (for a cell that touches a building, see `super::road::touches_building`).
+//! Every one of the three is the same shape at the same canonical
+//! orientation; only what's built over/around it differs, so it's a
 //! [`RoadPieceVariant`](super::road::RoadPieceVariant) alongside the kind
 //! rather than a kind of its own, and [`RoadCatalogue`] is keyed on the
-//! `(kind, variant)` pair. A style with no `-tunnel` exports yet is simply a
-//! style whose tunnel half is all [`RoadCatalogueError::Missing`] — the same
-//! per-file tolerance a missing corner already gets, and
+//! `(kind, variant)` pair. A style with no `-tunnel` or `-connected` exports
+//! yet is simply a style whose missing half is all [`RoadCatalogueError::Missing`]
+//! — the same per-file tolerance a missing corner already gets, and
 //! `city::road_build` asks the catalogue before ever *recording* a cell as
-//! a tunnel, so a half-populated style never leaves an unresolvable cell
-//! behind. [`RoadCatalogue::get`] deliberately does not fall back from one
-//! variant to the other.
+//! one of the non-`Surface` variants, so a half-populated style never leaves
+//! an unresolvable cell behind. [`RoadCatalogue::get`] deliberately does not
+//! fall back from one variant to another.
 //!
 //! ## Style is a lookup key, not a shape rule
 //!
@@ -130,19 +132,21 @@ fn kind_stem(kind: RoadPieceKind) -> &'static str {
 }
 
 /// The filename stem one `(kind, variant)` pair loads from — [`kind_stem`]
-/// for [`RoadPieceVariant::Surface`], and that same stem plus `-tunnel` for
-/// [`RoadPieceVariant::Tunnel`] (ticket 071).
+/// for [`RoadPieceVariant::Surface`], and that same stem plus `-tunnel`
+/// (ticket 071) or `-connected` for [`RoadPieceVariant::Tunnel`]/
+/// [`RoadPieceVariant::Connected`] respectively.
 ///
-/// A **suffix on the kind's own name**, not a `tunnel/` subdirectory: a
-/// style directory is already the unit the loader treats as "one full set",
-/// and burying half a set one level deeper would make `style_dirs` have to
-/// tell a variant folder apart from a style folder. The suffixed name also
-/// keeps the two files for one kind adjacent in a directory listing, which
-/// is where an asset author compares them.
+/// A **suffix on the kind's own name**, not a `tunnel/`/`connected/`
+/// subdirectory: a style directory is already the unit the loader treats as
+/// "one full set", and burying part of a set one level deeper would make
+/// `style_dirs` have to tell a variant folder apart from a style folder. The
+/// suffixed name also keeps every file for one kind adjacent in a directory
+/// listing, which is where an asset author compares them.
 fn filename_for(kind: RoadPieceKind, variant: RoadPieceVariant) -> String {
     match variant {
         RoadPieceVariant::Surface => kind_stem(kind).to_string(),
         RoadPieceVariant::Tunnel => format!("{}-tunnel", kind_stem(kind)),
+        RoadPieceVariant::Connected => format!("{}-connected", kind_stem(kind)),
     }
 }
 
@@ -627,5 +631,12 @@ mod tests {
         assert_eq!(filename_for(RoadPieceKind::Straight, RoadPieceVariant::Tunnel), "straight-tunnel");
         assert_eq!(filename_for(RoadPieceKind::DeadEnd, RoadPieceVariant::Tunnel), "dead_end-tunnel");
         assert_eq!(filename_for(RoadPieceKind::Stair, RoadPieceVariant::Tunnel), "stairs-tunnel");
+    }
+
+    #[test]
+    fn a_connected_piece_is_named_after_its_kind_with_a_connected_suffix() {
+        assert_eq!(filename_for(RoadPieceKind::Straight, RoadPieceVariant::Connected), "straight-connected");
+        assert_eq!(filename_for(RoadPieceKind::DeadEnd, RoadPieceVariant::Connected), "dead_end-connected");
+        assert_eq!(filename_for(RoadPieceKind::Stair, RoadPieceVariant::Connected), "stairs-connected");
     }
 }

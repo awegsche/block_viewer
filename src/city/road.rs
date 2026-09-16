@@ -78,6 +78,19 @@
 //! "proven, not yet used" state F1-F3 themselves landed in — a later
 //! unconnected-building UI warning, or logistics in a later iteration, are
 //! the eventual readers.
+//!
+//! ## Connected road pieces: the reverse question, answered visually
+//!
+//! [`touches_building`] is [`touching_road_cells`] the other way round —
+//! "does this road cell touch a building" rather than "which cells does this
+//! building touch" — and, unlike the F4 queries above, it does have a
+//! consumer already: `super::road_build`'s `plan_connections` reads it to
+//! pick [`RoadPieceVariant::Connected`], a style-specific `<kind>-connected.nbt`
+//! piece that gives the player a visual cue that a road segment has actually
+//! reached a building, not just run past it. No ticket for this one; see
+//! [`RoadPieceVariant::Connected`] and `super::road_build`'s own module docs
+//! ("Connected") for how it's decided and its one known gap — a building
+//! placed beside an *already-built* road doesn't retroactively repaint it.
 
 use std::collections::{HashSet, VecDeque};
 
@@ -320,6 +333,37 @@ pub fn touching_road_cells(city: &City, building: &PlacedBuilding) -> HashSet<IV
     cells
 }
 
+/// Whether `cell` touches at least one currently-placed building's
+/// footprint — the reverse of [`touching_road_cells`]: that answers "which
+/// road cells does this building touch," this answers "does *this* cell
+/// touch a building." [`super::road_build`]'s `plan_connections` reads it to
+/// pick [`RoadPieceVariant::Connected`], the piece that visually signals a
+/// road segment has actually reached a building rather than just running
+/// past open ground.
+///
+/// `cell` need not be a road cell itself, and doesn't have to be — the same
+/// "ask before committing" shape [`connections_at`] allows for a cell that's
+/// only a candidate so far.
+///
+/// One neighbour cell at a time, each checked directly against
+/// [`City::occupant_at`] across its own 36 tiles, rather than walking every
+/// building and re-deriving [`touching_road_cells`] for each: a road cell's
+/// own occupancy grid already answers "is any part of this cell a building,"
+/// exactly the way [`place_building`](City::place_building) populates it —
+/// see [`state::footprint_tiles`], the same tiles a `PlacedBuilding`'s own
+/// occupancy comes from. Derived fresh every call, the same "authoritative,
+/// not cached" rule the rest of this module follows — unlike
+/// [`RoadPieceVariant::Tunnel`], nothing about checking this destroys the
+/// evidence it's based on, so it would be safe to call again later if a
+/// reactive re-tile (a building placed beside an already-built road) is ever
+/// added; see [`super::state::RoadCell::variant`] for why nothing does yet.
+pub fn touches_building(city: &City, cell: IVec2) -> bool {
+    Direction::ALL.iter().any(|&direction| {
+        let neighbour = cell + direction.offset();
+        state::road_cell_tiles(neighbour).any(|tile| matches!(city.occupant_at(tile), Some(state::Occupant::Building(_))))
+    })
+}
+
 /// Whether `id` names a currently-placed building that touches the road
 /// network at all — "is this building on the road network," the roadmap's
 /// own phrasing for F4. `None` if `id` isn't a currently-placed building;
@@ -403,43 +447,53 @@ pub enum RoadPieceKind {
     Stair,
 }
 
-/// Whether a cell's piece is the ordinary one or the tunnelled one — the
-/// second, *orthogonal* axis [`super::road_catalogue::RoadCatalogue`] is
-/// keyed on (ticket 071).
+/// Which of a style's alternate pieces a cell resolves to — the second,
+/// *orthogonal* axis [`super::road_catalogue::RoadCatalogue`] is keyed on
+/// (ticket 071 added [`Self::Tunnel`]; [`Self::Connected`] is a later,
+/// ticketless addition — see its own doc comment).
 ///
-/// A tunnel straight is still a [`RoadPieceKind::Straight`]: same
-/// connections, same [`select_piece`] answer, same [`Rotation`]. What a
-/// tunnel changes is only which `.nbt` that answer resolves to — one that
-/// carves a bore through the hillside sitting on top of the cell instead of
-/// laying paving under open sky. So this is a variant of a kind, not a
-/// seventh kind: making it one would need a `canonical_pattern` entry, a
-/// `select_piece` branch and a connection shape it doesn't have, for a
-/// distinction that isn't about connectivity at all.
-///
-/// Which one a cell gets is decided from the terrain *once*, when the
-/// placement commits (`super::road_build`'s `plan_tunnels`), and then
-/// remembered on [`super::state::RoadCell::variant`] — see that field for
-/// why re-deriving it would fill its own tunnel back in.
+/// A tunnel or connected straight is still a [`RoadPieceKind::Straight`]:
+/// same connections, same [`select_piece`] answer, same [`Rotation`]. What a
+/// variant changes is only which `.nbt` that answer resolves to. So this is a
+/// variant of a kind, not extra kinds: making either one a kind of its own
+/// would need a `canonical_pattern` entry, a `select_piece` branch and a
+/// connection shape it doesn't have, for a distinction that isn't about
+/// connectivity at all.
 ///
 /// `Serialize`/`Deserialize` for the same reason [`Direction`] carries them:
 /// the variant is part of a cell's record and therefore of `city.ron`, and a
-/// mirror enum in `super::persistence` would be one more place for the two
-/// values to disagree.
+/// mirror enum in `super::persistence` would be one more place for the values
+/// to disagree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum RoadPieceVariant {
-    /// The ordinary piece — `<kind>.nbt`, open to the sky.
+    /// The ordinary piece — `<kind>.nbt`, open to the sky, touching no
+    /// building.
     #[default]
     Surface,
     /// The tunnelled piece — `<kind>-tunnel.nbt`, for a cell the terrain
     /// closes over. See `super::road_build::ROAD_TUNNEL_COVER_MAJORITY` for
-    /// what "closes over" is measured as.
+    /// what "closes over" is measured as. Decided from the terrain *once*,
+    /// when the placement commits (`super::road_build`'s `plan_tunnels`), and
+    /// then remembered on [`super::state::RoadCell::variant`] — see that
+    /// field for why re-deriving it would fill its own tunnel back in.
     Tunnel,
+    /// The connected piece — `<kind>-connected.nbt`, for a cell that touches
+    /// a currently-placed building (see [`touches_building`]) — a visual
+    /// signal to the player that this road segment actually reaches the
+    /// building next to it, distinct from a cell that merely sits beside
+    /// open ground. Decided when the cell is written or re-tiled
+    /// (`super::road_build`'s `plan_connections`), the same "once, then
+    /// remembered" shape as [`Self::Tunnel`], though for a different reason —
+    /// see [`super::state::RoadCell::variant`]. Loses to [`Self::Tunnel`]
+    /// when a cell would otherwise qualify for both: a tunnel is a physical
+    /// necessity the piece has to have, where this is only a cosmetic marker.
+    Connected,
 }
 
 impl RoadPieceVariant {
-    /// Both variants, for [`super::road_catalogue`] to iterate alongside
+    /// Every variant, for [`super::road_catalogue`] to iterate alongside
     /// [`RoadPieceKind::ALL`] — the catalogue loads one file per pair.
-    pub const ALL: [RoadPieceVariant; 2] = [RoadPieceVariant::Surface, RoadPieceVariant::Tunnel];
+    pub const ALL: [RoadPieceVariant; 3] = [RoadPieceVariant::Surface, RoadPieceVariant::Tunnel, RoadPieceVariant::Connected];
 }
 
 impl RoadPieceKind {
@@ -763,6 +817,52 @@ mod tests {
         let building = city.building(id).unwrap();
 
         assert_eq!(touching_road_cells(&city, building), HashSet::from([IVec2::new(1, 0)]));
+    }
+
+    // -- touches_building (the connected-piece marker) -----------------------
+
+    #[test]
+    fn touches_building_is_false_with_nothing_placed_at_all() {
+        let city = City::default();
+        assert!(!touches_building(&city, IVec2::new(0, 0)));
+    }
+
+    #[test]
+    fn touches_building_is_true_for_a_cell_just_outside_a_footprint() {
+        let mut city = City::default();
+        // Building occupies x = 6..8, z = 0..2 — directly east of cell (0, 0)
+        // (tiles 0..6 x 0..6).
+        city.place_building("house01", None, IVec3::new(6, 64, 0), Rotation::Deg0, IVec2::new(2, 2)).unwrap();
+        assert!(touches_building(&city, IVec2::new(0, 0)));
+    }
+
+    #[test]
+    fn touches_building_is_false_for_a_cell_nowhere_near_a_footprint() {
+        let mut city = City::default();
+        city.place_building("house01", None, IVec3::new(100, 64, 100), Rotation::Deg0, IVec2::new(2, 2)).unwrap();
+        assert!(!touches_building(&city, IVec2::new(0, 0)));
+    }
+
+    /// Same leniency [`touching_road_cells`] gives a building's own
+    /// footprint: a corner clip is enough to "cover" the whole neighbouring
+    /// cell in cell-of terms, but that's not what this asks — a building
+    /// three blocks deep inside its own cell doesn't reach a cell two cells
+    /// away just because they're both non-road.
+    #[test]
+    fn touches_building_is_false_for_a_cell_two_cells_away() {
+        let mut city = City::default();
+        city.place_building("house01", None, IVec3::new(2, 64, 2), Rotation::Deg0, IVec2::ONE).unwrap();
+        assert!(!touches_building(&city, IVec2::new(2, 0)));
+    }
+
+    /// `cell` doesn't need to be a road cell itself for this to answer — the
+    /// same "ask before committing" shape [`connections_at`] allows.
+    #[test]
+    fn touches_building_answers_for_a_cell_that_is_not_itself_a_road_cell() {
+        let mut city = City::default();
+        city.place_building("house01", None, IVec3::new(6, 64, 0), Rotation::Deg0, IVec2::new(2, 2)).unwrap();
+        assert!(!city.is_road_cell(IVec2::new(0, 0)));
+        assert!(touches_building(&city, IVec2::new(0, 0)));
     }
 
     #[test]

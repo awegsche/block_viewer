@@ -23,8 +23,9 @@ The rule, in one line: **every piece opens to the south.** Per file:
 | `cross.nbt`    | all four               |
 | `stairs.nbt`   | north + south, ascending toward **north** (tickets 067/068) |
 
-Every row above ships **twice** (ticket 071): `<name>.nbt` and
-`<name>-tunnel.nbt`. See "Tunnel pieces", below.
+Every row above can ship up to **three** files: `<name>.nbt`, `<name>-tunnel.nbt`
+(ticket 071) and `<name>-connected.nbt`. See "Tunnel pieces" and "Connected
+pieces", below.
 
 `city::road_catalogue`'s
 `the_shipped_dirt_pieces_are_authored_at_the_canonical_orientations` reads
@@ -96,6 +97,59 @@ A missing `-tunnel.nbt` is not an error: `RoadCatalogue::get` never falls back
 from one variant to the other, and `city::road_build` asks the catalogue
 *before* recording a cell as a tunnel, so a style with none simply keeps
 building its surface pieces the way it did before this existed.
+
+## Connected pieces: `<name>-connected.nbt`
+
+A road cell that touches a currently-placed building (`city::road::touches_building`
+— any of its four cardinal neighbour cells has a building's footprint in it)
+resolves to `<kind>-connected.nbt` instead of `<kind>.nbt`, where one exists —
+a visual cue that this stretch of road actually reaches a building rather than
+just running past open ground. There's no ticket behind this one; see
+`city::road::RoadPieceVariant::Connected` and `city::road_build`'s module docs
+("Connected") for the exact rule.
+
+Same contract as a tunnel piece: same `6` x/z footprint, same canonical
+orientation, same subgrade/surface layers — only what's built *around* the
+piece (a kerb, a lamp, paving stones, whatever signals "connected" for this
+style) should differ. A missing `-connected.nbt` is not an error, for the
+same reason a missing `-tunnel.nbt` isn't: the cell just keeps its plain
+surface piece.
+
+One thing this variant does **not** do, unlike a tunnel: if a building goes
+up *after* the road next to it is already built, the existing cell isn't
+retroactively repainted — nothing re-tiles a road cell when a building is
+placed or removed nearby yet. Only a cell a drag actually writes or re-tiles
+(because a neighbour's own connections changed) picks up `-connected.nbt`.
+
+### What's shipped
+
+`isolated-connected.nbt`, `dead_end-connected.nbt`, `straight-connected.nbt`,
+`corner-connected.nbt` and `t-connected.nbt` exist, built with `ranvil-cli
+struct fill` on top of a copy of each kind's plain piece. `cross-connected.nbt`
+doesn't: a cross cell's four neighbours are all road cells, and a road cell
+can never overlap a building's footprint tiles, so `road::touches_building`
+can never be true for one — nothing could ever select it.
+`stairs-connected.nbt` doesn't exist either — the ramp's side faces are
+fenced (a fall hazard along the slope) and its walkable height changes with
+`z`, so a side exit would need a per-row height and a fence gap rather than
+one flat cut; deferred rather than guessed at blind.
+
+Each shipped `-connected` piece adds a **`minecraft:gravel` exit** — two
+blocks wide, matching the surface course's own width — cut through the
+shoulder (and, on `isolated`/`dead_end`, through the two-deep grass verge
+behind their curb cap too) on every side [`canonical_pattern`] does *not*
+mark as open for that kind. Gravel rather than `dirt_path`: the automated
+`the_shipped_dirt_pieces_are_authored_at_the_canonical_orientations` check
+reads the exact edge cells and would misread a `dirt_path` exit on a
+non-canonical side as a real road connection. Gravel reads as neither, so it
+survives that check, and it doubles as the piece's cosmetic "connected"
+marker — the visual cue this section already asks for.
+
+Since a road cell can't have a building on a side that's also a road
+connection, every side left closed by [`canonical_pattern`] is the *only*
+kind of side that could ever face a building — so cutting an exit on
+every closed side (rather than guessing which one) covers every rotation
+`select_piece` could ever apply the piece at.
 
 ## Game data
 

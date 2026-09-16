@@ -199,19 +199,31 @@ pub struct RoadCell {
     /// and a straight connect identically, which is why
     /// [`super::road::select_piece`] never returns `Stair`.
     pub ascent: Option<super::road::Direction>,
-    /// Whether this cell's piece is the ordinary one or the tunnelled one
-    /// (ticket 071) — [`super::road_catalogue::RoadCatalogue`]'s second key
-    /// alongside the kind.
+    /// Which of the style's alternate pieces this cell resolved to — the
+    /// ordinary open-sky one, the tunnelled one (ticket 071), or the
+    /// connected one that signals the cell reaches a building — see
+    /// [`super::road::RoadPieceVariant`]. [`super::road_catalogue::RoadCatalogue`]'s
+    /// second key alongside the kind.
     ///
-    /// Stored, like [`Self::base_y`] and [`Self::ascent`], because it cannot
-    /// survive being re-derived — and here that isn't a subtle drift but a
-    /// straight contradiction: a tunnel piece **carves away the very cover
-    /// that made it a tunnel**. Re-sample a written tunnel cell and the 36
-    /// blocks over it are the air the piece just cut, so it reads as
-    /// `Surface`, and the next re-tile (a neighbour growing a connection —
-    /// `super::road_build::affected_cells`) writes the open-sky piece back
-    /// into the hillside, filling the bore in around the player. The cell
-    /// remembers what it was built as, the way it remembers its ground.
+    /// Stored, like [`Self::base_y`] and [`Self::ascent`], rather than
+    /// re-derived on every read. For [`super::road::RoadPieceVariant::Tunnel`]
+    /// that isn't a subtle drift but a straight contradiction: a tunnel piece
+    /// **carves away the very cover that made it a tunnel**. Re-sample a
+    /// written tunnel cell and the 36 blocks over it are the air the piece
+    /// just cut, so it reads as `Surface`, and the next re-tile (a neighbour
+    /// growing a connection — `super::road_build::affected_cells`) writes the
+    /// open-sky piece back into the hillside, filling the bore in around the
+    /// player.
+    ///
+    /// [`super::road::RoadPieceVariant::Connected`] has no such
+    /// self-destroying check — `super::road::touches_building` is safe to
+    /// call again any time — but it's still frozen here rather than
+    /// re-derived, for consistency with the other two and because nothing yet
+    /// re-tiles a road cell when a building is placed or removed next to it
+    /// after the fact. A building that shows up beside an already-built road
+    /// doesn't retroactively repaint it; only a cell this drag actually
+    /// writes or re-tiles picks the variant up. The cell remembers what it
+    /// was built as, the way it remembers its ground.
     pub variant: super::road::RoadPieceVariant,
 }
 

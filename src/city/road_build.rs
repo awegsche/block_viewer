@@ -143,6 +143,32 @@
 //! reads as open sky and the next re-tile would fill the bore back in with
 //! hillside.
 //!
+//! ## Connected: signalling a road that reaches a building
+//!
+//! Separately from the terrain, a road cell can sit right next to a
+//! building — and up to here nothing about how it's *built* told the player
+//! that. [`plan_connections`] is the pass that does: for a cell not already
+//! resolved to [`RoadPieceVariant::Tunnel`], it asks
+//! [`road::touches_building`] whether the cell touches a currently-placed
+//! building's footprint, and — if the catalogue actually has the piece —
+//! resolves it to [`RoadPieceVariant::Connected`] instead of
+//! [`RoadPieceVariant::Surface`]. Run *after* [`plan_tunnels`] and only over
+//! cells [`plan_tunnels`] left `Surface`: a tunnel is a physical necessity
+//! the piece has to have, where a connected marker is only cosmetic, so
+//! terrain wins the one cell that could ever want both. The same
+//! catalogue-gating shape [`stair_available`]/[`plan_tunnels`] already use: a
+//! style with no `-connected` exports keeps building the plain surface piece
+//! it always did, rather than recording a variant nothing can render.
+//!
+//! Like [`plan_tunnels`], it never touches a cell that's already road — see
+//! [`super::state::RoadCell::variant`] for the consequence: a building
+//! dropped in next to a road that was already there doesn't retroactively
+//! repaint it, only a cell this drag actually writes or re-tiles can pick the
+//! marker up. Unlike a tunnel's variant, nothing about [`road::touches_building`]
+//! is destroyed by writing the piece, so that gap is a missing reactive
+//! re-tile, not a hard constraint the way tunnel's freeze is — a later pass
+//! triggered off building placement/removal is the natural way to close it.
+//!
 //! ## Terrain fit, reusing E2 rather than reinventing it for cells
 //!
 //! A road cell is exactly a [`super::state::ROAD_CELL_SIZE`]-square footprint
@@ -822,6 +848,31 @@ fn plan_tunnels(
     }
 }
 
+/// Fills in [`RoadPieceVariant::Connected`] for any cell [`plan_tunnels`]
+/// left `Surface` that touches a currently-placed building — see the module
+/// docs' "Connected".
+///
+/// A cell that is **already** road is left alone, exactly like
+/// [`plan_tunnels`] — see [`state::RoadCell::variant`] for why. A cell
+/// [`plan_tunnels`] already resolved to [`RoadPieceVariant::Tunnel`] is left
+/// alone too: physical cover always outranks the cosmetic marker.
+fn plan_connections(plan: &mut [CellPlan], path: &[IVec2], city: &City, catalogue: Option<&RoadCatalogue>, selected_style: Option<&str>) {
+    let Some(catalogue) = catalogue else { return };
+    for entry in plan.iter_mut() {
+        if entry.variant != RoadPieceVariant::Surface || city.road_cell_at(entry.cell).is_some() {
+            continue;
+        }
+        let Some(style) = style_for_cell(entry.cell, city, selected_style) else { continue };
+        if !road::touches_building(city, entry.cell) {
+            continue;
+        }
+        let (kind, _) = piece_for(connections_with_path(city, path, entry.cell), entry.ascent);
+        if catalogue.get(style, kind, RoadPieceVariant::Connected).is_some() {
+            entry.variant = RoadPieceVariant::Connected;
+        }
+    }
+}
+
 /// The piece kind and rotation a cell calls for: a stair if it has an
 /// [`state::RoadCell::ascent`], else whatever its connections imply. The
 /// write path's and the preview's shared answer — see
@@ -1128,6 +1179,10 @@ fn update_drag_preview(
     // preview and the commit share one answer so the player can't be shown
     // paving and given a bore.
     plan_tunnels(&mut plan, &path, &world, &city, catalogue.as_deref(), selected_style);
+    // And the *connected* piece where a cell touches a building — same
+    // "preview agrees with the commit" reasoning, see the module docs'
+    // "Connected".
+    plan_connections(&mut plan, &path, &city, catalogue.as_deref(), selected_style);
 
     for (index, planned) in plan.iter().enumerate() {
         let CellPlan { cell, base_y, ascent, variant } = *planned;
@@ -1294,6 +1349,8 @@ fn try_commit_drag(
     // heights above and *before* anything is written — once the tunnel
     // pieces are in the world the cover they were chosen for is gone.
     plan_tunnels(&mut plan, &path, &world, &city, catalogue.as_deref(), Some(build_style.as_str()));
+    // Which cells touch a building — see the module docs' "Connected".
+    plan_connections(&mut plan, &path, &city, catalogue.as_deref(), Some(build_style.as_str()));
 
     let newly_added: Vec<IVec2> = path.iter().copied().filter(|&cell| !city.is_road_cell(cell)).collect();
     for &CellPlan { cell, base_y, ascent, variant } in &plan {
@@ -2443,6 +2500,141 @@ mod tests {
         let solid: std::collections::HashSet<&str> =
             edit.edits().iter().map(|e| e.state.name.as_str()).filter(|name| *name != "minecraft:air").collect();
         assert_eq!(solid, std::collections::HashSet::from(["minecraft:cobblestone"]));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // -- plan_connections ------------------------------------------------------
+
+    /// A `"dirt"` catalogue holding a five-tall straight and, if
+    /// `with_connected`, a five-tall `straight-connected` beside it — paved
+    /// in andesite so a write can be told apart from both the surface and
+    /// tunnel pieces.
+    fn connected_catalogue(dir: &std::path::Path, with_connected: bool) -> RoadCatalogue {
+        write_variant_piece(dir, "dirt", RoadPieceKind::Straight, RoadPieceVariant::Surface, &piece_of_height(5));
+        if with_connected {
+            let mut connected = piece_of_height(5);
+            connected.palette[1] = state_named("minecraft:andesite");
+            write_variant_piece(dir, "dirt", RoadPieceKind::Straight, RoadPieceVariant::Connected, &connected);
+        }
+        let (catalogue, _skipped) = super::super::road_catalogue::load_road_catalogue_dir(dir);
+        catalogue
+    }
+
+    /// A three-cell straight run at Y 64, optionally with a building touching
+    /// the middle cell, run through [`plan_drag`], [`plan_tunnels`] and then
+    /// [`plan_connections`]. Answers with the middle cell's planned variant.
+    fn middle_variant_with_building(dir: &std::path::Path, with_connected: bool, place_building: bool) -> RoadPieceVariant {
+        let path: Vec<IVec2> = (0..3).map(|x| IVec2::new(x, 0)).collect();
+        let world = world_with_cell_ground(&path.iter().map(|&c| (c, 64)).collect::<Vec<_>>());
+
+        let catalogue = connected_catalogue(dir, with_connected);
+        let mut city = City::default();
+        if place_building {
+            // South of cell (1, 0) (tiles 6..12 x 0..6): x = 6..8, z = 6..8,
+            // sharing the edge at z = 6.
+            city.place_building("house01", None, IVec3::new(6, 64, 6), Rotation::Deg0, IVec2::new(2, 2)).unwrap();
+        }
+
+        let mut plan = plan_drag(&path, &world, &city, false).unwrap();
+        plan_tunnels(&mut plan, &path, &world, &city, Some(&catalogue), Some("dirt"));
+        plan_connections(&mut plan, &path, &city, Some(&catalogue), Some("dirt"));
+        plan[1].variant
+    }
+
+    #[test]
+    fn a_cell_touching_a_building_becomes_connected() {
+        let dir = temp_dir("connected_touching");
+        assert_eq!(middle_variant_with_building(&dir, true, true), RoadPieceVariant::Connected);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_cell_with_no_nearby_building_stays_surface() {
+        let dir = temp_dir("connected_no_building");
+        assert_eq!(middle_variant_with_building(&dir, true, false), RoadPieceVariant::Surface);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The [`stair_available`]/tunnel shape again: a style with no
+    /// `-connected` export keeps building its plain surface piece rather
+    /// than recording a variant nothing can render.
+    #[test]
+    fn a_style_with_no_connected_piece_never_records_a_connected_cell() {
+        let dir = temp_dir("connected_missing_piece");
+        assert_eq!(
+            middle_variant_with_building(&dir, false, true),
+            RoadPieceVariant::Surface,
+            "touching a building, but nothing to build it with"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A tunnel is a physical necessity the piece has to have; a connected
+    /// marker is only cosmetic. A cell that qualifies for both keeps the
+    /// tunnel.
+    #[test]
+    fn tunnel_cover_outranks_a_touching_building() {
+        let dir = temp_dir("connected_vs_tunnel");
+        write_variant_piece(&dir, "dirt", RoadPieceKind::Straight, RoadPieceVariant::Surface, &piece_of_height(5));
+        write_variant_piece(&dir, "dirt", RoadPieceKind::Straight, RoadPieceVariant::Tunnel, &piece_of_height(5));
+        write_variant_piece(&dir, "dirt", RoadPieceKind::Straight, RoadPieceVariant::Connected, &piece_of_height(5));
+        let (catalogue, _skipped) = super::super::road_catalogue::load_road_catalogue_dir(&dir);
+
+        let path: Vec<IVec2> = (0..3).map(|x| IVec2::new(x, 0)).collect();
+        let mut world = world_with_cell_ground(&path.iter().map(|&c| (c, 64)).collect::<Vec<_>>());
+        roof_cell(&mut world, path[1], 67, 36); // fully covered
+
+        let mut city = City::default();
+        city.place_building("house01", None, IVec3::new(6, 64, 6), Rotation::Deg0, IVec2::new(2, 2)).unwrap();
+
+        let mut plan = plan_drag(&path, &world, &city, false).unwrap();
+        plan_tunnels(&mut plan, &path, &world, &city, Some(&catalogue), Some("dirt"));
+        plan_connections(&mut plan, &path, &city, Some(&catalogue), Some("dirt"));
+
+        assert_eq!(plan[1].variant, RoadPieceVariant::Tunnel);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The same regression [`an_existing_tunnel_cell_keeps_its_variant_when_a_later_drag_recrosses_it`]
+    /// pins for tunnels, for the connected marker: a building placed next to
+    /// an *already-built* road cell doesn't retroactively repaint it — see
+    /// [`state::RoadCell::variant`]'s known gap.
+    #[test]
+    fn an_existing_road_cell_keeps_its_variant_when_a_building_shows_up_beside_it_later() {
+        let dir = temp_dir("connected_recross");
+        let catalogue = connected_catalogue(&dir, true);
+        let path: Vec<IVec2> = (0..3).map(|x| IVec2::new(x, 0)).collect();
+        let world = world_with_cell_ground(&path.iter().map(|&c| (c, 64)).collect::<Vec<_>>());
+
+        let mut city = City::default();
+        city.add_road_cell(path[1], "dirt", 64, None, RoadPieceVariant::Surface).unwrap();
+        city.place_building("house01", None, IVec3::new(6, 64, 6), Rotation::Deg0, IVec2::new(2, 2)).unwrap();
+
+        let mut plan = plan_drag(&path, &world, &city, false).unwrap();
+        plan_tunnels(&mut plan, &path, &world, &city, Some(&catalogue), Some("dirt"));
+        plan_connections(&mut plan, &path, &city, Some(&catalogue), Some("dirt"));
+        assert_eq!(plan[1].variant, RoadPieceVariant::Surface, "already road — frozen, not repainted by a later building");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The write-path half: a cell recorded as connected resolves to the
+    /// `-connected` blueprint, not to its kind's surface one.
+    #[test]
+    fn road_write_edit_writes_the_connected_piece_for_a_connected_cell() {
+        let dir = temp_dir("write_connected");
+        let catalogue = connected_catalogue(&dir, true);
+
+        let mut city = City::default();
+        city.add_road_cell(IVec2::new(0, -1), "dirt", 64, None, RoadPieceVariant::Surface).unwrap();
+        city.add_road_cell(IVec2::new(0, 0), "dirt", 64, None, RoadPieceVariant::Connected).unwrap();
+        city.add_road_cell(IVec2::new(0, 1), "dirt", 64, None, RoadPieceVariant::Surface).unwrap();
+
+        let edit = road_write_edit(&[IVec2::new(0, 0)], &catalogue, &city);
+        let solid: std::collections::HashSet<&str> =
+            edit.edits().iter().map(|e| e.state.name.as_str()).filter(|name| *name != "minecraft:air").collect();
+        assert_eq!(solid, std::collections::HashSet::from(["minecraft:andesite"]));
 
         std::fs::remove_dir_all(&dir).ok();
     }

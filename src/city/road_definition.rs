@@ -289,10 +289,10 @@ mod tests {
         let (catalogue, skipped) = load_road_catalogue_dir(&dir);
         // Only the surface pieces are written here — this fixture exists to
         // give a *style* some geometry to be validated against, not to
-        // exercise ticket 071's variants, so every `-tunnel` file is
-        // legitimately missing.
+        // exercise the other variants, so every `-tunnel`/`-connected` file
+        // is legitimately missing.
         assert!(
-            skipped.iter().all(|(_, _, variant, _)| *variant == RoadPieceVariant::Tunnel),
+            skipped.iter().all(|(_, _, variant, _)| *variant != RoadPieceVariant::Surface),
             "{skipped:?}"
         );
         catalogue

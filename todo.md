@@ -1404,3 +1404,29 @@ Y=0 in the world and won't be cleaned up by this fix — see the ticket.
   cleanly at both gable ends (no gap under the ridge). Also confirm it still
   sinks flush into uneven terrain the way 085's/086's checks already cover
   for `ground_level`, now at `1` instead of the old placeholder's `2`.
+- [ ] **Connected road pieces: eyeball now that `<kind>-connected.nbt` exists.**
+  `assets/city/roads/dirt/{isolated,dead_end,straight,corner,t}-connected.nbt`
+  are checked in (built with `ranvil-cli struct fill` on a copy of each
+  kind's plain piece — see the README's "Connected pieces" section, "What's
+  shipped"). `cross-connected.nbt` and `stairs-connected.nbt` are
+  deliberately not shipped (same section explains why). `cargo test` passes,
+  including `the_shipped_dirt_pieces_are_authored_at_the_canonical_orientations`
+  and `every_shipped_piece_rotates_through_all_four_rotations` against the
+  new files, but nothing has rendered them in the real game yet. Needs a
+  human at `cargo run --bin citybuilder`:
+  - Drag a road cell so it lands directly next to a placed building, and
+    confirm the piece that gets built there is the connected variant —
+    visually, a `minecraft:gravel` strip cut through the grass/kerb on the
+    side(s) *not* used by the road's own connections, wide enough to walk
+    from the road onto the building's footprint — rather than the ordinary
+    surface piece's solid grass border on that side.
+  - Confirm a cell that ends up both tunnelled *and* touching a building
+    still gets the tunnel piece, not the connected one (tunnel is meant to
+    win — see `city::road_build`'s "Connected" module docs).
+  - Confirm a building placed next to an *already-built* road cell does
+    **not** retroactively repaint it (the documented gap — nothing re-tiles
+    a road on building placement/removal yet).
+  - For `isolated`/`dead_end`/`corner`/`t`, drop a building on each of that
+    kind's closed sides in turn and confirm the gravel exit actually lines
+    up with the building on every side, not just one — the piece never
+    rotates per-building, so this is the one thing unit tests can't check.
