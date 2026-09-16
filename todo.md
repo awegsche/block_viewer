@@ -1346,3 +1346,51 @@ Y=0 in the world and won't be cleaned up by this fix — see the ticket.
   `Page Up`/`Page Down` on the hut's ghost and confirm the manual offset
   still nudges it up/down from the now-correct base height, rather than
   fighting the ground_level shift.
+- [ ] **086 Gatherer's Hut: it actually digs, fills its buffer, and a
+  warehouse hauls the drops away.** The automated suite covers the pure
+  decision logic directly (`next_gather_target`, `gather_edit`, `plan_dig`,
+  `settle_dig` — synthetic fixtures, no real window) and the
+  dispatch/poll/credit glue through a bare `App` with a task result fixed
+  ahead of time (`city::gatherer`'s own tests) — what it can't cover is
+  whether a real placement against real terrain actually levels ground a
+  human would call "levelled".
+
+  `cargo run --bin citybuilder` against a real save. Confirm the console's
+  "loaded N building definitions" count includes `gatherer_hut` with no
+  `skipped` line. Open the build menu, confirm a "Gatherer's Hut" row under
+  Production (cost 12 oak planks, 8 dirt; ticket 104 gave it real geometry —
+  a fenced 9x9 yard around a small hut, no longer `lumber.nbt`'s borrowed
+  box). Place it on a patch of ground with some visible unevenness or a
+  tree/rock nearby within ~6 blocks (its `radius_blocks`), and confirm
+  `ground_level: 1` sinks its one dirt layer into the terrain the same way
+  085's check already verified for the real Lumberjack's Hut.
+
+  Then leave the game running (unpaused) for a couple of minutes at normal
+  speed and watch a nearby raised bump or tree stump: confirm blocks near the
+  hut visibly disappear one at a time, roughly every 30 seconds
+  (`blocks_per_minute: 2.0`), working from the nearest diggable spot outward,
+  and stopping at the hut's own ground level — it should **not** dig a hole
+  below the surrounding terrain. Select the hut (Inspect mode) and confirm
+  its state reads `running`, its buffer count climbs, and once a warehouse is
+  in range along a road, the buffer line shows a haul departing the same way
+  a farm's does; with **no** warehouse in range, confirm the buffer still
+  fills and then holds instead of erroring. Let it dig out everything within
+  radius (small radius, should happen quickly) and confirm the state changes
+  to `site levelled` rather than spamming console output or stalling
+  ambiguously. Finally, confirm the "Last edit" line in the city panel is
+  **not** spammed by the hut's own background digs (by design — see
+  `finished_tickets/086-gatherer-hut.md`) while a real placement/demolish
+  elsewhere still updates it normally.
+- [ ] **104 Gatherer's Hut: eyeball the real model.** Built headlessly with
+  `ranvil-cli struct new`/`fill`/`set` (no Minecraft/viewer session), so
+  nobody has actually looked at it yet. `cargo run --bin citybuilder`
+  (or open `gatherer_hut.nbt` in the viewer), place a "Gatherer's Hut", and
+  confirm: the fenced 9x9 yard and hut both mesh without holes or misplaced
+  faces (the fence-ring connection states and the gable-roof stair tiers
+  were computed by hand, not auto-connected); the yard gate lines up with
+  the hut door with a dirt-path trail between them; the two interior
+  torches, the glass windows and the double chest/crafting table/barrel are
+  where they should be and not clipping through walls; and the roof closes
+  cleanly at both gable ends (no gap under the ridge). Also confirm it still
+  sinks flush into uneven terrain the way 085's/086's checks already cover
+  for `ground_level`, now at `1` instead of the old placeholder's `2`.

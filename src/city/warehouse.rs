@@ -197,11 +197,16 @@ pub fn warehouse_of<'a>(
     definition.building.warehouse.as_ref()
 }
 
-/// Whether `id` is a placed building that produces anything.
+/// Whether `id` is a placed building that produces anything — a
+/// `production` block, or (ticket 086) a `gatherer` one: both fill a
+/// [`super::production::Producer`] buffer a warehouse needs to reach the
+/// same way, and a gatherer with no road in range should stall exactly like
+/// an unserved farm does, not silently skip coverage because its output
+/// isn't a chosen recipe.
 fn is_producer(city: &City, definitions: &BuildingDefinitions, id: BuildingId) -> bool {
     city.definition_of(id)
         .and_then(|definition| definitions.get(definition))
-        .is_some_and(|definition| definition.building.production.is_some())
+        .is_some_and(|definition| definition.building.production.is_some() || definition.building.gatherer.is_some())
 }
 
 /// The whole coverage pass — see the module docs. A plain function over its
@@ -381,6 +386,7 @@ mod tests {
             cost: Vec::new(),
             warehouse,
             farm: None,
+            gatherer: None,
             category: Category::Production,
             ground_level: 0,
             integrity: Integrity { pristine_above: 0.95, ruined_below: 0.6 },

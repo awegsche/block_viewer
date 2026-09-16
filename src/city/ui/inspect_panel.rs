@@ -25,6 +25,7 @@ use bevy_egui::{egui, EguiContexts};
 
 use super::super::definition::BuildingDefinitions;
 use super::super::economy::EconomyConfig;
+use super::super::gatherer::gatherer_buffer_capacity;
 use super::super::inventory::short_name;
 use super::super::picking::SelectedBuilding;
 use super::super::placement::rotation_degrees;
@@ -51,17 +52,20 @@ fn buffer_lines(producer: &Producer, capacity: u64) -> Vec<String> {
     producer.buffer.iter().map(|(item, count)| format!("  {}: {count}/{capacity}", short_name(item))).collect()
 }
 
-/// This building's own buffer cap, if it has a `production` block at all —
-/// `0` otherwise, which reads as an empty buffer rather than a divide-by-zero
-/// anywhere downstream (nothing here divides by it).
+/// This building's own buffer cap, if it has a `production` or (ticket 086) a
+/// `gatherer` block — `0` otherwise, which reads as an empty buffer rather
+/// than a divide-by-zero anywhere downstream (nothing here divides by it). A
+/// definition with both is read as `production`'s own cap; the shipped set
+/// never declares both on one building.
 fn producer_capacity(placed: &PlacedBuilding, definitions: &BuildingDefinitions, economy: &EconomyConfig) -> u64 {
-    placed
-        .definition_id
-        .as_deref()
-        .and_then(|id| definitions.get(id))
-        .and_then(|entry| entry.building.production.as_ref())
-        .map(|spec| buffer_capacity(spec, economy))
-        .unwrap_or(0)
+    let Some(entry) = placed.definition_id.as_deref().and_then(|id| definitions.get(id)) else { return 0 };
+    if let Some(spec) = entry.building.production.as_ref() {
+        return buffer_capacity(spec, economy);
+    }
+    if let Some(gatherer) = entry.building.gatherer.as_ref() {
+        return gatherer_buffer_capacity(gatherer, economy);
+    }
+    0
 }
 
 /// Egui window: the selected building's name, position, rotation, and — if
@@ -146,6 +150,7 @@ mod tests {
             cost: Vec::new(),
             warehouse: None,
             farm: None,
+            gatherer: None,
             category: Category::Production,
             ground_level: 0,
             integrity: Integrity { pristine_above: 0.95, ruined_below: 0.6 },
@@ -202,6 +207,7 @@ mod tests {
             cost: Vec::new(),
             warehouse: None,
             farm: None,
+            gatherer: None,
             category: Category::Production,
             ground_level: 0,
             integrity: Integrity { pristine_above: 0.95, ruined_below: 0.6 },

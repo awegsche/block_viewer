@@ -127,6 +127,15 @@ pub struct Building {
     /// [`super::farm`].
     #[serde(default)]
     pub farm: Option<Farm>,
+    /// `Some` makes this building a gatherer — ticket 086's Gatherer's Hut,
+    /// the low-radius, low-speed answer to ground levelling and early
+    /// resource collection, as distinct from a specialised quarry/mine
+    /// (neither built yet). `None` for everything else. See [`Gatherer`].
+    /// Validated (so a bad file is caught early like every other block here)
+    /// but not yet simulated — the same gap `production`/`cost` sat in
+    /// between tickets 040 and 073/078.
+    #[serde(default)]
+    pub gatherer: Option<Gatherer>,
     /// Which section of the build menu (ticket 082, roadmap G1) this
     /// building lists under. `#[serde(default)]` rather than required —
     /// unlike `blueprint`/`footprint` this gates no real validation, only
@@ -218,6 +227,56 @@ pub struct Farm {
     /// tiles, the rate is zero, same as Anno's own farmhouses. Placing more
     /// than this many doesn't push the rate past 100%.
     pub tiles_for_full_rate: u32,
+}
+
+/// See [`Building::gatherer`] — ticket 086's Gatherer's Hut: a building that
+/// slowly clears the ground around itself instead of (or alongside) making
+/// anything. Unlike [`Production`], there is no `outputs` list here — what
+/// comes out is whatever block got dug up, resolved the same way
+/// `city::terraform`'s dig already resolves a drop, through
+/// [`super::drops::DropTable`], so a gatherer needs no item list of its own
+/// to stay honest as the block palette changes.
+///
+/// **The floor needs no field of its own.** "Removes every block top to
+/// bottom until it reaches its own ground level, and no deeper" is exactly
+/// [`Building::ground_level`] read back at the building's own placement — the
+/// same foundation height every other building already lines its blueprint's
+/// ground floor up against. A quarry that should keep digging *past* its own
+/// footprint's floor would be a different building shape, not a knob on this
+/// one.
+///
+/// **Schema only for now** — nothing ticks this yet; a `.ron` can declare a
+/// `gatherer` block today and it loads, validates, and does nothing, the
+/// same gap `production`/`cost` sat in between tickets 040 and 073/078. The
+/// model this repo already has for the eventual tick is `city::terraform`'s
+/// dig: a `WorldEdit` built by hand, one `.set()` per position, dispatched
+/// through `apply_building_edit` the same way — but running on a timer and
+/// bounded by [`radius_blocks`](Self::radius_blocks) rather than a player's
+/// drag, and crediting a [`super::production::Producer`]-shaped buffer
+/// instead of the global stock directly, so haulage can move its output the
+/// same way it already moves a producer's.
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct Gatherer {
+    /// How far from the building's own footprint a tile still counts, in
+    /// blocks — straight-line (Chebyshev), the same measure
+    /// [`Farm::radius_blocks`] uses and for the same reason: there's no road
+    /// for a gathering radius to be routed along. Deliberately small next to
+    /// a warehouse's road-cell reach or a specialised quarry/mine's eventual
+    /// pull — this building levels a build site, not a district.
+    pub radius_blocks: u32,
+    /// How many blocks this hut clears a minute — [`super::clock::GameClock`]
+    /// minutes, the same unit every [`ProductionItem::per_minute`] is
+    /// written in, so a gatherer's speed reads on the same scale as a
+    /// producer's rate even though nothing here is a rate of one *item*.
+    /// Deliberately slow: a specialised resource building reaches further and
+    /// pulls faster; this one buys a levelled build site, not a supply chain.
+    pub blocks_per_minute: f32,
+    /// How many stacks (`economy.stack_size`) of gathered drops this building
+    /// can hold before it stops digging and waits for a haul — the same
+    /// [`Production::buffer_stacks`] shape and default, since a gatherer's
+    /// output is meant to be hauled out exactly like a producer's.
+    #[serde(default = "default_buffer_stacks")]
+    pub buffer_stacks: u32,
 }
 
 /// How a building's horizontal footprint is determined. `FromBlueprint` (the
@@ -313,6 +372,10 @@ pub enum DefinitionError {
     /// dangling `requires` edge, since both name a building id that has to
     /// actually exist.
     DanglingFarmTile(String),
+    /// A `gatherer` block with a value nothing downstream could use (ticket
+    /// 086) — same shape as [`InvalidWarehouse`](Self::InvalidWarehouse) and
+    /// [`InvalidFarm`](Self::InvalidFarm).
+    InvalidGatherer(&'static str),
     /// `footprint: Explicit { x, z }` has a non-positive axis.
     InvalidFootprint { x: i32, z: i32 },
     /// `ground_level` isn't a real index into the matched blueprint's Y
@@ -355,6 +418,7 @@ impl std::fmt::Display for DefinitionError {
             DefinitionError::DanglingFarmTile(missing) => {
                 write!(f, "farm.tile names {missing:?}, which is not a loaded building")
             }
+            DefinitionError::InvalidGatherer(rule) => write!(f, "gatherer.{rule}"),
             DefinitionError::InvalidProduction { item, per_minute } => write!(
                 f,
                 "production entry for {item:?} has negative per_minute {per_minute}"
@@ -534,6 +598,20 @@ fn validate(building: &Building) -> Result<(), DefinitionError> {
         }
         if building.production.is_none() {
             return Err(DefinitionError::InvalidFarm("needs a production block to scale"));
+        }
+    }
+    // Ticket 086: a gatherer that reaches nowhere, digs at zero (or
+    // negative) speed, or can hold nothing is a mistake in the file, the
+    // same call `warehouse`/`farm` already make for their own knobs.
+    if let Some(gatherer) = &building.gatherer {
+        if gatherer.radius_blocks == 0 {
+            return Err(DefinitionError::InvalidGatherer("radius_blocks must be > 0"));
+        }
+        if gatherer.blocks_per_minute <= 0.0 {
+            return Err(DefinitionError::InvalidGatherer("blocks_per_minute must be > 0"));
+        }
+        if gatherer.buffer_stacks == 0 {
+            return Err(DefinitionError::InvalidGatherer("buffer_stacks must be > 0"));
         }
     }
     Ok(())
@@ -1325,6 +1403,126 @@ Building(
         assert_eq!(farm.tiles_for_full_rate, 3);
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- gatherer (ticket 086) -------------------------------------------
+
+    #[test]
+    fn a_zero_gatherer_radius_is_skipped() {
+        let catalogue = catalogue_with_house01();
+        let dir = temp_dir("gatherer_zero_radius");
+        fs::write(
+            dir.join("house01.ron"),
+            r#"Building(
+                name: "House",
+                blueprint: "house01.nbt",
+                tier: 1,
+                gatherer: Some(Gatherer(radius_blocks: 0, blocks_per_minute: 2.0)),
+                integrity: Integrity(pristine_above: 0.9, ruined_below: 0.5),
+            )"#,
+        )
+        .unwrap();
+
+        let (definitions, skipped) = load_definitions_dir(&dir, &catalogue);
+        assert!(definitions.is_empty());
+        assert_eq!(skipped.len(), 1);
+        assert!(matches!(skipped[0].1, DefinitionError::InvalidGatherer(_)));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_zero_or_negative_gatherer_speed_is_skipped() {
+        let catalogue = catalogue_with_house01();
+        let dir = temp_dir("gatherer_zero_speed");
+        fs::write(
+            dir.join("house01.ron"),
+            r#"Building(
+                name: "House",
+                blueprint: "house01.nbt",
+                tier: 1,
+                gatherer: Some(Gatherer(radius_blocks: 6, blocks_per_minute: 0.0)),
+                integrity: Integrity(pristine_above: 0.9, ruined_below: 0.5),
+            )"#,
+        )
+        .unwrap();
+
+        let (definitions, skipped) = load_definitions_dir(&dir, &catalogue);
+        assert!(definitions.is_empty());
+        assert_eq!(skipped.len(), 1);
+        assert!(matches!(skipped[0].1, DefinitionError::InvalidGatherer(_)));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_zero_gatherer_buffer_stacks_is_skipped() {
+        let catalogue = catalogue_with_house01();
+        let dir = temp_dir("gatherer_zero_buffer");
+        fs::write(
+            dir.join("house01.ron"),
+            r#"Building(
+                name: "House",
+                blueprint: "house01.nbt",
+                tier: 1,
+                gatherer: Some(Gatherer(radius_blocks: 6, blocks_per_minute: 2.0, buffer_stacks: 0)),
+                integrity: Integrity(pristine_above: 0.9, ruined_below: 0.5),
+            )"#,
+        )
+        .unwrap();
+
+        let (definitions, skipped) = load_definitions_dir(&dir, &catalogue);
+        assert!(definitions.is_empty());
+        assert_eq!(skipped.len(), 1);
+        assert!(matches!(skipped[0].1, DefinitionError::InvalidGatherer(_)));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A well-formed gatherer link survives and is read back with its fields
+    /// intact, `buffer_stacks` defaulting the same way `Production`'s does
+    /// when the file doesn't name it.
+    #[test]
+    fn a_valid_gatherer_is_carried_with_a_defaulted_buffer() {
+        let catalogue = catalogue_with_house01();
+        let dir = temp_dir("gatherer_valid");
+        fs::write(
+            dir.join("house01.ron"),
+            r#"Building(
+                name: "Gatherer's Hut",
+                blueprint: "house01.nbt",
+                tier: 1,
+                gatherer: Some(Gatherer(radius_blocks: 6, blocks_per_minute: 2.0)),
+                integrity: Integrity(pristine_above: 0.9, ruined_below: 0.5),
+            )"#,
+        )
+        .unwrap();
+
+        let (definitions, skipped) = load_definitions_dir(&dir, &catalogue);
+        assert!(skipped.is_empty(), "{skipped:?}");
+        let gatherer = definitions.get("house01").unwrap().building.gatherer.expect("gatherer should have loaded");
+        assert_eq!(gatherer.radius_blocks, 6);
+        assert_eq!(gatherer.blocks_per_minute, 2.0);
+        assert_eq!(gatherer.buffer_stacks, 4, "same default Production::buffer_stacks uses");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The gatherer hut this repo actually ships, loaded end to end — the
+    /// same shape `the_shipped_definitions_all_parse` covers for parsing
+    /// alone, but through the full catalogue this time.
+    #[test]
+    fn the_shipped_gatherer_hut_loads() {
+        let (catalogue, catalogue_skipped) = crate::blueprint::load_catalogue_dir(Path::new("assets/city/blueprints"));
+        assert!(catalogue_skipped.is_empty(), "{catalogue_skipped:?}");
+
+        let (definitions, skipped) = load_definitions_dir(Path::new("assets/city/buildings"), &catalogue);
+        assert!(skipped.is_empty(), "{skipped:?}");
+
+        let gatherer_hut = definitions.get("gatherer_hut").expect("gatherer_hut.ron should load");
+        let gatherer = gatherer_hut.building.gatherer.expect("should declare a gatherer block");
+        assert!(gatherer.radius_blocks > 0);
+        assert!(gatherer.blocks_per_minute > 0.0);
     }
 
     #[test]

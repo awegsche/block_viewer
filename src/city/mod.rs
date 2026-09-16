@@ -219,6 +219,25 @@
 //! every step fixed by another warehouse. `logistics.ron` moves to version 2
 //! to carry the in-flight stacks across a quit.
 //!
+//! ## The gatherer's dig (ticket 086, roadmap H2)
+//!
+//! [`gatherer::GathererPlugin`] finally reads [`definition::Gatherer`], data
+//! since it landed schema-only. A gatherer hub owns no resource of its own —
+//! its output fills a [`production::Producer`] buffer in the *same*
+//! [`production::ProductionState`] map a `production` block's building
+//! already uses, which is what lets a warehouse haul it and both UI panels
+//! display it without either one learning a gatherer exists as anything more
+//! than one more entry in that map (see [`gatherer`]'s own docs). Each tick
+//! it accrues `blocks_per_minute` into a per-building block carry and, once a
+//! whole one is owed, digs the nearest still-diggable tile within
+//! `radius_blocks` down to — and never past — [`definition::Building::ground_level`]'s
+//! own placed height, crediting whatever [`drops::DropTable`] says that block
+//! gives. No journal entry and no [`write_status::WriteStatus`] line, for the
+//! same "undo undoes builds, not time" reasoning production's own tick
+//! already gives, plus one more: a background write landing every few seconds
+//! per hub would never let the city panel's "Last edit" line show what the
+//! player actually just did.
+//!
 //! ## The build menu and city panel (ticket 050, roadmap G)
 //!
 //! [`ui::UiPlugin`] is the citybuilder's first real UI — its own
@@ -351,6 +370,7 @@ mod demolish;
 mod drops;
 mod economy;
 mod farm;
+mod gatherer;
 mod grid;
 mod hot_reload;
 mod inventory;
@@ -486,6 +506,7 @@ pub fn run() {
         .add_plugins(warehouse::WarehousePlugin)
         .add_plugins(farm::FarmPlugin)
         .add_plugins(production::ProductionPlugin)
+        .add_plugins(gatherer::GathererPlugin)
         .add_plugins(tool::ToolPlugin)
         .add_plugins(picking::PickingPlugin)
         .add_plugins(placement::PlacementPlugin)

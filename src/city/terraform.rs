@@ -189,7 +189,12 @@ fn rect_tiles(a: IVec2, b: IVec2) -> impl Iterator<Item = IVec2> {
 /// `city::grid`'s clutter-skipping `is_ground` — a dig or a level should
 /// clear a tree or a fence post exactly like it clears stone, not read past
 /// it the way a footprint fit does.
-fn topmost_block_y(tile: IVec2, world: &DecodedWorld) -> Option<i32> {
+///
+/// `pub(super)`: [`super::gatherer`]'s tick reuses this exact reading rather
+/// than a second copy of the section/local-coordinate arithmetic — a
+/// gatherer's dig is the same "what's on top right now" question this
+/// module's own dig already answers.
+pub(super) fn topmost_block_y(tile: IVec2, world: &DecodedWorld) -> Option<i32> {
     let size = world::SECTION_SIZE as i32;
     let chunk = (tile.x.div_euclid(size), tile.y.div_euclid(size));
     let column = world.columns.get(&chunk)?;

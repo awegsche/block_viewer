@@ -133,6 +133,15 @@ pub enum ProducerState {
     /// The buffer is at its cap and the building has stopped. Ticket 080's
     /// haulage is what clears it.
     BufferFull,
+    /// Ticket 086: a [`super::gatherer`] hub with nothing left inside its
+    /// radius above its own ground level — every reachable block down to the
+    /// floor is already gone. Distinct from [`Starved`](Self::Starved) (which
+    /// names a missing *input*, not a fact about the ground) and from
+    /// [`BufferFull`](Self::BufferFull) (which clears itself the moment a
+    /// haul empties the buffer; this doesn't clear on its own at all — the
+    /// site really is levelled). A building with a `production` block never
+    /// reaches this state.
+    Depleted,
 }
 
 impl ProducerState {
@@ -142,6 +151,7 @@ impl ProducerState {
             ProducerState::Running => "running",
             ProducerState::Starved => "starved",
             ProducerState::BufferFull => "buffer full",
+            ProducerState::Depleted => "site levelled",
         }
     }
 }
@@ -160,6 +170,13 @@ pub struct Producer {
     /// Fractional *input* debt, same shape as [`partial`](Self::partial).
     #[serde(default)]
     pub owed: BTreeMap<String, f32>,
+    /// Fractional blocks owed to [`super::gatherer`]'s dig, same shape as
+    /// [`partial`](Self::partial) and [`owed`](Self::owed) one direction
+    /// over again: a `Gatherer::blocks_per_minute` rate is a count of
+    /// *blocks*, not of one chosen item, so it can't share `partial`'s
+    /// per-item map the way a producer's own output does.
+    #[serde(default)]
+    pub dig_carry: f32,
     #[serde(default)]
     pub state: ProducerState,
     /// Which input it is short of, when [`state`](Self::state) is
@@ -261,6 +278,18 @@ impl ProductionState {
     /// creates a producer the first time it sees a building that needs one.
     pub fn insert(&mut self, id: BuildingId, producer: Producer) {
         self.producers.insert(id, producer);
+    }
+
+    /// `id`'s [`Producer`], creating a fresh (idle) one on first touch — the
+    /// same "create on first tick" shape [`tick`]'s own loop already gives a
+    /// building with a `production` block, exposed here so
+    /// [`super::gatherer`]'s tick can share one buffer/state per building
+    /// instance rather than keeping a second per-building map beside this
+    /// one (which is also what lets [`super::warehouse::compute_coverage`]'s
+    /// notion of "a producer" and haulage's dispatch loop reach a gatherer's
+    /// buffer without knowing it's a gatherer at all).
+    pub fn entry(&mut self, id: BuildingId) -> &mut Producer {
+        self.producers.entry(id).or_default()
     }
 
     /// Drops every producer whose building `city` no longer holds — a
@@ -1050,6 +1079,7 @@ mod tests {
                 cost: Vec::new(),
                 warehouse,
                 farm: None,
+                gatherer: None,
                 category: Category::Production,
                 ground_level: 0,
                 integrity: Integrity { pristine_above: 0.95, ruined_below: 0.6 },

@@ -2,8 +2,9 @@
 
 Not a work item: the design document for the citybuilder game and the shared
 world-edit infrastructure it uses. High-level tasks here get split into
-numbered tickets in this directory when picked up (**next free number: 086**).
-Companion to `ROADMAP.md`, which covers the viewer 001–029.
+numbered tickets in this directory when picked up. Companion to `ROADMAP.md`,
+which covers the viewer 001–029, and `RANVIL_CLI_ROADMAP.md`, which claims
+087–103 for a third executable, `ranvil-cli`. **Next free number: 104.**
 
 ## The goal
 
@@ -816,6 +817,58 @@ world is made of are the economy's own units.
   deferred: this building's output goes through the ordinary `production`
   buffer like every other producer, and its blueprint's chests are set
   dressing.
+- **The Gatherer's Hut (ticket 086, done)** — the low-radius, low-speed
+  answer to ground levelling and early resource collection this section's own
+  header promises, distinct from a specialised quarry/mine (neither built).
+  `definition::Gatherer` (`Building::gatherer`) adds `radius_blocks`,
+  `blocks_per_minute` and `buffer_stacks` — the last reusing
+  `Production::buffer_stacks`'s own shape and default. Deliberately no
+  `outputs` list: what comes out is whatever block was actually there,
+  resolved through `drops.ron` the same way `city::terraform`'s dig already
+  resolves one, not a chosen recipe. **"Digs down to its own foundation and
+  no deeper" needed no field of its own** — it's `ground_level` (085) read
+  back at the building's own placement, the same value `commit` and the
+  ghost preview already use. Shipped as `gatherer_hut.ron`, placeholder
+  geometry borrowing `lumber.nbt` (same pattern `warehouse01`/`warehouse02`
+  already use against `house01.nbt`) with a small radius and a slow rate.
+  - **`city::gatherer::GathererPlugin` is the tick.** No resource of its own
+    for the buffer: a gatherer's output fills a `production::Producer` in the
+    *same* `ProductionState` map a `production` block's building already
+    uses, which is the one decision that makes a warehouse haul it and both
+    UI panels display it without either learning a gatherer exists as more
+    than one more map entry (`warehouse::is_producer` and the two panels'
+    buffer-capacity lookups are the only two call sites that had to learn
+    that). `Producer::dig_carry` is `partial`/`owed`'s fractional-carry shape
+    one direction further over — a count of *blocks*, not of one item, since
+    `blocks_per_minute` isn't a recipe.
+  - **`next_gather_target` walks outward from the footprint** (Chebyshev,
+    `farm::rect_distance` — no road to route a gathering radius along, same
+    call `Farm::radius_blocks` makes), picking whichever still-diggable tile
+    is nearest and never the building's own footprint. A per-dispatch
+    `claimed` map remembers "the next Y down" for a tile already touched in
+    the same batch, so several blocks in one tick empty the nearest column
+    before moving outward rather than skipping a layer at a time across the
+    whole radius.
+  - **One write in flight per building, not one shared slot** — unlike
+    commit/terraform's single pending slot (only one placement or drag ever
+    happens at once), several huts can legitimately be digging the same
+    tick, and queuing them behind each other would slow every hub in the
+    city to whichever write is running. A hub with a write already pending
+    simply skips dispatch (and doesn't accrue more carry) until it settles.
+  - **No journal, no `WriteStatus` line** — same "undo undoes builds, not
+    time" reasoning production's own tick already gives, plus one more: a
+    write landing every few seconds per hub would never let the city panel's
+    "Last edit" line show what the player actually just did. `ChunksEdited`
+    still fires, so a dug block disappears from the mesh without a restart.
+  - **A depleted site is a real, distinct state** — `ProducerState::Depleted`
+    ("site levelled"), reached when nothing is left within radius above the
+    floor. The carry resets rather than growing forever with nothing to
+    spend it on; the hub keeps cheaply re-checking every tick after, in case
+    a neighbouring edit puts material back in range, rather than latching
+    permanently.
+  - **A failed dig refunds the carry it claimed but never spent** — the same
+    "unaffordable is refunded, not lost" shape ticket 073 gives a
+    placement's cost, applied here to time instead of materials.
 - **Still open in H2**: production *chains* have never been played — the
   shipped set is farms with no inputs, so `Production::inputs`, the starved
   state and `resolve_requirements`' tier tree are all implemented and

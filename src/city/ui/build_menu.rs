@@ -414,6 +414,7 @@ mod tests {
             cost: Vec::new(),
             warehouse: None,
             farm: None,
+            gatherer: None,
             category: Category::Production,
             ground_level: 0,
             integrity: Integrity { pristine_above: 0.95, ruined_below: 0.6 },

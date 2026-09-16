@@ -1,0 +1,39 @@
+// Ticket 086, roadmap C1: the Gatherer's Hut — ground levelling and early
+// resource collection, without a specialised quarry/mine's reach or speed
+// (neither built yet). See `Gatherer`'s own docs in `definition.rs` for how
+// the schema encodes "digs down to its own foundation and no deeper" without
+// a second field: `ground_level` below already says where that floor is.
+//
+// Ticket 104: real geometry, built headlessly with `ranvil-cli struct`
+// (new/fill/set) rather than exported from a Minecraft session — a fenced
+// 9x9 yard around a small single-room hut (oak-log/plank walls, gable roof,
+// a double chest + crafting table + barrel inside).
+Building(
+    name: "Gatherer's Hut",
+    blueprint: "gatherer_hut.nbt",
+    tier: 1,
+    requires: [],
+    category: Production,
+    footprint: FromBlueprint,
+    // One dirt layer (y=0) under the yard's grass/floor surface at y=1 — see
+    // gatherer_hut.nbt's own layout (ticket 104).
+    ground_level: 1,
+    cost: [
+        (block: "minecraft:oak_planks", count: 12),
+        (block: "minecraft:dirt", count: 8),
+    ],
+    gatherer: Some((
+        // Deliberately tighter than a warehouse's road-cell reach or a
+        // farm's tile radius (roadmap H2): this building levels the site
+        // right around it, not a district.
+        radius_blocks: 6,
+        // Slow next to a specialised quarry/mine's eventual rate — the point
+        // is a levelled build site early on, not a real extraction economy.
+        blocks_per_minute: 2.0,
+        buffer_stacks: 4,
+    )),
+    integrity: Integrity(
+        pristine_above: 0.95,
+        ruined_below: 0.60,
+    ),
+)

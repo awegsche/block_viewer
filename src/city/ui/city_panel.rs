@@ -42,6 +42,7 @@ use super::super::inventory::{short_name, Stock};
 use super::super::definition::BuildingDefinitions;
 use super::super::economy::EconomyConfig;
 use super::super::farm::FarmCoverage;
+use super::super::gatherer::gatherer_buffer_capacity;
 use super::super::journal::Journal;
 use super::super::production::{buffer_capacity, ProductionState};
 use super::super::warehouse::{Coverage, StorageCapacity};
@@ -269,9 +270,18 @@ fn producer_lines(
             let placed = city.building(id)?;
             let name = placed.definition_id.as_deref().unwrap_or(&placed.catalogue_id);
             let definition = definitions.get(name);
+            // A gatherer (ticket 086) fills the same buffer a `production`
+            // block does but sizes it off `Gatherer::buffer_stacks` instead —
+            // a definition with both reads as `production`'s own cap; the
+            // shipped set never declares both on one building.
             let capacity = definition
                 .and_then(|definition| definition.building.production.as_ref())
                 .map(|spec| buffer_capacity(spec, economy))
+                .or_else(|| {
+                    definition
+                        .and_then(|definition| definition.building.gatherer.as_ref())
+                        .map(|gatherer| gatherer_buffer_capacity(gatherer, economy))
+                })
                 .unwrap_or(0);
             let mut state = match &producer.short_of {
                 Some(item) => format!("{} (needs {})", producer.state.label(), short_name(item)),
@@ -510,6 +520,7 @@ mod tests {
             cost: Vec::new(),
             warehouse: None,
             farm: Some(Farm { tile: "tile".to_string(), radius_blocks: 16, tiles_for_full_rate: 3 }),
+            gatherer: None,
             category: Category::Production,
             ground_level: 0,
             integrity: Integrity { pristine_above: 0.95, ruined_below: 0.6 },
@@ -561,6 +572,7 @@ mod tests {
             cost: Vec::new(),
             warehouse: None,
             farm: None,
+            gatherer: None,
             category: Category::Production,
             ground_level: 0,
             integrity: Integrity { pristine_above: 0.95, ruined_below: 0.6 },
