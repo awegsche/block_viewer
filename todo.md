@@ -655,7 +655,7 @@ these itself (see CLAUDE.md's "Manual/visual verification").
 - [ ] **045 RTS camera: controls feel right at the window.** The automated
   suite covers `CameraMode::Rts`'s pan/rotate/zoom math and clamps directly
   (a bare `App`, `Time` advanced by hand, no real window) -- what it can't
-  cover is whether the tuning (`rts_pan_speed_factor`, `rts_rotate_speed`,
+  cover is whether the tuning (`rts_pan_speed`, `rts_rotate_speed`,
   `rts_pitch_range`) actually feels usable, and whether Bevy's real cursor/
   input plumbing agrees with the test doubles.
 
@@ -675,6 +675,16 @@ these itself (see CLAUDE.md's "Manual/visual verification").
   *its* camera is untouched -- still starts in `Fly` mode with the free-fly
   controls exactly as before, proving `CameraStartMode`'s override is
   citybuilder-only.
+- [ ] **106 Rts pan speed constant: panning no longer crawls when zoomed
+  in, and 56.73 blocks/sec still feels right.** `cargo run --bin
+  citybuilder` against the real save. Scroll all the way in (min orbit
+  radius) and hold `W`/`A`/`S`/`D` -- panning should move at the same
+  speed as it does zoomed all the way out, not visibly crawl the way it
+  used to. Judge whether the flat 56.73 blocks/sec (`CameraSettings::
+  rts_pan_speed` in `src/camera.rs`) feels like a reasonable default speed
+  at both zoom extremes -- it was derived from the old zoom-tied formula's
+  speed at the rig's default spawn distance, not tuned by eye. Record any
+  retuning in `finished_tickets/106-rts-pan-speed-constant.md`.
 - [ ] **047 ghost preview: it actually reads as a translucent, validity-tinted
   building at the cursor.** The automated suite covers `resolve_placement`/
   `resolve_ghost`/`ghost_mesh`'s decisions and the keyboard selection
