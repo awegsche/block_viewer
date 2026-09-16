@@ -572,6 +572,20 @@ impl Box3 {
     pub fn new(min: IVec3, max: IVec3) -> Self {
         Self { min, max }
     }
+
+    pub fn contains(&self, pos: IVec3) -> bool {
+        pos.cmpge(self.min).all() && pos.cmple(self.max).all()
+    }
+
+    /// Every position in the box, Y outer / Z middle / X inner — ticket
+    /// 115's planner is the first caller, walking `excavate` and `survey`
+    /// one block at a time.
+    pub fn iter(&self) -> impl Iterator<Item = IVec3> + '_ {
+        let (min, max) = (self.min, self.max);
+        (min.y..=max.y)
+            .flat_map(move |y| (min.z..=max.z).map(move |z| (y, z)))
+            .flat_map(move |(y, z)| (min.x..=max.x).map(move |x| IVec3::new(x, y, z)))
+    }
 }
 
 /// One unit of mining work — `MINES_DESIGN.md`'s "Order of work": one

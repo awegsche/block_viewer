@@ -250,11 +250,9 @@ impl Blueprint {
     /// The state at a Minecraft block coordinate, or `None` if it's outside
     /// the extracted volume.
     ///
-    /// No caller outside this module's tests yet, where it's how every
-    /// "the right block landed at the right index" assertion is written —
-    /// which is also what makes it the obvious thing for ticket 023/024 to
-    /// spot-check a blueprint with, so it stays.
-    #[allow(dead_code)]
+    /// This module's tests use it for every "the right block landed at the
+    /// right index" assertion; `city::mine::plan`'s `BlockSampler` impl for
+    /// `Blueprint` (ticket 115) is its first real caller.
     pub fn block_at(&self, block: IVec3) -> Option<&BlockState> {
         let bounds = SelectionBounds::from_corners(
             self.origin,
@@ -379,45 +377,84 @@ pub fn extract_blueprint(
     progress.begin(columns.len());
 
     for coord in columns {
-        let region_coord = chunk_to_region_coord(coord);
-        let (local_x, local_z) = local_chunk_index(coord, region_coord);
-
         {
             let mut cache = region_cache.lock().expect("region cache mutex poisoned");
-            match cache.get_or_load(region_coord) {
-                Ok(region) => {
-                    // A chunk the region doesn't have is ungenerated terrain:
-                    // air, and entirely normal at the edge of an explored
-                    // area.
-                    if let Some(nbt) = region.get_chunk(local_x, local_z) {
-                        match acc.sample_column(coord, nbt) {
-                            Ok(()) => {}
-                            Err(ColumnError::Nbt(err)) => acc.note_failed_column(coord, &err),
-                            Err(ColumnError::PaletteTooLarge) => {
-                                return Err(ExtractError::PaletteTooLarge)
-                            }
-                        }
-                    }
-                }
-                // The save has no region file here at all — the whole 512x512
-                // block area is unexplored. Air, not a failure.
-                Err(MCLoadError::PathNotFoundError) => {}
-                // A region that exists but wouldn't load (truncated/corrupt
-                // `.mca`). `RegionCache` has already logged it once; count the
-                // columns it costs us so the UI can report them.
-                //
-                // Note this only counts the *first* request for a broken
-                // region: the cache remembers the failure and answers later
-                // ones with `PathNotFoundError`, so a corrupt region shows up
-                // as one failed column plus a lot of quiet air.
-                Err(err) => acc.note_failed_region(region_coord, &err),
-            }
+            sample_column_through_cache(&mut acc, &mut cache, coord)?;
         }
-
         progress.advance();
     }
 
     Ok(acc.finish())
+}
+
+/// The same walk as [`extract_blueprint`], for a caller that already holds
+/// exclusive access to the region cache rather than an `Arc<Mutex<..>>` —
+/// `city::mine`'s slice survey (ticket 115), which is called from inside a
+/// job that also holds the lock for the write that follows. Locking a
+/// second time around a read this small would be pointless at best and a
+/// deadlock at worst, so this takes `cache` directly and never locks
+/// anything itself: the whole walk runs under whatever the caller already
+/// holds, for as long as the caller decided to hold it.
+///
+/// Shares [`sample_column_through_cache`] with [`extract_blueprint`] rather
+/// than duplicating the per-column body — the two only differ in *how* they
+/// get at the cache for each column, not in what they do with it once they
+/// have it.
+pub fn extract_blueprint_locked(
+    bounds: SelectionBounds,
+    cache: &mut RegionCache,
+    progress: &ExtractProgress,
+) -> Result<Blueprint, ExtractError> {
+    let mut acc = Accumulator::new(bounds)?;
+
+    let columns = column_order(bounds);
+    progress.begin(columns.len());
+
+    for coord in columns {
+        sample_column_through_cache(&mut acc, cache, coord)?;
+        progress.advance();
+    }
+
+    Ok(acc.finish())
+}
+
+/// One column of [`extract_blueprint`]/[`extract_blueprint_locked`]'s walk,
+/// against a region cache the caller already has `&mut` access to for the
+/// duration of this call.
+fn sample_column_through_cache(
+    acc: &mut Accumulator,
+    cache: &mut RegionCache,
+    coord: (i32, i32),
+) -> Result<(), ExtractError> {
+    let region_coord = chunk_to_region_coord(coord);
+    let (local_x, local_z) = local_chunk_index(coord, region_coord);
+
+    match cache.get_or_load(region_coord) {
+        Ok(region) => {
+            // A chunk the region doesn't have is ungenerated terrain: air,
+            // and entirely normal at the edge of an explored area.
+            if let Some(nbt) = region.get_chunk(local_x, local_z) {
+                match acc.sample_column(coord, nbt) {
+                    Ok(()) => {}
+                    Err(ColumnError::Nbt(err)) => acc.note_failed_column(coord, &err),
+                    Err(ColumnError::PaletteTooLarge) => return Err(ExtractError::PaletteTooLarge),
+                }
+            }
+        }
+        // The save has no region file here at all — the whole 512x512 block
+        // area is unexplored. Air, not a failure.
+        Err(MCLoadError::PathNotFoundError) => {}
+        // A region that exists but wouldn't load (truncated/corrupt `.mca`).
+        // `RegionCache` has already logged it once; count the columns it
+        // costs us so the UI can report them.
+        //
+        // Note this only counts the *first* request for a broken region: the
+        // cache remembers the failure and answers later ones with
+        // `PathNotFoundError`, so a corrupt region shows up as one failed
+        // column plus a lot of quiet air.
+        Err(err) => acc.note_failed_region(region_coord, &err),
+    }
+    Ok(())
 }
 
 /// Every chunk column `bounds` overlaps, ordered **region-major**: all of one

@@ -54,7 +54,10 @@ use super::inventory::Parcel;
 /// The three names that are air. `BlockState::AIR` covers the first; the
 /// other two only ever appear in generated terrain, which is exactly what a
 /// placement clears.
-const AIR_NAMES: [&str; 3] = [BlockState::AIR, "minecraft:cave_air", "minecraft:void_air"];
+///
+/// `pub(crate)` for `city::mine::plan`'s block classification (ticket 115),
+/// which needs the same three names and would otherwise have to repeat them.
+pub(crate) const AIR_NAMES: [&str; 3] = [BlockState::AIR, "minecraft:cave_air", "minecraft:void_air"];
 
 /// One entry of the file's `replaced` map: what a block gives instead of
 /// itself.

@@ -53,8 +53,8 @@ use crate::selection::SelectionBounds;
 // extraction itself falls back to, rather than picking a second number.
 #[allow(unused_imports)]
 pub use extract::{
-    extract_blueprint, BlockState, Blueprint, ExtractError, ExtractProgress, FALLBACK_DATA_VERSION,
-    MAX_BLOCKS,
+    extract_blueprint, extract_blueprint_locked, BlockState, Blueprint, ExtractError, ExtractProgress,
+    FALLBACK_DATA_VERSION, MAX_BLOCKS,
 };
 
 pub use export::{BlueprintExport, ExportState};

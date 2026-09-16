@@ -378,10 +378,8 @@ pub struct Mine {
     pub haul_at_stacks: Option<u32>,
     /// Block names (bare or `minecraft:`-prefixed) scanned for and dug in
     /// addition to every `*_ore` block — see [`is_valuable`](Self::is_valuable).
-    /// Empty by default. No non-test reader yet — `city::mine`'s slice scan
-    /// (ticket 115) is what will use it.
+    /// Empty by default. Read by `city::mine::plan::classify` (ticket 115).
     #[serde(default)]
-    #[allow(dead_code)]
     pub valuables: Vec<String>,
 }
 
@@ -398,9 +396,7 @@ fn default_max_void_run() -> u32 {
 }
 
 /// `stone` -> `minecraft:stone`, the same shorthand [`super::drops`] and
-/// [`super::economy`] accept in their own tables. No non-test caller yet —
-/// see [`Mine::is_valuable`].
-#[allow(dead_code)]
+/// [`super::economy`] accept in their own tables. See [`Mine::is_valuable`].
 fn namespaced(name: &str) -> String {
     let name = name.trim();
     if name.contains(':') {
@@ -433,9 +429,8 @@ impl Mine {
     /// Whether `block_name` should be scanned for and dug as ore: every
     /// `*_ore` block, plus anything listed in [`valuables`](Self::valuables).
     /// Both sides are run through [`namespaced`] first, so a valuables entry
-    /// can be written with or without the `minecraft:` prefix. No non-test
-    /// caller yet — see [`valuables`](Self::valuables).
-    #[allow(dead_code)]
+    /// can be written with or without the `minecraft:` prefix. Called from
+    /// `city::mine::plan::classify` (ticket 115).
     pub fn is_valuable(&self, block_name: &str) -> bool {
         let name = namespaced(block_name);
         name.ends_with("_ore") || self.valuables.iter().any(|valuable| namespaced(valuable) == name)

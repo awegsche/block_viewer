@@ -10,19 +10,22 @@
 //!   region cache, no `DecodedWorld`.
 //! - [`progress`] (ticket 114): [`progress::MineProgress`], the small
 //!   cursor that walks the design's "order of work" one slice at a time.
-//! - Ticket 115 adds survey + slice planning (region-cache reads, block
-//!   classification, the `WorldEdit` for one slice); ticket 116 adds the
-//!   plugin that ticks it, budgets jobs and persists the cursor. Until
-//!   then this module has no system and nothing wires it into `CityPlugin`
-//!   — see `MINES_DESIGN.md`'s "The rule everything below follows" for why
-//!   that split is deliberate rather than a gap.
+//! - [`plan`] (ticket 115): the region-cache read ([`plan::survey`]), block
+//!   classification ([`plan::classify`]), and the `WorldEdit` for one slice
+//!   or one sink job ([`plan::plan_slice`]). Ticket 116 adds the plugin
+//!   that ticks it, budgets jobs and persists the cursor. Until then this
+//!   module has no system and nothing wires it into `CityPlugin` — see
+//!   `MINES_DESIGN.md`'s "The rule everything below follows" for why that
+//!   split is deliberate rather than a gap.
 
-// No non-test caller yet for most of either module's public surface — 115
-// (survey + slice planning) and 116 (the tick) are what call into this,
-// the same gap ticket 113's `Mine::is_valuable`/`valuables` sat in between
-// 113 and 116. Whole-module rather than per-item: nearly everything here
-// is in that position at once, unlike 113's one field and one method.
+// No non-test caller yet for most of `layout`/`progress`'s public surface
+// (116, the tick, is what calls into them) or for `plan`'s (also 116) — the
+// same gap ticket 113's `Mine::is_valuable`/`valuables` sat in between 113
+// and 115. Whole-module rather than per-item: nearly everything here is in
+// that position at once, unlike 113's one field and one method.
 #[allow(dead_code)]
 pub mod layout;
+#[allow(dead_code)]
+pub mod plan;
 #[allow(dead_code)]
 pub mod progress;

@@ -125,7 +125,7 @@ pub enum FootprintFit {
 /// redstone-component family at once, the same way `world::tint`'s `_leaves`
 /// heuristic does for a different purpose; the exact-match list below is
 /// everything else that isn't itself a suffix family.
-fn is_clutter_name(name: &str) -> bool {
+pub(super) fn is_clutter_name(name: &str) -> bool {
     const CLUTTER_SUFFIXES: &[&str] = &[
         "_leaves",
         "_log",
