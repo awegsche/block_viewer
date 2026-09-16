@@ -141,6 +141,7 @@ use super::inventory::{Parcel, Stock};
 use super::journal::{self, Journal, Ledger};
 use super::picking::{HoveredBlock, PickingSet};
 use super::placement::{self, GhostPlacement, PlacementSelection};
+use super::road_build::BuildingFootprintChanged;
 use super::state::{self, BuildingId, PlacedBuilding};
 use super::tool::ActiveTool;
 use super::write_status::{WriteKind, WriteStatus};
@@ -197,6 +198,9 @@ impl Plugin for CommitPlugin {
             // `viewer::paint::PaintPlugin` makes, and it's what lets a
             // standalone test app spawn `CommitPlugin` on its own.
             .add_event::<ChunksEdited>()
+            // Ticket 110 — same idempotent registration, so this plugin can
+            // fire it in a test app without `RoadBuildPlugin` present.
+            .add_event::<BuildingFootprintChanged>()
             // After `PickingSet` for the same reason ticket 047's ghost
             // preview orders there — `try_commit_placement` needs *this*
             // frame's `HoveredBlock`, not last frame's.
@@ -395,12 +399,14 @@ fn try_commit_placement(
 /// success: journals the as-built baseline and fires [`ChunksEdited`] (W7).
 /// On failure: rolls the synchronous [`state::City::place_building`] back —
 /// the "transactionally" half of the roadmap's own wording for E4.
+#[allow(clippy::too_many_arguments)]
 fn poll_commit(
     mut commit: ResMut<CommitState>,
     mut city: ResMut<state::City>,
     mut journal: ResMut<Journal>,
     mut write_status: ResMut<WriteStatus>,
     mut edited: EventWriter<ChunksEdited>,
+    mut footprints: EventWriter<BuildingFootprintChanged>,
     mut stock: ResMut<Stock>,
     drops: Res<DropTable>,
     capacity: Option<Res<super::warehouse::StorageCapacity>>,
@@ -454,8 +460,12 @@ fn poll_commit(
                 }
                 journal.record_placement(building, placement.clone(), baseline, Ledger { credited, debited: spent });
             }
-            write_status.record_success(WriteKind::Placed, placement.catalogue_id, &report);
+            write_status.record_success(WriteKind::Placed, placement.catalogue_id.clone(), &report);
             edited.send(ChunksEdited(report.chunks));
+            // Ticket 110: a road beside this footprint may now want its
+            // connected piece. Only from this arm — a rolled-back placement
+            // never changed what any road cell touches.
+            footprints.send(BuildingFootprintChanged(placement));
         }
         Err(err) => {
             city.remove_building(building);
@@ -750,6 +760,11 @@ mod tests {
         assert_eq!(fired.len(), 1);
         assert_eq!(fired[0].0, vec![(0, 0)]);
 
+        // Ticket 110: the road re-tile hears about the footprint that landed.
+        let footprints: Vec<_> = app.world_mut().resource_mut::<Events<BuildingFootprintChanged>>().drain().collect();
+        assert_eq!(footprints.len(), 1);
+        assert_eq!(footprints[0].0.origin, a_placement().origin);
+
         // The city entry the click made synchronously survives a successful
         // write untouched.
         assert!(!app.world().resource::<state::City>().is_tile_free(IVec2::new(0, 0)));
@@ -777,6 +792,8 @@ mod tests {
 
         let fired = app.world_mut().resource_mut::<Events<ChunksEdited>>().drain().count();
         assert_eq!(fired, 0, "nothing changed in the world, so nothing needs re-meshing");
+        let footprints = app.world_mut().resource_mut::<Events<BuildingFootprintChanged>>().drain().count();
+        assert_eq!(footprints, 0, "a rolled-back placement never touched what any road cell borders");
     }
 
     // --- ticket 073: the ledger ---------------------------------------------

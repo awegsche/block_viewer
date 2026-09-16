@@ -45,7 +45,8 @@ use crate::region_cache::RegionCache;
 use super::commit::apply_building_edit;
 use super::inventory::{Parcel, Stock};
 use super::journal::{Journal, JournalEntry, Ledger};
-use super::state::{BuildingId, City};
+use super::road_build::BuildingFootprintChanged;
+use super::state::{BuildingId, City, PlacedBuilding};
 use super::warehouse::{storage_capacity, StorageCapacity};
 use super::write_status::{WriteKind, WriteStatus};
 
@@ -72,6 +73,9 @@ impl std::fmt::Display for UndoneKind {
 struct PendingUndo {
     #[allow(dead_code)] // kept for parity with `PendingCommit`/`PendingDemolition`; not read yet
     building: BuildingId,
+    /// The footprint this undo took out of, or put back into, [`City`] —
+    /// handed to ticket 110's road re-tile once the write lands.
+    placement: PlacedBuilding,
     definition: String,
     kind: UndoneKind,
     task: Task<Result<EditReport, EditRefusal>>,
@@ -131,6 +135,8 @@ impl Plugin for UndoPlugin {
             // uses across `city::commit`/`city::demolish`.
             .init_resource::<WriteStatus>()
             .add_event::<ChunksEdited>()
+            // Ticket 110 — idempotent, same as `ChunksEdited` above.
+            .add_event::<BuildingFootprintChanged>()
             .add_systems(Update, (start_undo, poll_undo).chain());
     }
 }
@@ -226,14 +232,19 @@ fn start_undo(
         apply_building_edit(&mut cache, &edit, &policy)
     });
 
-    undo.pending = Some(PendingUndo { building: step.building, definition, kind, task });
+    undo.pending = Some(PendingUndo { building: step.building, placement: step.placement, definition, kind, task });
     undo.state = UndoState::Writing;
 }
 
 /// Single non-blocking poll of the in-flight undo — same
 /// `block_on(poll_once(..))` pattern every other task in this crate uses. A
 /// failure here is reported, not rolled back — see the module docs.
-fn poll_undo(mut undo: ResMut<UndoCommand>, mut write_status: ResMut<WriteStatus>, mut edited: EventWriter<ChunksEdited>) {
+fn poll_undo(
+    mut undo: ResMut<UndoCommand>,
+    mut write_status: ResMut<WriteStatus>,
+    mut edited: EventWriter<ChunksEdited>,
+    mut footprints: EventWriter<BuildingFootprintChanged>,
+) {
     let result = {
         let Some(pending) = &mut undo.pending else { return };
         let Some(result) = block_on(poll_once(&mut pending.task)) else {
@@ -241,7 +252,7 @@ fn poll_undo(mut undo: ResMut<UndoCommand>, mut write_status: ResMut<WriteStatus
         };
         result
     };
-    let PendingUndo { definition, kind, .. } = undo.pending.take().expect("just matched Some above");
+    let PendingUndo { placement, definition, kind, .. } = undo.pending.take().expect("just matched Some above");
 
     match result {
         Ok(report) => {
@@ -253,6 +264,10 @@ fn poll_undo(mut undo: ResMut<UndoCommand>, mut write_status: ResMut<WriteStatus
             write_status.record_success(WriteKind::Undo, definition.clone(), &report);
             undo.state = UndoState::Done { definition, kind };
             edited.send(ChunksEdited(report.chunks));
+            // Ticket 110: undoing a placement removes a footprint, undoing a
+            // demolition puts one back — the road re-tile re-reads the cells
+            // beside it the same way either direction.
+            footprints.send(BuildingFootprintChanged(placement));
         }
         Err(err) => {
             println!(
@@ -279,6 +294,17 @@ mod tests {
         let mut app = App::new();
         app.add_plugins(UndoPlugin).insert_resource(City::default()).insert_resource(Journal::default());
         app
+    }
+
+    fn a_placement() -> PlacedBuilding {
+        PlacedBuilding {
+            catalogue_id: "house01".to_string(),
+            definition_id: None,
+            origin: IVec3::new(0, 64, 0),
+            rotation: Rotation::Deg0,
+            footprint: IVec2::ONE,
+            work_area: None,
+        }
     }
 
     fn run_until_settled(app: &mut App) {
@@ -418,6 +444,7 @@ mod tests {
         let mut app = app();
         app.world_mut().resource_mut::<UndoCommand>().pending = Some(PendingUndo {
             building: super::super::state::City::default().place_building("house01", None, IVec3::ZERO, Rotation::Deg0, IVec2::ONE).unwrap(),
+            placement: a_placement(),
             definition: "house01".to_string(),
             kind: UndoneKind::Placement,
             task: pool().spawn(async {
@@ -433,6 +460,13 @@ mod tests {
 
         let fired: Vec<_> = app.world_mut().resource_mut::<Events<ChunksEdited>>().drain().collect();
         assert_eq!(fired.len(), 1);
+
+        // Ticket 110: the footprint that just left `City` reaches the road
+        // re-tile, carried on the step rather than looked up in a journal
+        // entry that no longer exists.
+        let footprints: Vec<_> = app.world_mut().resource_mut::<Events<BuildingFootprintChanged>>().drain().collect();
+        assert_eq!(footprints.len(), 1);
+        assert_eq!(footprints[0].0.origin, a_placement().origin);
     }
 
     /// The documented gap: once `undo_last` has run, a write failure is
@@ -446,6 +480,7 @@ mod tests {
         let mut app = app();
         app.world_mut().resource_mut::<UndoCommand>().pending = Some(PendingUndo {
             building: super::super::state::City::default().place_building("house01", None, IVec3::ZERO, Rotation::Deg0, IVec2::ONE).unwrap(),
+            placement: a_placement(),
             definition: "house01".to_string(),
             kind: UndoneKind::Demolition,
             task: pool().spawn(async { Err(EditRefusal::ChunkNotGenerated { chunk: (5, 0) }) }),
@@ -459,5 +494,7 @@ mod tests {
 
         let fired = app.world_mut().resource_mut::<Events<ChunksEdited>>().drain().count();
         assert_eq!(fired, 0, "the write never landed, so nothing needs re-meshing");
+        let footprints = app.world_mut().resource_mut::<Events<BuildingFootprintChanged>>().drain().count();
+        assert_eq!(footprints, 0, "the world didn't change, so no road beside the footprint should be re-tiled yet");
     }
 }

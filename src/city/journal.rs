@@ -343,6 +343,7 @@ impl Journal {
         let edit = entry.baseline().restore_edit();
         let ledger = entry.ledger().clone();
 
+        let placement = entry.placement().clone();
         let building = match entry {
             JournalEntry::Placed { building, .. } => {
                 let building = *building;
@@ -353,7 +354,7 @@ impl Journal {
                 city.remove_building(building);
                 building
             }
-            JournalEntry::Demolished { building, placement, .. } => {
+            JournalEntry::Demolished { building, .. } => {
                 let building = *building;
                 city.insert_loaded(building, placement.clone()).map_err(UndoError::Occupied)?;
                 building
@@ -361,7 +362,7 @@ impl Journal {
         };
 
         self.entries.pop();
-        Ok(UndoStep { building, edit, ledger })
+        Ok(UndoStep { building, placement, edit, ledger })
     }
 }
 
@@ -371,6 +372,11 @@ impl Journal {
 #[derive(Debug)]
 pub struct UndoStep {
     pub building: BuildingId,
+    /// The undone entry's own [`PlacedBuilding`] — the footprint that just
+    /// left [`City`] (a placement undone) or came back into it (a demolition
+    /// undone). Ticket 110's road re-tile needs the geometry either way, and
+    /// after `undo_last` returns the entry that held it is gone.
+    pub placement: PlacedBuilding,
     pub edit: WorldEdit,
     /// What the undone entry moved in and out of the stock — the caller
     /// settles it in reverse (add back what was debited, take back what was

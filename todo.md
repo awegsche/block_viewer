@@ -1465,3 +1465,19 @@ Y=0 in the world and won't be cleaned up by this fix — see the ticket.
   the old area untouched; (d) "Clear working area" puts the hut back to
   "no working area"; (e) save (existing `city.ron` from before this ticket
   should still load, huts with no area) and reload keeps a drawn area.
+- [ ] **110 Reactive re-tile: a building beside an existing road repaints it.**
+  `cargo test --lib` is green (the flip is asserted both in `City` and in a
+  fixture region's blocks), but the live mesh update needs eyes. At
+  `cargo run --bin citybuilder`, drag a short dirt road across open ground
+  first, then place a building right beside the middle of it: the
+  touching cell should visibly change to its `-connected` piece a moment
+  after the placement lands (console: `N road cell(s) re-tiled beside a
+  building`), without any other cell of the road being rewritten. Demolish
+  the building: the cell goes back to the plain piece. Undo the demolition:
+  connected again; undo the placement: plain again. Also check: (a) a road
+  cell that was built as a tunnel (drag along the foot of a hill) is never
+  flipped by a building placed or removed next to it; (b) two buildings
+  sharing one road cell — demolishing one leaves the piece connected and
+  logs no re-tile; (c) a cell whose kind has no `-connected.nbt` shipped
+  (`cross`, `stairs` — see `assets/city/roads/dirt/README.md`) stays as it
+  was, no console error.

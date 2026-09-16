@@ -275,13 +275,14 @@ pub struct RoadCell {
     ///
     /// [`super::road::RoadPieceVariant::Connected`] has no such
     /// self-destroying check — `super::road::touches_building` is safe to
-    /// call again any time — but it's still frozen here rather than
-    /// re-derived, for consistency with the other two and because nothing yet
-    /// re-tiles a road cell when a building is placed or removed next to it
-    /// after the fact. A building that shows up beside an already-built road
-    /// doesn't retroactively repaint it; only a cell this drag actually
-    /// writes or re-tiles picks the variant up. The cell remembers what it
-    /// was built as, the way it remembers its ground.
+    /// call again any time — so it is the one variant that *is* revisited
+    /// after the cell exists: ticket 110's
+    /// `super::road_build::retile_beside_buildings` re-reads it for exactly
+    /// the cells a building's footprint just appeared or disappeared next
+    /// to, through [`City::set_road_cell_variant`], and never for a cell
+    /// already recorded `Tunnel`. Still stored rather than derived on every
+    /// read, so the write path and the preview keep reading one recorded
+    /// answer rather than each taking their own.
     pub variant: super::road::RoadPieceVariant,
 }
 
@@ -582,6 +583,25 @@ impl City {
         }
         self.road_cells.insert(cell, RoadCell { style: style.into(), base_y, ascent, variant });
         Ok(())
+    }
+
+    /// Repaints an existing road cell's [`RoadCell::variant`] in place
+    /// (ticket 110), returning what it was before so the caller can put it
+    /// back if the world write that follows fails. `None` — and nothing
+    /// changed — if `cell` isn't a road cell.
+    ///
+    /// The one field of a [`RoadCell`] that is allowed to change after the
+    /// cell exists: [`add_road_cell`](Self::add_road_cell)'s idempotence
+    /// deliberately protects `base_y`/`ascent`/`variant` from a drag that
+    /// merely re-crosses the cell, so a *reactive* re-tile — a building
+    /// appearing or disappearing beside a road that was already there —
+    /// needs its own way in. `style`, `base_y` and `ascent` stay
+    /// untouchable: the reasons [`RoadCell`] gives for freezing them (drift,
+    /// a stair flipping under the player) still hold; only the connected
+    /// marker is a reading that stays true to re-take.
+    pub fn set_road_cell_variant(&mut self, cell: IVec2, variant: super::road::RoadPieceVariant) -> Option<super::road::RoadPieceVariant> {
+        let road = self.road_cells.get_mut(&cell)?;
+        Some(std::mem::replace(&mut road.variant, variant))
     }
 
     /// Clears a road cell and frees all 36 of its block tiles. Returns

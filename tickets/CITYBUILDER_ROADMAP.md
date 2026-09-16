@@ -4,7 +4,7 @@ Not a work item: the design document for the citybuilder game and the shared
 world-edit infrastructure it uses. High-level tasks here get split into
 numbered tickets in this directory when picked up. Companion to `ROADMAP.md`,
 which covers the viewer 001–029, and `RANVIL_CLI_ROADMAP.md`, which claims
-087–103 for a third executable, `ranvil-cli`. **Next free number: 104.**
+087–103 for a third executable, `ranvil-cli`. **Next free number: 112.**
 
 ## The goal
 
@@ -445,6 +445,27 @@ Building(
   subtle drift but a straight contradiction, since writing the tunnel carves
   away the very cover that chose it, and a re-tiled neighbour would fill the
   bore back in with hillside.
+- **Connected is the third variant, and the one that gets revisited**
+  (ticket 110). `<kind>-connected.nbt` marks a cell that touches a
+  building's footprint (`road::touches_building`, cell-grained per 108);
+  `plan_connections` picks it at drag time for the cells the drag adds,
+  after `plan_tunnels` and only for cells that pass left `Surface` — a
+  tunnel is a physical necessity, a connected marker is cosmetic, so terrain
+  wins the one cell that could want both. Unlike a tunnel, nothing about
+  writing the piece destroys the evidence, so this variant alone is
+  re-derived *after* the fact: `commit`/`demolish`/`undo` fire
+  `road_build::BuildingFootprintChanged` from the same success arm that
+  fires `ChunksEdited` (never from a rollback or a journal replay), and
+  `retile_beside_buildings` re-reads `touches_building` for exactly the
+  cells `touching_road_cells` names, flips those whose recorded variant no
+  longer matches through `City::set_road_cell_variant` — never a tunnel,
+  never a cell whose style has no `-connected` piece, never a cell that's
+  already right (two buildings sharing a cell, one leaving, is a no-op) —
+  and writes them as one merged edit, rolling every variant back if the
+  write fails. Event-driven rather than a `city.is_changed()` re-derive the
+  way `warehouse::recompute` is, because this one is a world write, not an
+  in-memory walk. Only the variant is ever touched: a building never
+  invalidates a cell's existence, style, height or ascent.
 - **Connectivity queries** — four functions built entirely on
   `reachable_from`/`is_connected` (no second BFS).
   `touching_road_cells(city, building)` bridges a footprint to adjacent road

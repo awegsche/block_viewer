@@ -160,14 +160,58 @@
 //! style with no `-connected` exports keeps building the plain surface piece
 //! it always did, rather than recording a variant nothing can render.
 //!
-//! Like [`plan_tunnels`], it never touches a cell that's already road — see
-//! [`super::state::RoadCell::variant`] for the consequence: a building
-//! dropped in next to a road that was already there doesn't retroactively
-//! repaint it, only a cell this drag actually writes or re-tiles can pick the
-//! marker up. Unlike a tunnel's variant, nothing about [`road::touches_building`]
-//! is destroyed by writing the piece, so that gap is a missing reactive
-//! re-tile, not a hard constraint the way tunnel's freeze is — a later pass
-//! triggered off building placement/removal is the natural way to close it.
+//! Like [`plan_tunnels`], it never touches a cell that's already road — a
+//! drag only decides the variant of cells it is itself adding. The other
+//! direction, a building appearing or disappearing *beside* a road that was
+//! already there, is the reactive re-tile below.
+//!
+//! ## Reactive re-tile: a building beside an existing road (ticket 110)
+//!
+//! Unlike a tunnel's variant, nothing about [`road::touches_building`] is
+//! destroyed by writing the piece — it's safe to ask again at any time — so
+//! the connected marker can be *revisited* for exactly the cells whose
+//! answer may have changed. [`BuildingFootprintChanged`] is that trigger:
+//! fired by `city::commit`, `city::demolish` and `city::undo` from the same
+//! success arm that fires [`ChunksEdited`] (never from a rollback, never from
+//! a journal replay — only a change that also landed in the world), carrying
+//! the footprint that appeared or disappeared. One event for both
+//! directions, because the recompute is the same either way: it re-reads
+//! `touches_building` fresh rather than being told which way the change went.
+//!
+//! Event-driven rather than re-derived from `City` on every change:
+//! `city::warehouse::recompute` can afford to rebuild its coverage from
+//! scratch on `city.is_changed()` because that's an in-memory walk, but this
+//! is a real world write, and re-scanning every road cell on every unrelated
+//! `City` mutation (a production tick's neighbour, a road drag's own cells)
+//! would mean spurious write tasks for nothing.
+//!
+//! [`retile_beside_buildings`] does the work: [`road::touching_road_cells`]
+//! names the candidates, each is skipped if it's recorded
+//! [`RoadPieceVariant::Tunnel`] (tunnel always wins — the same rule
+//! [`plan_connections`] follows), otherwise the wanted variant is
+//! `Connected` if `touches_building` now says so *and* the catalogue holds
+//! `(style, kind, Connected)` for the cell's kind (the same catalogue gating,
+//! so a style with no `-connected` export stays `Surface` rather than
+//! recording a piece nothing can render), else `Surface`. A cell whose
+//! recorded variant already matches is left alone — which is what makes a
+//! second building beside an already-connected cell, or removing one of two
+//! buildings that share a cell, a no-op rather than a rewrite. The rest
+//! repaint through [`City::set_road_cell_variant`] *before* the write, and
+//! [`road_write_edit`] then reads those cells' now-current records the same
+//! way a drag's commit does; on a failed write every repainted cell goes
+//! back to the variant `set_road_cell_variant` returned — the same "don't
+//! leave city state ahead of the world" shape [`poll_road_build`]'s own
+//! failure arm follows for a drag's `newly_added` cells.
+//!
+//! Only the *variant* is ever touched. A building never invalidates a road
+//! cell's existence, its style, height or ascent — see
+//! [`super::state::RoadCell`] for why those stay frozen.
+//!
+//! Events queue in [`RetileState`] until nothing else in this module has a
+//! write in flight: a re-tile that ran while a drag's write was pending could
+//! paint a cell that drag then rolls back on failure, and several footprints
+//! landing close together (a demolish and a commit settling the same frame)
+//! are cheaper as one merged write than as a queue of single-cell ones.
 //!
 //! ## Terrain fit, reusing E2 rather than reinventing it for cells
 //!
@@ -307,6 +351,35 @@ struct RoadBuildState {
     pending: Option<PendingRoadBuild>,
 }
 
+/// A building's footprint just appeared in, or disappeared from,
+/// [`City`] *and* the world — see the module docs' "Reactive re-tile"
+/// (ticket 110). Carries the [`state::PlacedBuilding`] as it was placed:
+/// for a removal that's the pre-removal snapshot, since only the geometry
+/// is needed to find the road cells it touched, not a live `City` entry.
+///
+/// Sent by `city::commit::poll_commit`, `city::demolish::poll_demolish` and
+/// `city::undo::poll_undo` from their success arms only.
+#[derive(Event, Debug, Clone)]
+pub struct BuildingFootprintChanged(pub state::PlacedBuilding);
+
+/// A reactive re-tile's write, in flight — [`PendingRoadBuild`]'s
+/// counterpart for the cells [`retile_beside_buildings`] repainted.
+struct PendingRetile {
+    /// Each repainted cell with the variant it held *before* — what a failed
+    /// write puts back. See the module docs' "Reactive re-tile".
+    previous: Vec<(IVec2, RoadPieceVariant)>,
+    task: Task<Result<EditReport, EditRefusal>>,
+}
+
+/// [`BuildingFootprintChanged`] events not yet acted on, and the one
+/// re-tile write in flight — see the module docs' "Reactive re-tile" for
+/// why the queue exists rather than reading events straight off the reader.
+#[derive(Resource, Default)]
+struct RetileState {
+    queued: Vec<state::PlacedBuilding>,
+    pending: Option<PendingRetile>,
+}
+
 /// The pool of preview entities for the current drag path, plus the caches
 /// [`preview_mesh`] fills — the road-tool counterpart of
 /// `city::placement::GhostState`. `entities` grows to the longest path drawn
@@ -344,17 +417,31 @@ impl Plugin for RoadBuildPlugin {
             .init_resource::<RoadBuildState>()
             .init_resource::<RoadPreviewState>()
             .init_resource::<RoadStyleSelection>()
+            .init_resource::<RetileState>()
             // Same idempotent-either-order shape `city::commit`/`city::demolish`
             // already document for this resource.
             .init_resource::<WriteStatus>()
             .add_event::<ChunksEdited>()
+            // Ticket 110 — registered here *and* by each plugin that sends
+            // it, idempotently, so any of them stands alone in a test app.
+            .add_event::<BuildingFootprintChanged>()
             // After `PickingSet`, same reason every other per-frame reader of
             // `HoveredBlock` orders there. `cycle_road_style` first, so a
             // `[`/`]` press this frame is reflected in this same frame's
-            // preview and commit.
+            // preview and commit. The re-tile pair last: `poll_road_build`
+            // has settled any drag write by then, which is the gate
+            // `retile_beside_buildings` waits behind.
             .add_systems(
                 Update,
-                (cycle_road_style, update_drag_state, update_drag_preview, try_commit_drag, poll_road_build)
+                (
+                    cycle_road_style,
+                    update_drag_state,
+                    update_drag_preview,
+                    try_commit_drag,
+                    poll_road_build,
+                    retile_beside_buildings,
+                    poll_retile,
+                )
                     .chain()
                     .after(PickingSet),
             );
@@ -1437,6 +1524,140 @@ fn poll_road_build(
             }
             println!("block_viewer: road build failed, rolled back {} cell(s): {err}", newly_added.len());
             write_status.record_failure(WriteKind::Road, format!("{} road cell(s)", newly_added.len()), err.to_string());
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------------------------
+// ---- reactive re-tile beside a placed/removed building (ticket 110) ----------------------------
+// -----------------------------------------------------------------------------------------------
+
+/// Which [`RoadPieceVariant`] `cell` should be recorded as *now*, given the
+/// buildings currently in `city` — `None` when the cell's recorded variant
+/// is already right (or the cell isn't road, or is a tunnel, which is never
+/// revisited). The pure half of [`retile_beside_buildings`]; see the module
+/// docs' "Reactive re-tile" for each rule.
+fn wanted_variant(cell: IVec2, city: &City, catalogue: &RoadCatalogue) -> Option<RoadPieceVariant> {
+    let road = city.road_cell_at(cell)?;
+    if road.variant == RoadPieceVariant::Tunnel {
+        return None;
+    }
+    let (kind, _) = piece_for(road::connections_at(city, cell), road.ascent);
+    let wanted = if road::touches_building(city, cell) && catalogue.get(&road.style, kind, RoadPieceVariant::Connected).is_some() {
+        RoadPieceVariant::Connected
+    } else {
+        RoadPieceVariant::Surface
+    };
+    (wanted != road.variant).then_some(wanted)
+}
+
+/// Queues every [`BuildingFootprintChanged`] and, once no road write is in
+/// flight, repaints the road cells beside the queued footprints whose
+/// connected marker no longer matches what [`road::touches_building`] says,
+/// then dispatches the rewrite — see the module docs' "Reactive re-tile".
+fn retile_beside_buildings(
+    mut footprints: EventReader<BuildingFootprintChanged>,
+    mut retile: ResMut<RetileState>,
+    build: Res<RoadBuildState>,
+    mut city: ResMut<City>,
+    catalogue: Option<Res<RoadCatalogue>>,
+    region_cache: Option<Res<SharedRegionCache>>,
+) {
+    // Drained every frame regardless of whether anything below can run, so
+    // an event never ages out of the reader while a write is pending.
+    retile.queued.extend(footprints.read().map(|event| event.0.clone()));
+    if retile.queued.is_empty() || retile.pending.is_some() || build.pending.is_some() {
+        return;
+    }
+    let placements = std::mem::take(&mut retile.queued);
+
+    let Some(catalogue) = catalogue else {
+        // Without a catalogue no cell could ever have been recorded
+        // `Connected` (`plan_connections` gates on it too), and there's
+        // nothing to write — the same "recorded, nothing to render" state
+        // `try_commit_drag` accepts.
+        return;
+    };
+
+    // Candidates across every queued footprint, deduplicated — two footprints
+    // bordering one cell ask about it once.
+    let mut candidates: Vec<IVec2> = Vec::new();
+    for placement in &placements {
+        for cell in road::touching_road_cells(&city, placement) {
+            if !candidates.contains(&cell) {
+                candidates.push(cell);
+            }
+        }
+    }
+
+    let mut previous: Vec<(IVec2, RoadPieceVariant)> = Vec::new();
+    for cell in candidates {
+        let Some(wanted) = wanted_variant(cell, &city, &catalogue) else { continue };
+        if let Some(was) = city.set_road_cell_variant(cell, wanted) {
+            previous.push((cell, was));
+        }
+    }
+    if previous.is_empty() {
+        return;
+    }
+
+    let changed: Vec<IVec2> = previous.iter().map(|&(cell, _)| cell).collect();
+    let edit = road_write_edit(&changed, &catalogue, &city);
+    let Some(region_cache) = region_cache.filter(|_| !edit.is_empty()) else {
+        // Nothing can be written (no save loaded, or no piece for the cell
+        // after all): keep city state where it was, exactly as a failed
+        // write would.
+        for (cell, was) in previous {
+            city.set_road_cell_variant(cell, was);
+        }
+        println!("block_viewer: road re-tile beside building skipped: nothing to write");
+        return;
+    };
+
+    let cache: Arc<Mutex<RegionCache>> = region_cache.0.clone();
+    let policy = EditPolicy { capture_replaced: false, allow_dirty_regions: true, ..EditPolicy::default() };
+    let task = AsyncComputeTaskPool::get().spawn(async move {
+        let mut cache = cache.lock().expect("region cache mutex poisoned");
+        super::commit::apply_building_edit(&mut cache, &edit, &policy)
+    });
+    retile.pending = Some(PendingRetile { previous, task });
+}
+
+/// Single non-blocking poll of the in-flight re-tile — [`poll_road_build`]'s
+/// shape. On failure every repainted cell's variant goes back to what it
+/// was; see the module docs' "Reactive re-tile".
+fn poll_retile(
+    mut retile: ResMut<RetileState>,
+    mut city: ResMut<City>,
+    mut write_status: ResMut<WriteStatus>,
+    mut edited: EventWriter<ChunksEdited>,
+) {
+    let result = {
+        let Some(pending) = &mut retile.pending else { return };
+        let Some(result) = block_on(poll_once(&mut pending.task)) else {
+            return; // Still applying.
+        };
+        result
+    };
+    let PendingRetile { previous, .. } = retile.pending.take().expect("just matched Some above");
+    let what = format!("{} road cell(s) re-tiled beside a building", previous.len());
+
+    match result {
+        Ok(report) => {
+            println!(
+                "block_viewer: {what} ({} block(s) across {} chunk(s), not yet saved to disk)",
+                report.blocks_written,
+                report.chunks.len()
+            );
+            write_status.record_success(WriteKind::Road, what, &report);
+            edited.send(ChunksEdited(report.chunks));
+        }
+        Err(err) => {
+            for (cell, was) in previous {
+                city.set_road_cell_variant(cell, was);
+            }
+            println!("block_viewer: road re-tile failed, variants rolled back: {err}");
+            write_status.record_failure(WriteKind::Road, what, err.to_string());
         }
     }
 }
@@ -2596,10 +2817,11 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// The same regression [`an_existing_tunnel_cell_keeps_its_variant_when_a_later_drag_recrosses_it`]
-    /// pins for tunnels, for the connected marker: a building placed next to
-    /// an *already-built* road cell doesn't retroactively repaint it — see
-    /// [`state::RoadCell::variant`]'s known gap.
+    /// The same rule [`an_existing_tunnel_cell_keeps_its_variant_when_a_later_drag_recrosses_it`]
+    /// pins for tunnels, for the connected marker: a *drag* never repaints a
+    /// cell that's already road, even one a building has since appeared
+    /// beside. Repainting that cell is the reactive re-tile's job (ticket
+    /// 110, tests below), triggered by the building, not by a later drag.
     #[test]
     fn an_existing_road_cell_keeps_its_variant_when_a_building_shows_up_beside_it_later() {
         let dir = temp_dir("connected_recross");
@@ -2654,5 +2876,412 @@ mod tests {
         roof_cell(&mut world, cell, 67, 7);
         assert_eq!(cover_at(cell, 67, &world), 7);
         assert_eq!(cover_at(cell, 68, &world), 0, "one layer up is its own question");
+    }
+
+    // -- reactive re-tile beside a building (ticket 110) -----------------------
+
+    use crate::region_cache::RegionCache as Cache;
+    use mc_anvil::region::{ChunkPayload, Region, CHUNKS_PER_REGION};
+    use mc_anvil::SaveMeta as Meta;
+    use rnbt::{NbtField, NbtList, NbtValue};
+
+    /// A single-region, single-chunk fixture save — the same slimmed-down
+    /// copy of `viewer::paint::tests::Fixture` that `city::commit`'s and
+    /// `city::demolish`'s tests each carry, for the reason those give (it's
+    /// private to each module). One all-stone section at world Y 0..15.
+    struct Fixture {
+        dir: std::path::PathBuf,
+        meta: Meta,
+    }
+
+    impl Fixture {
+        fn new(label: &str) -> Self {
+            let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let dir = std::env::temp_dir().join(format!("block_viewer-retile-{label}-{nanos}"));
+            let region_dir = dir.join("region");
+            std::fs::create_dir_all(&region_dir).expect("create temp dir");
+
+            let mut payloads: Vec<Option<ChunkPayload>> = vec![None; CHUNKS_PER_REGION];
+            payloads[0] = Some(ChunkPayload::Nbt(full_chunk()));
+            let path = region_dir.join("r.0.0.mca");
+            Region::new(0, 0, &path).write(&payloads).expect("write the fixture region");
+
+            let meta = Meta { name: "retile-fixture".to_string(), path: dir.clone(), region_dir, regions: vec![(0, 0)] };
+            Self { dir, meta }
+        }
+
+        fn shared_cache(&self) -> SharedRegionCache {
+            SharedRegionCache(Arc::new(Mutex::new(Cache::new(self.meta.clone(), 4))))
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn full_chunk() -> NbtField {
+        let palette = NbtList::Compound(vec![NbtField::new_compound("", vec![NbtField::new_string("Name", "minecraft:stone")])]);
+        let section = NbtField::new_compound(
+            "",
+            vec![
+                NbtField { name: "Y".to_string(), value: NbtValue::Byte(0) },
+                NbtField::new_compound("block_states", vec![NbtField::new_list("palette", palette)]),
+            ],
+        );
+        NbtField::new_compound(
+            "",
+            vec![
+                NbtField::new_list("sections", NbtList::Compound(vec![section])),
+                NbtField::new_i32("xPos", 0),
+                NbtField::new_i32("zPos", 0),
+                NbtField::new_i32("yPos", -4),
+                NbtField::new_i32("DataVersion", 4438),
+                NbtField::new_string("Status", "minecraft:full"),
+                NbtField { name: "isLightOn".to_string(), value: NbtValue::Byte(1) },
+            ],
+        )
+    }
+
+    fn block_name_at(cache: &SharedRegionCache, at: IVec3) -> String {
+        let mut cache = cache.0.lock().unwrap();
+        let address = crate::edit::address_of(at);
+        cache
+            .get_or_load(address.region)
+            .expect("resident")
+            .get_block(address.local_x, address.y, address.local_z)
+            .expect("a populated chunk")
+            .get_string("Name")
+            .expect("a palette entry")
+            .clone()
+    }
+
+    /// The cell every re-tile test watches: the middle of a three-cell
+    /// straight run along `z = 0`, so it resolves to `Straight` — the one
+    /// kind [`connected_catalogue`] ships a `-connected` piece for.
+    const MIDDLE: IVec2 = IVec2::new(1, 0);
+    /// A recorded ground of 5 puts the five-tall piece at world Y 3..=7 —
+    /// inside the fixture's one stone section — see [`cell_write_origin`].
+    const BASE_Y: i32 = 5;
+    /// One solid block of [`MIDDLE`]'s piece: local `(1, 0, 0)` (local
+    /// `(0, 0, 0)` is the air every [`piece_of_height`] keeps).
+    const PROBE: IVec3 = IVec3::new(7, 3, 0);
+
+    /// `RoadBuildPlugin` alone, with `catalogue` loaded and, if given, a
+    /// save to write into — the plugins that *send*
+    /// [`BuildingFootprintChanged`] are deliberately absent: their tests
+    /// prove they fire it, these prove what happens when it arrives.
+    fn retile_test_app(catalogue: RoadCatalogue, cache: Option<SharedRegionCache>) -> App {
+        let mut app = road_build_test_app();
+        app.insert_resource(catalogue);
+        if let Some(cache) = cache {
+            app.insert_resource(cache);
+        }
+        app
+    }
+
+    /// Three `Surface` cells `(0, 0)`, `(1, 0)`, `(2, 0)` at [`BASE_Y`].
+    fn straight_run(city: &mut City) {
+        for x in 0..3 {
+            city.add_road_cell(IVec2::new(x, 0), "dirt", BASE_Y, None, RoadPieceVariant::Surface).unwrap();
+        }
+    }
+
+    /// A 2x2 building south of [`MIDDLE`] — tiles `x 6..8, z 6..8`, in cell
+    /// `(1, 1)`, whose north neighbour is `MIDDLE`.
+    fn place_south(city: &mut City) -> state::BuildingId {
+        city.place_building("house01", None, IVec3::new(6, BASE_Y, 6), Rotation::Deg0, IVec2::new(2, 2)).unwrap()
+    }
+
+    /// A 2x2 building north of [`MIDDLE`] — tiles `x 6..8, z -2..0`, in
+    /// cell `(1, -1)`.
+    fn place_north(city: &mut City) -> state::BuildingId {
+        city.place_building("house01", None, IVec3::new(6, BASE_Y, -2), Rotation::Deg0, IVec2::new(2, 2)).unwrap()
+    }
+
+    fn footprint_changed(app: &mut App, placement: state::PlacedBuilding) {
+        app.world_mut().send_event(BuildingFootprintChanged(placement));
+    }
+
+    /// Ticks until the queue is empty and no re-tile write is in flight.
+    fn run_until_retiled(app: &mut App) {
+        for _ in 0..200 {
+            app.update();
+            let retile = app.world().resource::<RetileState>();
+            if retile.pending.is_none() && retile.queued.is_empty() {
+                return;
+            }
+        }
+        panic!("re-tile never settled");
+    }
+
+    fn variant_at(app: &App, cell: IVec2) -> RoadPieceVariant {
+        app.world().resource::<City>().road_cell_at(cell).expect("a road cell").variant
+    }
+
+    fn chunks_edited_count(app: &mut App) -> usize {
+        app.world_mut().resource_mut::<Events<ChunksEdited>>().drain().count()
+    }
+
+    #[test]
+    fn a_building_placed_beside_an_existing_surface_cell_rewrites_it_connected() {
+        let dir = temp_dir("retile_place");
+        let fixture = Fixture::new("place");
+        let cache = fixture.shared_cache();
+        let mut app = retile_test_app(connected_catalogue(&dir, true), Some(cache.clone()));
+
+        let placement = {
+            let mut city = app.world_mut().resource_mut::<City>();
+            straight_run(&mut city);
+            let id = place_south(&mut city);
+            city.building(id).unwrap().clone()
+        };
+        footprint_changed(&mut app, placement);
+        run_until_retiled(&mut app);
+
+        assert_eq!(variant_at(&app, MIDDLE), RoadPieceVariant::Connected, "recorded in City");
+        assert_eq!(block_name_at(&cache, PROBE), "minecraft:andesite", "and the connected piece is in the world");
+        assert_eq!(chunks_edited_count(&mut app), 1, "one merged write, re-meshed live");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn removing_that_building_reverts_the_cell_to_surface() {
+        let dir = temp_dir("retile_remove");
+        let fixture = Fixture::new("remove");
+        let cache = fixture.shared_cache();
+        let mut app = retile_test_app(connected_catalogue(&dir, true), Some(cache.clone()));
+
+        // Placed and connected, as the placement's own re-tile would have
+        // left it; then the building goes, the way `poll_demolish` removes it
+        // before firing the pre-removal snapshot.
+        let placement = {
+            let mut city = app.world_mut().resource_mut::<City>();
+            straight_run(&mut city);
+            city.set_road_cell_variant(MIDDLE, RoadPieceVariant::Connected);
+            let id = place_south(&mut city);
+            city.remove_building(id).unwrap()
+        };
+        footprint_changed(&mut app, placement);
+        run_until_retiled(&mut app);
+
+        assert_eq!(variant_at(&app, MIDDLE), RoadPieceVariant::Surface);
+        assert_eq!(block_name_at(&cache, PROBE), "minecraft:stone", "the plain surface piece is back in the world");
+        assert_eq!(chunks_edited_count(&mut app), 1);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The same precedence [`tunnel_cover_outranks_a_touching_building`]
+    /// pins at plan time, after the fact: whatever appears or disappears
+    /// beside a tunnel cell, it stays a tunnel — a re-tile to the open-sky
+    /// piece would fill the bore back in.
+    #[test]
+    fn a_tunnel_cell_never_flips_whatever_appears_or_disappears_beside_it() {
+        let dir = temp_dir("retile_tunnel");
+        write_variant_piece(&dir, "dirt", RoadPieceKind::Straight, RoadPieceVariant::Surface, &piece_of_height(5));
+        write_variant_piece(&dir, "dirt", RoadPieceKind::Straight, RoadPieceVariant::Tunnel, &piece_of_height(5));
+        write_variant_piece(&dir, "dirt", RoadPieceKind::Straight, RoadPieceVariant::Connected, &piece_of_height(5));
+        let (catalogue, _skipped) = super::super::road_catalogue::load_road_catalogue_dir(&dir);
+        let fixture = Fixture::new("tunnel");
+        let mut app = retile_test_app(catalogue, Some(fixture.shared_cache()));
+
+        let (id, placement) = {
+            let mut city = app.world_mut().resource_mut::<City>();
+            straight_run(&mut city);
+            city.set_road_cell_variant(MIDDLE, RoadPieceVariant::Tunnel);
+            let id = place_south(&mut city);
+            (id, city.building(id).unwrap().clone())
+        };
+        footprint_changed(&mut app, placement.clone());
+        run_until_retiled(&mut app);
+        assert_eq!(variant_at(&app, MIDDLE), RoadPieceVariant::Tunnel, "a building beside it doesn't make it connected");
+        assert_eq!(chunks_edited_count(&mut app), 0, "nothing to rewrite");
+
+        app.world_mut().resource_mut::<City>().remove_building(id);
+        footprint_changed(&mut app, placement);
+        run_until_retiled(&mut app);
+        assert_eq!(variant_at(&app, MIDDLE), RoadPieceVariant::Tunnel, "nor does its removal make it surface");
+        assert_eq!(chunks_edited_count(&mut app), 0);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The catalogue gating [`a_style_with_no_connected_piece_never_records_a_connected_cell`]
+    /// pins at plan time, after the fact: no `-connected.nbt`, no phantom
+    /// variant — and no panic.
+    #[test]
+    fn a_style_with_no_connected_piece_stays_surface_when_a_building_shows_up() {
+        let dir = temp_dir("retile_missing_piece");
+        let fixture = Fixture::new("missing");
+        let mut app = retile_test_app(connected_catalogue(&dir, false), Some(fixture.shared_cache()));
+
+        let placement = {
+            let mut city = app.world_mut().resource_mut::<City>();
+            straight_run(&mut city);
+            let id = place_south(&mut city);
+            city.building(id).unwrap().clone()
+        };
+        footprint_changed(&mut app, placement);
+        run_until_retiled(&mut app);
+
+        assert_eq!(variant_at(&app, MIDDLE), RoadPieceVariant::Surface);
+        assert_eq!(chunks_edited_count(&mut app), 0);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Two buildings share [`MIDDLE`] as a neighbour: removing one leaves
+    /// the other still touching it, so the cell stays `Connected` and
+    /// nothing is rewritten — not a spurious round trip down to `Surface`
+    /// and back.
+    #[test]
+    fn two_buildings_bordering_one_cell_keep_it_connected_when_one_goes() {
+        let dir = temp_dir("retile_shared_cell");
+        let fixture = Fixture::new("shared");
+        let mut app = retile_test_app(connected_catalogue(&dir, true), Some(fixture.shared_cache()));
+
+        let (south, north) = {
+            let mut city = app.world_mut().resource_mut::<City>();
+            straight_run(&mut city);
+            let south = place_south(&mut city);
+            let north = place_north(&mut city);
+            (city.building(south).unwrap().clone(), city.building(north).unwrap().clone())
+        };
+        assert_eq!(
+            road::touching_road_cells(app.world().resource::<City>(), &north),
+            std::collections::HashSet::from([MIDDLE]),
+            "the north building really does border the same one cell"
+        );
+
+        // Both placed: one connected cell, one write.
+        footprint_changed(&mut app, south.clone());
+        footprint_changed(&mut app, north);
+        run_until_retiled(&mut app);
+        assert_eq!(variant_at(&app, MIDDLE), RoadPieceVariant::Connected);
+        assert_eq!(chunks_edited_count(&mut app), 1, "two footprints beside one cell is one write, not two");
+
+        // The south one goes; the north one still touches the cell.
+        let city_south_id = app.world().resource::<City>().buildings().find(|(_, b)| b.origin == south.origin).map(|(id, _)| id).unwrap();
+        app.world_mut().resource_mut::<City>().remove_building(city_south_id);
+        footprint_changed(&mut app, south);
+        run_until_retiled(&mut app);
+        assert_eq!(variant_at(&app, MIDDLE), RoadPieceVariant::Connected, "still touched by the other building");
+        assert_eq!(chunks_edited_count(&mut app), 0, "and so nothing was rewritten");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A write that fails leaves every repainted cell recorded exactly as it
+    /// was — the same "city state never gets ahead of the world" rule
+    /// [`poll_road_build_failure_rolls_back_only_the_newly_added_cells`] pins
+    /// for a drag.
+    #[test]
+    fn a_failed_retile_write_puts_every_variant_back() {
+        let mut app = road_build_test_app();
+        {
+            let mut city = app.world_mut().resource_mut::<City>();
+            straight_run(&mut city);
+            // As `retile_beside_buildings` leaves it the instant before the
+            // write is dispatched: repainted, with the old value remembered.
+            city.set_road_cell_variant(MIDDLE, RoadPieceVariant::Connected);
+        }
+        let task = pool().spawn(async { Err(EditRefusal::Empty) });
+        app.world_mut().resource_mut::<RetileState>().pending =
+            Some(PendingRetile { previous: vec![(MIDDLE, RoadPieceVariant::Surface)], task });
+
+        run_until_retiled(&mut app);
+
+        assert_eq!(variant_at(&app, MIDDLE), RoadPieceVariant::Surface, "rolled back to what it was before the event");
+        assert_eq!(chunks_edited_count(&mut app), 0);
+    }
+
+    /// The other way a write can't happen: no save loaded. Same outcome —
+    /// the variants are put back rather than left pointing at a piece that
+    /// never reached the world.
+    #[test]
+    fn a_retile_with_no_save_loaded_leaves_the_variants_untouched() {
+        let dir = temp_dir("retile_no_save");
+        let mut app = retile_test_app(connected_catalogue(&dir, true), None);
+
+        let placement = {
+            let mut city = app.world_mut().resource_mut::<City>();
+            straight_run(&mut city);
+            let id = place_south(&mut city);
+            city.building(id).unwrap().clone()
+        };
+        footprint_changed(&mut app, placement);
+        run_until_retiled(&mut app);
+
+        assert_eq!(variant_at(&app, MIDDLE), RoadPieceVariant::Surface);
+        assert_eq!(chunks_edited_count(&mut app), 0);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Undo, end to end with `UndoPlugin`: undoing the placement that had
+    /// flipped [`MIDDLE`] to `Connected` flips it back, and undoing *that*
+    /// demolition flips it to `Connected` again — the event carries the
+    /// footprint off the undo step either way.
+    #[test]
+    fn undo_reverses_the_neighbours_flip_in_both_directions() {
+        use super::super::journal::{Baseline, Journal, Ledger};
+        use super::super::undo::{UndoCommand, UndoPlugin};
+
+        let dir = temp_dir("retile_undo");
+        let fixture = Fixture::new("undo");
+        let cache = fixture.shared_cache();
+        let mut app = retile_test_app(connected_catalogue(&dir, true), Some(cache.clone()));
+        app.add_plugins(UndoPlugin).insert_resource(Journal::default());
+
+        // A placement that has already landed and re-tiled MIDDLE: the
+        // building is in City, its journal entry carries a one-block
+        // baseline inside the fixture's stone (so the undo has a real,
+        // successful write to make), and the cell is Connected.
+        let (id, placement) = {
+            let mut city = app.world_mut().resource_mut::<City>();
+            straight_run(&mut city);
+            city.set_road_cell_variant(MIDDLE, RoadPieceVariant::Connected);
+            let id = place_south(&mut city);
+            (id, city.building(id).unwrap().clone())
+        };
+        let baseline = || Baseline {
+            written: vec![(IVec3::new(7, 10, 7), state_named("minecraft:stone"))],
+            previous: vec![(IVec3::new(7, 10, 7), state_named("minecraft:stone"))],
+            data_version: Some(4438),
+        };
+        app.world_mut().resource_mut::<Journal>().record_placement(id, placement.clone(), baseline(), Ledger::default());
+
+        let run_undo = |app: &mut App| {
+            assert!(app.world_mut().resource_mut::<UndoCommand>().request());
+            for _ in 0..200 {
+                app.update();
+                let retile = app.world().resource::<RetileState>();
+                if !app.world().resource::<UndoCommand>().busy() && retile.pending.is_none() && retile.queued.is_empty() {
+                    return;
+                }
+            }
+            panic!("undo + re-tile never settled");
+        };
+
+        // Undo the placement: the building leaves, MIDDLE goes back to Surface.
+        run_undo(&mut app);
+        assert!(app.world().resource::<City>().building(id).is_none(), "the placement was undone");
+        assert_eq!(variant_at(&app, MIDDLE), RoadPieceVariant::Surface);
+        assert_eq!(block_name_at(&cache, PROBE), "minecraft:stone");
+
+        // Now a demolition of the same building sits on the journal (as
+        // `poll_demolish` would have left it); undoing it puts the building
+        // back, and MIDDLE with it.
+        app.world_mut().resource_mut::<City>().remove_building(id); // already gone; no-op, for symmetry with poll_demolish
+        app.world_mut().resource_mut::<Journal>().record_demolition(id, placement, baseline(), Ledger::default());
+        run_undo(&mut app);
+        assert!(app.world().resource::<City>().building(id).is_some(), "the demolition was undone");
+        assert_eq!(variant_at(&app, MIDDLE), RoadPieceVariant::Connected);
+        assert_eq!(block_name_at(&cache, PROBE), "minecraft:andesite");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

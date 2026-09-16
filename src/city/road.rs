@@ -354,9 +354,10 @@ pub fn touching_road_cells(city: &City, building: &PlacedBuilding) -> HashSet<IV
 /// occupancy comes from. Derived fresh every call, the same "authoritative,
 /// not cached" rule the rest of this module follows — unlike
 /// [`RoadPieceVariant::Tunnel`], nothing about checking this destroys the
-/// evidence it's based on, so it would be safe to call again later if a
-/// reactive re-tile (a building placed beside an already-built road) is ever
-/// added; see [`super::state::RoadCell::variant`] for why nothing does yet.
+/// evidence it's based on, which is what lets ticket 110's reactive re-tile
+/// (`super::road_build::retile_beside_buildings`) ask it again for the cells
+/// beside a building that was just placed or removed; see
+/// [`super::state::RoadCell::variant`].
 pub fn touches_building(city: &City, cell: IVec2) -> bool {
     Direction::ALL.iter().any(|&direction| {
         let neighbour = cell + direction.offset();

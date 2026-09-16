@@ -75,6 +75,7 @@ use super::drops::DropTable;
 use super::inventory::Stock;
 use super::journal::{Baseline, Journal, Ledger};
 use super::picking::{HoveredBlock, PickingSet};
+use super::road_build::BuildingFootprintChanged;
 use super::state::{BuildingId, City, Occupant, PlacedBuilding};
 use super::write_status::{WriteKind, WriteStatus};
 
@@ -113,6 +114,8 @@ impl Plugin for DemolishPlugin {
             // module docs.
             .init_resource::<WriteStatus>()
             .add_event::<ChunksEdited>()
+            // Ticket 110 — idempotent, same as `ChunksEdited` above.
+            .add_event::<BuildingFootprintChanged>()
             // After `PickingSet` for the same reason ticket 047's ghost
             // preview and ticket 048's commit both order there —
             // `try_demolish` needs *this* frame's `HoveredBlock`.
@@ -220,12 +223,14 @@ fn try_demolish(
 /// module docs), journals the demolition's own baseline, and fires
 /// [`ChunksEdited`] (W7). On failure: nothing to undo — `City` was never
 /// touched.
+#[allow(clippy::too_many_arguments)]
 fn poll_demolish(
     mut demolish: ResMut<DemolishState>,
     mut city: ResMut<City>,
     mut journal: ResMut<Journal>,
     mut write_status: ResMut<WriteStatus>,
     mut edited: EventWriter<ChunksEdited>,
+    mut footprints: EventWriter<BuildingFootprintChanged>,
     mut stock: ResMut<Stock>,
     drops: Res<DropTable>,
 ) {
@@ -274,8 +279,13 @@ fn poll_demolish(
                     Ledger { credited: Default::default(), debited },
                 );
             }
-            write_status.record_success(WriteKind::Demolished, placement.catalogue_id, &report);
+            write_status.record_success(WriteKind::Demolished, placement.catalogue_id.clone(), &report);
             edited.send(ChunksEdited(report.chunks));
+            // Ticket 110: `placement` is the pre-removal snapshot — the
+            // re-tile only needs its geometry to find the cells it touched,
+            // not a live `City` entry (which is gone as of `remove_building`
+            // above).
+            footprints.send(BuildingFootprintChanged(placement));
         }
         Err(err) => {
             println!("block_viewer: demolition of {} failed, nothing was changed: {err}", placement.catalogue_id);
@@ -435,6 +445,12 @@ mod tests {
         let fired: Vec<_> = app.world_mut().resource_mut::<Events<ChunksEdited>>().drain().collect();
         assert_eq!(fired.len(), 1);
         assert_eq!(fired[0].0, vec![(0, 0)]);
+
+        // Ticket 110: the re-tile gets the footprint that just left, as the
+        // pre-removal snapshot — `City` no longer has it to look up.
+        let footprints: Vec<_> = app.world_mut().resource_mut::<Events<BuildingFootprintChanged>>().drain().collect();
+        assert_eq!(footprints.len(), 1);
+        assert_eq!(footprints[0].0.origin, a_placement().origin);
     }
 
     // --- ticket 073: a demolition pays for its own backfill -----------------
@@ -537,6 +553,8 @@ mod tests {
 
         let fired = app.world_mut().resource_mut::<Events<ChunksEdited>>().drain().count();
         assert_eq!(fired, 0);
+        let footprints = app.world_mut().resource_mut::<Events<BuildingFootprintChanged>>().drain().count();
+        assert_eq!(footprints, 0, "the building is still there, so no road beside it changed");
     }
 
     // --- a real write, end to end: try_demolish + poll_demolish against a ---
