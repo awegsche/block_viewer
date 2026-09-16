@@ -170,11 +170,13 @@ pub struct CameraSettings {
     /// so the citybuilder's camera always looks down at the terrain rather
     /// than up toward the horizon or straight down at its own feet.
     pub rts_pitch_range: Range<f32>,
-    /// `Rts` pan speed = `orbit_radius * rts_pan_speed_factor`, so panning
-    /// covers the same visual ground per second regardless of zoom — the
-    /// same "scale with the current radius" idea `orbit_zoom_sensitivity`
-    /// already uses for zoom.
-    pub rts_pan_speed_factor: f32,
+    /// `Rts` pan speed in blocks/sec — constant regardless of zoom. Used to
+    /// scale with `orbit_radius`, which made panning crawl to a halt when
+    /// zoomed in; this is 20% faster than that old formula produced at the
+    /// rig's default spawn zoom level (`orbit_radius` ≈ 39.4, from
+    /// `lib.rs::setup_world`'s `eye = target + Vec3::new(-24.0, 20.0, 24.0)`
+    /// offset): `39.395 * 1.2 * 1.2 ≈ 56.73`.
+    pub rts_pan_speed: f32,
     /// Radians/sec of yaw rotation from `Rts`'s `Q`/`E` keys.
     pub rts_rotate_speed: f32,
 }
@@ -194,7 +196,7 @@ impl Default for CameraSettings {
             // Roughly -80°..-11°: always angled down at the terrain, never
             // up toward the horizon and never near straight down.
             rts_pitch_range: -1.4..-0.2,
-            rts_pan_speed_factor: 1.2,
+            rts_pan_speed: 56.73,
             rts_rotate_speed: std::f32::consts::FRAC_PI_2,
         }
     }
@@ -402,8 +404,7 @@ fn drive_camera(
                 }
 
                 if pan_dir != Vec3::ZERO {
-                    let speed = rig.orbit_radius
-                        * settings.rts_pan_speed_factor
+                    let speed = settings.rts_pan_speed
                         * if keys.pressed(KeyCode::ShiftLeft) {
                             settings.sprint_multiplier
                         } else {
