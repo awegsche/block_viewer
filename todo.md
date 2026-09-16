@@ -1283,6 +1283,16 @@ Y=0 in the world and won't be cleaned up by this fix — see the ticket.
   the whole job; nothing in `src/` has to change. Until then, a city with two
   warehouses and a farm is three identical houses, which is worth knowing
   before eyeballing anything.
+- [ ] **113 placeholder geometry: mine01/02/03 need a real `.nbt` export.**
+  `assets/city/buildings/mine01.ron`, `mine02.ron` and `mine03.ron` all point
+  `blueprint` at `lumber.nbt`, because no headframe/shaft-house export exists
+  yet — so all three currently place a lumberjack's hut. Their
+  `footprint: Explicit(x: 16, z: 16)` is already the size the design's shaft
+  math is built around, so exporting a real `mine01.nbt` (etc., the 019-024
+  selection -> "Save structure" flow in `block_viewer`) and pointing
+  `blueprint` at it is the whole job — nothing in `src/` has to change. See
+  ticket 118. Until then, a city with a Mine is a lumberjack's hut with a
+  much bigger buffer.
 - [ ] **077/078/079 economy, end to end in the real app.** `cargo run --bin
   citybuilder` against a real save. Build a `Wheat Farm` and a `Warehouse`,
   drag a dirt road between them, and watch the City panel: the farm's row

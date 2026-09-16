@@ -200,6 +200,7 @@ mod tests {
             warehouse: None,
             farm,
             gatherer: None,
+            mine: None,
             category: Category::Production,
             ground_level: 0,
             integrity: Integrity { pristine_above: 0.95, ruined_below: 0.6 },

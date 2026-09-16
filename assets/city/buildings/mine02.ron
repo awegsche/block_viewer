@@ -1,0 +1,38 @@
+// Ticket 113, roadmap H3. Deep Mine: mine01's tier 2 — same shaft geometry,
+// reaches further down and digs faster; the tech tree, not an upgrade
+// mechanic, is what makes it a second building (see mine01.ron for the
+// shared design notes and MINES_DESIGN.md for the full geometry).
+//
+// PLACEHOLDER GEOMETRY, the warehouse01 way — see mine01.ron and
+// ../../../todo.md; a real mine02.nbt lands with ticket 118.
+Building(
+    name: "Deep Mine",
+    blueprint: "lumber.nbt",
+    tier: 2,
+    requires: ["mine01"],
+    category: Production,
+    footprint: Explicit(x: 16, z: 16),
+    ground_level: 2,
+    cost: [
+        (block: "minecraft:oak_planks", count: 96),
+        (block: "minecraft:oak_log", count: 48),
+        (block: "minecraft:cobblestone", count: 96),
+        (block: "minecraft:raw_iron", count: 32),
+    ],
+    mine: Some((
+        shaft: (x: 5, z: 5),
+        shaft_size: 6,
+        first_level_depth: 12,
+        // + gold, lapis, redstone.
+        min_level_y: -24,
+        level_reach: 100,
+        gallery_length: 200,
+        blocks_per_minute: 90.0,
+        buffer_stacks: 512,
+        haul_at_stacks: Some(64),
+    )),
+    integrity: Integrity(
+        pristine_above: 0.95,
+        ruined_below: 0.60,
+    ),
+)

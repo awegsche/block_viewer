@@ -1,0 +1,45 @@
+// Ticket 113, roadmap H3. Mine: a surface complex over a primary shaft that
+// slowly digs itself deeper and wider over time — see MINES_DESIGN.md for
+// the full geometry. Like the Gatherer's Hut, it has no recipe: what comes
+// out is whatever was actually there, resolved through drops.ron.
+//
+// PLACEHOLDER GEOMETRY, the warehouse01 way: `blueprint` points at
+// lumber.nbt because no real headframe/shaft-house export exists yet. The
+// `footprint`/`ground_level` below are already the real numbers the mine's
+// layout math is built around; a real mine01.nbt exported over it (ticket
+// 118) will look correct without touching this file. See ../../../todo.md.
+Building(
+    name: "Mine",
+    blueprint: "lumber.nbt",
+    tier: 1,
+    requires: [],
+    category: Production,
+    footprint: Explicit(x: 16, z: 16),
+    // Borrowed from lumber.ron, describing the borrowed blueprint.
+    ground_level: 2,
+    cost: [
+        (block: "minecraft:oak_planks", count: 64),
+        (block: "minecraft:oak_log", count: 32),
+        (block: "minecraft:cobblestone", count: 64),
+    ],
+    mine: Some((
+        // Unrotated blueprint (x, z); rotated with the footprint at
+        // placement (city::mine::layout, ticket 114).
+        shaft: (x: 5, z: 5),
+        shaft_size: 6,
+        // A whole multiple of level_spacing (shaft_size - 2 == 4): the
+        // first level's landing has to fall on a ring corner.
+        first_level_depth: 12,
+        // Coal/iron/copper band. mine02/mine03 reach further.
+        min_level_y: 16,
+        level_reach: 100,
+        gallery_length: 200,
+        blocks_per_minute: 60.0,
+        buffer_stacks: 512,
+        haul_at_stacks: Some(64),
+    )),
+    integrity: Integrity(
+        pristine_above: 0.95,
+        ruined_below: 0.60,
+    ),
+)

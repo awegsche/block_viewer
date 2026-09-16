@@ -87,6 +87,7 @@ use bevy::prelude::Resource;
 use serde::Deserialize;
 
 use crate::blueprint::BuildingCatalogue;
+use crate::world::WORLD_MIN_Y;
 
 /// One building's game data, deserialized directly from a `.ron` file.
 /// Field-for-field the roadmap's C1 sketch, minus the inline `id` — see the
@@ -129,13 +130,19 @@ pub struct Building {
     pub farm: Option<Farm>,
     /// `Some` makes this building a gatherer — ticket 086's Gatherer's Hut,
     /// the low-radius, low-speed answer to ground levelling and early
-    /// resource collection, as distinct from a specialised quarry/mine
-    /// (neither built yet). `None` for everything else. See [`Gatherer`].
-    /// Validated (so a bad file is caught early like every other block here)
-    /// but not yet simulated — the same gap `production`/`cost` sat in
-    /// between tickets 040 and 073/078.
+    /// resource collection, as distinct from a specialised mine (ticket 113,
+    /// `MINES_DESIGN.md`; see [`Mine`]). `None` for everything else. See
+    /// [`Gatherer`]. Validated (so a bad file is caught early like every
+    /// other block here) but not yet simulated — the same gap
+    /// `production`/`cost` sat in between tickets 040 and 073/078.
     #[serde(default)]
     pub gatherer: Option<Gatherer>,
+    /// `Some` makes this building a mine (ticket 113, `MINES_DESIGN.md`) —
+    /// the specialised extraction building [`Building::gatherer`]'s docs have
+    /// been contrasting themselves against since 086. `None` for everything
+    /// else. See [`Mine`] and `city::mine` (ticket 116) for the tick.
+    #[serde(default)]
+    pub mine: Option<Mine>,
     /// Which section of the build menu (ticket 082, roadmap G1) this
     /// building lists under. `#[serde(default)]` rather than required —
     /// unlike `blueprint`/`footprint` this gates no real validation, only
@@ -298,6 +305,143 @@ impl Gatherer {
     }
 }
 
+/// Min corner of [`Mine::shaft`], in the *unrotated* blueprint's `(x, z)` —
+/// its own type rather than a bare `IVec2` because [`DefinitionError::
+/// ShaftOutsideFootprint`] carries it verbatim and a tuple would lose the
+/// field names in that message.
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct ShaftAt {
+    pub x: i32,
+    pub z: i32,
+}
+
+/// See [`Building::mine`] — ticket 113's Mine: a surface complex plus
+/// everything it digs underneath itself over time (`MINES_DESIGN.md`). Like
+/// [`Gatherer`] there is no `outputs` list — what comes out is whatever was
+/// actually there, resolved through [`super::drops::DropTable`] — and no
+/// recipe at all, since a mine has nothing to consume.
+///
+/// **Why no `ground`/`stairs`/`pillar` block fields.** The design names the
+/// materials (cobblestone, oak stairs, oak log, stripped oak log). They're
+/// constants in `city::mine::layout` (ticket 114) until a second mine style
+/// wants different ones — the same call `road_definition` made before
+/// ticket 059 gave roads styles. Don't pre-build the knob before anything
+/// reads it.
+///
+/// **The tick is `city::mine`** (ticket 116; schema-only until then), the
+/// same `Producer`-buffer/haulage reuse [`Gatherer`]'s docs describe, sized
+/// up (`buffer_stacks: 512` shipped, i.e. 4096 blocks at the debug
+/// `stack_size` of 8).
+#[derive(Debug, Clone, Deserialize)]
+pub struct Mine {
+    /// Min corner of the shaft square, in the *unrotated* blueprint's
+    /// `(x, z)` — rotated the same way a block position is when the
+    /// building is placed (`city::mine::layout`, ticket 114).
+    pub shaft: ShaftAt,
+    /// Outer edge of the stair ring around the shaft's light well.
+    /// [`level_spacing`](Self::level_spacing) is derived from it, which is
+    /// what makes every mining level's landing fall on a ring corner — see
+    /// `MINES_DESIGN.md`'s "level_spacing is derived, not declared".
+    #[serde(default = "default_shaft_size")]
+    pub shaft_size: u32,
+    /// `floor_y - first_level_depth` is the first mining level's floor. Must
+    /// be a whole multiple of [`level_spacing`](Self::level_spacing) — see
+    /// [`validate`].
+    pub first_level_depth: u32,
+    /// The tier knob: no mining level's floor may go below this world Y.
+    /// `Mine` stops in the iron/coal band; `Deepslate Mine` reaches diamond.
+    pub min_level_y: i32,
+    /// Each secondary shaft arm's length, north and south of the primary
+    /// shaft, in blocks.
+    pub level_reach: u32,
+    /// Each tertiary gallery's length, east and west of the secondary
+    /// shaft, in blocks.
+    pub gallery_length: u32,
+    #[serde(default = "default_torch_spacing")]
+    pub torch_spacing: u32,
+    /// Consecutive all-air slices along a gallery or secondary arm that end
+    /// it — a cave crossing is a few blocks; a breakout to the surface never
+    /// stops on its own.
+    #[serde(default = "default_max_void_run")]
+    pub max_void_run: u32,
+    pub blocks_per_minute: f32,
+    /// How many stacks of dug material this mine can hold before it stops
+    /// digging and waits for a haul — the same [`Gatherer::buffer_stacks`]
+    /// shape and default, sized up in every shipped `.ron`.
+    #[serde(default = "default_buffer_stacks")]
+    pub buffer_stacks: u32,
+    /// Ticket 112's partial-haul threshold, the same shape as
+    /// [`Gatherer::haul_at_stacks`]. `None` defaults to half of
+    /// `buffer_stacks`; a value at or above `buffer_stacks` is refused by
+    /// [`validate`].
+    #[serde(default)]
+    pub haul_at_stacks: Option<u32>,
+    /// Block names (bare or `minecraft:`-prefixed) scanned for and dug in
+    /// addition to every `*_ore` block — see [`is_valuable`](Self::is_valuable).
+    /// Empty by default. No non-test reader yet — `city::mine`'s slice scan
+    /// (ticket 115) is what will use it.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub valuables: Vec<String>,
+}
+
+fn default_shaft_size() -> u32 {
+    6
+}
+
+fn default_torch_spacing() -> u32 {
+    8
+}
+
+fn default_max_void_run() -> u32 {
+    6
+}
+
+/// `stone` -> `minecraft:stone`, the same shorthand [`super::drops`] and
+/// [`super::economy`] accept in their own tables. No non-test caller yet —
+/// see [`Mine::is_valuable`].
+#[allow(dead_code)]
+fn namespaced(name: &str) -> String {
+    let name = name.trim();
+    if name.contains(':') {
+        name.to_string()
+    } else {
+        format!("minecraft:{name}")
+    }
+}
+
+impl Mine {
+    /// One flight of stairs runs along each side of the ring between two
+    /// corner landings; a side has `shaft_size - 2` non-corner tiles, so
+    /// that's exactly how far one flight descends — see `MINES_DESIGN.md`'s
+    /// "level_spacing is derived, not declared".
+    pub fn level_spacing(&self) -> i32 {
+        self.shaft_size as i32 - 2
+    }
+
+    /// The fill level, in stacks, past which a partial stack is hauled —
+    /// see [`haul_at_stacks`](Self::haul_at_stacks). Always strictly below
+    /// `buffer_stacks` for a definition that passed [`validate`]. No
+    /// non-test caller yet — `city::mine`'s tick (ticket 116) is what will
+    /// use it, the same gap `Gatherer::haul_threshold_stacks` sat in
+    /// between tickets 086 and 111.
+    #[allow(dead_code)]
+    pub fn haul_threshold_stacks(&self) -> u32 {
+        self.haul_at_stacks.unwrap_or(self.buffer_stacks / 2)
+    }
+
+    /// Whether `block_name` should be scanned for and dug as ore: every
+    /// `*_ore` block, plus anything listed in [`valuables`](Self::valuables).
+    /// Both sides are run through [`namespaced`] first, so a valuables entry
+    /// can be written with or without the `minecraft:` prefix. No non-test
+    /// caller yet — see [`valuables`](Self::valuables).
+    #[allow(dead_code)]
+    pub fn is_valuable(&self, block_name: &str) -> bool {
+        let name = namespaced(block_name);
+        name.ends_with("_ore") || self.valuables.iter().any(|valuable| namespaced(valuable) == name)
+    }
+}
+
 /// How a building's horizontal footprint is determined. `FromBlueprint` (the
 /// default) reads it off the matched [`CatalogueEntry`](super::blueprint::CatalogueEntry);
 /// `Explicit` overrides it — for a building whose placeable footprint should
@@ -420,6 +564,16 @@ pub enum DefinitionError {
     /// 086) — same shape as [`InvalidWarehouse`](Self::InvalidWarehouse) and
     /// [`InvalidFarm`](Self::InvalidFarm).
     InvalidGatherer(&'static str),
+    /// A `mine` block with a value nothing downstream could use (ticket
+    /// 113) — same shape as [`InvalidWarehouse`](Self::InvalidWarehouse),
+    /// [`InvalidFarm`](Self::InvalidFarm) and
+    /// [`InvalidGatherer`](Self::InvalidGatherer).
+    InvalidMine(&'static str),
+    /// `mine.shaft` (plus its one-block lining) doesn't fit inside the
+    /// building's resolved footprint (ticket 113) — needs that resolution,
+    /// so [`load_entry`] catches it rather than [`validate`], the same split
+    /// [`InvalidGroundLevel`](Self::InvalidGroundLevel) uses.
+    ShaftOutsideFootprint { shaft: ShaftAt, shaft_size: u32, footprint: IVec2 },
     /// `footprint: Explicit { x, z }` has a non-positive axis.
     InvalidFootprint { x: i32, z: i32 },
     /// `ground_level` isn't a real index into the matched blueprint's Y
@@ -467,6 +621,13 @@ impl std::fmt::Display for DefinitionError {
                 write!(f, "farm.tile names {missing:?}, which is not a loaded building")
             }
             DefinitionError::InvalidGatherer(rule) => write!(f, "gatherer.{rule}"),
+            DefinitionError::InvalidMine(rule) => write!(f, "mine.{rule}"),
+            DefinitionError::ShaftOutsideFootprint { shaft, shaft_size, footprint } => write!(
+                f,
+                "mine.shaft ({}, {}) sized {shaft_size} (plus its one-block lining) does not fit inside the \
+                 {}x{} footprint",
+                shaft.x, shaft.z, footprint.x, footprint.y
+            ),
             DefinitionError::InvalidProduction { item, per_minute } => write!(
                 f,
                 "production entry for {item:?} has negative per_minute {per_minute}"
@@ -679,6 +840,64 @@ fn validate(building: &Building) -> Result<(), DefinitionError> {
             });
         }
     }
+    // Ticket 113: a mine with a value nothing downstream could use, the same
+    // call `warehouse`/`farm`/`gatherer` already make for their own knobs.
+    if let Some(mine) = &building.mine {
+        // A 3-wide shaft has a 1-wide interior, which is not the 4-wide
+        // secondary shaft the design is built around.
+        if mine.shaft_size < 4 {
+            return Err(DefinitionError::InvalidMine("shaft_size must be >= 4"));
+        }
+        let level_spacing = mine.level_spacing();
+        // A level's landing must fall on a ring corner — MINES_DESIGN.md's
+        // "level_spacing is derived, not declared".
+        if (mine.first_level_depth as i32) < level_spacing || mine.first_level_depth as i32 % level_spacing != 0 {
+            return Err(DefinitionError::InvalidMine(
+                "first_level_depth must be a positive multiple of shaft_size - 2",
+            ));
+        }
+        // `GALLERY_PITCH` (ticket 114, `city::mine::layout`) is 4 — not
+        // imported here since that module doesn't exist until then. A
+        // shorter reach can't fit even the first row of galleries.
+        if mine.level_reach < 4 {
+            return Err(DefinitionError::InvalidMine("level_reach must be >= 4 (GALLERY_PITCH)"));
+        }
+        if mine.gallery_length == 0 {
+            return Err(DefinitionError::InvalidMine("gallery_length must be > 0"));
+        }
+        if mine.torch_spacing == 0 {
+            return Err(DefinitionError::InvalidMine("torch_spacing must be > 0"));
+        }
+        if mine.max_void_run == 0 {
+            return Err(DefinitionError::InvalidMine("max_void_run must be > 0"));
+        }
+        if mine.blocks_per_minute <= 0.0 {
+            return Err(DefinitionError::InvalidMine("blocks_per_minute must be > 0"));
+        }
+        if mine.buffer_stacks == 0 {
+            return Err(DefinitionError::InvalidMine("buffer_stacks must be > 0"));
+        }
+        // Ticket 112, same rule as `production`'s above.
+        if let Some(haul_at_stacks) = mine.haul_at_stacks.filter(|&at| at >= mine.buffer_stacks) {
+            return Err(DefinitionError::HaulAtNotBelowBuffer {
+                block: "mine",
+                haul_at_stacks,
+                buffer_stacks: mine.buffer_stacks,
+            });
+        }
+        // The deepest scan layer is the level floor itself; the bedrock
+        // band is -64..=-60, and 8 leaves a flight of slack under it.
+        if mine.min_level_y < WORLD_MIN_Y + 8 {
+            return Err(DefinitionError::InvalidMine("min_level_y must be >= WORLD_MIN_Y + 8"));
+        }
+        // A mine is its own producer — the panels resolve one capacity per
+        // building, and the shipped set never needs two.
+        if building.production.is_some() || building.gatherer.is_some() {
+            return Err(DefinitionError::InvalidMine(
+                "a mine is its own producer; drop the production/gatherer block",
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -722,6 +941,26 @@ fn load_entry(
     }
 
     let footprint = resolve_footprint(building.footprint, catalogue_entry.footprint);
+
+    // Ticket 113: needs the resolved footprint, so this lives here rather
+    // than in `validate` — a file-only check can't know how big the
+    // building it names actually is. The lining is written from
+    // `floor_y - 1` down, so strictly it could poke outside the footprint
+    // underground, but keeping it inside is free and a neighbour's
+    // foundation or a road's tunnel could be right there.
+    if let Some(mine) = &building.mine {
+        let shaft_size = mine.shaft_size as i32;
+        let fits_x = mine.shaft.x >= 1 && mine.shaft.x + shaft_size + 1 <= footprint.x;
+        let fits_z = mine.shaft.z >= 1 && mine.shaft.z + shaft_size + 1 <= footprint.y;
+        if !fits_x || !fits_z {
+            return Err(DefinitionError::ShaftOutsideFootprint {
+                shaft: mine.shaft,
+                shaft_size: mine.shaft_size,
+                footprint,
+            });
+        }
+    }
+
     // `blueprint_stem` is `Some` by construction: `catalogue_entry` above
     // only matched because it was.
     let catalogue_id = blueprint_stem.expect("catalogue_entry matched on this stem above").to_string();
@@ -1656,6 +1895,269 @@ Building(
         assert_eq!(gatherer.haul_threshold_stacks(), 4);
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- mine (ticket 113) -----------------------------------------------
+
+    /// A base `Building` RON with a well-formed `mine` block and an explicit
+    /// 16x16 footprint (real geometry doesn't exist until ticket 118) —
+    /// every mine test below starts here and overrides one field with
+    /// `{field}` so the test reads as a diff from "known good" rather than
+    /// repeating the whole block.
+    fn mine_ron(field: &str) -> String {
+        format!(
+            r#"Building(
+                name: "Mine",
+                blueprint: "house01.nbt",
+                tier: 1,
+                footprint: Explicit(x: 16, z: 16),
+                mine: Some(Mine(
+                    shaft: (x: 5, z: 5),
+                    first_level_depth: 12,
+                    min_level_y: 16,
+                    level_reach: 100,
+                    gallery_length: 200,
+                    blocks_per_minute: 60.0,
+                    {field}
+                )),
+                integrity: Integrity(pristine_above: 0.9, ruined_below: 0.5),
+            )"#
+        )
+    }
+
+    fn load_one_mine(name: &str, ron: &str) -> (BuildingDefinitions, Vec<(PathBuf, DefinitionError)>) {
+        let catalogue = catalogue_with_house01();
+        let dir = temp_dir(name);
+        fs::write(dir.join("house01.ron"), ron).unwrap();
+        let result = load_definitions_dir(&dir, &catalogue);
+        fs::remove_dir_all(&dir).ok();
+        result
+    }
+
+    #[test]
+    fn a_valid_mine_is_carried_with_documented_defaults() {
+        let (definitions, skipped) = load_one_mine("mine_valid", &mine_ron(""));
+        assert!(skipped.is_empty(), "{skipped:?}");
+        let mine = &definitions.get("house01").unwrap().building.mine.as_ref().expect("mine should have loaded");
+        assert_eq!(mine.shaft.x, 5);
+        assert_eq!(mine.shaft.z, 5);
+        assert_eq!(mine.shaft_size, 6, "default_shaft_size");
+        assert_eq!(mine.torch_spacing, 8, "default_torch_spacing");
+        assert_eq!(mine.max_void_run, 6, "default_max_void_run");
+        assert_eq!(mine.buffer_stacks, 4, "the shared default_buffer_stacks");
+        assert_eq!(mine.haul_at_stacks, None);
+        assert!(mine.valuables.is_empty());
+        assert_eq!(mine.level_spacing(), 4, "shaft_size - 2");
+    }
+
+    #[test]
+    fn a_shaft_size_below_4_is_skipped() {
+        let (definitions, skipped) = load_one_mine("mine_shaft_size", &mine_ron("shaft_size: 3,"));
+        assert!(definitions.is_empty());
+        assert_eq!(skipped.len(), 1);
+        assert!(matches!(skipped[0].1, DefinitionError::InvalidMine(_)));
+    }
+
+    /// `first_level_depth: 10` with the default `shaft_size: 6`
+    /// (`level_spacing() == 4`) isn't a whole multiple of the spacing, so no
+    /// level's floor would land on a ring corner.
+    #[test]
+    fn a_first_level_depth_not_a_multiple_of_spacing_is_skipped() {
+        let ron = mine_ron("").replace("first_level_depth: 12,", "first_level_depth: 10,");
+        let (definitions, skipped) = load_one_mine("mine_bad_depth", &ron);
+        assert!(definitions.is_empty());
+        assert_eq!(skipped.len(), 1);
+        assert!(matches!(skipped[0].1, DefinitionError::InvalidMine(_)));
+    }
+
+    #[test]
+    fn a_first_level_depth_that_is_a_multiple_of_spacing_is_carried() {
+        // The base fixture already uses 12, a multiple of the default
+        // spacing of 4 — this is the positive case the test above assumes.
+        let (definitions, skipped) = load_one_mine("mine_good_depth", &mine_ron(""));
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert_eq!(definitions.get("house01").unwrap().building.mine.as_ref().unwrap().first_level_depth, 12);
+    }
+
+    #[test]
+    fn a_level_reach_below_the_gallery_pitch_is_skipped() {
+        let ron = mine_ron("").replace("level_reach: 100,", "level_reach: 3,");
+        let (definitions, skipped) = load_one_mine("mine_short_reach", &ron);
+        assert!(definitions.is_empty());
+        assert_eq!(skipped.len(), 1);
+        assert!(matches!(skipped[0].1, DefinitionError::InvalidMine(_)));
+    }
+
+    #[test]
+    fn a_zero_gallery_length_is_skipped() {
+        let ron = mine_ron("").replace("gallery_length: 200,", "gallery_length: 0,");
+        let (definitions, skipped) = load_one_mine("mine_zero_gallery", &ron);
+        assert!(definitions.is_empty());
+        assert_eq!(skipped.len(), 1);
+        assert!(matches!(skipped[0].1, DefinitionError::InvalidMine(_)));
+    }
+
+    #[test]
+    fn a_zero_torch_spacing_is_skipped() {
+        let (definitions, skipped) = load_one_mine("mine_zero_torch", &mine_ron("torch_spacing: 0,"));
+        assert!(definitions.is_empty());
+        assert_eq!(skipped.len(), 1);
+        assert!(matches!(skipped[0].1, DefinitionError::InvalidMine(_)));
+    }
+
+    #[test]
+    fn a_zero_max_void_run_is_skipped() {
+        let (definitions, skipped) = load_one_mine("mine_zero_void_run", &mine_ron("max_void_run: 0,"));
+        assert!(definitions.is_empty());
+        assert_eq!(skipped.len(), 1);
+        assert!(matches!(skipped[0].1, DefinitionError::InvalidMine(_)));
+    }
+
+    #[test]
+    fn a_zero_or_negative_mine_speed_is_skipped() {
+        let ron = mine_ron("").replace("blocks_per_minute: 60.0,", "blocks_per_minute: 0.0,");
+        let (definitions, skipped) = load_one_mine("mine_zero_speed", &ron);
+        assert!(definitions.is_empty());
+        assert_eq!(skipped.len(), 1);
+        assert!(matches!(skipped[0].1, DefinitionError::InvalidMine(_)));
+    }
+
+    #[test]
+    fn a_zero_mine_buffer_stacks_is_skipped() {
+        let (definitions, skipped) = load_one_mine("mine_zero_buffer", &mine_ron("buffer_stacks: 0,"));
+        assert!(definitions.is_empty());
+        assert_eq!(skipped.len(), 1);
+        assert!(matches!(skipped[0].1, DefinitionError::InvalidMine(_)));
+    }
+
+    #[test]
+    fn a_mine_haul_threshold_at_the_cap_is_skipped() {
+        let (definitions, skipped) =
+            load_one_mine("mine_haul_at_cap", &mine_ron("buffer_stacks: 8, haul_at_stacks: Some(8),"));
+        assert!(definitions.is_empty());
+        assert_eq!(skipped.len(), 1);
+        assert!(matches!(
+            skipped[0].1,
+            DefinitionError::HaulAtNotBelowBuffer { block: "mine", haul_at_stacks: 8, buffer_stacks: 8 }
+        ));
+    }
+
+    /// `WORLD_MIN_Y + 8 == -56` — one below that refuses, and (per the next
+    /// test) exactly `-56` is fine: it's the shipped Deepslate Mine's own
+    /// value.
+    #[test]
+    fn a_min_level_y_below_the_bedrock_margin_is_skipped() {
+        let ron = mine_ron("").replace("min_level_y: 16,", "min_level_y: -57,");
+        let (definitions, skipped) = load_one_mine("mine_too_deep", &ron);
+        assert!(definitions.is_empty());
+        assert_eq!(skipped.len(), 1);
+        assert!(matches!(skipped[0].1, DefinitionError::InvalidMine(_)));
+    }
+
+    #[test]
+    fn a_min_level_y_at_the_bedrock_margin_is_carried() {
+        let ron = mine_ron("").replace("min_level_y: 16,", "min_level_y: -56,");
+        let (definitions, skipped) = load_one_mine("mine_deepest_allowed", &ron);
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert_eq!(definitions.get("house01").unwrap().building.mine.as_ref().unwrap().min_level_y, -56);
+    }
+
+    #[test]
+    fn a_mine_with_a_production_block_is_skipped() {
+        let ron = mine_ron("").replacen(
+            "integrity: Integrity",
+            "production: Some(Production(outputs: [(item: \"minecraft:stone\", per_minute: 1.0)])),\n\
+             integrity: Integrity",
+            1,
+        );
+        let (definitions, skipped) = load_one_mine("mine_with_production", &ron);
+        assert!(definitions.is_empty());
+        assert_eq!(skipped.len(), 1);
+        assert!(matches!(skipped[0].1, DefinitionError::InvalidMine(_)));
+    }
+
+    #[test]
+    fn a_mine_with_a_gatherer_block_is_skipped() {
+        let ron = mine_ron("").replacen(
+            "integrity: Integrity",
+            "gatherer: Some(Gatherer(radius_blocks: 6, blocks_per_minute: 2.0)),\n\
+             integrity: Integrity",
+            1,
+        );
+        let (definitions, skipped) = load_one_mine("mine_with_gatherer", &ron);
+        assert!(definitions.is_empty());
+        assert_eq!(skipped.len(), 1);
+        assert!(matches!(skipped[0].1, DefinitionError::InvalidMine(_)));
+    }
+
+    /// A shaft at `(0, 5)` leaves no room for the one-block lining on the
+    /// west side — `fits_x` requires `shaft.x >= 1`.
+    #[test]
+    fn a_shaft_flush_against_the_footprint_edge_is_skipped() {
+        let ron = mine_ron("").replace("shaft: (x: 5, z: 5),", "shaft: (x: 0, z: 5),");
+        let (definitions, skipped) = load_one_mine("mine_shaft_flush", &ron);
+        assert!(definitions.is_empty());
+        assert_eq!(skipped.len(), 1);
+        assert!(matches!(skipped[0].1, DefinitionError::ShaftOutsideFootprint { .. }));
+    }
+
+    /// A shaft at `(10, 5)` with the default `shaft_size: 6` reaches
+    /// `10 + 6 + 1 = 17`, past the fixture's 16-wide footprint.
+    #[test]
+    fn a_shaft_whose_far_edge_overruns_the_footprint_is_skipped() {
+        let ron = mine_ron("").replace("shaft: (x: 5, z: 5),", "shaft: (x: 10, z: 5),");
+        let (definitions, skipped) = load_one_mine("mine_shaft_overrun", &ron);
+        assert!(definitions.is_empty());
+        assert_eq!(skipped.len(), 1);
+        assert!(matches!(skipped[0].1, DefinitionError::ShaftOutsideFootprint { .. }));
+    }
+
+    #[test]
+    fn mine_is_valuable_matches_ore_suffix_and_listed_valuables() {
+        let mine = Mine {
+            shaft: ShaftAt { x: 5, z: 5 },
+            shaft_size: 6,
+            first_level_depth: 12,
+            min_level_y: 16,
+            level_reach: 100,
+            gallery_length: 200,
+            torch_spacing: 8,
+            max_void_run: 6,
+            blocks_per_minute: 60.0,
+            buffer_stacks: 512,
+            haul_at_stacks: None,
+            valuables: vec!["ancient_debris".to_string()],
+        };
+        assert!(mine.is_valuable("minecraft:deepslate_iron_ore"));
+        assert!(mine.is_valuable("iron_ore"), "bare names normalise the same as drops.ron's shorthand");
+        assert!(mine.is_valuable("ancient_debris"), "explicitly listed");
+        assert!(mine.is_valuable("minecraft:ancient_debris"), "listed, prefixed either way");
+        assert!(!mine.is_valuable("stone"));
+        assert!(!mine.is_valuable("minecraft:netherrack"), "not an ore and not listed");
+    }
+
+    /// The three shipped tiers this ticket adds — real files, loaded end to
+    /// end, chaining through `resolve_requirements` the same way
+    /// `warehouse01`/`warehouse02` already do.
+    #[test]
+    fn the_shipped_mine_tiers_load_and_chain_requirements() {
+        let (catalogue, catalogue_skipped) = crate::blueprint::load_catalogue_dir(Path::new("assets/city/blueprints"));
+        assert!(catalogue_skipped.is_empty(), "{catalogue_skipped:?}");
+
+        let (definitions, skipped) = load_definitions_dir(Path::new("assets/city/buildings"), &catalogue);
+        assert!(skipped.is_empty(), "{skipped:?}");
+
+        let mine01 = definitions.get("mine01").expect("mine01.ron should load");
+        let mine02 = definitions.get("mine02").expect("mine02.ron should load");
+        let mine03 = definitions.get("mine03").expect("mine03.ron should load");
+        assert_eq!(mine02.building.requires, vec!["mine01".to_string()]);
+        assert_eq!(mine03.building.requires, vec!["mine02".to_string()]);
+        for entry in [mine01, mine02, mine03] {
+            let mine = entry.building.mine.as_ref().expect("should declare a mine block");
+            assert!(mine.blocks_per_minute > 0.0);
+        }
+        assert!(mine01.building.mine.as_ref().unwrap().min_level_y > mine02.building.mine.as_ref().unwrap().min_level_y);
+        assert!(mine02.building.mine.as_ref().unwrap().min_level_y > mine03.building.mine.as_ref().unwrap().min_level_y);
     }
 
     /// The gatherer hut this repo actually ships, loaded end to end — the

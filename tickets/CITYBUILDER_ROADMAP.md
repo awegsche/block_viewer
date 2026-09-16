@@ -840,7 +840,7 @@ world is made of are the economy's own units.
   dressing.
 - **The Gatherer's Hut (ticket 086, done)** — the low-radius, low-speed
   answer to ground levelling and early resource collection this section's own
-  header promises, distinct from a specialised quarry/mine (neither built).
+  header promises, distinct from a specialised mine (see "H3 — Mines" below).
   `definition::Gatherer` (`Building::gatherer`) adds `radius_blocks`,
   `blocks_per_minute` and `buffer_stacks` — the last reusing
   `Production::buffer_stacks`'s own shape and default. Deliberately no

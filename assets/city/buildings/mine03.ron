@@ -1,0 +1,41 @@
+// Ticket 113, roadmap H3. Deepslate Mine: mine02's tier 3, reaching the
+// diamond/emerald band. `min_level_y: -56` keeps the deepest scan layer
+// above the bedrock band (-64..=-60); `never_dig` (ticket 115) guards it
+// anyway. See mine01.ron for the shared design notes and MINES_DESIGN.md
+// for the full geometry.
+//
+// PLACEHOLDER GEOMETRY, the warehouse01 way — see mine01.ron and
+// ../../../todo.md; a real mine03.nbt lands with ticket 118.
+Building(
+    name: "Deepslate Mine",
+    blueprint: "lumber.nbt",
+    tier: 3,
+    requires: ["mine02"],
+    category: Production,
+    footprint: Explicit(x: 16, z: 16),
+    ground_level: 2,
+    cost: [
+        (block: "minecraft:oak_planks", count: 128),
+        (block: "minecraft:oak_log", count: 64),
+        (block: "minecraft:cobblestone", count: 128),
+        (block: "minecraft:raw_iron", count: 48),
+        (block: "minecraft:raw_gold", count: 24),
+    ],
+    mine: Some((
+        shaft: (x: 5, z: 5),
+        shaft_size: 6,
+        first_level_depth: 12,
+        // + diamond, emerald. -56 is WORLD_MIN_Y (-64) + 8: the deepest
+        // this tier's own validation rule allows.
+        min_level_y: -56,
+        level_reach: 100,
+        gallery_length: 200,
+        blocks_per_minute: 120.0,
+        buffer_stacks: 512,
+        haul_at_stacks: Some(64),
+    )),
+    integrity: Integrity(
+        pristine_above: 0.95,
+        ruined_below: 0.60,
+    ),
+)
