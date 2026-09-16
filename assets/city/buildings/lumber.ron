@@ -25,7 +25,7 @@ Building(
         (block: "minecraft:oak_log", count: 10),
     ],
     production: Some(Production(
-        outputs: [(item: "minecraft:oak_log", per_minute: 8.0)],
+        outputs: [(item: "minecraft:oak_log", per_minute: 40.0)],
         buffer_stacks: 4,
     )),
     // Zero output until at least one lumber_farm_01 tile stands nearby, full

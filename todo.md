@@ -1377,8 +1377,9 @@ Y=0 in the world and won't be cleaned up by this fix — see the ticket.
 
   Then leave the game running (unpaused) for a couple of minutes at normal
   speed and watch a nearby raised bump or tree stump: confirm blocks near the
-  hut visibly disappear one at a time, roughly every 30 seconds
-  (`blocks_per_minute: 2.0`), working from the nearest diggable spot outward,
+  hut visibly disappear one at a time, roughly every 3 seconds
+  (`blocks_per_minute: 20.0`, bumped from `2.0` for faster debug feedback —
+  ticket 107), working from the nearest diggable spot outward,
   and stopping at the hut's own ground level — it should **not** dig a hole
   below the surrounding terrain. Select the hut (Inspect mode) and confirm
   its state reads `running`, its buffer count climbs, and once a warehouse is
@@ -1430,3 +1431,18 @@ Y=0 in the world and won't be cleaned up by this fix — see the ticket.
     kind's closed sides in turn and confirm the gravel exit actually lines
     up with the building on every side, not just one — the piece never
     rotates per-building, so this is the one thing unit tests can't check.
+- [ ] **107 Inspect panel: warehouse status line and Clear buffer button.**
+  `cargo test` is green, but nobody has looked at the panel itself yet. At
+  `cargo run --bin citybuilder`, select (Inspect mode) a producer that's
+  within a warehouse's road-connected radius and confirm the new line reads
+  `Warehouse: <name> (<N.N> min away)`; select one with no warehouse in range
+  and confirm it instead shows a red "⚠ Not connected to a warehouse"
+  warning. With the buffer non-empty, confirm a "Clear buffer" button appears
+  under the buffer lines and clicking it empties the buffer immediately (no
+  journal entry expected — demolish/undo should not see a clear as an
+  action). Also confirm the debug-speed tuning this ticket shipped alongside
+  actually reads as faster: `economy.ron`'s `stack_size` 64 -> 8 should make
+  a farm/gatherer buffer fill and a haul dispatch in well under a minute, and
+  the Lumberjack's Hut (`per_minute` 8 -> 40) and Gatherer's Hut
+  (`blocks_per_minute` 2.0 -> 20.0) should visibly produce/dig noticeably
+  faster than before.

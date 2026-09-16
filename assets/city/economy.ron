@@ -32,7 +32,11 @@
 // before an `interchangeable` synonym.
 (
     // ---- the unit the economy moves things in ---------------------------
-    stack_size: 64,
+    // Lowered from Minecraft's own 64 for faster haulage feedback while
+    // debugging: a smaller stack (and buffer, since buffer capacity is
+    // buffer_stacks * stack_size) fills and dispatches in seconds instead of
+    // minutes.
+    stack_size: 8,
 
     // ---- what the city can hold with no warehouse -----------------------
     // The founding grant below is 960 items, so this leaves room to work

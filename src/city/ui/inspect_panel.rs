@@ -26,11 +26,12 @@ use bevy_egui::{egui, EguiContexts};
 use super::super::definition::BuildingDefinitions;
 use super::super::economy::EconomyConfig;
 use super::super::gatherer::gatherer_buffer_capacity;
-use super::super::inventory::short_name;
+use super::super::inventory::{short_name, Parcel};
 use super::super::picking::SelectedBuilding;
 use super::super::placement::rotation_degrees;
 use super::super::production::{buffer_capacity, Producer, ProductionState};
 use super::super::state::{self, PlacedBuilding};
+use super::super::warehouse::Coverage;
 
 /// The selected building's own display name — its definition's, via
 /// [`state::City::definition_of`], falling back to the catalogue id the same
@@ -68,15 +69,36 @@ fn producer_capacity(placed: &PlacedBuilding, definitions: &BuildingDefinitions,
     0
 }
 
+/// Ticket 107: the panel's line for whether `id` is reachable by a warehouse
+/// at all — [`super::super::warehouse::Coverage`] already answers this for
+/// haulage's own dispatch; this is its first display. `None` means "not
+/// connected", which the panel shows as a warning rather than a line naming
+/// nothing.
+fn warehouse_status(
+    id: state::BuildingId,
+    coverage: Option<&Coverage>,
+    city: &state::City,
+    definitions: &BuildingDefinitions,
+) -> Option<String> {
+    let served = coverage?.served(id)?;
+    let name = city
+        .building(served.warehouse)
+        .map(|warehouse| building_name(served.warehouse, &warehouse.catalogue_id, city, definitions))
+        .unwrap_or_else(|| "warehouse".to_string());
+    Some(format!("Warehouse: {name} ({:.1} min away)", served.travel_minutes))
+}
+
 /// Egui window: the selected building's name, position, rotation, and — if
-/// it's a producer — its running state and buffer. Draws nothing at all with
-/// nothing selected; see the module docs.
+/// it's a producer — its running state, warehouse connection, and buffer
+/// (with a "Clear buffer" debug button, ticket 107). Draws nothing at all
+/// with nothing selected; see the module docs.
 pub(super) fn inspect_panel(
     mut contexts: EguiContexts,
     selected: Res<SelectedBuilding>,
     city: Res<state::City>,
     definitions: Res<BuildingDefinitions>,
-    production: Res<ProductionState>,
+    mut production: ResMut<ProductionState>,
+    coverage: Option<Res<Coverage>>,
     economy: Res<EconomyConfig>,
 ) {
     let Some(id) = selected.0 else { return };
@@ -84,6 +106,8 @@ pub(super) fn inspect_panel(
     // the same "clears itself out" behaviour a fresh click on empty ground
     // gives it, just arrived at without one.
     let Some(placed) = city.building(id) else { return };
+
+    let mut clear_buffer = false;
 
     egui::Window::new("Inspect").show(contexts.ctx_mut(), |ui| {
         ui.label(building_name(id, &placed.catalogue_id, &city, &definitions));
@@ -93,6 +117,16 @@ pub(super) fn inspect_panel(
         if let Some(producer) = production.get(id) {
             ui.separator();
             ui.label(format!("State: {}", producer.state.label()));
+
+            match warehouse_status(id, coverage.as_deref(), &city, &definitions) {
+                Some(line) => {
+                    ui.label(line);
+                }
+                None => {
+                    ui.colored_label(egui::Color32::from_rgb(220, 60, 60), "⚠ Not connected to a warehouse");
+                }
+            }
+
             let capacity = producer_capacity(placed, &definitions, &economy);
             if producer.buffer.is_empty() {
                 ui.label("Buffer: (empty)");
@@ -101,17 +135,30 @@ pub(super) fn inspect_panel(
                 for line in buffer_lines(producer, capacity) {
                     ui.label(line);
                 }
+                if ui.button("Clear buffer").clicked() {
+                    clear_buffer = true;
+                }
             }
         }
     });
+
+    if clear_buffer {
+        production.entry(id).buffer = Parcel::default();
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::blueprint::Rotation;
-    use crate::city::definition::{Building, Category, FootprintSpec, Integrity, LoadedBuilding, Production, ProductionItem};
+    use crate::city::definition::{
+        Building, Category, FootprintSpec, Integrity, LoadedBuilding, Production, ProductionItem, Warehouse,
+    };
     use crate::city::production::ProducerState;
+    use crate::city::road::RoadPieceVariant;
+    use crate::city::road_definition::RoadTypes;
+    use crate::city::state::ROAD_CELL_SIZE;
+    use crate::city::warehouse::compute_coverage;
     use std::path::PathBuf;
 
     fn placement(catalogue_id: &str, definition_id: Option<&str>) -> PlacedBuilding {
@@ -237,5 +284,90 @@ mod tests {
     #[test]
     fn producer_state_labels_read_as_a_sentence_fragment() {
         assert_eq!(ProducerState::Running.label(), "running");
+    }
+
+    // --- warehouse_status (ticket 107) --------------------------------------
+
+    fn warehouse_status_defs() -> BuildingDefinitions {
+        let warehouse = Building {
+            name: "Warehouse".to_string(),
+            blueprint: "warehouse.nbt".to_string(),
+            tier: 1,
+            requires: Vec::new(),
+            footprint: FootprintSpec::FromBlueprint,
+            production: None,
+            cost: Vec::new(),
+            warehouse: Some(Warehouse { radius_cells: 8, concurrent_hauls: 2, handling_minutes: 0.0, storage: 4096 }),
+            farm: None,
+            gatherer: None,
+            category: Category::Production,
+            ground_level: 0,
+            integrity: Integrity { pristine_above: 0.95, ruined_below: 0.6 },
+        };
+        let farm = Building {
+            name: "Farm".to_string(),
+            blueprint: "farm.nbt".to_string(),
+            tier: 1,
+            requires: Vec::new(),
+            footprint: FootprintSpec::FromBlueprint,
+            production: Some(Production {
+                outputs: vec![ProductionItem { item: "minecraft:wheat".to_string(), per_minute: 12.0 }],
+                inputs: Vec::new(),
+                radius: None,
+                buffer_stacks: 4,
+            }),
+            cost: Vec::new(),
+            warehouse: None,
+            farm: None,
+            gatherer: None,
+            category: Category::Production,
+            ground_level: 0,
+            integrity: Integrity { pristine_above: 0.95, ruined_below: 0.6 },
+        };
+        BuildingDefinitions::from_entries(vec![
+            LoadedBuilding { id: "warehouse01".to_string(), path: PathBuf::new(), building: warehouse, footprint: IVec2::ONE, catalogue_id: "warehouse01".to_string() },
+            LoadedBuilding { id: "farm01".to_string(), path: PathBuf::new(), building: farm, footprint: IVec2::ONE, catalogue_id: "farm01".to_string() },
+        ])
+    }
+
+    #[test]
+    fn warehouse_status_names_the_serving_warehouse_and_its_travel_time() {
+        let mut city = state::City::default();
+        for x in 0..=1 {
+            city.add_road_cell(IVec2::new(x, 0), "dirt", 64, None, RoadPieceVariant::Surface).unwrap();
+        }
+        let at = |cell: i32| IVec3::new(cell * ROAD_CELL_SIZE, 64, -1);
+        city.place_building("warehouse01", Some("warehouse01".to_string()), at(0), Rotation::Deg0, IVec2::ONE).unwrap();
+        let farm =
+            city.place_building("farm01", Some("farm01".to_string()), at(1), Rotation::Deg0, IVec2::ONE).unwrap();
+
+        let defs = warehouse_status_defs();
+        let coverage = compute_coverage(&city, &defs, &RoadTypes::default());
+
+        let status =
+            warehouse_status(farm, Some(&coverage), &city, &defs).expect("the farm is one cell from the warehouse");
+        assert!(status.starts_with("Warehouse: Warehouse ("), "{status}");
+    }
+
+    #[test]
+    fn warehouse_status_warns_when_nothing_serves_the_producer() {
+        let mut city = state::City::default();
+        let farm = city
+            .place_building("farm01", Some("farm01".to_string()), IVec3::new(500, 64, 500), Rotation::Deg0, IVec2::ONE)
+            .unwrap();
+
+        let defs = warehouse_status_defs();
+        let coverage = compute_coverage(&city, &defs, &RoadTypes::default());
+
+        assert!(warehouse_status(farm, Some(&coverage), &city, &defs).is_none());
+    }
+
+    /// The tolerant `Option<Res<Coverage>>` shape: a minimal test `App` that
+    /// never adds `WarehousePlugin` must read as "not connected", not panic.
+    #[test]
+    fn warehouse_status_is_none_with_no_coverage_resource() {
+        let city = state::City::default();
+        let defs = BuildingDefinitions::default();
+        assert!(warehouse_status(state::BuildingId::from_u64(0), None, &city, &defs).is_none());
     }
 }

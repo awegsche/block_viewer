@@ -29,7 +29,7 @@ Building(
         radius_blocks: 6,
         // Slow next to a specialised quarry/mine's eventual rate — the point
         // is a levelled build site early on, not a real extraction economy.
-        blocks_per_minute: 2.0,
+        blocks_per_minute: 20.0,
         buffer_stacks: 4,
     )),
     integrity: Integrity(
