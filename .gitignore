@@ -1,1 +1,7 @@
 /target
+
+# Local Paper server used to pre-generate saves with Chunky — see
+# docs/world-pregeneration.md. Jars/world data, not project source.
+/utils
+
+bash.exe.stackdump
