@@ -391,6 +391,7 @@ mod grid;
 mod hot_reload;
 mod inventory;
 mod journal;
+mod mine;
 mod persistence;
 mod picking;
 mod placement;

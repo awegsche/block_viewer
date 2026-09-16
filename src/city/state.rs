@@ -325,6 +325,33 @@ pub fn footprint_extent(footprint: IVec2, rotation: Rotation) -> IVec2 {
     }
 }
 
+/// Where a single unrotated local `(x, z)` tile inside a `footprint`-sized
+/// footprint lands once that footprint is rotated — the same per-cell corner
+/// math [`crate::blueprint::rotate_blueprint`] applies to a block's grid
+/// position (`rotate90_pos`), just dropped to two dimensions and driven by
+/// [`footprint_extent`]'s axis swap instead of a blueprint's own `size`.
+///
+/// `tile` is expected to be inside `0..footprint.x` / `0..footprint.y`; nothing
+/// here checks that, the same way `rotate_blueprint` trusts its grid indices.
+/// Ticket 114 (`city::mine::layout::MineFrame::from_placement`) is the first
+/// caller — rotating a mine's `shaft` corner into world space — and rotates
+/// *both* corners of the shaft square through this and takes the
+/// componentwise min, since a single corner's image under a 90°/270° turn is
+/// the square's opposite corner, not its new minimum.
+///
+/// No non-test caller outside `city::mine::layout` yet — that module itself
+/// has no caller until ticket 115/116 wire it in, the gap ticket 113's
+/// `Mine::is_valuable` sat in.
+#[allow(dead_code)]
+pub fn rotate_local_tile(tile: IVec2, footprint: IVec2, rotation: Rotation) -> IVec2 {
+    match rotation {
+        Rotation::Deg0 => tile,
+        Rotation::Deg90 => IVec2::new(footprint.y - 1 - tile.y, tile.x),
+        Rotation::Deg180 => IVec2::new(footprint.x - 1 - tile.x, footprint.y - 1 - tile.y),
+        Rotation::Deg270 => IVec2::new(tile.y, footprint.x - 1 - tile.x),
+    }
+}
+
 /// Every Minecraft `(x, z)` tile a footprint covers when placed at `origin`
 /// with `rotation` — the rectangle [`footprint_extent`] describes, walked
 /// one tile per block, with `origin` as its minimum corner regardless of
@@ -921,6 +948,23 @@ mod tests {
         assert_eq!(footprint_extent(footprint, Rotation::Deg180), footprint);
         assert_eq!(footprint_extent(footprint, Rotation::Deg90), IVec2::new(5, 3));
         assert_eq!(footprint_extent(footprint, Rotation::Deg270), IVec2::new(5, 3));
+    }
+
+    #[test]
+    fn rotate_local_tile_walks_a_corner_around_the_footprint() {
+        // A 3x5 footprint's four corners, walked clockwise under each
+        // rotation — the same check `footprint_extent_swaps_axes_only_on_a_quarter_turn`
+        // makes for the bounding box, one level down at a single tile.
+        let footprint = IVec2::new(3, 5);
+        let nw = IVec2::new(0, 0);
+        assert_eq!(rotate_local_tile(nw, footprint, Rotation::Deg0), IVec2::new(0, 0));
+        // NW rotated 90 degrees clockwise lands at the new footprint's NE
+        // corner: (extent.x - 1, 0) = (4, 0).
+        assert_eq!(rotate_local_tile(nw, footprint, Rotation::Deg90), IVec2::new(4, 0));
+        // 180 degrees: the opposite corner of the original footprint.
+        assert_eq!(rotate_local_tile(nw, footprint, Rotation::Deg180), IVec2::new(2, 4));
+        // 270 degrees: the new footprint's SW corner.
+        assert_eq!(rotate_local_tile(nw, footprint, Rotation::Deg270), IVec2::new(0, 2));
     }
 
     #[test]
