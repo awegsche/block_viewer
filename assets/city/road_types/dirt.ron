@@ -2,6 +2,9 @@
 // Geometry lives at assets/city/roads/dirt/ — see that directory's README.md.
 RoadType(
     name: "Dirt Path",
-    travel_speed: 1.0,
+    // 10x for faster haulage feedback while debugging (matches
+    // `economy.ron`'s `stack_size` cut for the same reason) -- a one-line
+    // revert if this turns out to matter for real balance testing.
+    travel_speed: 10.0,
     capacity: 4,
 )
