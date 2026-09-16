@@ -23,10 +23,12 @@ Building(
         (block: "minecraft:dirt", count: 8),
     ],
     gatherer: Some((
-        // Deliberately tighter than a warehouse's road-cell reach or a
-        // farm's tile radius (roadmap H2): this building levels the site
-        // right around it, not a district.
-        radius_blocks: 6,
+        // Ticket 111: not an area of its own any more — the hut digs only
+        // inside the working area the player draws for it (inspect panel,
+        // "Draw working area"), and this is how far from the footprint that
+        // rectangle may reach. Three times 086's automatic 6-block ring:
+        // the player decides how much of it to use, so it can be generous.
+        radius_blocks: 18,
         // Slow next to a specialised quarry/mine's eventual rate — the point
         // is a levelled build site early on, not a real extraction economy.
         blocks_per_minute: 20.0,

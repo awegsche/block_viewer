@@ -844,11 +844,25 @@ world is made of are the economy's own units.
   - **`next_gather_target` walks outward from the footprint** (Chebyshev,
     `farm::rect_distance` — no road to route a gathering radius along, same
     call `Farm::radius_blocks` makes), picking whichever still-diggable tile
-    is nearest and never the building's own footprint. A per-dispatch
-    `claimed` map remembers "the next Y down" for a tile already touched in
-    the same batch, so several blocks in one tick empty the nearest column
-    before moving outward rather than skipping a layer at a time across the
-    whole radius.
+    is nearest. A per-dispatch `claimed` map remembers "the next Y down" for
+    a tile already touched in the same batch, so several blocks in one tick
+    empty the nearest column before moving outward rather than skipping a
+    layer at a time across the whole area.
+  - **Ticket 111: the area is the player's, and the city's tiles are off
+    limits.** 086's automatic `radius_blocks` ring dug the road next to the
+    hut — nothing consulted `City` occupancy, and a road piece sits one
+    block above ground, so it was always the topmost block in reach. Now
+    `next_gather_target` skips every tile with an `Occupant` (roads, other
+    buildings, its own footprint), and digs only inside
+    `PlacedBuilding::work_area`, a rectangle drawn from the inspect panel
+    ("Draw working area" -> `ActiveTool::DrawWorkArea`, a corner-to-corner
+    drag in `city::work_area`, gizmo rings for the area/reach/candidate).
+    `None` until drawn — `ProducerState::NoWorkArea`, nothing accrues.
+    `radius_blocks` (18, three times 086's 6) is the cap the drawn
+    rectangle is clamped to, not an area of its own. Persisted on
+    `SavedBuilding`/the journal's `SavedPlacement` with `#[serde(default)]`
+    and no version bump — the first field whose default is the truth about
+    an older file rather than a guess.
   - **One write in flight per building, not one shared slot** — unlike
     commit/terraform's single pending slot (only one placement or drag ever
     happens at once), several huts can legitimately be digging the same

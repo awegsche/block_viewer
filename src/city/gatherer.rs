@@ -40,17 +40,37 @@
 //! read back. [`next_gather_target`] treats that as the floor: strictly
 //! *above* it is diggable, at or below it is not.
 //!
-//! ## Nearest tile first, never the building's own footprint
+//! ## Where it digs: the player's rectangle, never the city's own tiles
 //!
-//! [`next_gather_target`] scans every tile within [`Gatherer::radius_blocks`]
-//! (Chebyshev, [`super::farm::rect_distance`] — the same measure and the
-//! same reason [`super::definition::Farm::radius_blocks`] uses it: there's
-//! no road for a gathering radius to be routed along) and picks whichever
-//! still-diggable one is closest to the building's own footprint, which it
-//! never enters. A `claimed` map remembers "the next Y down" per tile
-//! already touched *within one dispatch*, so digging several blocks in one
-//! tick empties the nearest column before moving outward rather than
-//! skipping across the radius one layer at a time.
+//! Ticket 111. A hut digs inside its [`super::state::PlacedBuilding::work_area`]
+//! — a rectangle the player draws from the inspect panel
+//! (`city::work_area`) — and nowhere else; with none drawn it sits in
+//! [`ProducerState::NoWorkArea`] and accrues nothing. Ticket 086's automatic
+//! "everything within [`Gatherer::radius_blocks`]" is gone: that radius is
+//! now the *cap* on how far a drawn area may reach (`WorkArea::clamp_to_reach`,
+//! applied when the drag commits), not an area of its own, which is why
+//! nothing here reads it any more.
+//!
+//! Inside that rectangle, [`next_gather_target`] skips every tile [`City`]
+//! has an [`super::state::Occupant`] for — a road cell's tiles, another
+//! building's footprint, its own footprint — before it ever looks at the
+//! terrain. This is the bug ticket 111 exists for: 086 excluded only the
+//! hut's own footprint, and a road piece, sitting one block *above* ground,
+//! was always the topmost block on its tile and so always the first thing
+//! reached for. The city's claim on a tile is checked here, at dig time,
+//! rather than cut out of the area when drawn, so a road built through an
+//! existing area is safe from the next tick on without anything re-deriving.
+//!
+//! ## Nearest tile first
+//!
+//! Among the remaining tiles [`next_gather_target`] picks whichever
+//! still-diggable one is closest to the building's own footprint (Chebyshev,
+//! [`super::farm::rect_distance`] — the same measure
+//! [`super::definition::Farm::radius_blocks`] uses, for the same reason:
+//! there's no road to route a dig along). A `claimed` map remembers "the
+//! next Y down" per tile already touched *within one dispatch*, so digging
+//! several blocks in one tick empties the nearest column before moving
+//! outward rather than skipping across the area one layer at a time.
 //!
 //! ## One write in flight per building, not one shared slot
 //!
@@ -96,7 +116,7 @@ use super::economy::EconomyConfig;
 use super::farm::rect_distance;
 use super::journal::Baseline;
 use super::production::{Producer, ProducerState, ProductionState};
-use super::state::{footprint_extent, BuildingId, City};
+use super::state::{footprint_extent, BuildingId, City, WorkArea};
 
 /// How many stacks (`economy.stack_size`) `gatherer` can hold before it stops
 /// digging — the same shape and reasoning
@@ -106,46 +126,54 @@ pub fn gatherer_buffer_capacity(gatherer: &Gatherer, economy: &EconomyConfig) ->
     u64::from(gatherer.buffer_stacks).saturating_mul(economy.stack_size)
 }
 
-/// The next block a gatherer should remove, or `None` when nothing within
-/// [`radius`] is still above `floor_y` — see the module docs' "Nearest tile
-/// first". `claimed` is a per-dispatch scratchpad (not persisted): once a
-/// tile is picked, its entry remembers the *next* Y down so a second call in
-/// the same batch keeps digging the same column rather than re-reading its
-/// old topmost height from `world` (which the in-flight edit hasn't reached
-/// yet).
-fn next_gather_target(
+/// One hut's dig geometry, read off its placement once per tick by
+/// [`dispatch_digs`] — the footprint rectangle (`max` exclusive, the
+/// [`super::state::footprint_tiles`] convention), the floor it digs down to
+/// (see the module docs' "Where it stops"), and the area it digs within
+/// (`None` until the player draws one — see "Where it digs").
+#[derive(Debug, Clone, Copy)]
+struct DigSite {
     footprint_min: IVec2,
     footprint_max: IVec2,
-    radius: i32,
     floor_y: i32,
+    area: Option<WorkArea>,
+}
+
+/// The next block a gatherer should remove, or `None` when nothing in
+/// `area` is still above `floor_y` — see the module docs' "Where it digs"
+/// and "Nearest tile first". A tile [`City`] has an occupant for is never a
+/// target, whatever stands on it. `claimed` is a per-dispatch scratchpad
+/// (not persisted): once a tile is picked, its entry remembers the *next* Y
+/// down so a second call in the same batch keeps digging the same column
+/// rather than re-reading its old topmost height from `world` (which the
+/// in-flight edit hasn't reached yet).
+fn next_gather_target(
+    site: &DigSite,
+    area: WorkArea,
     world: &DecodedWorld,
+    city: &City,
     claimed: &mut HashMap<IVec2, i32>,
 ) -> Option<IVec3> {
     let mut best: Option<(IVec2, i32, i32)> = None; // (tile, y, distance)
-    for x in (footprint_min.x - radius)..(footprint_max.x + radius) {
-        for z in (footprint_min.y - radius)..(footprint_max.y + radius) {
-            let tile = IVec2::new(x, z);
-            // Never dig the building's own footprint.
-            if tile.x >= footprint_min.x && tile.x < footprint_max.x && tile.y >= footprint_min.y && tile.y < footprint_max.y {
-                continue;
-            }
-            let distance = rect_distance(footprint_min, footprint_max, tile, tile + IVec2::ONE);
-            if distance > radius {
-                continue;
-            }
-            let y = match claimed.get(&tile) {
-                Some(&next_y) => next_y,
-                None => match super::terraform::topmost_block_y(tile, world) {
-                    Some(top) => top,
-                    None => continue, // chunk not decoded — skip, don't refuse the whole batch
-                },
-            };
-            if y <= floor_y {
-                continue; // this tile is already down to (or below) its floor
-            }
-            if best.is_none_or(|(_, _, best_distance)| distance < best_distance) {
-                best = Some((tile, y, distance));
-            }
+    for tile in area.tiles() {
+        // Never dig anything the city has claimed — a road cell's tiles,
+        // another building's footprint, this building's own.
+        if city.occupant_at(tile).is_some() {
+            continue;
+        }
+        let distance = rect_distance(site.footprint_min, site.footprint_max, tile, tile + IVec2::ONE);
+        let y = match claimed.get(&tile) {
+            Some(&next_y) => next_y,
+            None => match super::terraform::topmost_block_y(tile, world) {
+                Some(top) => top,
+                None => continue, // chunk not decoded — skip, don't refuse the whole batch
+            },
+        };
+        if y <= site.floor_y {
+            continue; // this tile is already down to (or below) its floor
+        }
+        if best.is_none_or(|(_, _, best_distance)| distance < best_distance) {
+            best = Some((tile, y, distance));
         }
     }
     let (tile, y, _) = best?;
@@ -156,13 +184,13 @@ fn next_gather_target(
 /// Builds the `WorldEdit` for one dig batch: up to `blocks` individual
 /// blocks, each the globally nearest still-diggable one, cleared to air.
 /// Returns fewer than `blocks` positions (down to empty) once nothing is
-/// left within radius above `floor_y` — the caller reads that as "depleted",
+/// left in `area` above the floor — the caller reads that as "depleted",
 /// not as a partial failure.
-fn gather_edit(footprint_min: IVec2, footprint_max: IVec2, radius: i32, floor_y: i32, blocks: u32, world: &DecodedWorld) -> WorldEdit {
+fn gather_edit(site: &DigSite, area: WorkArea, blocks: u32, world: &DecodedWorld, city: &City) -> WorldEdit {
     let mut edit = WorldEdit::new();
     let mut claimed: HashMap<IVec2, i32> = HashMap::new();
     for _ in 0..blocks {
-        let Some(target) = next_gather_target(footprint_min, footprint_max, radius, floor_y, world, &mut claimed) else {
+        let Some(target) = next_gather_target(site, area, world, city, &mut claimed) else {
             break;
         };
         edit.set(target, BlockState::air());
@@ -176,21 +204,28 @@ fn gather_edit(footprint_min: IVec2, footprint_max: IVec2, radius: i32, floor_y:
 /// [`super::terraform::dig_edit`]/`level_edit` use for their own systems.
 /// Mutates `producer`'s `dig_carry`/`state` exactly as the system would;
 /// returns the edit to dispatch, or `None` when nothing should be sent this
-/// tick (a full buffer, a write already in flight, still accumulating, or
-/// depleted).
+/// tick (no working area, a full buffer, a write already in flight, still
+/// accumulating, or depleted).
 #[allow(clippy::too_many_arguments)]
 fn plan_dig(
     producer: &mut Producer,
     gatherer: &Gatherer,
     capacity: u64,
     already_pending: bool,
-    footprint_min: IVec2,
-    footprint_max: IVec2,
-    floor_y: i32,
+    site: &DigSite,
     minutes: f32,
     world: &DecodedWorld,
+    city: &City,
 ) -> Option<WorldEdit> {
-    // The cap first, same order `advance_producer` checks it in: a full
+    // No area, nothing to do at all — before even the buffer check, since
+    // "draw one" is the thing the player can act on (ticket 111). No carry
+    // accrues: the hut isn't waiting on anything, it hasn't been told where
+    // to work.
+    let Some(area) = site.area else {
+        producer.state = ProducerState::NoWorkArea;
+        return None;
+    };
+    // The cap next, same order `advance_producer` checks it in: a full
     // buffer stops everything, including the carry, so a hub sitting next
     // to an idle warehouse doesn't pointlessly keep "digging" into a buffer
     // that's already full.
@@ -209,9 +244,9 @@ fn plan_dig(
     }
     let blocks = blocks as u32;
 
-    let edit = gather_edit(footprint_min, footprint_max, gatherer.radius_blocks as i32, floor_y, blocks, world);
+    let edit = gather_edit(site, area, blocks, world, city);
     if edit.is_empty() {
-        // Nothing left within radius above the floor — the site really is
+        // Nothing left in the area above the floor — the site really is
         // levelled. Reset the carry rather than letting it grow forever
         // while there's nothing to spend it on; `next_gather_target` is
         // cheap enough to keep re-checking every tick after this, in case a
@@ -309,14 +344,16 @@ fn dispatch_digs(
         let capacity = gatherer_buffer_capacity(gatherer, &economy);
         let extent = footprint_extent(placed.footprint, placed.rotation);
         let footprint_min = IVec2::new(placed.origin.x, placed.origin.z);
-        let footprint_max = footprint_min + extent;
-        let floor_y = placed.origin.y + definition.building.ground_level as i32;
+        let site = DigSite {
+            footprint_min,
+            footprint_max: footprint_min + extent,
+            floor_y: placed.origin.y + definition.building.ground_level as i32,
+            area: placed.work_area,
+        };
         let already_pending = state.pending.contains_key(&id);
 
         let producer = production.entry(id);
-        let Some(edit) =
-            plan_dig(producer, gatherer, capacity, already_pending, footprint_min, footprint_max, floor_y, minutes, &world)
-        else {
+        let Some(edit) = plan_dig(producer, gatherer, capacity, already_pending, &site, minutes, &world, &city) else {
             continue;
         };
 
@@ -364,8 +401,10 @@ mod tests {
     use bevy::tasks::TaskPool;
 
     use super::*;
+    use crate::blueprint::Rotation;
     use crate::city::definition::Gatherer;
     use crate::city::economy::EconomyConfig;
+    use crate::city::road::RoadPieceVariant;
     use crate::world::{BiomeRegistry, BlockId, BlockRegistry, ChunkColumn, ChunkSection};
 
     // --- gatherer_buffer_capacity --------------------------------------------
@@ -424,6 +463,24 @@ mod tests {
         DecodedWorld { registry: Arc::new(Mutex::new(registry)), biomes: Arc::new(Mutex::new(BiomeRegistry::new())), columns }
     }
 
+    // --- a hut placed in a city, and its dig site --------------------------
+
+    /// A [`City`] with one building covering `footprint_min..footprint_max`
+    /// (so its own tiles are occupied, the way a real hut's are), and the
+    /// [`DigSite`] for it with `area` drawn — `None` for no area at all.
+    fn site_in_city(footprint_min: IVec2, footprint_max: IVec2, floor_y: i32, area: Option<WorkArea>) -> (DigSite, City) {
+        let mut city = City::default();
+        let origin = IVec3::new(footprint_min.x, floor_y, footprint_min.y);
+        city.place_building("gatherer_hut", None, origin, Rotation::Deg0, footprint_max - footprint_min).unwrap();
+        (DigSite { footprint_min, footprint_max, floor_y, area }, city)
+    }
+
+    /// A square area `radius` blocks out from the footprint on every side —
+    /// what ticket 086's automatic radius used to cover, drawn by hand.
+    fn area_around(footprint_min: IVec2, footprint_max: IVec2, radius: i32) -> WorkArea {
+        WorkArea::new(footprint_min - IVec2::splat(radius), footprint_max + IVec2::splat(radius) - IVec2::ONE)
+    }
+
     // --- next_gather_target ---------------------------------------------------
 
     #[test]
@@ -434,52 +491,94 @@ mod tests {
         // ever be picked.
         let world =
             world_with_heights(60, &[(IVec2::new(7, 5), 64), (IVec2::new(12, 5), 64)]);
+        let (min, max) = (IVec2::new(5, 5), IVec2::new(7, 7));
+        let (site, city) = site_in_city(min, max, 60, None);
         let mut claimed = StdHashMap::new();
         let target =
-            next_gather_target(IVec2::new(5, 5), IVec2::new(7, 7), 10, 60, &world, &mut claimed).expect("something in range");
+            next_gather_target(&site, area_around(min, max, 10), &world, &city, &mut claimed).expect("something in range");
         assert_eq!(target, IVec3::new(7, 64, 5), "the east-touching tile, not one further out");
     }
 
     #[test]
     fn never_targets_the_buildings_own_footprint() {
         let world = world_with_heights(64, &[]);
+        let (min, max) = (IVec2::new(0, 0), IVec2::new(1, 1));
+        let (site, city) = site_in_city(min, max, 60, None);
         let mut claimed = StdHashMap::new();
-        // Radius 0 from a 1x1 footprint at (0,0) reaches only the footprint
-        // tile itself, which must never be a target.
-        let target = next_gather_target(IVec2::new(0, 0), IVec2::new(1, 1), 0, 60, &world, &mut claimed);
+        // An area of exactly the footprint tile — occupied by the building
+        // itself, which must never be a target.
+        let target = next_gather_target(&site, WorkArea::new(min, min), &world, &city, &mut claimed);
         assert_eq!(target, None);
+    }
+
+    /// Ticket 111's bug: a road piece sits one block above ground, so it was
+    /// always the topmost block in reach. Every tile the city has claimed —
+    /// a road cell's, another building's — is off limits, whatever's on it.
+    #[test]
+    fn never_targets_a_road_cell_or_another_buildings_tiles() {
+        // Two raised columns: (8, 5) is under road cell (1, 0) (tiles 6..12
+        // x 0..6); (2, 9) is under a second building. Everything else is at
+        // the floor. Nothing should be diggable at all.
+        let world = world_with_heights(60, &[(IVec2::new(8, 5), 64), (IVec2::new(2, 9), 64)]);
+        let (min, max) = (IVec2::new(4, 4), IVec2::new(6, 6));
+        let (site, mut city) = site_in_city(min, max, 60, None);
+        city.add_road_cell(IVec2::new(1, 0), "dirt", 60, None, RoadPieceVariant::Surface).unwrap();
+        city.place_building("house01", None, IVec3::new(2, 60, 9), Rotation::Deg0, IVec2::ONE).unwrap();
+        let mut claimed = StdHashMap::new();
+        let target = next_gather_target(&site, area_around(min, max, 6), &world, &city, &mut claimed);
+        assert_eq!(target, None, "a road tile and another building's tile are both untouchable");
+
+        // Sanity: with the road gone, the raised road tile is fair game.
+        assert!(city.remove_road_cell(IVec2::new(1, 0)));
+        let target = next_gather_target(&site, area_around(min, max, 6), &world, &city, &mut claimed);
+        assert_eq!(target, Some(IVec3::new(8, 64, 5)));
     }
 
     #[test]
     fn stops_at_the_floor_and_does_not_go_deeper() {
         let world = world_with_heights(64, &[]);
-        let mut claimed = StdHashMap::new();
+        let (min, max) = (IVec2::new(5, 5), IVec2::new(6, 6));
         // floor_y == 64 (the tile's own topmost block) means nothing is
         // strictly above it — already levelled.
-        let target = next_gather_target(IVec2::new(5, 5), IVec2::new(6, 6), 6, 64, &world, &mut claimed);
+        let (site, city) = site_in_city(min, max, 64, None);
+        let mut claimed = StdHashMap::new();
+        let target = next_gather_target(&site, area_around(min, max, 6), &world, &city, &mut claimed);
         assert_eq!(target, None);
     }
 
     #[test]
     fn a_second_call_digs_the_same_column_one_layer_lower() {
         let world = world_with_heights(64, &[]);
+        let (min, max) = (IVec2::new(0, 0), IVec2::new(1, 1));
+        let (site, city) = site_in_city(min, max, 60, None);
+        let area = area_around(min, max, 6);
         let mut claimed = StdHashMap::new();
-        let first = next_gather_target(IVec2::new(0, 0), IVec2::new(1, 1), 6, 60, &world, &mut claimed).unwrap();
-        let second = next_gather_target(IVec2::new(0, 0), IVec2::new(1, 1), 6, 60, &world, &mut claimed).unwrap();
+        let first = next_gather_target(&site, area, &world, &city, &mut claimed).unwrap();
+        let second = next_gather_target(&site, area, &world, &city, &mut claimed).unwrap();
         assert_eq!(first.y, 64);
         assert_eq!(second.y, 63, "reads the claimed map, not the stale world height");
         assert_eq!((first.x, first.z), (second.x, second.z), "same nearest tile both times");
     }
 
+    /// Ticket 111: the area is the only boundary — a raised tile just
+    /// outside it is never touched, however close to the hut it is.
     #[test]
-    fn a_tile_beyond_the_radius_never_counts() {
-        let world = world_with_heights(64, &[]);
+    fn a_tile_outside_the_area_never_counts() {
+        // Floor everywhere except two raised tiles: (3, 5) inside the area,
+        // (5, 8) one tile outside it.
+        let world = world_with_heights(60, &[(IVec2::new(3, 5), 64), (IVec2::new(5, 8), 64)]);
+        let (min, max) = (IVec2::new(5, 5), IVec2::new(6, 6));
+        let (site, city) = site_in_city(min, max, 60, None);
+        let area = WorkArea::new(IVec2::new(2, 4), IVec2::new(7, 7));
         let mut claimed = StdHashMap::new();
-        // 1x1 footprint at origin, radius 1 — reaches x/z in -1..=1 only.
-        let target = next_gather_target(IVec2::new(0, 0), IVec2::new(1, 1), 1, 60, &world, &mut claimed);
-        assert!(target.is_some(), "something within radius 1 should be found");
-        let target = target.unwrap();
-        assert!((target.x - 0).abs() <= 1 + 1 && (target.z - 0).abs() <= 1 + 1);
+        let first = next_gather_target(&site, area, &world, &city, &mut claimed);
+        assert_eq!(first, Some(IVec3::new(3, 64, 5)));
+        // Dig that column down to the floor, then nothing is left.
+        for _ in 0..3 {
+            next_gather_target(&site, area, &world, &city, &mut claimed);
+        }
+        let next = next_gather_target(&site, area, &world, &city, &mut claimed);
+        assert_eq!(next, None, "(5, 8) is outside the area");
     }
 
     #[test]
@@ -487,8 +586,10 @@ mod tests {
         // Only chunk (0,0) is decoded; a footprint far outside it has no
         // diggable neighbours at all.
         let world = world_with_heights(64, &[]);
+        let (min, max) = (IVec2::new(500, 500), IVec2::new(501, 501));
+        let (site, city) = site_in_city(min, max, 60, None);
         let mut claimed = StdHashMap::new();
-        let target = next_gather_target(IVec2::new(500, 500), IVec2::new(501, 501), 4, 60, &world, &mut claimed);
+        let target = next_gather_target(&site, area_around(min, max, 4), &world, &city, &mut claimed);
         assert_eq!(target, None);
     }
 
@@ -497,7 +598,9 @@ mod tests {
     #[test]
     fn gather_edit_removes_the_requested_number_of_blocks() {
         let world = world_with_heights(64, &[]);
-        let edit = gather_edit(IVec2::new(0, 0), IVec2::new(1, 1), 6, 60, 3, &world);
+        let (min, max) = (IVec2::new(0, 0), IVec2::new(1, 1));
+        let (site, city) = site_in_city(min, max, 60, None);
+        let edit = gather_edit(&site, area_around(min, max, 6), 3, &world, &city);
         assert_eq!(edit.len(), 3);
         for e in edit.edits() {
             assert_eq!(e.state.name, "minecraft:air");
@@ -505,12 +608,14 @@ mod tests {
     }
 
     #[test]
-    fn gather_edit_stops_early_once_the_radius_is_exhausted() {
+    fn gather_edit_stops_early_once_the_area_is_exhausted() {
         // Base terrain sits at the floor (63, not diggable) everywhere
         // except one column raised to 65 — two layers above the floor, and
-        // the only diggable material anywhere in range.
+        // the only diggable material anywhere in the area.
         let world = world_with_heights(63, &[(IVec2::new(0, 0), 65)]);
-        let edit = gather_edit(IVec2::new(5, 5), IVec2::new(6, 6), 20, 63, 10, &world);
+        let (min, max) = (IVec2::new(5, 5), IVec2::new(6, 6));
+        let (site, city) = site_in_city(min, max, 63, None);
+        let edit = gather_edit(&site, area_around(min, max, 20), 10, &world, &city);
         assert_eq!(edit.len(), 2, "only (0,0) has anything above floor 63, two layers of it");
     }
 
@@ -520,13 +625,34 @@ mod tests {
         Gatherer { radius_blocks: radius, blocks_per_minute: per_minute, buffer_stacks }
     }
 
+    /// A 1x1 hut at the origin with a 6-block area drawn around it, floor
+    /// at 60 — the fixture every `plan_dig` test below shares.
+    fn planned_site() -> (DigSite, City) {
+        let (min, max) = (IVec2::new(0, 0), IVec2::new(1, 1));
+        site_in_city(min, max, 60, Some(area_around(min, max, 6)))
+    }
+
+    /// Ticket 111: no area, no dig, no carry — and the state says why.
+    #[test]
+    fn plan_dig_does_nothing_and_says_so_with_no_work_area() {
+        let world = world_with_heights(64, &[]);
+        let mut producer = Producer::default();
+        let gatherer = gatherer(6, 2.0, 4);
+        let (site, city) = site_in_city(IVec2::new(0, 0), IVec2::new(1, 1), 60, None);
+        let edit = plan_dig(&mut producer, &gatherer, 256, false, &site, 5.0, &world, &city);
+        assert!(edit.is_none());
+        assert_eq!(producer.state, ProducerState::NoWorkArea);
+        assert_eq!(producer.dig_carry, 0.0, "nothing accrues while there's nowhere to spend it");
+    }
+
     #[test]
     fn plan_dig_does_nothing_before_a_whole_block_accrues() {
         let world = world_with_heights(64, &[]);
         let mut producer = Producer::default();
         let gatherer = gatherer(6, 2.0, 4);
+        let (site, city) = planned_site();
         // 0.1 minutes at 2/min is 0.2 of a block.
-        let edit = plan_dig(&mut producer, &gatherer, 256, false, IVec2::new(0, 0), IVec2::new(1, 1), 60, 0.1, &world);
+        let edit = plan_dig(&mut producer, &gatherer, 256, false, &site, 0.1, &world, &city);
         assert!(edit.is_none());
         assert!(producer.dig_carry > 0.0, "the fraction is kept, not dropped");
     }
@@ -536,8 +662,9 @@ mod tests {
         let world = world_with_heights(64, &[]);
         let mut producer = Producer::default();
         let gatherer = gatherer(6, 2.0, 4);
+        let (site, city) = planned_site();
         // 1 minute at 2/min owes exactly 2 whole blocks.
-        let edit = plan_dig(&mut producer, &gatherer, 256, false, IVec2::new(0, 0), IVec2::new(1, 1), 60, 1.0, &world);
+        let edit = plan_dig(&mut producer, &gatherer, 256, false, &site, 1.0, &world, &city);
         let edit = edit.expect("two whole blocks were owed");
         assert_eq!(edit.len(), 2);
         assert_eq!(producer.dig_carry, 0.0);
@@ -550,7 +677,8 @@ mod tests {
         let mut producer = Producer::default();
         producer.buffer.add("minecraft:stone", 256);
         let gatherer = gatherer(6, 2.0, 4);
-        let edit = plan_dig(&mut producer, &gatherer, 256, false, IVec2::new(0, 0), IVec2::new(1, 1), 60, 5.0, &world);
+        let (site, city) = planned_site();
+        let edit = plan_dig(&mut producer, &gatherer, 256, false, &site, 5.0, &world, &city);
         assert!(edit.is_none());
         assert_eq!(producer.state, ProducerState::BufferFull);
         assert_eq!(producer.dig_carry, 0.0, "a full buffer must not keep accruing carry either");
@@ -561,18 +689,20 @@ mod tests {
         let world = world_with_heights(64, &[]);
         let mut producer = Producer::default();
         let gatherer = gatherer(6, 2.0, 4);
-        let edit = plan_dig(&mut producer, &gatherer, 256, true, IVec2::new(0, 0), IVec2::new(1, 1), 60, 5.0, &world);
+        let (site, city) = planned_site();
+        let edit = plan_dig(&mut producer, &gatherer, 256, true, &site, 5.0, &world, &city);
         assert!(edit.is_none());
         assert_eq!(producer.dig_carry, 0.0, "no accrual while a write is already in flight");
     }
 
     #[test]
-    fn plan_dig_goes_depleted_once_nothing_is_left_within_radius() {
+    fn plan_dig_goes_depleted_once_nothing_is_left_in_the_area() {
         // The whole area is already at floor height.
         let world = world_with_heights(60, &[]);
         let mut producer = Producer::default();
         let gatherer = gatherer(6, 2.0, 4);
-        let edit = plan_dig(&mut producer, &gatherer, 256, false, IVec2::new(0, 0), IVec2::new(1, 1), 60, 60.0, &world);
+        let (site, city) = planned_site();
+        let edit = plan_dig(&mut producer, &gatherer, 256, false, &site, 60.0, &world, &city);
         assert!(edit.is_none());
         assert_eq!(producer.state, ProducerState::Depleted);
         assert_eq!(producer.dig_carry, 0.0, "the carry is reset rather than growing forever");

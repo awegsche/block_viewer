@@ -245,24 +245,25 @@ pub struct Farm {
 /// footprint's floor would be a different building shape, not a knob on this
 /// one.
 ///
-/// **Schema only for now** — nothing ticks this yet; a `.ron` can declare a
-/// `gatherer` block today and it loads, validates, and does nothing, the
-/// same gap `production`/`cost` sat in between tickets 040 and 073/078. The
-/// model this repo already has for the eventual tick is `city::terraform`'s
-/// dig: a `WorldEdit` built by hand, one `.set()` per position, dispatched
-/// through `apply_building_edit` the same way — but running on a timer and
-/// bounded by [`radius_blocks`](Self::radius_blocks) rather than a player's
-/// drag, and crediting a [`super::production::Producer`]-shaped buffer
-/// instead of the global stock directly, so haulage can move its output the
-/// same way it already moves a producer's.
+/// **The tick is `city::gatherer`** (ticket 086; schema-only until then):
+/// `city::terraform`'s dig shape — a `WorldEdit` built by hand, one `.set()`
+/// per position, dispatched through `apply_building_edit` — running on a
+/// timer and bounded by the player's drawn working area (ticket 111,
+/// `city::work_area`, capped by [`radius_blocks`](Self::radius_blocks))
+/// rather than a drag, and crediting a [`super::production::Producer`]-shaped
+/// buffer instead of the global stock directly, so haulage can move its
+/// output the same way it already moves a producer's.
 #[derive(Debug, Clone, Copy, Deserialize)]
 pub struct Gatherer {
-    /// How far from the building's own footprint a tile still counts, in
-    /// blocks — straight-line (Chebyshev), the same measure
+    /// How far from the building's own footprint its working area may
+    /// reach, in blocks — straight-line (Chebyshev), the same measure
     /// [`Farm::radius_blocks`] uses and for the same reason: there's no road
-    /// for a gathering radius to be routed along. Deliberately small next to
-    /// a warehouse's road-cell reach or a specialised quarry/mine's eventual
-    /// pull — this building levels a build site, not a district.
+    /// for a gathering radius to be routed along. Ticket 111: the *cap* on
+    /// the rectangle the player draws (`state::WorkArea::clamp_to_reach`),
+    /// not an area the hut digs on its own — with nothing drawn it digs
+    /// nothing. 086's automatic ring made this small (6) so a hut levelled
+    /// a build site, not a district; with the player choosing the area it's
+    /// three times that.
     pub radius_blocks: u32,
     /// How many blocks this hut clears a minute — [`super::clock::GameClock`]
     /// minutes, the same unit every [`ProductionItem::per_minute`] is

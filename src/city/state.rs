@@ -153,6 +153,64 @@ pub struct PlacedBuilding {
     /// the right tiles without the caller having to look the definition back
     /// up.
     pub footprint: IVec2,
+    /// Ticket 111: where a gatherer digs — a player-drawn rectangle, `None`
+    /// until one has been drawn (a hut with no area does nothing, see
+    /// `city::gatherer`). Meaningless for a building without a `gatherer`
+    /// block, and always `None` for one. Kept on the placement itself, not
+    /// in a side map, for the same reason [`footprint`](Self::footprint) is:
+    /// everything that already clones, saves or restores a `PlacedBuilding`
+    /// (the journal's demolish-undo copy, `persistence`) carries it for
+    /// free, so demolish-then-undo brings the area back without anyone
+    /// learning it exists. Only [`City::set_work_area`] ever writes it.
+    pub work_area: Option<WorkArea>,
+}
+
+/// An inclusive axis-aligned rectangle of Minecraft `(x, z)` block tiles —
+/// a gatherer's working area (ticket 111), drawn by the player. Both
+/// corners inclusive, unlike the `(min, max)`-exclusive pairs
+/// [`footprint_tiles`]/`farm::rect_distance` deal in: this is the corner
+/// pair a click-drag naturally produces (a one-tile drag is `min == max`),
+/// and [`WorkArea::new`] takes either corner order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkArea {
+    pub min: IVec2,
+    pub max: IVec2,
+}
+
+impl WorkArea {
+    /// The rectangle `a` and `b` span, either corner order.
+    pub fn new(a: IVec2, b: IVec2) -> Self {
+        Self { min: a.min(b), max: a.max(b) }
+    }
+
+    /// Every tile in the rectangle, row by row. Order isn't meaningful to
+    /// any caller.
+    pub fn tiles(self) -> impl Iterator<Item = IVec2> {
+        let (min, max) = (self.min, self.max);
+        (min.x..=max.x).flat_map(move |x| (min.y..=max.y).map(move |z| IVec2::new(x, z)))
+    }
+
+    /// Number of tiles.
+    pub fn len(self) -> u32 {
+        let extent = self.max - self.min + IVec2::ONE;
+        (extent.x * extent.y) as u32
+    }
+
+    /// The part of this rectangle that lies within `radius` blocks
+    /// (Chebyshev) of a footprint spanning `footprint_min..footprint_max`
+    /// (`max` exclusive, the [`footprint_tiles`] convention) — the box that
+    /// footprint expanded by `radius` on every side. `None` if nothing of it
+    /// does: a drag entirely out of reach is refused, not silently moved.
+    /// The footprint's own tiles are *not* cut out — the gatherer's
+    /// occupancy guard already never digs them, and cutting a hole would
+    /// turn one rectangle into up to four.
+    pub fn clamp_to_reach(self, footprint_min: IVec2, footprint_max: IVec2, radius: i32) -> Option<Self> {
+        let reach_min = footprint_min - IVec2::splat(radius);
+        let reach_max = footprint_max + IVec2::splat(radius) - IVec2::ONE; // inclusive
+        let min = self.min.max(reach_min);
+        let max = self.max.min(reach_max);
+        (min.x <= max.x && min.y <= max.y).then_some(Self { min, max })
+    }
 }
 
 /// One placed road cell — the style it was built as, plus the world Y its
@@ -368,9 +426,23 @@ impl City {
         }
         self.buildings.insert(
             id,
-            PlacedBuilding { catalogue_id: catalogue_id.into(), definition_id, origin, rotation, footprint },
+            PlacedBuilding { catalogue_id: catalogue_id.into(), definition_id, origin, rotation, footprint, work_area: None },
         );
         Ok(id)
+    }
+
+    /// Sets (or, with `None`, clears) `id`'s [`PlacedBuilding::work_area`]
+    /// (ticket 111). `false` if `id` isn't a placed building. Not
+    /// journalled — drawing an area is a setting, like a road cell's
+    /// style, not a build; see [`PlacedBuilding::work_area`].
+    pub fn set_work_area(&mut self, id: BuildingId, area: Option<WorkArea>) -> bool {
+        match self.buildings.get_mut(&id) {
+            Some(building) => {
+                building.work_area = area;
+                true
+            }
+            None => false,
+        }
     }
 
     /// Removes a placed building and frees exactly the tiles its own record
@@ -854,5 +926,64 @@ mod tests {
         assert_eq!(ids, HashSet::from([a, b]));
         assert_eq!(city.road_cells().count(), 2);
         assert_eq!(city.len(), 2);
+    }
+
+    // --- work areas (ticket 111) ---------------------------------------------------------------
+
+    #[test]
+    fn a_placed_building_starts_with_no_work_area_and_set_work_area_sets_it() {
+        let mut city = City::default();
+        let id = city.place_building("house01", None, IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::ONE).unwrap();
+        assert_eq!(city.building(id).unwrap().work_area, None);
+
+        let area = WorkArea::new(IVec2::new(3, -2), IVec2::new(-1, 4));
+        assert!(city.set_work_area(id, Some(area)));
+        assert_eq!(city.building(id).unwrap().work_area, Some(area));
+        assert!(city.set_work_area(id, None));
+        assert_eq!(city.building(id).unwrap().work_area, None);
+    }
+
+    #[test]
+    fn set_work_area_on_a_missing_building_is_false() {
+        let mut city = City::default();
+        assert!(!city.set_work_area(BuildingId(7), Some(WorkArea::new(IVec2::ZERO, IVec2::ONE))));
+    }
+
+    #[test]
+    fn work_area_new_orders_the_corners_and_counts_tiles() {
+        let area = WorkArea::new(IVec2::new(3, -2), IVec2::new(-1, 4));
+        assert_eq!(area.min, IVec2::new(-1, -2));
+        assert_eq!(area.max, IVec2::new(3, 4));
+        assert_eq!(area.len(), 5 * 7);
+        assert_eq!(area.tiles().count(), 35);
+        assert!(area.tiles().any(|t| t == IVec2::new(3, 4)), "max corner is inclusive");
+        assert!(!area.tiles().any(|t| t == IVec2::new(4, 4)));
+        assert_eq!(WorkArea::new(IVec2::ONE, IVec2::ONE).len(), 1, "a click is one tile");
+    }
+
+    #[test]
+    fn clamp_to_reach_keeps_a_rectangle_already_inside() {
+        // 2x2 footprint at (0,0), radius 3: reach covers -3..=4 on both axes.
+        let area = WorkArea::new(IVec2::new(-3, -3), IVec2::new(4, 4));
+        assert_eq!(area.clamp_to_reach(IVec2::ZERO, IVec2::splat(2), 3), Some(area));
+    }
+
+    #[test]
+    fn clamp_to_reach_cuts_the_part_beyond_the_radius() {
+        let area = WorkArea::new(IVec2::new(-10, 1), IVec2::new(10, 20));
+        let clamped = area.clamp_to_reach(IVec2::ZERO, IVec2::splat(2), 3).unwrap();
+        assert_eq!(clamped, WorkArea::new(IVec2::new(-3, 1), IVec2::new(4, 4)));
+    }
+
+    #[test]
+    fn clamp_to_reach_refuses_a_rectangle_entirely_out_of_reach() {
+        let area = WorkArea::new(IVec2::new(5, 0), IVec2::new(9, 0));
+        assert_eq!(area.clamp_to_reach(IVec2::ZERO, IVec2::splat(2), 3), None);
+    }
+
+    #[test]
+    fn clamp_to_reach_leaves_the_footprint_itself_inside() {
+        let area = WorkArea::new(IVec2::new(0, 0), IVec2::new(1, 1));
+        assert_eq!(area.clamp_to_reach(IVec2::ZERO, IVec2::splat(2), 3), Some(area));
     }
 }

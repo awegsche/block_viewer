@@ -1,13 +1,15 @@
 //! Which tool the player has active — inspecting a placed building, building
-//! placement, road building, or terraforming (ticket 055, roadmap F2;
-//! extended to a third tool by ticket 057, roadmap H1; a fourth, the resting
-//! state, by ticket 083). All four share the same left-click/hover machinery
+//! placement, road building, terraforming, or drawing a gatherer's working
+//! area (ticket 055, roadmap F2; extended to a third tool by ticket 057,
+//! roadmap H1; a fourth, the resting state, by ticket 083; a fifth by ticket
+//! 111). All five share the same left-click/hover machinery
 //! (`picking::HoveredBlock`, `camera::EguiInputCapture`) but drive completely
 //! different previews and commits (`city::placement`/`city::commit` for
 //! buildings, `city::road_build` for roads, `city::terraform` for dig/level,
-//! `city::picking::SelectedBuilding` for inspecting); [`ActiveTool`] is the
-//! one bit that decides which of the four a click and a hover mean this
-//! frame, so only one ever reacts to the same input at once.
+//! `city::picking::SelectedBuilding` for inspecting, `city::work_area` for
+//! the area); [`ActiveTool`] is the one bit that decides which of the five a
+//! click and a hover mean this frame, so only one ever reacts to the same
+//! input at once.
 //!
 //! ## Inspect is the resting state, not a fourth stop on the cycle
 //!
@@ -30,7 +32,11 @@
 //! inspecting enters the cycle at `Building` (the same place a fresh build
 //! menu click would have put a player anyway) rather than looping back to
 //! `Inspect`, which is why the cycle's own wraparound still only touches the
-//! three build-ish tools. Deliberately *not* wired to also flip back to
+//! three build-ish tools. [`ActiveTool::DrawWorkArea`] (ticket 111) is the
+//! same kind of non-stop: only the inspect panel's button ever enters it,
+//! and it leaves by itself (a committed drag, or `Escape`) back to
+//! `Inspect`; `T` from it enters the cycle at `Building` just as from
+//! `Inspect`, abandoning the drag. Deliberately *not* wired to also flip back to
 //! [`ActiveTool::Building`] on a number-key or build-menu pick (both would
 //! need a `ResMut<ActiveTool>` threaded into two more call sites for a rough
 //! edge — press `T` again after picking a building while in road mode — that
@@ -65,6 +71,10 @@ pub enum ActiveTool {
     Road,
     /// Ticket 057, roadmap H1: dig and level — see `city::terraform`.
     Terraform,
+    /// Ticket 111: a left-drag draws the selected gatherer's working area —
+    /// see `city::work_area`. Entered only from the inspect panel, never
+    /// from `T`; see the module docs.
+    DrawWorkArea,
 }
 
 pub struct ToolPlugin;
@@ -86,7 +96,7 @@ fn toggle_tool(keys: Res<ButtonInput<KeyCode>>, egui_input: Res<camera::EguiInpu
     }
     if keys.just_pressed(KeyCode::KeyT) {
         *tool = match *tool {
-            ActiveTool::Inspect => ActiveTool::Building,
+            ActiveTool::Inspect | ActiveTool::DrawWorkArea => ActiveTool::Building,
             ActiveTool::Building => ActiveTool::Road,
             ActiveTool::Road => ActiveTool::Terraform,
             ActiveTool::Terraform => ActiveTool::Building,
@@ -138,6 +148,16 @@ mod tests {
     fn t_from_inspect_enters_the_cycle_at_building() {
         let mut app = tool_test_app();
         assert_eq!(*app.world().resource::<ActiveTool>(), ActiveTool::Inspect);
+        press(&mut app, KeyCode::KeyT);
+        assert_eq!(*app.world().resource::<ActiveTool>(), ActiveTool::Building);
+    }
+
+    /// Ticket 111: same non-stop as `Inspect` — `T` abandons the drawing
+    /// and enters the cycle at `Building`.
+    #[test]
+    fn t_from_draw_work_area_enters_the_cycle_at_building() {
+        let mut app = tool_test_app();
+        *app.world_mut().resource_mut::<ActiveTool>() = ActiveTool::DrawWorkArea;
         press(&mut app, KeyCode::KeyT);
         assert_eq!(*app.world().resource::<ActiveTool>(), ActiveTool::Building);
     }

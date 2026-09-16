@@ -1446,3 +1446,22 @@ Y=0 in the world and won't be cleaned up by this fix — see the ticket.
   the Lumberjack's Hut (`per_minute` 8 -> 40) and Gatherer's Hut
   (`blocks_per_minute` 2.0 -> 20.0) should visibly produce/dig noticeably
   faster than before.
+- [ ] **111 Gatherer's Hut: player-drawn working area, never digs roads.**
+  `cargo test` is green, but the drawing and the gizmos need eyes. At
+  `cargo run --bin citybuilder`, place a Gatherer's Hut beside a dirt road
+  and select it (Inspect mode): the panel should show a red "⚠ No working
+  area - draw one" and the hut's state should read "no working area" while
+  nothing is dug. Click "Draw working area" — the button should grey out
+  and read "Drawing... (Escape to cancel)", a faint white ring should
+  appear around the hut at its 18-block reach, and a left-click drag should
+  show a yellow candidate ring following the cursor. Drag a rectangle that
+  covers the road *and* a neighbouring building and release: the tool
+  should drop back to Inspect with the panel still open, now showing
+  `Working area: (x, z) - (x, z), N tiles` and a green ring. Let it run:
+  the ground inside the ring gets levelled while the road piece and the
+  other building stay intact. Also check: (a) the rings follow the terrain
+  on a slope rather than floating/burying; (b) dragging past the white
+  reach ring visibly clips the candidate to it; (c) Escape mid-drag leaves
+  the old area untouched; (d) "Clear working area" puts the hut back to
+  "no working area"; (e) save (existing `city.ron` from before this ticket
+  should still load, huts with no area) and reload keeps a drawn area.

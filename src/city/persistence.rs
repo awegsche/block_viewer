@@ -79,6 +79,15 @@
 //! already cut through a hill would re-tile itself back into solid
 //! hillside — and this is the field the "no quiet defaults" precedent above
 //! was being kept for. Refused, same as the four bumps before it.
+//!
+//! *Not* bumped by ticket 111, which adds [`SavedBuilding::work_area`] with
+//! `#[serde(default)]` instead — the first field to make the case the
+//! precedent above asks for. Every earlier default would have been a
+//! *guess* (a tunnel read as surface, a catalogue id read as a definition
+//! id); a version-7 file's gatherer huts genuinely never had an area drawn,
+//! so `None` is the truth about that file, not a stand-in for it. Same
+//! argument `super::journal`'s `SavedPlacement::definition_id` already made
+//! for itself.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -87,7 +96,7 @@ use bevy::math::{IVec2, IVec3};
 use serde::{Deserialize, Serialize};
 
 use super::road::{Direction, RoadPieceVariant};
-use super::state::{BuildingId, City, PlacedBuilding, PlacementError};
+use super::state::{BuildingId, City, PlacedBuilding, PlacementError, WorkArea};
 use crate::blueprint::Rotation;
 
 /// The `CitySave` schema version this build writes and reads. Bumped only
@@ -130,6 +139,12 @@ struct SavedBuilding {
     origin: (i32, i32, i32),
     rotation: Rotation,
     footprint: (i32, i32),
+    /// Ticket 111: a gatherer's drawn working area, `((min_x, min_z),
+    /// (max_x, max_z))` inclusive — see [`super::state::WorkArea`]. The
+    /// first field here that *defaults* rather than bumping
+    /// [`CURRENT_VERSION`]: see the module docs.
+    #[serde(default)]
+    work_area: Option<((i32, i32), (i32, i32))>,
 }
 
 /// One saved road cell — cell coordinates plus the style
@@ -208,6 +223,7 @@ pub fn save_city(city: &City, save_root: &Path) -> Result<(), PersistenceError> 
             origin: (building.origin.x, building.origin.y, building.origin.z),
             rotation: building.rotation,
             footprint: (building.footprint.x, building.footprint.y),
+            work_area: building.work_area.map(|a| ((a.min.x, a.min.y), (a.max.x, a.max.y))),
         })
         .collect();
     buildings.sort_by_key(|b| b.id);
@@ -262,6 +278,7 @@ pub fn load_city(save_root: &Path) -> Result<City, PersistenceError> {
             origin: IVec3::new(x, y, z),
             rotation: saved.rotation,
             footprint: IVec2::new(fx, fz),
+            work_area: saved.work_area.map(|((ax, az), (bx, bz))| WorkArea { min: IVec2::new(ax, az), max: IVec2::new(bx, bz) }),
         };
         city.insert_loaded(BuildingId::from_u64(saved.id), building)
             .map_err(PersistenceError::Corrupt)?;
@@ -434,6 +451,33 @@ mod tests {
             .place_building("house01", None, IVec3::new(10, 64, 10), Rotation::Deg0, IVec2::ONE)
             .unwrap();
         assert_ne!(third, second, "second's id must never be reissued, even across a save/load round trip");
+    }
+
+    /// Ticket 111: a drawn area survives a save/load, and a file written
+    /// before areas existed (no `work_area` field at all) loads with every
+    /// building at `None` — see the module docs on why this field defaults
+    /// rather than bumping the version.
+    #[test]
+    fn a_work_area_round_trips_and_an_old_file_without_one_loads_as_none() {
+        let dir = temp_dir("work_area_round_trip");
+        let mut city = City::default();
+        let a = city.place_building("gatherer_hut", Some("gatherer_hut".to_string()), IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::splat(2)).unwrap();
+        let b = city.place_building("house01", None, IVec3::new(20, 64, 20), Rotation::Deg0, IVec2::ONE).unwrap();
+        let area = WorkArea { min: IVec2::new(-5, -3), max: IVec2::new(7, 4) };
+        city.set_work_area(a, Some(area));
+        save_city(&city, &dir).unwrap();
+
+        let loaded = load_city(&dir).unwrap();
+        assert_eq!(loaded.building(a).unwrap().work_area, Some(area));
+        assert_eq!(loaded.building(b).unwrap().work_area, None);
+
+        fs::write(
+            city_file_path(&dir),
+            "(version: 7, next_id: 1, buildings: [(id: 0, catalogue_id: \"gatherer_hut\", definition_id: None, origin: (0, 64, 0), rotation: Deg0, footprint: (2, 2))], road_cells: [])",
+        )
+        .unwrap();
+        let loaded = load_city(&dir).unwrap();
+        assert_eq!(loaded.building(BuildingId::from_u64(0)).unwrap().work_area, None);
     }
 
     #[test]

@@ -376,7 +376,7 @@ fn try_commit_placement(
     spent.add_all(&consumed);
     let gained = produced;
     let placed =
-        PlacedBuilding { catalogue_id: id, definition_id, origin, rotation: selection.rotation, footprint: entry.footprint };
+        PlacedBuilding { catalogue_id: id, definition_id, origin, rotation: selection.rotation, footprint: entry.footprint, work_area: None };
 
     let cache: Arc<Mutex<RegionCache>> = region_cache.0.clone();
     let policy = EditPolicy { capture_replaced: true, allow_dirty_regions: true, ..EditPolicy::default() };
@@ -712,6 +712,7 @@ mod tests {
             origin: IVec3::new(0, 64, 0),
             rotation: Rotation::Deg0,
             footprint: IVec2::new(2, 2),
+            work_area: None,
         }
     }
 

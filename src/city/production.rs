@@ -142,6 +142,13 @@ pub enum ProducerState {
     /// site really is levelled). A building with a `production` block never
     /// reaches this state.
     Depleted,
+    /// Ticket 111: a [`super::gatherer`] hub with no working area drawn yet
+    /// ([`super::state::PlacedBuilding::work_area`] is `None`). Nothing
+    /// accrues — the hut hasn't been told where to work, which is neither
+    /// [`Depleted`](Self::Depleted) (an area that's *done*) nor a missing
+    /// input. Clears the moment the player draws one. A building with a
+    /// `production` block never reaches this state.
+    NoWorkArea,
 }
 
 impl ProducerState {
@@ -152,6 +159,7 @@ impl ProducerState {
             ProducerState::Starved => "starved",
             ProducerState::BufferFull => "buffer full",
             ProducerState::Depleted => "site levelled",
+            ProducerState::NoWorkArea => "no working area",
         }
     }
 }

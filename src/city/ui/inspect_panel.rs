@@ -19,6 +19,17 @@
 //! crate reads block damage. A stub health number here would be something to
 //! rip out later rather than fill in now; this panel grows one when I4 lands
 //! and not before.
+//!
+//! ## The working-area section (ticket 111)
+//!
+//! For a gatherer, the panel also shows its drawn working area (or a
+//! warning that there is none — a hut without one does nothing) and is the
+//! one place that switches [`ActiveTool`] to `DrawWorkArea`: the area
+//! belongs to *this* building, and the panel is what knows which one is
+//! selected. The drawing itself, and the tool's way back to `Inspect`, live
+//! in `city::work_area`; this is only the button. Both this and ticket 107's
+//! "Clear buffer" mutate after the window closure, not inside it — the
+//! window borrows the resources it displays.
 
 use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts};
@@ -30,7 +41,8 @@ use super::super::inventory::{short_name, Parcel};
 use super::super::picking::SelectedBuilding;
 use super::super::placement::rotation_degrees;
 use super::super::production::{buffer_capacity, Producer, ProductionState};
-use super::super::state::{self, PlacedBuilding};
+use super::super::state::{self, PlacedBuilding, WorkArea};
+use super::super::tool::ActiveTool;
 use super::super::warehouse::Coverage;
 
 /// The selected building's own display name — its definition's, via
@@ -88,18 +100,41 @@ fn warehouse_status(
     Some(format!("Warehouse: {name} ({:.1} min away)", served.travel_minutes))
 }
 
+/// Whether `placed` is a gatherer — the one kind of building with a working
+/// area to show and draw (ticket 111).
+fn is_gatherer(placed: &PlacedBuilding, definitions: &BuildingDefinitions) -> bool {
+    placed.definition_id.as_deref().and_then(|id| definitions.get(id)).is_some_and(|entry| entry.building.gatherer.is_some())
+}
+
+/// The panel's line for a drawn working area: both corners, Minecraft
+/// `(x, z)`, and the tile count.
+fn work_area_line(area: WorkArea) -> String {
+    format!("Working area: ({}, {}) - ({}, {}), {} tiles", area.min.x, area.min.y, area.max.x, area.max.y, area.len())
+}
+
+/// What the panel's working-area buttons asked for this frame — resolved
+/// after the window closes, the way `clear_buffer` is.
+#[derive(Default)]
+struct WorkAreaRequest {
+    draw: bool,
+    clear: bool,
+}
+
 /// Egui window: the selected building's name, position, rotation, and — if
 /// it's a producer — its running state, warehouse connection, and buffer
-/// (with a "Clear buffer" debug button, ticket 107). Draws nothing at all
-/// with nothing selected; see the module docs.
+/// (with a "Clear buffer" debug button, ticket 107); for a gatherer, its
+/// working area and the buttons to draw or clear one (ticket 111). Draws
+/// nothing at all with nothing selected; see the module docs.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn inspect_panel(
     mut contexts: EguiContexts,
     selected: Res<SelectedBuilding>,
-    city: Res<state::City>,
+    mut city: ResMut<state::City>,
     definitions: Res<BuildingDefinitions>,
     mut production: ResMut<ProductionState>,
     coverage: Option<Res<Coverage>>,
     economy: Res<EconomyConfig>,
+    mut tool: Option<ResMut<ActiveTool>>,
 ) {
     let Some(id) = selected.0 else { return };
     // A stale selection (the building was demolished since) draws nothing —
@@ -108,6 +143,8 @@ pub(super) fn inspect_panel(
     let Some(placed) = city.building(id) else { return };
 
     let mut clear_buffer = false;
+    let mut work_area = WorkAreaRequest::default();
+    let drawing = matches!(tool.as_deref(), Some(ActiveTool::DrawWorkArea));
 
     egui::Window::new("Inspect").show(contexts.ctx_mut(), |ui| {
         ui.label(building_name(id, &placed.catalogue_id, &city, &definitions));
@@ -140,10 +177,39 @@ pub(super) fn inspect_panel(
                 }
             }
         }
+
+        if is_gatherer(placed, &definitions) {
+            ui.separator();
+            match placed.work_area {
+                Some(area) => {
+                    ui.label(work_area_line(area));
+                }
+                None => {
+                    ui.colored_label(egui::Color32::from_rgb(220, 60, 60), "⚠ No working area - draw one");
+                }
+            }
+            ui.horizontal(|ui| {
+                let label = if drawing { "Drawing... (Escape to cancel)" } else { "Draw working area" };
+                if ui.add_enabled(!drawing, egui::Button::new(label)).clicked() {
+                    work_area.draw = true;
+                }
+                if placed.work_area.is_some() && ui.button("Clear working area").clicked() {
+                    work_area.clear = true;
+                }
+            });
+        }
     });
 
     if clear_buffer {
         production.entry(id).buffer = Parcel::default();
+    }
+    if work_area.clear {
+        city.set_work_area(id, None);
+    }
+    if work_area.draw {
+        if let Some(tool) = tool.as_deref_mut() {
+            *tool = ActiveTool::DrawWorkArea;
+        }
     }
 }
 
@@ -152,7 +218,7 @@ mod tests {
     use super::*;
     use crate::blueprint::Rotation;
     use crate::city::definition::{
-        Building, Category, FootprintSpec, Integrity, LoadedBuilding, Production, ProductionItem, Warehouse,
+        Building, Category, FootprintSpec, Gatherer, Integrity, LoadedBuilding, Production, ProductionItem, Warehouse,
     };
     use crate::city::production::ProducerState;
     use crate::city::road::RoadPieceVariant;
@@ -168,6 +234,7 @@ mod tests {
             origin: IVec3::new(1, 64, 2),
             rotation: Rotation::Deg90,
             footprint: IVec2::ONE,
+            work_area: None,
         }
     }
 
@@ -281,6 +348,22 @@ mod tests {
 
     // Sanity: `ProducerState::label` is what the panel prints for "State:" —
     // pinned here so a relabel doesn't silently drift.
+    // --- the working-area section (ticket 111) ---------------------------------------------
+
+    #[test]
+    fn work_area_line_names_both_corners_and_the_tile_count() {
+        let area = WorkArea::new(IVec2::new(-3, 2), IVec2::new(4, 5));
+        assert_eq!(work_area_line(area), "Working area: (-3, 2) - (4, 5), 32 tiles");
+    }
+
+    #[test]
+    fn is_gatherer_reads_the_definitions_gatherer_block() {
+        let definitions = warehouse_status_defs();
+        assert!(!is_gatherer(&placement("warehouse01", Some("warehouse01")), &definitions));
+        assert!(!is_gatherer(&placement("house01", None), &definitions));
+        assert!(is_gatherer(&placement("gatherer_hut", Some("gatherer_hut")), &definitions));
+    }
+
     #[test]
     fn producer_state_labels_read_as_a_sentence_fragment() {
         assert_eq!(ProducerState::Running.label(), "running");
@@ -324,9 +407,25 @@ mod tests {
             ground_level: 0,
             integrity: Integrity { pristine_above: 0.95, ruined_below: 0.6 },
         };
+        let hut = Building {
+            name: "Gatherer's Hut".to_string(),
+            blueprint: "gatherer_hut.nbt".to_string(),
+            tier: 1,
+            requires: Vec::new(),
+            footprint: FootprintSpec::FromBlueprint,
+            production: None,
+            cost: Vec::new(),
+            warehouse: None,
+            farm: None,
+            gatherer: Some(Gatherer { radius_blocks: 18, blocks_per_minute: 20.0, buffer_stacks: 4 }),
+            category: Category::Production,
+            ground_level: 0,
+            integrity: Integrity { pristine_above: 0.95, ruined_below: 0.6 },
+        };
         BuildingDefinitions::from_entries(vec![
             LoadedBuilding { id: "warehouse01".to_string(), path: PathBuf::new(), building: warehouse, footprint: IVec2::ONE, catalogue_id: "warehouse01".to_string() },
             LoadedBuilding { id: "farm01".to_string(), path: PathBuf::new(), building: farm, footprint: IVec2::ONE, catalogue_id: "farm01".to_string() },
+            LoadedBuilding { id: "gatherer_hut".to_string(), path: PathBuf::new(), building: hut, footprint: IVec2::ONE, catalogue_id: "gatherer_hut".to_string() },
         ])
     }
 

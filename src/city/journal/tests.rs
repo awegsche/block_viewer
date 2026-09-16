@@ -20,7 +20,7 @@ fn dirt() -> BlockState {
 }
 
 fn placed(definition: &str, origin: IVec3, footprint: IVec2) -> PlacedBuilding {
-    PlacedBuilding { catalogue_id: definition.to_string(), definition_id: None, origin, rotation: Rotation::Deg0, footprint }
+    PlacedBuilding { catalogue_id: definition.to_string(), definition_id: None, origin, rotation: Rotation::Deg0, footprint, work_area: None }
 }
 
 // -------------------------------------------------------------------------------------------------

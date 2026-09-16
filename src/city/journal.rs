@@ -54,7 +54,7 @@ use crate::edit::route::refusal_for;
 use crate::edit::{BlockEdit, EditReport, RegionSource, WorldEdit};
 
 use super::inventory::Parcel;
-use super::state::{BuildingId, City, PlacedBuilding, PlacementError};
+use super::state::{BuildingId, City, PlacedBuilding, PlacementError, WorkArea};
 
 // -------------------------------------------------------------------------------------------------
 // ---- the as-built baseline (roadmap I1) ----------------------------------------------------------
@@ -612,6 +612,12 @@ struct SavedPlacement {
     origin: (i32, i32, i32),
     rotation: Rotation,
     footprint: (i32, i32),
+    /// Ticket 111: a gatherer's drawn working area, `((min_x, min_z),
+    /// (max_x, max_z))` inclusive. `#[serde(default)]` on the same argument
+    /// `definition_id` makes above: an entry written before areas existed
+    /// had none drawn, so `None` is what's true of it.
+    #[serde(default)]
+    work_area: Option<((i32, i32), (i32, i32))>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -628,6 +634,7 @@ fn saved_placement(placement: &PlacedBuilding) -> SavedPlacement {
         origin: (placement.origin.x, placement.origin.y, placement.origin.z),
         rotation: placement.rotation,
         footprint: (placement.footprint.x, placement.footprint.y),
+        work_area: placement.work_area.map(|a| ((a.min.x, a.min.y), (a.max.x, a.max.y))),
     }
 }
 
@@ -640,6 +647,10 @@ fn placement_from_saved(saved: SavedPlacement) -> PlacedBuilding {
         origin: IVec3::new(x, y, z),
         rotation: saved.rotation,
         footprint: bevy::math::IVec2::new(fx, fz),
+        work_area: saved.work_area.map(|((ax, az), (bx, bz))| WorkArea {
+            min: bevy::math::IVec2::new(ax, az),
+            max: bevy::math::IVec2::new(bx, bz),
+        }),
     }
 }
 

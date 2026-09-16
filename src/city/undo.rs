@@ -395,6 +395,7 @@ mod tests {
             origin: IVec3::new(0, 64, 0),
             rotation: Rotation::Deg0,
             footprint: IVec2::ONE,
+            work_area: None,
         };
         let baseline = super::super::journal::Baseline {
             written: vec![(IVec3::new(0, 64, 0), BlockState { name: "minecraft:stone".to_string(), properties: Vec::new() })],

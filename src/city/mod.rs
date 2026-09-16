@@ -229,14 +229,30 @@
 //! display it without either one learning a gatherer exists as anything more
 //! than one more entry in that map (see [`gatherer`]'s own docs). Each tick
 //! it accrues `blocks_per_minute` into a per-building block carry and, once a
-//! whole one is owed, digs the nearest still-diggable tile within
-//! `radius_blocks` down to — and never past — [`definition::Building::ground_level`]'s
+//! whole one is owed, digs the nearest still-diggable tile in its working
+//! area down to — and never past — [`definition::Building::ground_level`]'s
 //! own placed height, crediting whatever [`drops::DropTable`] says that block
 //! gives. No journal entry and no [`write_status::WriteStatus`] line, for the
 //! same "undo undoes builds, not time" reasoning production's own tick
 //! already gives, plus one more: a background write landing every few seconds
 //! per hub would never let the city panel's "Last edit" line show what the
 //! player actually just did.
+//!
+//! ## The gatherer's working area (ticket 111)
+//!
+//! 086's hut dug everything within `radius_blocks` of itself — the road
+//! beside it included, since nothing consulted [`state::City`]'s occupancy.
+//! Two changes: [`gatherer`] now skips every tile the city has an
+//! [`state::Occupant`] for (roads, other buildings, its own footprint), and
+//! *where* it digs is a rectangle the player draws —
+//! [`state::PlacedBuilding::work_area`], `None` until drawn, during which
+//! the hut sits in [`production::ProducerState::NoWorkArea`]. `radius_blocks`
+//! (now 18, three times 086's 6) is the cap on how far that rectangle may
+//! reach, not an area of its own. [`work_area::WorkAreaPlugin`] is the
+//! drawing: a fifth [`tool::ActiveTool`] (`DrawWorkArea`) entered only from
+//! the inspect panel's button, committed by a corner-to-corner drag, left by
+//! that release or `Escape`, with gizmo rings for the committed area, the
+//! reach box and the candidate under the cursor — see [`work_area`]'s docs.
 //!
 //! ## The build menu and city panel (ticket 050, roadmap G)
 //!
@@ -390,6 +406,7 @@ mod tool;
 mod ui;
 mod undo;
 mod warehouse;
+mod work_area;
 mod write_status;
 
 use bevy::app::AppExit;
@@ -514,6 +531,7 @@ pub fn run() {
         .add_plugins(demolish::DemolishPlugin)
         .add_plugins(road_build::RoadBuildPlugin)
         .add_plugins(terraform::TerraformPlugin)
+        .add_plugins(work_area::WorkAreaPlugin)
         .add_plugins(undo::UndoPlugin)
         .add_plugins(save::SavePlugin)
         .add_plugins(ui::UiPlugin)

@@ -305,6 +305,7 @@ mod tests {
             origin: IVec3::new(0, 64, 0),
             rotation: Rotation::Deg0,
             footprint: IVec2::new(2, 2),
+            work_area: None,
         }
     }
 
