@@ -915,6 +915,24 @@ world is made of are the economy's own units.
   identical houses next to a genuinely distinct lumberjack's hut and its
   fields; see `../todo.md`.
 
+## H3 — Mines (tickets 113–119, designed, not built)
+
+The specialised extraction building H2's Gatherer's Hut has been contrasting
+itself against since 086. Design in `MINES_DESIGN.md`; the short version:
+a surface complex placed like any building, a square primary shaft with a
+spiral stair (one landing per corner, which is what makes 4-block level
+spacing fall out of a 6-wide shaft rather than being a second knob), a
+4×3 secondary shaft north/south at the current level and 2×3 galleries
+east/west every 4 blocks, each slice's 4×5 cross-section scanned for ore.
+Geometry is a **pure function of definition + placement + cursor**, so the
+generator is idempotent and a lost progress file fast-forwards instead of
+corrupting. Reads go through the region cache (`extract_blueprint`), never
+`DecodedWorld`; writes use `HeightmapPolicy::Leave` and skip `ChunksEdited`
+below the render floor, so **nothing a mine does underground is ever
+rendered by the citybuilder** — it's walked in Minecraft. Buffer and
+haulage are the gatherer's `Producer` reuse, one size up (`buffer_stacks:
+512`). Tiers are `min_level_y`: Mine 16, Deep Mine −24, Deepslate Mine −56.
+
 ## I — Damage: the world diffing back (iteration 2, except I1)
 
 Blocks a player alters in Minecraft, inside a building's volume, count as
