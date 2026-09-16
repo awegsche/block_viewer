@@ -73,10 +73,16 @@
 //!
 //! Three rules that are less obvious than they look:
 //!
-//! - **A stalled producer ships its largest partial stack**, below
-//!   `stack_size`. Without this, a building whose outputs are *mixed* can
-//!   fill its buffer to the cap without any one item ever reaching a full
-//!   stack, and deadlock there forever.
+//! - **A producer past its haul threshold ships its largest partial
+//!   stack**, below `stack_size`. A building whose outputs are *mixed* — a
+//!   gatherer's drops above all — can fill its buffer to the cap without any
+//!   one item ever reaching a full stack. Ticket 080 guarded that deadlock
+//!   by shipping a partial once the producer had *stalled*; ticket 112
+//!   moves the trigger to a fill level strictly below the cap
+//!   (`haul_at_stacks`, see [`haul_threshold`]) so a mixed producer hauls
+//!   while it is still running rather than only after it has stopped. The
+//!   loader refuses a threshold at or above the cap, which is what keeps
+//!   "full" a strict superset of "past the threshold".
 //! - **A delivery the city has no room for blocks at the warehouse** holding
 //!   its goods, rather than dropping them. That closes the loop the storage
 //!   cap opens: stock full -> hauls block -> hauler slots stay occupied ->
@@ -323,6 +329,32 @@ pub fn buffer_capacity(production: &Production, economy: &EconomyConfig) -> u64 
     u64::from(production.buffer_stacks).saturating_mul(economy.stack_size)
 }
 
+/// How many items `production` holds before it ships a partial stack
+/// (ticket 112) — [`Production::haul_threshold_stacks`] in items, the same
+/// arithmetic [`buffer_capacity`] does for the cap. Strictly below
+/// [`buffer_capacity`] for any definition the loader accepted.
+pub fn haul_threshold(production: &Production, economy: &EconomyConfig) -> u64 {
+    u64::from(production.haul_threshold_stacks()).saturating_mul(economy.stack_size)
+}
+
+/// `id`'s haul threshold in items, read off whichever block gives it a
+/// buffer — `production`'s, or (ticket 086) `gatherer`'s. A producer whose
+/// definition has neither (or is gone) never ships a partial: `u64::MAX`,
+/// so only a full stack can move it.
+fn producer_haul_threshold(city: &City, definitions: &BuildingDefinitions, id: BuildingId, economy: &EconomyConfig) -> u64 {
+    let Some(entry) = city.building(id).and_then(|placed| placed.definition_id.as_deref()).and_then(|id| definitions.get(id))
+    else {
+        return u64::MAX;
+    };
+    if let Some(spec) = entry.building.production.as_ref() {
+        return haul_threshold(spec, economy);
+    }
+    if let Some(gatherer) = entry.building.gatherer.as_ref() {
+        return super::gatherer::gatherer_haul_threshold(gatherer, economy);
+    }
+    u64::MAX
+}
+
 pub struct ProductionPlugin;
 
 impl Plugin for ProductionPlugin {
@@ -377,7 +409,7 @@ fn tick(
     let capacity = warehouse::storage_capacity(capacity.as_deref());
     deliver_arrivals(&mut production, &mut stock, capacity, minutes);
     if let Some(coverage) = coverage {
-        dispatch_hauls(&mut production, &city, &definitions, &coverage, economy.stack_size);
+        dispatch_hauls(&mut production, &city, &definitions, &coverage, economy.as_ref());
     }
 }
 
@@ -410,13 +442,13 @@ fn deliver_arrivals(production: &mut ProductionState, stock: &mut Stock, capacit
 
 /// Dispatches at most one stack per producer per tick, subject to its
 /// warehouse's `concurrent_hauls` — see the module docs for what "a stack"
-/// means and why a stalled producer may ship a partial one.
+/// means and why a producer past its haul threshold may ship a partial one.
 fn dispatch_hauls(
     production: &mut ProductionState,
     city: &City,
     definitions: &BuildingDefinitions,
     coverage: &Coverage,
-    stack_size: u64,
+    economy: &EconomyConfig,
 ) {
     // Deterministic order: two producers competing for the last slot of a
     // tier-1 warehouse should resolve the same way every frame, not by
@@ -434,8 +466,9 @@ fn dispatch_hauls(
             continue;
         }
 
+        let haul_at = producer_haul_threshold(city, definitions, producer_id, economy);
         let Some(producer) = production.producers.get_mut(&producer_id) else { continue };
-        let Some((item, count)) = ready_stack(producer, stack_size) else { continue };
+        let Some((item, count)) = ready_stack(producer, economy.stack_size, haul_at) else { continue };
 
         producer.buffer.remove(&item, count);
         let mut parcel = Parcel::default();
@@ -451,18 +484,23 @@ fn dispatch_hauls(
 }
 
 /// Which stack this producer is ready to send, if any: a full one, or — once
-/// it has stalled — its largest partial. See the module docs for why the
-/// second case exists.
+/// its buffer holds `haul_at` items in total (ticket 112) — its largest
+/// partial. See the module docs for why the second case exists.
+///
+/// `haul_at` is strictly below the buffer cap for any loaded definition, so
+/// a [`ProducerState::BufferFull`] producer is always past it; the state
+/// itself is deliberately not consulted here, which is what lets a gatherer
+/// haul while it is still digging.
 ///
 /// Ties between two items of equal size go to the lower id, so a mixed
 /// producer's dispatch order doesn't wander.
-fn ready_stack(producer: &Producer, stack_size: u64) -> Option<(String, u64)> {
+fn ready_stack(producer: &Producer, stack_size: u64, haul_at: u64) -> Option<(String, u64)> {
     let largest = producer.buffer.iter().max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(a.0)))?;
     let (item, held) = (largest.0.to_string(), largest.1);
 
     if held >= stack_size {
         Some((item, stack_size))
-    } else if producer.state == ProducerState::BufferFull && held > 0 {
+    } else if producer.buffer.total() >= haul_at && held > 0 {
         Some((item, held))
     } else {
         None
@@ -750,6 +788,7 @@ mod tests {
                 .collect(),
             radius: None,
             buffer_stacks,
+            haul_at_stacks: None,
         }
     }
 
@@ -1132,7 +1171,8 @@ mod tests {
     /// so these exercise the same road-distance answer the game uses.
     fn dispatch(production: &mut ProductionState, city: &City, definitions: &BuildingDefinitions, stack_size: u64) {
         let coverage = compute_coverage(city, definitions, &RoadTypes::default());
-        dispatch_hauls(production, city, definitions, &coverage, stack_size);
+        let economy = EconomyConfig { stack_size, ..EconomyConfig::default() };
+        dispatch_hauls(production, city, definitions, &coverage, &economy);
     }
 
     fn producer_holding(item: &str, count: u64, state: ProducerState) -> Producer {
@@ -1173,15 +1213,18 @@ mod tests {
         assert!(production.shipments().is_empty());
     }
 
-    /// The module docs' deadlock guard: a stalled producer whose outputs are
-    /// mixed may never reach a full stack of any one of them.
+    /// The module docs' deadlock guard, ticket 112's way round: a producer
+    /// whose outputs are mixed may never reach a full stack of any one of
+    /// them, so once its combined total passes the haul threshold — half the
+    /// cap here, `buffer_stacks: 2` at 64 a stack, so 64 items — its largest
+    /// partial goes *while it is still running*.
     #[test]
-    fn a_stalled_producer_ships_its_largest_partial_stack() {
+    fn a_producer_past_its_haul_threshold_ships_its_largest_partial_stack() {
         let mut city = City::default();
         let (_, farms) = road_town(&mut city, 1);
         let definitions = haul_definitions(2);
 
-        let mut producer = producer_holding("minecraft:wheat", 40, ProducerState::BufferFull);
+        let mut producer = producer_holding("minecraft:wheat", 40, ProducerState::Running);
         producer.buffer.add("minecraft:carrot", 24);
 
         let mut production = ProductionState::default();
@@ -1190,6 +1233,71 @@ mod tests {
 
         assert_eq!(production.shipments().len(), 1);
         assert_eq!(production.shipments()[0].parcel.get("minecraft:wheat"), 40, "the largest partial goes first");
+    }
+
+    /// Below the threshold, a mixed buffer with no full stack waits — that is
+    /// what makes the threshold a threshold rather than "always ship".
+    #[test]
+    fn a_mixed_buffer_below_the_haul_threshold_waits() {
+        let mut city = City::default();
+        let (_, farms) = road_town(&mut city, 1);
+        let definitions = haul_definitions(2);
+
+        let mut producer = producer_holding("minecraft:wheat", 40, ProducerState::Running);
+        producer.buffer.add("minecraft:carrot", 23);
+
+        let mut production = ProductionState::default();
+        production.insert(farms[0], producer);
+        dispatch(&mut production, &city, &definitions, 64);
+
+        assert!(production.shipments().is_empty());
+    }
+
+    /// A stalled producer is always past the threshold (the loader keeps it
+    /// strictly below the cap), so 080's original guard still holds.
+    #[test]
+    fn a_stalled_producer_still_ships_its_largest_partial_stack() {
+        let mut city = City::default();
+        let (_, farms) = road_town(&mut city, 1);
+        let definitions = haul_definitions(2);
+
+        let mut producer = producer_holding("minecraft:wheat", 60, ProducerState::BufferFull);
+        producer.buffer.add("minecraft:carrot", 60);
+        producer.buffer.add("minecraft:potato", 8);
+
+        let mut production = ProductionState::default();
+        production.insert(farms[0], producer);
+        dispatch(&mut production, &city, &definitions, 64);
+
+        assert_eq!(production.shipments().len(), 1);
+        assert_eq!(production.shipments()[0].parcel.get("minecraft:carrot"), 60, "ties go to the lower id");
+    }
+
+    /// An explicit `haul_at_stacks` moves the trigger: `1` of `4` stacks
+    /// means a partial leaves from 64 items, not from the default 128.
+    #[test]
+    fn an_explicit_haul_at_stacks_sets_the_trigger() {
+        let mut city = City::default();
+        let (_, farms) = road_town(&mut city, 1);
+        let mut farm = spec(&[("minecraft:wheat", 60.0)], &[], 4);
+        farm.haul_at_stacks = Some(1);
+        let definitions = BuildingDefinitions::from_entries(vec![
+            definition(
+                "warehouse01",
+                Some(Warehouse { radius_cells: 8, concurrent_hauls: 2, handling_minutes: 0.0, storage: 100_000 }),
+                None,
+            ),
+            definition("farm01", None, Some(farm)),
+        ]);
+
+        let mut producer = producer_holding("minecraft:wheat", 40, ProducerState::Running);
+        producer.buffer.add("minecraft:carrot", 24);
+
+        let mut production = ProductionState::default();
+        production.insert(farms[0], producer);
+        dispatch(&mut production, &city, &definitions, 64);
+
+        assert_eq!(production.shipments().len(), 1, "64 items is past a 1-stack threshold");
     }
 
     /// The throughput knob: a tier-1 warehouse with one cart serving two

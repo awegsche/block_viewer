@@ -278,6 +278,24 @@ pub struct Gatherer {
     /// output is meant to be hauled out exactly like a producer's.
     #[serde(default = "default_buffer_stacks")]
     pub buffer_stacks: u32,
+    /// Ticket 112: the fill level, in stacks, at which this building ships
+    /// its largest *partial* stack rather than waiting for a full one — the
+    /// same knob as [`Production::haul_at_stacks`], and the one that matters
+    /// most here, since a hut's drops are mixed and no single item reliably
+    /// reaches a full stack before the combined total reaches the cap.
+    /// `None` defaults to half of `buffer_stacks`; a value at or above
+    /// `buffer_stacks` is refused by [`validate`].
+    #[serde(default)]
+    pub haul_at_stacks: Option<u32>,
+}
+
+impl Gatherer {
+    /// The fill level, in stacks, past which a partial stack is hauled —
+    /// see [`haul_at_stacks`](Self::haul_at_stacks). Always strictly below
+    /// `buffer_stacks` for a definition that passed [`validate`].
+    pub fn haul_threshold_stacks(&self) -> u32 {
+        self.haul_at_stacks.unwrap_or(self.buffer_stacks / 2)
+    }
 }
 
 /// How a building's horizontal footprint is determined. `FromBlueprint` (the
@@ -313,6 +331,26 @@ pub struct Production {
     /// to state.
     #[serde(default = "default_buffer_stacks")]
     pub buffer_stacks: u32,
+    /// Ticket 112: the fill level, in stacks, at which this building ships
+    /// its largest *partial* stack even though no one item has reached a
+    /// full `stack_size` — so a producer with mixed outputs hauls while it
+    /// is still running, rather than only once it has stalled at the cap
+    /// (which was ticket 080's deadlock guard doing double duty as the
+    /// normal trigger). A full stack still leaves the moment it exists,
+    /// whatever this says. `None` defaults to half of `buffer_stacks`; a
+    /// value at or above `buffer_stacks` is refused by [`validate`], since
+    /// that would be exactly the stall-then-haul behaviour this replaces.
+    #[serde(default)]
+    pub haul_at_stacks: Option<u32>,
+}
+
+impl Production {
+    /// The fill level, in stacks, past which a partial stack is hauled —
+    /// see [`haul_at_stacks`](Self::haul_at_stacks). Always strictly below
+    /// `buffer_stacks` for a definition that passed [`validate`].
+    pub fn haul_threshold_stacks(&self) -> u32 {
+        self.haul_at_stacks.unwrap_or(self.buffer_stacks / 2)
+    }
 }
 
 /// Four stacks: enough that a warehouse a short haul away never starves a
@@ -361,6 +399,11 @@ pub enum DefinitionError {
     InvalidProduction { item: String, per_minute: f32 },
     /// `production.buffer_stacks: 0` (ticket 078) — see `check_building`.
     ZeroBufferStacks,
+    /// A `production` or `gatherer` block whose `haul_at_stacks` isn't
+    /// strictly below its `buffer_stacks` (ticket 112): equal means "haul
+    /// only once stalled", which is the behaviour the field exists to
+    /// replace, so the loader refuses it rather than silently honouring it.
+    HaulAtNotBelowBuffer { block: &'static str, haul_at_stacks: u32, buffer_stacks: u32 },
     /// A `warehouse` block with a value nothing downstream could use
     /// (ticket 079) — carries the rule it broke, since there are three and
     /// they read the same way in a panel.
@@ -414,6 +457,10 @@ impl std::fmt::Display for DefinitionError {
                 write!(f, "cost entry for {block:?} has non-positive count {count}")
             }
             DefinitionError::ZeroBufferStacks => write!(f, "production.buffer_stacks must be > 0"),
+            DefinitionError::HaulAtNotBelowBuffer { block, haul_at_stacks, buffer_stacks } => write!(
+                f,
+                "{block}.haul_at_stacks ({haul_at_stacks}) must be below {block}.buffer_stacks ({buffer_stacks})"
+            ),
             DefinitionError::InvalidWarehouse(rule) => write!(f, "warehouse.{rule}"),
             DefinitionError::InvalidFarm(rule) => write!(f, "farm.{rule}"),
             DefinitionError::DanglingFarmTile(missing) => {
@@ -566,6 +613,15 @@ fn validate(building: &Building) -> Result<(), DefinitionError> {
         if production.buffer_stacks == 0 {
             return Err(DefinitionError::ZeroBufferStacks);
         }
+        // Ticket 112: the haul threshold and the cap must never be the same
+        // number — see `HaulAtNotBelowBuffer`.
+        if let Some(haul_at_stacks) = production.haul_at_stacks.filter(|&at| at >= production.buffer_stacks) {
+            return Err(DefinitionError::HaulAtNotBelowBuffer {
+                block: "production",
+                haul_at_stacks,
+                buffer_stacks: production.buffer_stacks,
+            });
+        }
     }
     // Ticket 079: a warehouse that reaches nowhere or can carry nothing is a
     // mistake in the file, not a value the coverage pass should have to
@@ -613,6 +669,14 @@ fn validate(building: &Building) -> Result<(), DefinitionError> {
         }
         if gatherer.buffer_stacks == 0 {
             return Err(DefinitionError::InvalidGatherer("buffer_stacks must be > 0"));
+        }
+        // Ticket 112, same rule as `production`'s above.
+        if let Some(haul_at_stacks) = gatherer.haul_at_stacks.filter(|&at| at >= gatherer.buffer_stacks) {
+            return Err(DefinitionError::HaulAtNotBelowBuffer {
+                block: "gatherer",
+                haul_at_stacks,
+                buffer_stacks: gatherer.buffer_stacks,
+            });
         }
     }
     Ok(())
@@ -1505,6 +1569,91 @@ Building(
         assert_eq!(gatherer.radius_blocks, 6);
         assert_eq!(gatherer.blocks_per_minute, 2.0);
         assert_eq!(gatherer.buffer_stacks, 4, "same default Production::buffer_stacks uses");
+        assert_eq!(gatherer.haul_at_stacks, None);
+        assert_eq!(gatherer.haul_threshold_stacks(), 2, "ticket 112: half the cap when the file doesn't say");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- haul threshold (ticket 112) ------------------------------------------
+
+    /// The hard rule: a threshold equal to the cap is the stall-then-haul
+    /// behaviour ticket 112 replaces, so the loader refuses it outright.
+    #[test]
+    fn a_gatherer_haul_threshold_at_the_cap_is_skipped() {
+        let catalogue = catalogue_with_house01();
+        let dir = temp_dir("gatherer_haul_at_cap");
+        fs::write(
+            dir.join("house01.ron"),
+            r#"Building(
+                name: "Gatherer's Hut",
+                blueprint: "house01.nbt",
+                tier: 1,
+                gatherer: Some(Gatherer(radius_blocks: 6, blocks_per_minute: 2.0, buffer_stacks: 4, haul_at_stacks: Some(4))),
+                integrity: Integrity(pristine_above: 0.9, ruined_below: 0.5),
+            )"#,
+        )
+        .unwrap();
+
+        let (definitions, skipped) = load_definitions_dir(&dir, &catalogue);
+        assert!(definitions.is_empty());
+        assert_eq!(skipped.len(), 1);
+        assert!(matches!(
+            skipped[0].1,
+            DefinitionError::HaulAtNotBelowBuffer { block: "gatherer", haul_at_stacks: 4, buffer_stacks: 4 }
+        ));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_production_haul_threshold_above_the_cap_is_skipped() {
+        let catalogue = catalogue_with_house01();
+        let dir = temp_dir("production_haul_above_cap");
+        fs::write(
+            dir.join("house01.ron"),
+            r#"Building(
+                name: "Farm",
+                blueprint: "house01.nbt",
+                tier: 1,
+                production: Some(Production(outputs: [(item: "wheat", per_minute: 1.0)], buffer_stacks: 2, haul_at_stacks: Some(3))),
+                integrity: Integrity(pristine_above: 0.9, ruined_below: 0.5),
+            )"#,
+        )
+        .unwrap();
+
+        let (definitions, skipped) = load_definitions_dir(&dir, &catalogue);
+        assert!(definitions.is_empty());
+        assert_eq!(skipped.len(), 1);
+        assert!(matches!(
+            skipped[0].1,
+            DefinitionError::HaulAtNotBelowBuffer { block: "production", haul_at_stacks: 3, buffer_stacks: 2 }
+        ));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_haul_threshold_below_the_cap_is_carried() {
+        let catalogue = catalogue_with_house01();
+        let dir = temp_dir("gatherer_haul_below_cap");
+        fs::write(
+            dir.join("house01.ron"),
+            r#"Building(
+                name: "Gatherer's Hut",
+                blueprint: "house01.nbt",
+                tier: 1,
+                gatherer: Some(Gatherer(radius_blocks: 6, blocks_per_minute: 2.0, buffer_stacks: 12, haul_at_stacks: Some(4))),
+                integrity: Integrity(pristine_above: 0.9, ruined_below: 0.5),
+            )"#,
+        )
+        .unwrap();
+
+        let (definitions, skipped) = load_definitions_dir(&dir, &catalogue);
+        assert!(skipped.is_empty(), "{skipped:?}");
+        let gatherer = definitions.get("house01").unwrap().building.gatherer.expect("gatherer should have loaded");
+        assert_eq!(gatherer.haul_at_stacks, Some(4));
+        assert_eq!(gatherer.haul_threshold_stacks(), 4);
 
         fs::remove_dir_all(&dir).ok();
     }

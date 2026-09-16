@@ -126,6 +126,16 @@ pub fn gatherer_buffer_capacity(gatherer: &Gatherer, economy: &EconomyConfig) ->
     u64::from(gatherer.buffer_stacks).saturating_mul(economy.stack_size)
 }
 
+/// How many items `gatherer` holds before haulage ships a partial stack
+/// (ticket 112) — [`Gatherer::haul_threshold_stacks`] in items, the mirror
+/// of [`super::production::haul_threshold`] for the same reason
+/// [`gatherer_buffer_capacity`] mirrors `buffer_capacity`. Strictly below
+/// the capacity for any definition the loader accepted, which is what lets
+/// a hut keep digging while its drops are already on the road.
+pub fn gatherer_haul_threshold(gatherer: &Gatherer, economy: &EconomyConfig) -> u64 {
+    u64::from(gatherer.haul_threshold_stacks()).saturating_mul(economy.stack_size)
+}
+
 /// One hut's dig geometry, read off its placement once per tick by
 /// [`dispatch_digs`] — the footprint rectangle (`max` exclusive, the
 /// [`super::state::footprint_tiles`] convention), the floor it digs down to
@@ -411,9 +421,21 @@ mod tests {
 
     #[test]
     fn buffer_capacity_is_stacks_times_stack_size() {
-        let gatherer = Gatherer { radius_blocks: 6, blocks_per_minute: 2.0, buffer_stacks: 4 };
+        let gatherer = Gatherer { radius_blocks: 6, blocks_per_minute: 2.0, buffer_stacks: 4, haul_at_stacks: None };
         let economy = EconomyConfig { stack_size: 64, ..EconomyConfig::default() };
         assert_eq!(gatherer_buffer_capacity(&gatherer, &economy), 256);
+    }
+
+    /// Ticket 112: the threshold defaults to half the cap, and an explicit
+    /// value is read in the same stacks-times-stack-size units.
+    #[test]
+    fn haul_threshold_is_below_the_capacity() {
+        let economy = EconomyConfig { stack_size: 8, ..EconomyConfig::default() };
+        let defaulted = Gatherer { radius_blocks: 6, blocks_per_minute: 2.0, buffer_stacks: 12, haul_at_stacks: None };
+        assert_eq!(gatherer_haul_threshold(&defaulted, &economy), 48);
+        let explicit = Gatherer { radius_blocks: 6, blocks_per_minute: 2.0, buffer_stacks: 12, haul_at_stacks: Some(4) };
+        assert_eq!(gatherer_haul_threshold(&explicit, &economy), 32);
+        assert!(gatherer_haul_threshold(&explicit, &economy) < gatherer_buffer_capacity(&explicit, &economy));
     }
 
     // --- a small synthetic world, same shape terraform's own tests use ------
@@ -622,7 +644,7 @@ mod tests {
     // --- plan_dig -----------------------------------------------------------
 
     fn gatherer(radius: u32, per_minute: f32, buffer_stacks: u32) -> Gatherer {
-        Gatherer { radius_blocks: radius, blocks_per_minute: per_minute, buffer_stacks }
+        Gatherer { radius_blocks: radius, blocks_per_minute: per_minute, buffer_stacks, haul_at_stacks: None }
     }
 
     /// A 1x1 hut at the origin with a 6-block area drawn around it, floor

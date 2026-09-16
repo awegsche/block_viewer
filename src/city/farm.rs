@@ -212,6 +212,7 @@ mod tests {
             inputs: Vec::new(),
             radius: None,
             buffer_stacks: 4,
+            haul_at_stacks: None,
         }
     }
 

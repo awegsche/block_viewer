@@ -1481,3 +1481,15 @@ Y=0 in the world and won't be cleaned up by this fix — see the ticket.
   logs no re-tile; (c) a cell whose kind has no `-connected.nbt` shipped
   (`cross`, `stairs` — see `assets/city/roads/dirt/README.md`) stays as it
   was, no console error.
+
+- [ ] **112 Gatherer's Hut hauls before it stalls.** `cargo test` is green
+  (dispatch is asserted against the threshold, not `BufferFull`), but the
+  feel needs eyes. At `cargo run --bin citybuilder`, place a warehouse and a
+  road, then a Gatherer's Hut beside the road with a working area drawn
+  over mixed terrain (grass + stone/gravel). Inspect the hut: the buffer
+  lines should climb past 32 items total (`haul_at_stacks: 4` at
+  `stack_size: 8`) and a partial stack of its biggest pile should leave for
+  the warehouse *while the state still reads `running`* — the buffer should
+  then hover somewhere between ~32 and the 96-item cap rather than ever
+  sitting at `buffer full` with a warehouse in reach. Cut the road and the
+  hut should fill all the way to 96 and only then stall.

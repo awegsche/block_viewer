@@ -278,7 +278,7 @@ mod tests {
             cost: Vec::new(),
             warehouse: None,
             farm: None,
-            gatherer: Some(Gatherer { radius_blocks: radius, blocks_per_minute: 1.0, buffer_stacks: 1 }),
+            gatherer: Some(Gatherer { radius_blocks: radius, blocks_per_minute: 1.0, buffer_stacks: 1, haul_at_stacks: None }),
             category: Category::Production,
             ground_level: 0,
             integrity: Integrity { pristine_above: 0.95, ruined_below: 0.6 },

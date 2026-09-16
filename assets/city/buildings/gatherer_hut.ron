@@ -32,7 +32,17 @@ Building(
         // Slow next to a specialised quarry/mine's eventual rate — the point
         // is a levelled build site early on, not a real extraction economy.
         blocks_per_minute: 20.0,
-        buffer_stacks: 4,
+        // Ticket 112. A hut's drops are mixed (dirt, grass, stone, gravel,
+        // sand...), so no single item reliably reaches a full stack before
+        // the combined total does — which with the old 4-stack buffer meant
+        // the hut only ever hauled once it had stalled at the cap. The two
+        // numbers below are deliberately far apart and MUST stay different:
+        // hauling starts at `haul_at_stacks` (its largest pile leaves as a
+        // partial stack) while the hut goes on digging into the headroom
+        // above it; only `buffer_stacks` stops the dig. The loader refuses
+        // a threshold at or above the cap.
+        buffer_stacks: 12,
+        haul_at_stacks: Some(4),
     )),
     integrity: Integrity(
         pristine_above: 0.95,
