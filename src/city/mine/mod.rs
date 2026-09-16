@@ -61,7 +61,6 @@
 //! This is the one place in the crate that deliberately leaves a written
 //! chunk's heightmaps stale.
 
-#[allow(dead_code)] // no non-test caller yet — 117 and 118 are
 pub mod layout;
 pub mod plan;
 pub mod progress;
@@ -134,7 +133,6 @@ const MINE_EDIT_POLICY: EditPolicy = EditPolicy {
 /// given (read by [`poll_jobs`]'s log line).
 struct PendingJob {
     task: Task<JobResult>,
-    #[allow(dead_code)] // read only by a future panel/log line
     budget: u32,
 }
 
@@ -174,6 +172,16 @@ pub struct MineState {
     /// several more slices' worth of progress to the same fault. Cleared the
     /// moment a job for that building lands successfully.
     retry_single: HashSet<BuildingId>,
+}
+
+impl MineState {
+    /// The budget of the job currently in flight for `id`, if any — ticket
+    /// 117's "Job: digging (N blocks budget)" line, shown only while a job
+    /// is pending. The one reader of [`PendingJob::budget`] outside this
+    /// module.
+    pub fn pending_budget(&self, id: BuildingId) -> Option<u32> {
+        self.pending.get(&id).map(|job| job.budget)
+    }
 }
 
 pub struct MinePlugin;

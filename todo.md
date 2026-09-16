@@ -1526,3 +1526,15 @@ Y=0 in the world and won't be cleaned up by this fix — see the ticket.
   the mine (`citybuilder/mines.ron`), and demolishing the mine leaves the
   shaft and galleries in the world (same as a Gatherer's Hut's pit) while
   clearing its buffer/progress.
+
+- [ ] **117 Mine inspect-panel section: the numbers actually move.** `cargo
+  test` covers each line function against hand-built `MineProgress`
+  fixtures, but nothing has driven the panel against a live, ticking mine.
+  At `cargo run --bin citybuilder`, place a Mine and select it. Confirm:
+  the "Level"/"Shaft"/"Phase" lines update as jobs land (level/floor Y and
+  shaft depth advance; the phase text moves through `mining` and
+  `sinking`); a "Job: digging (N blocks budget)" line appears only while a
+  job is actually in flight and disappears once it settles; and, for a
+  mine whose `min_level_y` is set just under its first level's floor (so
+  it mines out almost immediately), the phase settles on `mined out` and
+  stays there — no flicker back to `mining` or `sinking` on a later tick.

@@ -34,11 +34,13 @@
 use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts};
 
-use super::super::definition::BuildingDefinitions;
+use super::super::definition::{BuildingDefinitions, Mine};
 use super::super::economy::EconomyConfig;
 use super::super::gatherer::gatherer_buffer_capacity;
 use super::super::inventory::{short_name, Parcel};
-use super::super::mine::mine_buffer_capacity;
+use super::super::mine::layout::{Arm, MineFrame};
+use super::super::mine::progress::{LevelCursor, MineProgress, Phase, RowStep};
+use super::super::mine::{mine_buffer_capacity, MineState};
 use super::super::picking::SelectedBuilding;
 use super::super::placement::rotation_degrees;
 use super::super::production::{buffer_capacity, Producer, ProductionState};
@@ -124,11 +126,117 @@ struct WorkAreaRequest {
     clear: bool,
 }
 
+/// This building's `Mine` definition and blueprint ground level, if it has
+/// one — [`is_gatherer`]'s counterpart for the mine section (ticket 117);
+/// bundled with `ground_level` since [`MineFrame::from_placement`] needs
+/// both.
+fn mine_definition<'a>(placed: &PlacedBuilding, definitions: &'a BuildingDefinitions) -> Option<(&'a Mine, u32)> {
+    let entry = definitions.get(placed.definition_id.as_deref()?)?;
+    let mine = entry.building.mine.as_ref()?;
+    Some((mine, entry.building.ground_level))
+}
+
+/// How many mining levels this shaft ever reaches: every level whose floor
+/// is still at or above [`Mine::min_level_y`], counting from level 0 —
+/// ticket 117's "total = levels from level_floor(0) down to min_level_y".
+fn total_levels(frame: &MineFrame, mine: &Mine) -> u32 {
+    let diff = frame.level_floor(0) - mine.min_level_y;
+    (diff / frame.level_spacing()) as u32 + 1
+}
+
+/// The panel's "Level" line: the level currently being sunk toward or
+/// mined, 1-based of the shaft's total, and the world Y its floor sits (or
+/// will sit) at.
+fn level_line(frame: &MineFrame, mine: &Mine, progress: &MineProgress) -> String {
+    let total = total_levels(frame, mine);
+    let (index, floor_y) = match &progress.phase {
+        Phase::Sinking { target } => (frame.level_at_floor(*target).unwrap_or(0), *target),
+        Phase::Mining(cursor) => (cursor.level, progress.bottom),
+        Phase::MinedOut => (total - 1, frame.level_floor(total - 1)),
+    };
+    format!("Level: {} of {total} (floor Y {floor_y})", index + 1)
+}
+
+/// The panel's "Shaft" line: the primary shaft's current bottom and how far
+/// it has been sunk from the surface.
+fn shaft_line(frame: &MineFrame, progress: &MineProgress) -> String {
+    format!("Shaft: bottom Y {}, {} blocks deep", progress.bottom, frame.floor_y - progress.bottom)
+}
+
+fn arm_name(arm: Arm) -> &'static str {
+    match arm {
+        Arm::North => "north",
+        Arm::South => "south",
+    }
+}
+
+/// How many of a level's `rows_per_arm * 4` galleries are closed (dug to
+/// their end, void-run-stopped, refused or bedrock — the panel doesn't
+/// distinguish, ticket 117) as of `cursor`'s position. Rows behind the
+/// cursor are always fully resolved one way or another (dug to completion,
+/// or never opened because their arm closed first — see `MINES_DESIGN.md`'s
+/// "row 0 north, row 0 south, row 1 north, …"), so they count in full; the
+/// current row counts whichever of its two arms the cursor has already
+/// finished or is presently working.
+fn closed_galleries(cursor: &LevelCursor) -> u32 {
+    let side_closed = |side: Arm| -> u32 {
+        if cursor.arm_closed[side.index()] {
+            return 2;
+        }
+        if cursor.arm != side {
+            // North always precedes South within a row; a side that isn't
+            // the cursor's current one and isn't closed is either done
+            // (South's turn, North finished) or not started yet (North's
+            // turn, South waiting).
+            return if side == Arm::North { 2 } else { 0 };
+        }
+        match &cursor.step {
+            RowStep::Galleries { faces, .. } => faces.iter().filter(|f| f.closed).count() as u32,
+            RowStep::Secondary => 0,
+        }
+    };
+    cursor.row * 4 + side_closed(Arm::North) + side_closed(Arm::South)
+}
+
+/// The panel's "Phase" line: which of mining/sinking/mined-out this mine is
+/// in, with that phase's own progress detail.
+fn phase_line(frame: &MineFrame, mine: &Mine, progress: &MineProgress) -> String {
+    match &progress.phase {
+        Phase::Mining(cursor) => {
+            let level = frame.level(cursor.level);
+            let rows_per_arm = level.rows_per_arm(mine.level_reach as i32);
+            let total_galleries = rows_per_arm * 4;
+            let closed = closed_galleries(cursor);
+            format!(
+                "Phase: mining — north arm {} m, south arm {} m, row {} of {rows_per_arm} ({}), galleries {closed} of {total_galleries} closed",
+                cursor.arm_reach[Arm::North.index()],
+                cursor.arm_reach[Arm::South.index()],
+                cursor.row + 1,
+                arm_name(cursor.arm),
+            )
+        }
+        Phase::Sinking { target } => {
+            let flights = (progress.bottom - target) / frame.level_spacing();
+            let plural = if flights == 1 { "" } else { "s" };
+            format!("Phase: sinking to Y {target} ({flights} flight{plural} left)")
+        }
+        Phase::MinedOut => "Phase: mined out".to_string(),
+    }
+}
+
+/// The panel's "Job" line — only shown while a job is actually pending for
+/// this building (ticket 117): the same "in flight" hint a gatherer's dig
+/// has none of, useful here since a mine job can take a moment.
+fn job_line(budget: u32) -> String {
+    format!("Job: digging ({budget} blocks budget)")
+}
+
 /// Egui window: the selected building's name, position, rotation, and — if
 /// it's a producer — its running state, warehouse connection, and buffer
 /// (with a "Clear buffer" debug button, ticket 107); for a gatherer, its
-/// working area and the buttons to draw or clear one (ticket 111). Draws
-/// nothing at all with nothing selected; see the module docs.
+/// working area and the buttons to draw or clear one (ticket 111); for a
+/// mine, its level/shaft/phase/job progress (ticket 117). Draws nothing at
+/// all with nothing selected; see the module docs.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn inspect_panel(
     mut contexts: EguiContexts,
@@ -138,6 +246,7 @@ pub(super) fn inspect_panel(
     mut production: ResMut<ProductionState>,
     coverage: Option<Res<Coverage>>,
     economy: Res<EconomyConfig>,
+    mine_state: Option<Res<MineState>>,
     mut tool: Option<ResMut<ActiveTool>>,
 ) {
     let Some(id) = selected.0 else { return };
@@ -201,6 +310,27 @@ pub(super) fn inspect_panel(
                     work_area.clear = true;
                 }
             });
+        }
+
+        if let Some((mine, ground_level)) = mine_definition(placed, &definitions) {
+            let frame = MineFrame::from_placement(placed, mine, ground_level);
+            let fresh_progress;
+            let progress = match mine_state.as_deref().and_then(|state| state.progress.get(&id)) {
+                Some(progress) => progress,
+                None => {
+                    fresh_progress = MineProgress::new(&frame);
+                    &fresh_progress
+                }
+            };
+
+            ui.separator();
+            ui.label("Mine");
+            ui.label(level_line(&frame, mine, progress));
+            ui.label(shaft_line(&frame, progress));
+            ui.label(phase_line(&frame, mine, progress));
+            if let Some(budget) = mine_state.as_deref().and_then(|state| state.pending_budget(id)) {
+                ui.label(job_line(budget));
+            }
         }
     });
 
@@ -479,5 +609,213 @@ mod tests {
         let city = state::City::default();
         let defs = BuildingDefinitions::default();
         assert!(warehouse_status(state::BuildingId::from_u64(0), None, &city, &defs).is_none());
+    }
+
+    // --- the mine section (ticket 117) ------------------------------------
+
+    use crate::city::definition::ShaftAt;
+    use crate::city::mine::layout::GallerySide;
+    use crate::city::mine::progress::Face;
+
+    fn mine_defs() -> BuildingDefinitions {
+        let mine = Mine {
+            shaft: ShaftAt { x: 5, z: 5 },
+            shaft_size: 6,
+            first_level_depth: 12,
+            min_level_y: 16,
+            level_reach: 100,
+            gallery_length: 200,
+            torch_spacing: 8,
+            max_void_run: 6,
+            blocks_per_minute: 60.0,
+            buffer_stacks: 512,
+            haul_at_stacks: Some(64),
+            valuables: Vec::new(),
+        };
+        let building = Building {
+            name: "Mine".to_string(),
+            blueprint: "mine.nbt".to_string(),
+            tier: 1,
+            requires: Vec::new(),
+            footprint: FootprintSpec::FromBlueprint,
+            production: None,
+            cost: Vec::new(),
+            warehouse: None,
+            farm: None,
+            gatherer: None,
+            mine: Some(mine),
+            category: Category::Production,
+            ground_level: 2,
+            integrity: Integrity { pristine_above: 0.95, ruined_below: 0.6 },
+        };
+        BuildingDefinitions::from_entries(vec![LoadedBuilding {
+            id: "mine01".to_string(),
+            path: PathBuf::new(),
+            building,
+            footprint: IVec2::ONE,
+            catalogue_id: "mine01".to_string(),
+        }])
+    }
+
+    fn mine_frame() -> MineFrame {
+        MineFrame { shaft_min: IVec2::new(100, 200), shaft_size: 6, floor_y: 64, first_level_depth: 12 }
+    }
+
+    #[test]
+    fn mine_definition_is_none_for_a_non_mine_building() {
+        let definitions = warehouse_status_defs();
+        assert!(mine_definition(&placement("warehouse01", Some("warehouse01")), &definitions).is_none());
+        assert!(mine_definition(&placement("house01", None), &definitions).is_none());
+    }
+
+    #[test]
+    fn mine_definition_reads_the_mine_block_and_ground_level() {
+        let defs = mine_defs();
+        let (mine, ground_level) =
+            mine_definition(&placement("mine01", Some("mine01")), &defs).expect("mine01 has a mine block");
+        assert_eq!(mine.min_level_y, 16);
+        assert_eq!(ground_level, 2);
+    }
+
+    #[test]
+    fn total_levels_counts_every_level_floor_down_to_min_level_y() {
+        // level_floor(0) = 64 - 12 = 52, spacing = 6 - 2 = 4: 52, 48, ..., 16 is 10 levels.
+        let f = mine_frame();
+        let defs = mine_defs();
+        let mine = defs.get("mine01").unwrap().building.mine.as_ref().unwrap();
+        assert_eq!(total_levels(&f, mine), 10);
+    }
+
+    #[test]
+    fn level_line_shows_the_current_mining_level_one_based() {
+        let f = mine_frame();
+        let defs = mine_defs();
+        let mine = defs.get("mine01").unwrap().building.mine.as_ref().unwrap();
+        let cursor = LevelCursor {
+            level: 1,
+            row: 0,
+            arm: Arm::North,
+            step: RowStep::Secondary,
+            arm_reach: [0, 0],
+            arm_closed: [false, false],
+        };
+        let floor = f.level_floor(1);
+        let progress = MineProgress { bottom: floor, phase: Phase::Mining(cursor) };
+        assert_eq!(level_line(&f, mine, &progress), format!("Level: 2 of 10 (floor Y {floor})"));
+    }
+
+    #[test]
+    fn level_line_shows_the_level_being_sunk_toward() {
+        let f = mine_frame();
+        let defs = mine_defs();
+        let mine = defs.get("mine01").unwrap().building.mine.as_ref().unwrap();
+        let target = f.level_floor(2);
+        let progress = MineProgress { bottom: target + f.level_spacing(), phase: Phase::Sinking { target } };
+        assert_eq!(level_line(&f, mine, &progress), format!("Level: 3 of 10 (floor Y {target})"));
+    }
+
+    #[test]
+    fn level_line_shows_the_last_level_once_mined_out() {
+        let f = mine_frame();
+        let defs = mine_defs();
+        let mine = defs.get("mine01").unwrap().building.mine.as_ref().unwrap();
+        let progress = MineProgress { bottom: 16, phase: Phase::MinedOut };
+        assert_eq!(level_line(&f, mine, &progress), "Level: 10 of 10 (floor Y 16)");
+    }
+
+    #[test]
+    fn shaft_line_reports_bottom_and_depth() {
+        let f = mine_frame();
+        let progress = MineProgress { bottom: 44, phase: Phase::MinedOut };
+        assert_eq!(shaft_line(&f, &progress), "Shaft: bottom Y 44, 20 blocks deep");
+    }
+
+    #[test]
+    fn phase_line_reports_sinking_with_flights_left() {
+        let f = mine_frame();
+        let defs = mine_defs();
+        let mine = defs.get("mine01").unwrap().building.mine.as_ref().unwrap();
+        let progress = MineProgress { bottom: 44, phase: Phase::Sinking { target: 40 } };
+        assert_eq!(phase_line(&f, mine, &progress), "Phase: sinking to Y 40 (1 flight left)");
+    }
+
+    #[test]
+    fn phase_line_reports_mined_out() {
+        let f = mine_frame();
+        let defs = mine_defs();
+        let mine = defs.get("mine01").unwrap().building.mine.as_ref().unwrap();
+        let progress = MineProgress { bottom: 16, phase: Phase::MinedOut };
+        assert_eq!(phase_line(&f, mine, &progress), "Phase: mined out");
+    }
+
+    #[test]
+    fn phase_line_reports_a_fresh_row_as_no_galleries_closed() {
+        let f = mine_frame();
+        let defs = mine_defs();
+        let mine = defs.get("mine01").unwrap().building.mine.as_ref().unwrap();
+        let cursor = LevelCursor {
+            level: 0,
+            row: 0,
+            arm: Arm::North,
+            step: RowStep::Secondary,
+            arm_reach: [0, 0],
+            arm_closed: [false, false],
+        };
+        let progress = MineProgress { bottom: f.level_floor(0), phase: Phase::Mining(cursor) };
+        assert_eq!(
+            phase_line(&f, mine, &progress),
+            "Phase: mining — north arm 0 m, south arm 0 m, row 1 of 25 (north), galleries 0 of 100 closed"
+        );
+    }
+
+    #[test]
+    fn phase_line_counts_finished_rows_in_full_and_the_current_rows_own_faces() {
+        let f = mine_frame();
+        let defs = mine_defs();
+        let mine = defs.get("mine01").unwrap().building.mine.as_ref().unwrap();
+        let faces = [
+            Face { distance: 5, void_run: 0, closed: true },
+            Face { distance: 2, void_run: 0, closed: false },
+        ];
+        let cursor = LevelCursor {
+            level: 0,
+            row: 3,
+            arm: Arm::South,
+            step: RowStep::Galleries { faces, next: GallerySide::West },
+            arm_reach: [36, 32],
+            arm_closed: [false, false],
+        };
+        let progress = MineProgress { bottom: f.level_floor(0), phase: Phase::Mining(cursor) };
+        // 3 finished rows (12) + north done this row (2) + one closed south face (1) = 15.
+        assert_eq!(
+            phase_line(&f, mine, &progress),
+            "Phase: mining — north arm 36 m, south arm 32 m, row 4 of 25 (south), galleries 15 of 100 closed"
+        );
+    }
+
+    #[test]
+    fn phase_line_counts_a_permanently_closed_arm_as_closed_for_every_later_row() {
+        let f = mine_frame();
+        let defs = mine_defs();
+        let mine = defs.get("mine01").unwrap().building.mine.as_ref().unwrap();
+        let cursor = LevelCursor {
+            level: 0,
+            row: 5,
+            arm: Arm::South,
+            step: RowStep::Secondary,
+            arm_reach: [8, 20],
+            arm_closed: [true, false],
+        };
+        let progress = MineProgress { bottom: f.level_floor(0), phase: Phase::Mining(cursor) };
+        // 5 finished rows (20) + north permanently closed (2) + south not started this row (0) = 22.
+        assert_eq!(
+            phase_line(&f, mine, &progress),
+            "Phase: mining — north arm 8 m, south arm 20 m, row 6 of 25 (south), galleries 22 of 100 closed"
+        );
+    }
+
+    #[test]
+    fn job_line_names_the_pending_budget() {
+        assert_eq!(job_line(96), "Job: digging (96 blocks budget)");
     }
 }
