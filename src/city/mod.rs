@@ -489,6 +489,7 @@ pub fn run() {
     let journal = load_journal(&save_root);
     let stock = load_stock(&save_root, &economy_config);
     let production = load_logistics(&save_root, &city);
+    let mine_state = load_mines(&save_root, &city);
 
     app.insert_resource(RenderFloor(FloorPolicy::BelowSurface { margin: 16 }))
         // Ticket 070: further than the viewer's default 10. The RTS camera
@@ -513,6 +514,7 @@ pub fn run() {
         .insert_resource(economy_config)
         .insert_resource(stock)
         .insert_resource(production)
+        .insert_resource(mine_state)
         .insert_resource(CitySavePath(if save_root.as_os_str().is_empty() { None } else { Some(save_root) }))
         // Ticket 061, roadmap C4: hot reload, seeded above so the first
         // `Update` tick doesn't immediately redo the load just above.
@@ -525,6 +527,7 @@ pub fn run() {
         .add_plugins(farm::FarmPlugin)
         .add_plugins(production::ProductionPlugin)
         .add_plugins(gatherer::GathererPlugin)
+        .add_plugins(mine::MinePlugin)
         .add_plugins(tool::ToolPlugin)
         .add_plugins(picking::PickingPlugin)
         .add_plugins(placement::PlacementPlugin)
@@ -547,7 +550,14 @@ pub fn run() {
         // time they're written — see the module docs' "Save world".
         .add_systems(
             Last,
-            (flush_world_on_exit, save_city_on_exit, save_journal_on_exit, save_stock_on_exit, save_logistics_on_exit)
+            (
+                flush_world_on_exit,
+                save_city_on_exit,
+                save_journal_on_exit,
+                save_stock_on_exit,
+                save_logistics_on_exit,
+                save_mines_on_exit,
+            )
                 .chain(),
         )
         .run();
@@ -801,6 +811,46 @@ fn save_logistics_on_exit(
 
     if let Err(err) = production::save_logistics(&production, save_root) {
         println!("block_viewer: could not save production state: {err}");
+    }
+}
+
+/// Loads [`mine::MineState`] from `save_root`. Same "logged and started
+/// empty rather than refused" contract [`load_logistics`] gives a version
+/// mismatch, for the same reason: a mine's progress regenerates by
+/// fast-forwarding through its own tunnels (see `mine`'s own module docs),
+/// unlike a placement or a baseline.
+fn load_mines(save_root: &Path, city: &state::City) -> mine::MineState {
+    if save_root.as_os_str().is_empty() {
+        return mine::MineState::default();
+    }
+
+    match mine::load_mines(save_root, city) {
+        Ok(loaded) => {
+            if loaded.progress.len() > 0 {
+                println!(
+                    "block_viewer: loaded {} mine{} from {}",
+                    loaded.progress.len(),
+                    if loaded.progress.len() == 1 { "" } else { "s" },
+                    mine::mines_file_path_for_log(save_root).display(),
+                );
+            }
+            loaded
+        }
+        Err(err) => {
+            println!("block_viewer: could not load mine progress, starting empty: {err}");
+            mine::MineState::default()
+        }
+    }
+}
+
+fn save_mines_on_exit(mut exit_events: EventReader<AppExit>, state: Res<mine::MineState>, save_path: Res<CitySavePath>) {
+    if exit_events.read().count() == 0 {
+        return;
+    }
+    let Some(save_root) = &save_path.0 else { return };
+
+    if let Err(err) = mine::save_mines(&state, save_root) {
+        println!("block_viewer: could not save mine progress: {err}");
     }
 }
 

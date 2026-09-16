@@ -1503,3 +1503,26 @@ Y=0 in the world and won't be cleaned up by this fix — see the ticket.
   then hover somewhere between ~32 and the 96-item cap rather than ever
   sitting at `buffer full` with a warehouse in reach. Cut the road and the
   hut should fill all the way to 96 and only then stall.
+
+- [ ] **116 Mine simulation tick: a placed Mine actually digs.** `cargo
+  test` is green (job budgeting, the slice loop, settling and persistence
+  are all covered against synthetic samplers/apps), but nothing has ever
+  driven this against a real save. At `cargo run --bin citybuilder`, place
+  a Mine (placeholder geometry, ticket 118 gives it a real model) on
+  flat, stone-heavy terrain with a warehouse and a road, then let it run.
+  In the citybuilder: the buffer should climb, hauls should leave for the
+  warehouse, the inspect panel's state should read `running`, and —the
+  important negative check — **nothing underground should appear and the
+  terrain around the mine should not re-mesh or flicker** as galleries
+  advance below 030's render floor; the well's mouth should be visible
+  through the placeholder floor once the shaft starts sinking. Then quit
+  (so the world flushes), open the save in Minecraft and walk down the
+  shaft: a spiral staircase with a landing at every corner, torches, and
+  corner pillars; a 4-wide cobblestone corridor north and south at the
+  bottom with pillars and torches on both walls; 2×3 galleries branching
+  east/west off it with one-sided torches; cobblestone where a gallery
+  crossed a cave; and no water anywhere in it. Also check: quitting and
+  reloading mid-dig resumes the same level/row/arm rather than restarting
+  the mine (`citybuilder/mines.ron`), and demolishing the mine leaves the
+  shaft and galleries in the world (same as a Gatherer's Hut's pit) while
+  clearing its buffer/progress.

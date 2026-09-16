@@ -155,6 +155,13 @@ pub enum ProducerState {
     /// input. Clears the moment the player draws one. A building with a
     /// `production` block never reaches this state.
     NoWorkArea,
+    /// Ticket 116: a [`super::mine`] with no mining level left below its
+    /// `min_level_y` — terminal, the same "cheaply re-checked every tick"
+    /// shape [`Depleted`](Self::Depleted) has, but distinct from it: a mine
+    /// stops because its tier's depth limit says so, not because the ground
+    /// nearby ran out. A building with a `production` or `gatherer` block
+    /// never reaches this state.
+    MinedOut,
 }
 
 impl ProducerState {
@@ -166,6 +173,7 @@ impl ProducerState {
             ProducerState::BufferFull => "buffer full",
             ProducerState::Depleted => "site levelled",
             ProducerState::NoWorkArea => "no working area",
+            ProducerState::MinedOut => "mined out",
         }
     }
 }
@@ -351,6 +359,9 @@ fn producer_haul_threshold(city: &City, definitions: &BuildingDefinitions, id: B
     }
     if let Some(gatherer) = entry.building.gatherer.as_ref() {
         return super::gatherer::gatherer_haul_threshold(gatherer, economy);
+    }
+    if let Some(mine) = entry.building.mine.as_ref() {
+        return super::mine::mine_haul_threshold(mine, economy);
     }
     u64::MAX
 }

@@ -38,6 +38,7 @@ use super::super::definition::BuildingDefinitions;
 use super::super::economy::EconomyConfig;
 use super::super::gatherer::gatherer_buffer_capacity;
 use super::super::inventory::{short_name, Parcel};
+use super::super::mine::mine_buffer_capacity;
 use super::super::picking::SelectedBuilding;
 use super::super::placement::rotation_degrees;
 use super::super::production::{buffer_capacity, Producer, ProductionState};
@@ -77,6 +78,9 @@ fn producer_capacity(placed: &PlacedBuilding, definitions: &BuildingDefinitions,
     }
     if let Some(gatherer) = entry.building.gatherer.as_ref() {
         return gatherer_buffer_capacity(gatherer, economy);
+    }
+    if let Some(mine) = entry.building.mine.as_ref() {
+        return mine_buffer_capacity(mine, economy);
     }
     0
 }

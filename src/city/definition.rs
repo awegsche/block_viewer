@@ -417,11 +417,7 @@ impl Mine {
 
     /// The fill level, in stacks, past which a partial stack is hauled —
     /// see [`haul_at_stacks`](Self::haul_at_stacks). Always strictly below
-    /// `buffer_stacks` for a definition that passed [`validate`]. No
-    /// non-test caller yet — `city::mine`'s tick (ticket 116) is what will
-    /// use it, the same gap `Gatherer::haul_threshold_stacks` sat in
-    /// between tickets 086 and 111.
-    #[allow(dead_code)]
+    /// `buffer_stacks` for a definition that passed [`validate`].
     pub fn haul_threshold_stacks(&self) -> u32 {
         self.haul_at_stacks.unwrap_or(self.buffer_stacks / 2)
     }

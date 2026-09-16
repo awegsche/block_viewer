@@ -204,9 +204,11 @@ pub fn warehouse_of<'a>(
 /// an unserved farm does, not silently skip coverage because its output
 /// isn't a chosen recipe.
 fn is_producer(city: &City, definitions: &BuildingDefinitions, id: BuildingId) -> bool {
-    city.definition_of(id)
-        .and_then(|definition| definitions.get(definition))
-        .is_some_and(|definition| definition.building.production.is_some() || definition.building.gatherer.is_some())
+    city.definition_of(id).and_then(|definition| definitions.get(definition)).is_some_and(|definition| {
+        definition.building.production.is_some()
+            || definition.building.gatherer.is_some()
+            || definition.building.mine.is_some()
+    })
 }
 
 /// The whole coverage pass — see the module docs. A plain function over its
@@ -368,7 +370,7 @@ impl PartialOrd for Step {
 mod tests {
     use super::*;
     use crate::blueprint::Rotation;
-    use crate::city::definition::{Building, Category, FootprintSpec, Integrity, LoadedBuilding, Production, ProductionItem};
+    use crate::city::definition::{Building, Category, FootprintSpec, Integrity, LoadedBuilding, Mine, Production, ProductionItem, ShaftAt};
     use crate::city::road::RoadPieceVariant;
     use crate::city::road_definition::{LoadedRoadType, RoadType};
     use crate::city::state::ROAD_CELL_SIZE;
@@ -406,6 +408,37 @@ mod tests {
 
     fn warehouse(radius_cells: u32, storage: u64) -> Warehouse {
         Warehouse { radius_cells, concurrent_hauls: 2, handling_minutes: 0.0, storage }
+    }
+
+    fn mine_only_building() -> Building {
+        let mut def = building(None, None);
+        def.mine = Some(Mine {
+            shaft: ShaftAt { x: 5, z: 5 },
+            shaft_size: 6,
+            first_level_depth: 12,
+            min_level_y: 16,
+            level_reach: 100,
+            gallery_length: 200,
+            torch_spacing: 8,
+            max_void_run: 6,
+            blocks_per_minute: 60.0,
+            buffer_stacks: 512,
+            haul_at_stacks: Some(64),
+            valuables: Vec::new(),
+        });
+        def
+    }
+
+    /// Ticket 116: a mine fills the same buffer a `production`/`gatherer`
+    /// block does, so it has to be recognised as a producer for the same
+    /// reason 086's own note gives — without this a mine never gets a
+    /// warehouse.
+    #[test]
+    fn is_producer_is_true_for_a_mine_only_definition() {
+        let definitions = definitions(&[("mine01", mine_only_building())]);
+        let mut city = City::default();
+        let id = place(&mut city, "mine01", IVec2::new(0, 0));
+        assert!(is_producer(&city, &definitions, id));
     }
 
     fn definitions(entries: &[(&str, Building)]) -> BuildingDefinitions {

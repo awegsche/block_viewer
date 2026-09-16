@@ -44,6 +44,7 @@ use super::super::economy::EconomyConfig;
 use super::super::farm::FarmCoverage;
 use super::super::gatherer::gatherer_buffer_capacity;
 use super::super::journal::Journal;
+use super::super::mine::mine_buffer_capacity;
 use super::super::production::{buffer_capacity, ProductionState};
 use super::super::warehouse::{Coverage, StorageCapacity};
 use super::super::save::{SaveCommand, SaveState};
@@ -281,6 +282,11 @@ fn producer_lines(
                     definition
                         .and_then(|definition| definition.building.gatherer.as_ref())
                         .map(|gatherer| gatherer_buffer_capacity(gatherer, economy))
+                })
+                .or_else(|| {
+                    definition
+                        .and_then(|definition| definition.building.mine.as_ref())
+                        .map(|mine| mine_buffer_capacity(mine, economy))
                 })
                 .unwrap_or(0);
             let mut state = match &producer.short_of {
