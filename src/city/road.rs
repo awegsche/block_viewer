@@ -68,8 +68,9 @@
 //!
 //! Everything above works in road-cell space only — nothing yet ties a
 //! *building*'s footprint to the road cells next to it. [`touching_road_cells`]
-//! is that bridge (a building's footprint tiles' block-adjacent neighbours,
-//! resolved to cells via [`state::cell_of`]), and [`is_building_connected`]/
+//! is that bridge (every cell the footprint covers, fully or partially, via
+//! [`state::cell_of`] — then that cell's own cardinal neighbours), and
+//! [`is_building_connected`]/
 //! [`buildings_connected`]/[`buildings_reachable_from`] are the roadmap's own
 //! "is this building on the road network"/"what does this road segment
 //! reach" questions, answered by composing it with [`reachable_from`]/
@@ -284,29 +285,35 @@ pub fn is_connected(city: &City, a: IVec2, b: IVec2) -> bool {
 // primitives already above rather than a second BFS or a second occupancy
 // walk.
 
-/// Every road cell orthogonally adjacent to `building`'s footprint — the
-/// candidate connection points [`is_building_connected`]/
-/// [`buildings_connected`] check against. A road cell can never overlap a
-/// building's own footprint tiles ([`state::City::place_building`]'s and
-/// [`state::City::add_road_cell`]'s shared occupancy grid rules that out), so
-/// checking every footprint tile's four block-adjacent neighbours — not just
-/// the ones on the footprint's outer edge — is correct, if a little
-/// redundant for a building's interior tiles: an interior neighbour is
-/// always another footprint tile, never a road cell, so it simply never
-/// matches. A large footprint can neighbour more than one cell along a
-/// single edge (a road cell is [`state::ROAD_CELL_SIZE`] blocks wide; a
-/// building's footprint is measured in single blocks) — this returns all of
-/// them, not just the nearest.
-#[allow(dead_code)] // no consumer yet — see the module docs' F4 section
+/// Every road cell orthogonally adjacent to a cell `building`'s footprint
+/// fully or partially covers — the candidate connection points
+/// [`is_building_connected`]/[`buildings_connected`] check against, and
+/// [`super::warehouse::compute_coverage`]'s own start set.
+///
+/// Deliberately lenient, and cell-grained rather than block-grained: every
+/// footprint tile is resolved to the single [`state::cell_of`] road cell it
+/// falls in — call that cell "covered" by the building, whether the
+/// building fills it edge to edge or only clips one corner — and then it's
+/// *that* cell's cardinal neighbours that get checked for a road, not the
+/// building's own block-adjacent tiles. A road touching any part of a
+/// covered cell's territory counts as touching the building; the building
+/// doesn't have to reach all the way to that cell's edge itself. A road cell
+/// can never overlap a building's own footprint tiles
+/// ([`state::City::place_building`]'s and [`state::City::add_road_cell`]'s
+/// shared occupancy grid rules that out), so a covered cell never turns up
+/// as its own answer. A large footprint can cover more than one cell — this
+/// returns every road cell adjacent to any of them, not just the nearest.
 pub fn touching_road_cells(city: &City, building: &PlacedBuilding) -> HashSet<IVec2> {
-    const BLOCK_NEIGHBOURS: [IVec2; 4] = [IVec2::new(0, -1), IVec2::new(0, 1), IVec2::new(1, 0), IVec2::new(-1, 0)];
+    let covered: HashSet<IVec2> = state::footprint_tiles(building.origin, building.footprint, building.rotation)
+        .map(state::cell_of)
+        .collect();
 
     let mut cells = HashSet::new();
-    for tile in state::footprint_tiles(building.origin, building.footprint, building.rotation) {
-        for offset in BLOCK_NEIGHBOURS {
-            let cell = state::cell_of(tile + offset);
-            if is_road(city, cell) {
-                cells.insert(cell);
+    for &cell in &covered {
+        for direction in Direction::ALL {
+            let neighbour = cell + direction.offset();
+            if is_road(city, neighbour) {
+                cells.insert(neighbour);
             }
         }
     }
@@ -739,6 +746,23 @@ mod tests {
         let building = city.building(id).unwrap();
 
         assert_eq!(touching_road_cells(&city, building), HashSet::from([IVec2::new(0, 0), IVec2::new(1, 0)]));
+    }
+
+    /// The leniency this function is for: a footprint that only clips the
+    /// corner of a cell, nowhere near that cell's own edge, still "covers"
+    /// the whole cell — so a road on the *far* side of it counts as
+    /// touching. Block-adjacency alone would find nothing here.
+    #[test]
+    fn touching_road_cells_finds_a_road_on_the_far_side_of_a_partially_covered_cell() {
+        let mut city = City::default();
+        // Tile (2, 2) is deep inside cell (0, 0) (tiles 0..6 x 0..6) --
+        // 3 blocks from every edge of that cell, let alone a road cell.
+        let id = city.place_building("house01", None, IVec3::new(2, 64, 2), Rotation::Deg0, IVec2::ONE).unwrap();
+        // Road one cell east of (0, 0), sharing no tile with the footprint.
+        city.add_road_cell(IVec2::new(1, 0), "dirt", 64, None, RoadPieceVariant::Surface).unwrap();
+        let building = city.building(id).unwrap();
+
+        assert_eq!(touching_road_cells(&city, building), HashSet::from([IVec2::new(1, 0)]));
     }
 
     #[test]
