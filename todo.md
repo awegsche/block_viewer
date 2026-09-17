@@ -1538,3 +1538,19 @@ Y=0 in the world and won't be cleaned up by this fix — see the ticket.
   mine whose `min_level_y` is set just under its first level's floor (so
   it mines out almost immediately), the phase settles on `mined out` and
   stays there — no flicker back to `mining` or `sinking` on a later tick.
+- [ ] **120 palette shape drift fix: savegame `01` actually opens and looks
+  right.** `ranvil`'s `ChunkRegion::load_chunks` now normalizes the three
+  newer palette-entry shapes (`DataVersion` 5023) back to the legacy one on
+  read — verified headlessly via `ranvil-cli --save 01 column 0,0` (real
+  terrain instead of the old "unexpected NBT type" error / all-air), and via
+  new unit tests in `ranvil/src/chunkregion.rs` covering all three shapes plus
+  a chunk mixing old and new shapes across sections. Not run in the window:
+  `cargo run --bin block_viewer` (or `citybuilder`), open savegame `01`, and
+  confirm (1) the window opens without the previous failure/empty-looking
+  world, (2) terrain streams in and looks like real generated terrain (not
+  flat/all-air), and (3) block properties survived — point the block
+  inspector at a stair, log, or anything with an orientation and confirm the
+  properties line isn't empty. If any of that's still wrong, check whether
+  `world::decode_chunk`/`viewer::paint`/`city::*` are all getting their chunk
+  `NbtField` through `ChunkRegion::get_chunk` (the normalization only runs
+  there) rather than parsing raw NBT some other way.
