@@ -258,6 +258,9 @@ const DIRECTION_INDEPENDENT_PROPERTIES: &[&str] = &[
     "can_summon",
     "vertical_direction",
     "sculk_sensor_phase",
+    // Ticket 118: a lantern's mount (ceiling vs. floor) has no horizontal
+    // direction to rotate.
+    "hanging",
 ];
 
 /// The `north`/`south`/`east`/`west` property keys, present as a group on
@@ -654,6 +657,16 @@ mod tests {
         let s = BlockState {
             name: "minecraft:oak_slab".to_string(),
             properties: vec![("type".to_string(), "top".to_string()), ("waterlogged".to_string(), "true".to_string())],
+        };
+        let r = rotate_block_state(&s, 1).unwrap();
+        assert_eq!(r, s);
+    }
+
+    #[test]
+    fn lantern_hanging_passes_through_unchanged() {
+        let s = BlockState {
+            name: "minecraft:lantern".to_string(),
+            properties: vec![("hanging".to_string(), "false".to_string())],
         };
         let r = rotate_block_state(&s, 1).unwrap();
         assert_eq!(r, s);

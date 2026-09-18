@@ -3,16 +3,17 @@
 // mechanic, is what makes it a second building (see mine01.ron for the
 // shared design notes and MINES_DESIGN.md for the full geometry).
 //
-// PLACEHOLDER GEOMETRY, the warehouse01 way — see mine01.ron and
-// ../../../todo.md; a real mine02.nbt lands with ticket 118.
+// Shares mine01.nbt (ticket 118) — the warehouse01/02 way, per
+// MINES_DESIGN.md's "Tiers": tiers differ by depth and rate, not visible
+// geometry.
 Building(
     name: "Deep Mine",
-    blueprint: "lumber.nbt",
+    blueprint: "mine.nbt",
     tier: 2,
     requires: ["mine01"],
     category: Production,
     footprint: Explicit(x: 16, z: 16),
-    ground_level: 2,
+    ground_level: 1,
     cost: [
         (block: "minecraft:oak_planks", count: 96),
         (block: "minecraft:oak_log", count: 48),

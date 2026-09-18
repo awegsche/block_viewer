@@ -3,20 +3,20 @@
 // the full geometry. Like the Gatherer's Hut, it has no recipe: what comes
 // out is whatever was actually there, resolved through drops.ron.
 //
-// PLACEHOLDER GEOMETRY, the warehouse01 way: `blueprint` points at
-// lumber.nbt because no real headframe/shaft-house export exists yet. The
-// `footprint`/`ground_level` below are already the real numbers the mine's
-// layout math is built around; a real mine01.nbt exported over it (ticket
-// 118) will look correct without touching this file. See ../../../todo.md.
+// Real geometry (ticket 118): mine.nbt, a timber headframe over the shaft
+// with a storage shed and yard decoration. The headframe floor (y=1) is one
+// uniform cobblestone slab across the whole shaft footprint — lining, ring
+// and interior alike, the same material city::mine::layout's GROUND
+// constant digs with underground — so there is no seam at the shaft's
+// border whether or not the mine has started sinking yet.
 Building(
     name: "Mine",
-    blueprint: "lumber.nbt",
+    blueprint: "mine.nbt",
     tier: 1,
     requires: [],
     category: Production,
     footprint: Explicit(x: 16, z: 16),
-    // Borrowed from lumber.ron, describing the borrowed blueprint.
-    ground_level: 2,
+    ground_level: 1,
     cost: [
         (block: "minecraft:oak_planks", count: 64),
         (block: "minecraft:oak_log", count: 32),

@@ -1283,16 +1283,26 @@ Y=0 in the world and won't be cleaned up by this fix — see the ticket.
   the whole job; nothing in `src/` has to change. Until then, a city with two
   warehouses and a farm is three identical houses, which is worth knowing
   before eyeballing anything.
-- [ ] **113 placeholder geometry: mine01/02/03 need a real `.nbt` export.**
-  `assets/city/buildings/mine01.ron`, `mine02.ron` and `mine03.ron` all point
-  `blueprint` at `lumber.nbt`, because no headframe/shaft-house export exists
-  yet — so all three currently place a lumberjack's hut. Their
-  `footprint: Explicit(x: 16, z: 16)` is already the size the design's shaft
-  math is built around, so exporting a real `mine01.nbt` (etc., the 019-024
-  selection -> "Save structure" flow in `block_viewer`) and pointing
-  `blueprint` at it is the whole job — nothing in `src/` has to change. See
-  ticket 118. Until then, a city with a Mine is a lumberjack's hut with a
-  much bigger buffer.
+- [ ] **118 Mine: a real model (`mine.nbt`).** `cargo test --lib` is green
+  (`struct validate` and the four-rotation `struct rotate` round-trip both
+  pass headlessly), but nothing has driven it in either the citybuilder or
+  Minecraft. At `cargo run --bin citybuilder`, place a Mine on reasonably
+  flat ground: it should now look like a timber headframe with a lantern
+  turret over the shaft and a lean-to storage shed, not the borrowed
+  lumberjack's hut. Confirm the headframe floor reads as one continuous
+  cobblestone slab under the whole shaft square — no visible seam or
+  differently-coloured patch where the ring/lining sits versus the rest of
+  the floor — both before the mine starts digging and (per ticket 116's own
+  to-do, above) once the well opens through it. Then quit and open the save
+  in Minecraft: walk up to the headframe (double door on the north side,
+  open framing on the east wall, pitched roof, open-topped lantern turret
+  directly over the well) and the attached storage shed (double chest,
+  barrels); check the yard decoration (rail + hopper stub, fenced ore pile,
+  log pile, water trough, lanterns) reads as intended and that nothing
+  underground is visible or disturbed by the surface model itself. Also
+  place one at each of the four rotations (or drag-rotate one while
+  placing) and confirm the door/turret/shed stay attached to the headframe
+  correctly rather than drifting off it.
 - [ ] **077/078/079 economy, end to end in the real app.** `cargo run --bin
   citybuilder` against a real save. Build a `Wheat Farm` and a `Warehouse`,
   drag a dirt road between them, and watch the City panel: the farm's row
@@ -1508,14 +1518,16 @@ Y=0 in the world and won't be cleaned up by this fix — see the ticket.
   test` is green (job budgeting, the slice loop, settling and persistence
   are all covered against synthetic samplers/apps), but nothing has ever
   driven this against a real save. At `cargo run --bin citybuilder`, place
-  a Mine (placeholder geometry, ticket 118 gives it a real model) on
-  flat, stone-heavy terrain with a warehouse and a road, then let it run.
+  a Mine (real headframe model as of ticket 118) on flat, stone-heavy
+  terrain with a warehouse and a road, then let it run.
   In the citybuilder: the buffer should climb, hauls should leave for the
   warehouse, the inspect panel's state should read `running`, and —the
   important negative check — **nothing underground should appear and the
   terrain around the mine should not re-mesh or flicker** as galleries
   advance below 030's render floor; the well's mouth should be visible
-  through the placeholder floor once the shaft starts sinking. Then quit
+  through the headframe's cobblestone floor once the shaft starts sinking,
+  with no seam between the pre-placed floor and the freshly-dug ring/lining
+  around it. Then quit
   (so the world flushes), open the save in Minecraft and walk down the
   shaft: a spiral staircase with a landing at every corner, torches, and
   corner pillars; a 4-wide cobblestone corridor north and south at the
