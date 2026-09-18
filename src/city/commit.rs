@@ -461,7 +461,7 @@ fn poll_commit(
                 journal.record_placement(building, placement.clone(), baseline, Ledger { credited, debited: spent });
             }
             write_status.record_success(WriteKind::Placed, placement.catalogue_id.clone(), &report);
-            edited.send(ChunksEdited(report.chunks));
+            edited.send(ChunksEdited::from_report(&report));
             // Ticket 110: a road beside this footprint may now want its
             // connected piece. Only from this arm — a rolled-back placement
             // never changed what any road cell touches.
@@ -742,7 +742,7 @@ mod tests {
             blocks_written: 1,
             chunks: vec![(0, 0)],
             regions: vec![(0, 0)],
-            replaced: Some(vec![(IVec3::new(0, 64, 0), BlockState::air())]),
+            replaced: Some(vec![(IVec3::new(0, 64, 0), BlockState::air())]), ..Default::default()
         };
         let task = pool().spawn(async move { Ok(report) });
 
@@ -758,7 +758,7 @@ mod tests {
 
         let fired: Vec<_> = app.world_mut().resource_mut::<Events<ChunksEdited>>().drain().collect();
         assert_eq!(fired.len(), 1);
-        assert_eq!(fired[0].0, vec![(0, 0)]);
+        assert_eq!(fired[0].chunks(), vec![(0, 0)]);
 
         // Ticket 110: the road re-tile hears about the footprint that landed.
         let footprints: Vec<_> = app.world_mut().resource_mut::<Events<BuildingFootprintChanged>>().drain().collect();
@@ -842,7 +842,7 @@ mod tests {
             blocks_written: 3,
             chunks: vec![(0, 0)],
             regions: vec![(0, 0)],
-            replaced: Some(replaced.clone()),
+            replaced: Some(replaced.clone()), ..Default::default()
         };
         app.world_mut().resource_mut::<CommitState>().pending =
             Some(pending_that_replaced(building, replaced, a_parcel(&[("minecraft:oak_planks", 40)]), Ok(report)));
@@ -893,7 +893,7 @@ mod tests {
             blocks_written: 1,
             chunks: vec![(0, 0)],
             regions: vec![(0, 0)],
-            replaced: Some(replaced.clone()),
+            replaced: Some(replaced.clone()), ..Default::default()
         };
         let mut pending = pending_that_replaced(building, replaced, Parcel::default(), Ok(report));
         std::mem::swap(&mut pending.spent, &mut spent);

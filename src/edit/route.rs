@@ -31,7 +31,7 @@ use std::collections::BTreeMap;
 
 use mc_anvil::chunkregion::ChunkRegion;
 
-use super::{apply, plan, EditPolicy, EditRefusal, EditReport, WorldEdit};
+use super::{apply, plan, ChunkBorders, EditPolicy, EditRefusal, EditReport, WorldEdit};
 use crate::edit::address_of;
 use crate::region_cache::RegionCache;
 
@@ -252,18 +252,23 @@ pub(crate) fn refusal_for(coord: (i32, i32), unavailable: RegionUnavailable) -> 
 /// `(5, 32)` sorts before `(7, 0)` and they live in different files).
 fn merge(reports: Vec<((i32, i32), EditReport)>) -> EditReport {
     let mut merged = EditReport::default();
+    // `chunks` and `borders` are parallel lists, so they're sorted as pairs
+    // (ticket 123) — a chunk belongs to exactly one region, so no key
+    // repeats across the concatenation.
+    let mut chunks: Vec<((i32, i32), ChunkBorders)> = Vec::new();
 
     for (region_coord, report) in reports {
         merged.blocks_written += report.blocks_written;
         merged.regions.push(region_coord);
-        merged.chunks.extend(report.chunks);
+        chunks.extend(report.chunks.into_iter().zip(report.borders));
         if let Some(replaced) = report.replaced {
             merged.replaced.get_or_insert_with(Vec::new).extend(replaced);
         }
     }
 
     merged.regions.sort_unstable();
-    merged.chunks.sort_unstable();
+    chunks.sort_unstable_by_key(|(chunk, _)| *chunk);
+    (merged.chunks, merged.borders) = chunks.into_iter().unzip();
     if let Some(replaced) = merged.replaced.as_mut() {
         replaced.sort_unstable_by_key(|(at, _)| (at.y, at.z, at.x));
     }

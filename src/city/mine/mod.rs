@@ -405,10 +405,10 @@ fn poll_jobs(
                 state.progress.insert(id, job.progress);
                 state.retry_single.remove(&id);
 
-                let chunks: Vec<(i32, i32)> =
-                    report.chunks.iter().copied().filter(|&(cx, cz)| chunk_reaches_above_floor(&job.edit, cx, cz, &world)).collect();
-                if !chunks.is_empty() {
-                    edited.send(ChunksEdited(chunks));
+                let mut chunks = ChunksEdited::from_report(report);
+                chunks.0.retain(|&((cx, cz), _)| chunk_reaches_above_floor(&job.edit, cx, cz, &world));
+                if !chunks.0.is_empty() {
+                    edited.send(chunks);
                 }
             }
             Err(err) => {
@@ -553,6 +553,73 @@ mod tests {
             buffer_stacks,
             haul_at_stacks: None,
             valuables: Vec::new(),
+        }
+    }
+
+    /// Throughput probe, not a pass/fail test (`#[ignore]`d): how long one
+    /// real mine job holds the region-cache lock — the whole of
+    /// [`dispatch_jobs`]'s task body (survey + plan + `apply_building_edit`),
+    /// against the real save, in memory only (nothing is written to disk).
+    /// Every chunk-load task blocks on that same lock for as long as this
+    /// takes, so this number times jobs-per-second is the fraction of the
+    /// time streaming can't fetch a chunk at all. Run with:
+    ///
+    /// `cargo test --lib city::mine::tests::probe -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn probe_real_mine_job_lock_hold_time() {
+        use mc_anvil::region::REGION_WIDTH_IN_CHUNKS;
+        use std::time::Instant;
+
+        let saves = mc_anvil::get_saves().expect("could not read the Minecraft saves directory");
+        let meta = saves.into_iter().find(|s| !s.regions.is_empty()).expect("need a save with at least one region");
+        let (rx, rz) = meta.regions[0];
+        let half = (REGION_WIDTH_IN_CHUNKS / 2) as i32;
+        let chunk = (rx * REGION_WIDTH_IN_CHUNKS as i32 + half, rz * REGION_WIDTH_IN_CHUNKS as i32 + half);
+        let shaft_min = IVec2::new(chunk.0 * 16 + 4, chunk.1 * 16 + 4);
+
+        let mut cache = RegionCache::new(meta, 25);
+        let t = Instant::now();
+        cache.get_or_load(crate::region_cache::chunk_to_region_coord(chunk)).unwrap();
+        println!("region load: {:?}", t.elapsed());
+
+        // The surface under the shaft: highest non-air block in a column.
+        let probe = Box3::new(IVec3::new(shaft_min.x, -64, shaft_min.y), IVec3::new(shaft_min.x, 319, shaft_min.y));
+        let sampler = survey(&probe, &mut cache).expect("survey");
+        let floor_y = (-64..=319)
+            .rev()
+            .find(|&y| sampler.block(IVec3::new(shaft_min.x, y, shaft_min.y)).is_some_and(|s| s.name != "minecraft:air"))
+            .expect("some terrain") + 1;
+        println!("floor_y {floor_y} at shaft {shaft_min:?}");
+
+        // mine01.ron's numbers.
+        let mine = mine_with(6, 12, 16, 6, 60.0, 512);
+        let frame = MineFrame { shaft_min, shaft_size: 6, floor_y, first_level_depth: 12 };
+        let mut progress = MineProgress::new(&frame);
+
+        // Successive jobs the way `dispatch_jobs` issues them at 1x with
+        // `blocks_per_minute: 60` — one every ~second, budget rarely above
+        // a handful of blocks.
+        for job in 0..12 {
+            let t = Instant::now();
+            let (edit, cost, next, slices) =
+                run_job(&mine, &frame, progress.clone(), 4, MAX_SLICES_PER_JOB, |bounds| survey(bounds, &mut cache).ok());
+            let planned = t.elapsed();
+            let applied = if edit.is_empty() {
+                Ok(EditReport::default())
+            } else {
+                crate::city::commit::apply_building_edit(&mut cache, &edit, &MINE_EDIT_POLICY)
+            };
+            let total = t.elapsed();
+            println!(
+                "job {job}: {:?} total (plan {:?}), {} slices, {} edits, cost {cost}, {:?}",
+                total,
+                planned,
+                slices.len(),
+                edit.edits().len(),
+                applied.as_ref().map(|r| r.chunks.len()).map_err(|e| e.to_string()),
+            );
+            progress = next;
         }
     }
 
@@ -802,7 +869,7 @@ mod tests {
     // --- settle_job -----------------------------------------------------------
 
     fn report(chunks: usize, written: usize) -> EditReport {
-        EditReport { blocks_written: written, chunks: vec![(0, 0)][..chunks].to_vec(), regions: vec![(0, 0)], replaced: None }
+        EditReport { blocks_written: written, chunks: vec![(0, 0)][..chunks].to_vec(), regions: vec![(0, 0)], replaced: None, ..Default::default() }
     }
 
     #[test]

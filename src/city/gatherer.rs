@@ -396,10 +396,10 @@ fn poll_digs(mut state: ResMut<GathererDigState>, mut production: ResMut<Product
         if let Err(err) = &result {
             println!("block_viewer: gatherer dig failed: {err}");
         }
-        let chunks = if let Ok(report) = &result { Some(report.chunks.clone()) } else { None };
+        let chunks = result.as_ref().ok().map(ChunksEdited::from_report);
         settle_dig(production.entry(id), &edit, &result, &drops);
         if let Some(chunks) = chunks {
-            edited.send(ChunksEdited(chunks));
+            edited.send(chunks);
         }
     }
 }
@@ -733,7 +733,7 @@ mod tests {
     // --- settle_dig -----------------------------------------------------------
 
     fn report(chunks: usize, written: usize) -> EditReport {
-        EditReport { blocks_written: written, chunks: vec![(0, 0)][..chunks].to_vec(), regions: vec![(0, 0)], replaced: None }
+        EditReport { blocks_written: written, chunks: vec![(0, 0)][..chunks].to_vec(), regions: vec![(0, 0)], replaced: None, ..Default::default() }
     }
 
     #[test]

@@ -280,7 +280,7 @@ fn poll_demolish(
                 );
             }
             write_status.record_success(WriteKind::Demolished, placement.catalogue_id.clone(), &report);
-            edited.send(ChunksEdited(report.chunks));
+            edited.send(ChunksEdited::from_report(&report));
             // Ticket 110: `placement` is the pre-removal snapshot — the
             // re-tile only needs its geometry to find the cells it touched,
             // not a live `City` entry (which is gone as of `remove_building`
@@ -418,7 +418,7 @@ mod tests {
             blocks_written: 1,
             chunks: vec![(0, 0)],
             regions: vec![(0, 0)],
-            replaced: Some(vec![(IVec3::new(0, 64, 0), state_named("minecraft:stone"))]),
+            replaced: Some(vec![(IVec3::new(0, 64, 0), state_named("minecraft:stone"))]), ..Default::default()
         };
         let task = pool().spawn(async move { Ok(report) });
 
@@ -444,7 +444,7 @@ mod tests {
 
         let fired: Vec<_> = app.world_mut().resource_mut::<Events<ChunksEdited>>().drain().collect();
         assert_eq!(fired.len(), 1);
-        assert_eq!(fired[0].0, vec![(0, 0)]);
+        assert_eq!(fired[0].chunks(), vec![(0, 0)]);
 
         // Ticket 110: the re-tile gets the footprint that just left, as the
         // pre-removal snapshot — `City` no longer has it to look up.
@@ -479,7 +479,7 @@ mod tests {
             blocks_written: 1,
             chunks: vec![(0, 0)],
             regions: vec![(0, 0)],
-            replaced: Some(vec![(IVec3::new(0, 64, 0), state_named("minecraft:oak_planks"))]),
+            replaced: Some(vec![(IVec3::new(0, 64, 0), state_named("minecraft:oak_planks"))]), ..Default::default()
         };
         let task_edit = edit.clone();
         let task = pool().spawn(async move { Ok(report) });
@@ -517,7 +517,7 @@ mod tests {
             blocks_written: 1,
             chunks: vec![(0, 0)],
             regions: vec![(0, 0)],
-            replaced: Some(vec![(IVec3::new(0, 64, 0), state_named("minecraft:oak_planks"))]),
+            replaced: Some(vec![(IVec3::new(0, 64, 0), state_named("minecraft:oak_planks"))]), ..Default::default()
         };
         let task_edit = edit.clone();
         let task = pool().spawn(async move { Ok(report) });

@@ -1661,3 +1661,24 @@ Y=0 in the world and won't be cleaned up by this fix — see the ticket.
   count. `ChunkRetention`/`ChunkPreload` defaults are in
   `src/streaming.rs` if 1024/90s/2 want tuning. Ticket:
   `finished_tickets/122-chunk-streaming-preload-disc.md`.
+- [ ] **123 chunk streaming no longer starved by mine reloads: the
+  citybuilder loads chunks at a normal clip with mines digging.** Cause
+  was every mine job above the render floor buying a full reload of each
+  edited chunk plus re-meshes of all four neighbours, all serialised on
+  the block-registry lock with streaming's own loads (~10 ms per mesh,
+  one thread's worth). Fixed three ways: tasks mesh against a registry
+  snapshot with the lock released (5.6x on the probe's pooled pass),
+  only neighbours across a border the edit actually wrote on get
+  re-meshed — and only once the reload has landed — and one chunk
+  reloads at most every 250 ms (`ChunkReloadThrottle`). Check: `cargo run
+  --bin citybuilder` against the real save with 2-3 mines placed and
+  running at 4x; pan across unloaded terrain — chunks should stream in
+  at roughly the rate they do with the game paused, not ~1/s. Also worth
+  a look now that neighbour re-meshes are border-aware: place a
+  building straddling a chunk border, then demolish it — the
+  neighbouring chunk's faces along the border should update with no
+  seam or hole either way (this path had a latent stale-snapshot bug
+  before). If a mine's digging looks laggy by up to a quarter second
+  inside the shaft, that's the throttle — `ChunkReloadThrottle` in
+  `src/chunk_pipeline.rs` is the knob. Ticket:
+  `finished_tickets/123-chunk-streaming-starved-by-mine-reloads.md`.

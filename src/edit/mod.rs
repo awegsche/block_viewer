@@ -448,6 +448,59 @@ impl std::error::Error for EditRefusal {}
 // ---- the report ---------------------------------------------------------------------------------
 // -------------------------------------------------------------------------------------------------
 
+/// Which of a chunk's four borders an edit wrote a block *on* — the
+/// outermost column of blocks along that side (ticket 123). A neighbour's
+/// mesh only ever consults this chunk's border layer (`world::mesh`'s
+/// `occludes_at` steps exactly one block across), so a neighbour on a side
+/// the edit never reached has nothing to re-mesh for. Named after the
+/// neighbour that lies across each border, in `world::mesh::Neighbors`'s
+/// convention: `north` is `z - 1`, `east` is `x + 1`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ChunkBorders {
+    pub north: bool,
+    pub south: bool,
+    pub east: bool,
+    pub west: bool,
+}
+
+impl ChunkBorders {
+    /// Every border — what a caller assumes when it can't know better.
+    pub const ALL: Self = Self { north: true, south: true, east: true, west: true };
+
+    /// The borders a block at world `at` lies on. A corner block lies on
+    /// two; an interior block on none.
+    pub fn of_block(at: IVec3) -> Self {
+        let size = SECTION_SIZE as i32;
+        let (lx, lz) = (at.x.rem_euclid(size), at.z.rem_euclid(size));
+        Self {
+            north: lz == 0,
+            south: lz == size - 1,
+            east: lx == size - 1,
+            west: lx == 0,
+        }
+    }
+
+    pub fn any(self) -> bool {
+        self.north || self.south || self.east || self.west
+    }
+
+    /// The four flags in `chunk_pipeline`'s `neighbor_coords` order —
+    /// north, south, east, west — for zipping against the neighbours.
+    pub fn as_neighbor_order(self) -> [bool; 4] {
+        [self.north, self.south, self.east, self.west]
+    }
+
+    /// The union: a border either edit touched.
+    pub fn union(self, other: Self) -> Self {
+        Self {
+            north: self.north || other.north,
+            south: self.south || other.south,
+            east: self.east || other.east,
+            west: self.west || other.west,
+        }
+    }
+}
+
 /// What an edit did, or (from [`plan`]) what it would do.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EditReport {
@@ -456,6 +509,10 @@ pub struct EditReport {
     pub blocks_written: usize,
     /// The chunks the edit lands in, ascending.
     pub chunks: Vec<(i32, i32)>,
+    /// For each chunk in `chunks`, which of its borders the edit wrote on
+    /// (ticket 123) — what `chunk_pipeline` uses to re-mesh only the
+    /// neighbours that can have changed. Same order and length as `chunks`.
+    pub borders: Vec<ChunkBorders>,
     /// The region files the edit lands in, ascending — one from [`plan`], up
     /// to four from [`route::plan_routed`], which is the number a building
     /// placed on a region corner can reach.
@@ -537,6 +594,9 @@ pub fn plan(
     // Which section Ys each chunk needs, so the section check runs once per
     // (chunk, section) rather than once per block.
     let mut sections: BTreeMap<(i32, i32), BTreeSet<i32>> = BTreeMap::new();
+    // Which borders each chunk is written on (ticket 123) — same keys as
+    // `sections`, folded in the same pass.
+    let mut borders: BTreeMap<(i32, i32), ChunkBorders> = BTreeMap::new();
 
     for BlockEdit { at, .. } in edit.edits() {
         if at.y < WORLD_MIN_Y || at.y > WORLD_MAX_Y {
@@ -556,6 +616,8 @@ pub fn plan(
             .entry(address.chunk)
             .or_default()
             .insert(section_y_of(at.y));
+        let touched = borders.entry(address.chunk).or_default();
+        *touched = touched.union(ChunkBorders::of_block(*at));
     }
 
     for (chunk, section_ys) in &sections {
@@ -579,6 +641,8 @@ pub fn plan(
     Ok(EditReport {
         blocks_written: positions.len(),
         chunks: sections.keys().copied().collect(),
+        // `borders` and `sections` share keys, so this is in `chunks`' order.
+        borders: borders.into_values().collect(),
         regions: vec![region_coord],
         replaced: None,
     })

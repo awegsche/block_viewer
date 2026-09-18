@@ -1516,7 +1516,7 @@ fn poll_road_build(
                 newly_added.len()
             );
             write_status.record_success(WriteKind::Road, format!("{} road cell(s)", newly_added.len()), &report);
-            edited.send(ChunksEdited(report.chunks));
+            edited.send(ChunksEdited::from_report(&report));
         }
         Err(err) => {
             for cell in &newly_added {
@@ -1650,7 +1650,7 @@ fn poll_retile(
                 report.chunks.len()
             );
             write_status.record_success(WriteKind::Road, what, &report);
-            edited.send(ChunksEdited(report.chunks));
+            edited.send(ChunksEdited::from_report(&report));
         }
         Err(err) => {
             for (cell, was) in previous {
@@ -2075,7 +2075,7 @@ mod tests {
         let mut app = road_build_test_app();
         app.world_mut().resource_mut::<City>().add_road_cell(IVec2::new(0, 0), "dirt", 64, None, RoadPieceVariant::Surface).unwrap();
 
-        let report = EditReport { blocks_written: 36, chunks: vec![(0, 0)], regions: vec![(0, 0)], replaced: None };
+        let report = EditReport { blocks_written: 36, chunks: vec![(0, 0)], regions: vec![(0, 0)], replaced: None, ..Default::default() };
         let task = pool().spawn(async move { Ok(report) });
         app.world_mut().resource_mut::<RoadBuildState>().pending =
             Some(PendingRoadBuild { newly_added: vec![IVec2::new(0, 0)], task });
@@ -2087,7 +2087,7 @@ mod tests {
 
         let fired: Vec<_> = app.world_mut().resource_mut::<Events<ChunksEdited>>().drain().collect();
         assert_eq!(fired.len(), 1);
-        assert_eq!(fired[0].0, vec![(0, 0)]);
+        assert_eq!(fired[0].chunks(), vec![(0, 0)]);
     }
 
     #[test]

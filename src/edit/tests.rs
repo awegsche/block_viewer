@@ -549,11 +549,44 @@ fn planning_counts_blocks_and_chunks_and_writes_nothing() {
     assert_eq!(report.blocks_written, 3);
     assert_eq!(report.chunks, vec![(0, 0), (1, 0)]);
     assert_eq!(report.replaced, None);
+    // Ticket 123: (1, 5, 1) and (2, 5, 1) are interior to chunk (0, 0);
+    // (16, 5, 1) is chunk (1, 0)'s west-most column.
+    assert_eq!(
+        report.borders,
+        vec![ChunkBorders::default(), ChunkBorders { west: true, ..Default::default() }]
+    );
 
     // The dry run is a dry run: nothing dirtied, nothing on disk changed.
     assert!(!region.is_dirty());
     region.save().expect("a no-op save");
     assert_eq!(fixture.bytes(), before);
+}
+
+/// Ticket 123: which of a chunk's borders a block lies on, including the
+/// negative-coordinate side where `%` would get it wrong, and the union a
+/// report accumulates per chunk.
+#[test]
+fn chunk_borders_of_block_and_union() {
+    let none = ChunkBorders::default();
+    assert_eq!(ChunkBorders::of_block(IVec3::new(5, 0, 5)), none);
+    assert_eq!(ChunkBorders::of_block(IVec3::new(0, 0, 5)), ChunkBorders { west: true, ..none });
+    assert_eq!(ChunkBorders::of_block(IVec3::new(15, 0, 5)), ChunkBorders { east: true, ..none });
+    assert_eq!(ChunkBorders::of_block(IVec3::new(5, 0, 0)), ChunkBorders { north: true, ..none });
+    assert_eq!(ChunkBorders::of_block(IVec3::new(5, 0, 15)), ChunkBorders { south: true, ..none });
+    // A corner lies on two borders; chunk (-1, -1)'s far corner is (-1, -1).
+    assert_eq!(
+        ChunkBorders::of_block(IVec3::new(-1, 0, -1)),
+        ChunkBorders { east: true, south: true, ..none }
+    );
+    assert_eq!(ChunkBorders::of_block(IVec3::new(-16, 0, -16)), ChunkBorders { west: true, north: true, ..none });
+
+    let west = ChunkBorders { west: true, ..none };
+    let north = ChunkBorders { north: true, ..none };
+    assert_eq!(west.union(north), ChunkBorders { west: true, north: true, ..none });
+    assert!(!none.any());
+    assert!(west.any());
+    assert_eq!(ChunkBorders::ALL.as_neighbor_order(), [true; 4]);
+    assert_eq!(north.as_neighbor_order(), [true, false, false, false]);
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -1040,6 +1073,14 @@ fn a_building_on_a_region_corner_lands_in_all_four_files() {
     // One chunk per region here, and the chunk coordinates happen to be the
     // same four numbers — the corner is where both grids meet.
     assert_eq!(report.chunks, vec![(-1, -1), (-1, 0), (0, -1), (0, 0)]);
+    // Ticket 123: each chunk's borders follow it through the merge's sort —
+    // the 4x4 square around the origin sits in the corner of each of the
+    // four chunks, i.e. on the two borders facing the origin.
+    let b = |north, south, east, west| ChunkBorders { north, south, east, west };
+    assert_eq!(
+        report.borders,
+        vec![b(false, true, true, false), b(true, false, true, false), b(false, true, false, true), b(true, false, false, true)]
+    );
 
     for x in -2..2 {
         for z in -2..2 {

@@ -404,7 +404,7 @@ fn poll_terraform(
                 }
             }
             write_status.record_success(WriteKind::Terraform, format!("{tiles} tile(s)"), &report);
-            edited.send(ChunksEdited(report.chunks));
+            edited.send(ChunksEdited::from_report(&report));
         }
         Err(err) => {
             println!("block_viewer: terraform failed: {err}");
@@ -610,7 +610,7 @@ mod tests {
     #[test]
     fn poll_terraform_success_fires_chunks_edited_and_records_the_write() {
         let mut app = terraform_test_app();
-        let report = EditReport { blocks_written: 4, chunks: vec![(0, 0)], regions: vec![(0, 0)], replaced: None };
+        let report = EditReport { blocks_written: 4, chunks: vec![(0, 0)], regions: vec![(0, 0)], replaced: None, ..Default::default() };
         let task = pool().spawn(async move { Ok(report) });
         app.world_mut().resource_mut::<TerraformBuildState>().pending = Some(PendingTerraform { tiles: 4, edit: WorldEdit::new(), task });
 
@@ -619,7 +619,7 @@ mod tests {
         assert!(app.world().resource::<TerraformBuildState>().pending.is_none());
         let fired: Vec<_> = app.world_mut().resource_mut::<Events<ChunksEdited>>().drain().collect();
         assert_eq!(fired.len(), 1);
-        assert_eq!(fired[0].0, vec![(0, 0)]);
+        assert_eq!(fired[0].chunks(), vec![(0, 0)]);
 
         let write_status = app.world().resource::<WriteStatus>();
         assert!(matches!(write_status.last(), Some(super::super::write_status::LastWrite::Success(_))));
@@ -638,7 +638,7 @@ mod tests {
             blocks_written: written.len(),
             chunks: vec![(0, 0)],
             regions: vec![(0, 0)],
-            replaced: Some(replaced.iter().map(|(at, name)| (*at, name.parse().unwrap())).collect()),
+            replaced: Some(replaced.iter().map(|(at, name)| (*at, name.parse().unwrap())).collect()), ..Default::default()
         };
         let task = pool().spawn(async move { Ok(report) });
         app.world_mut().resource_mut::<TerraformBuildState>().pending =

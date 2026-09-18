@@ -263,7 +263,7 @@ fn poll_undo(
             );
             write_status.record_success(WriteKind::Undo, definition.clone(), &report);
             undo.state = UndoState::Done { definition, kind };
-            edited.send(ChunksEdited(report.chunks));
+            edited.send(ChunksEdited::from_report(&report));
             // Ticket 110: undoing a placement removes a footprint, undoing a
             // demolition puts one back — the road re-tile re-reads the cells
             // beside it the same way either direction.
@@ -448,7 +448,7 @@ mod tests {
             definition: "house01".to_string(),
             kind: UndoneKind::Placement,
             task: pool().spawn(async {
-                Ok(EditReport { blocks_written: 1, chunks: vec![(0, 0)], regions: vec![(0, 0)], replaced: None })
+                Ok(EditReport { blocks_written: 1, chunks: vec![(0, 0)], regions: vec![(0, 0)], replaced: None, ..Default::default() })
             }),
         });
         app.world_mut().resource_mut::<UndoCommand>().state = UndoState::Writing;

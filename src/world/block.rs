@@ -12,7 +12,13 @@ pub struct BlockId(pub u16);
 /// `BlockId(0)` is reserved for `"minecraft:air"` — [`BlockRegistry::new`]
 /// interns it first, and [`decode_chunk`](crate::world::decode::decode_chunk)
 /// relies on that to fast-path uniform-air sections.
-#[derive(Debug)]
+///
+/// `Clone` (ticket 123): a chunk task locks the shared registry only for
+/// decode (the one `&mut` user, via [`intern`](Self::intern)), then meshes
+/// against a clone — a snapshot taken after this chunk's decode already
+/// holds every id the column and its neighbours use, and a real save is
+/// ~150 names, so the copy is nothing next to the mesh it unblocks.
+#[derive(Debug, Clone)]
 pub struct BlockRegistry {
     names: Vec<String>,
     ids: HashMap<String, BlockId>,

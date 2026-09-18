@@ -18,7 +18,10 @@ pub struct BiomeId(pub u16);
 /// data at all ([`decode_chunk`](crate::world::decode::decode_chunk)) can
 /// fall back to it and read back as plains rather than forcing an `Option`
 /// through the mesher.
-#[derive(Debug)]
+///
+/// `Clone` for the same reason [`super::block::BlockRegistry`] is (ticket
+/// 123): a chunk task meshes against a snapshot rather than under the lock.
+#[derive(Debug, Clone)]
 pub struct BiomeRegistry {
     names: Vec<String>,
     ids: HashMap<String, BiomeId>,

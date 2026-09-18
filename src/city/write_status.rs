@@ -177,7 +177,7 @@ mod tests {
     use crate::edit::EditRefusal;
 
     fn a_report() -> EditReport {
-        EditReport { blocks_written: 12, chunks: vec![(0, 0), (0, 1)], regions: vec![(0, 0)], replaced: None }
+        EditReport { blocks_written: 12, chunks: vec![(0, 0), (0, 1)], regions: vec![(0, 0)], replaced: None, ..Default::default() }
     }
 
     fn a_summary() -> WriteSummary {

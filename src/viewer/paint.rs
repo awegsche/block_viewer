@@ -195,7 +195,7 @@ fn poll_paint(mut paint: ResMut<PaintCommand>, mut edited: EventWriter<ChunksEdi
                 "block_viewer: painted {blocks} block(s) across {chunks} chunk(s), \
                  {regions} region file(s)"
             );
-            edited.send(ChunksEdited(summary.report.chunks));
+            edited.send(ChunksEdited::from_report(&summary.report));
             PaintState::Done { blocks, chunks, regions }
         }
         Err(err) => {
@@ -423,7 +423,7 @@ mod tests {
                         blocks_written: 9,
                         chunks: vec![(0, 0), (1, 0)],
                         regions: vec![(0, 0)],
-                        replaced: None,
+                        replaced: None, ..Default::default()
                     },
                     regions_written: vec![(0, 0)],
                     backups: vec![],
@@ -442,7 +442,7 @@ mod tests {
         let fired: Vec<_> =
             app.world_mut().resource_mut::<Events<ChunksEdited>>().drain().collect();
         assert_eq!(fired.len(), 1);
-        assert_eq!(fired[0].0, vec![(0, 0), (1, 0)]);
+        assert_eq!(fired[0].chunks(), vec![(0, 0), (1, 0)]);
     }
 
     /// A write that fails (the world open in Minecraft, a refused edit, a

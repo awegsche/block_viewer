@@ -1104,7 +1104,7 @@ mod tests {
                 blocks_written: 1,
                 chunks: vec![(0, 0)],
                 regions: vec![(0, 0)],
-                replaced: None,
+                replaced: None, ..Default::default()
             },
             dry_run,
             backup_dir: PathBuf::from("backups/stamp"),

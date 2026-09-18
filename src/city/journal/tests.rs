@@ -43,6 +43,7 @@ fn baseline_capture_lines_up_written_and_previous_by_position() {
             (IVec3::new(1, 5, 1), BlockState::air()),
             (IVec3::new(2, 5, 1), BlockState::air()),
         ]),
+        ..Default::default()
     };
 
     let baseline = Baseline::capture(&edit, &report).expect("replaced was captured");

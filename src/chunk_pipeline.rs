@@ -31,13 +31,19 @@
 //! need to stay valid globally (shared with whatever `DecodedWorld` already
 //! holds), not just within one task.
 //!
-//! A task holds the registry lock across both decode *and* mesh (mesh's
-//! face culling calls back into the registry to resolve names via
-//! [`world::is_solid`]) — that serializes background chunk tasks against
-//! each other, but never blocks the main thread, which is what actually
-//! avoids frame stutter. A per-worker registry (sharded, merged back on
-//! poll) would restore inter-task parallelism if this ever shows up in a
-//! profile; not worth the complexity yet at one save's worth of block names.
+//! A task holds the registry lock for decode only (ticket 123). Decode is
+//! the one `&mut` user — it interns — and it's ~0.5 ms; mesh only *reads*
+//! the registry (face culling resolves names via [`world::is_solid`]) and
+//! is ~10 ms, so a task clones both registries the moment decode is done
+//! and meshes against the snapshots with the lock released. Until 123 the
+//! lock was held across both, which serialised every load, re-mesh and
+//! reload task on one thread's worth of meshing — fine while the only
+//! source of mesh work was the streaming frontier, but the citybuilder's
+//! mines (ticket 116) fire `ChunksEdited` continuously, and their reloads
+//! and neighbour re-meshes starved streaming down to ~1 chunk/s. A
+//! snapshot taken after this chunk's own decode holds every id the column
+//! and its (already-decoded) neighbours can contain, so meshing against it
+//! resolves exactly what meshing under the lock would have.
 //!
 //! ## Live re-mesh on edit (ticket 034, roadmap W7)
 //!
@@ -55,14 +61,18 @@
 //!   [`start_chunk_reloads`] / [`poll_completed_chunk_reloads`] — a full
 //!   re-decode *and* re-mesh, because unlike a 005-f neighbour, these
 //!   chunks' own blocks changed;
-//! - their loaded neighbours (that weren't themselves edited) go straight
-//!   into [`PendingChunkRemeshes`] — same as 005-f, since only the mesh
-//!   at the shared boundary can have changed.
+//! - their loaded neighbours go into [`PendingChunkRemeshes`] — same as
+//!   005-f, since only the mesh at the shared boundary can have changed —
+//!   but (ticket 123) only the neighbours across a border the edit
+//!   actually wrote on ([`crate::edit::ChunkBorders`]), and only once the
+//!   reload has *landed*. Queuing them at edit time, as 034 first did,
+//!   re-meshed every neighbour against the edited chunk's stale column and
+//!   nothing re-meshed them again afterwards.
 //!
 //! A coordinate that isn't currently in [`DecodedWorld`] is dropped rather
 //! than queued: it isn't on screen, and whenever it does stream in,
 //! [`load_and_mesh_chunk`] decodes it from the (already-edited) region for
-//! free.
+//! free. Reloads of one chunk are rate-limited by [`ChunkReloadThrottle`].
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -70,6 +80,7 @@ use std::sync::{Arc, Mutex};
 use bevy::prelude::*;
 use bevy::tasks::{block_on, poll_once, AsyncComputeTaskPool, Task};
 
+use crate::edit::{ChunkBorders, EditReport};
 use crate::region_cache::{chunk_to_region_coord, RegionCache};
 use crate::streaming::PendingChunkWork;
 use crate::world::warn::WarnLedger;
@@ -223,12 +234,40 @@ impl InFlightChunkRemeshes {
 
 /// Fired when an edit ([`crate::edit`], roadmap W4/W5) commits: the chunks
 /// whose blocks actually changed, straight from
-/// [`crate::edit::EditReport::chunks`]. Nothing in this crate sends it yet
-/// — that's W8 and the city's building placement — but the pipeline that
-/// reacts to it ([`queue_edited_chunk_reloads`]) is W7's, ticket 034, so it
-/// exists ahead of any caller.
+/// [`crate::edit::EditReport::chunks`], each paired with which of its
+/// borders the edit wrote on ([`EditReport::borders`], ticket 123) so the
+/// pipeline re-meshes only the neighbours that can have changed. The
+/// pipeline that reacts to it ([`queue_edited_chunk_reloads`]) is W7's,
+/// ticket 034.
 #[derive(Event, Debug, Clone)]
-pub struct ChunksEdited(pub Vec<(i32, i32)>);
+pub struct ChunksEdited(pub Vec<((i32, i32), ChunkBorders)>);
+
+impl ChunksEdited {
+    /// Every chunk `report` wrote, with its borders. A report built without
+    /// them (a hand-made one in a test) falls back to
+    /// [`ChunkBorders::ALL`] per chunk — the conservative reading.
+    pub fn from_report(report: &EditReport) -> Self {
+        Self(
+            report
+                .chunks
+                .iter()
+                .enumerate()
+                .map(|(i, &chunk)| (chunk, report.borders.get(i).copied().unwrap_or(ChunkBorders::ALL)))
+                .collect(),
+        )
+    }
+
+    /// `chunks` with every border assumed touched — for a sender that
+    /// doesn't know which.
+    pub fn all_borders(chunks: impl IntoIterator<Item = (i32, i32)>) -> Self {
+        Self(chunks.into_iter().map(|chunk| (chunk, ChunkBorders::ALL)).collect())
+    }
+
+    /// Just the coordinates, in order.
+    pub fn chunks(&self) -> Vec<(i32, i32)> {
+        self.0.iter().map(|&(chunk, _)| chunk).collect()
+    }
+}
 
 /// How many completed chunk-reload tasks (ticket 034) get uploaded per
 /// frame — the reload equivalent of [`ChunkUploadBudget`]/[`ChunkRemeshBudget`].
@@ -249,16 +288,33 @@ impl Default for ChunkReloadBudget {
 /// changed their blocks — as opposed to [`PendingChunkRemeshes`], whose
 /// coordinates only need their mesh rebuilt against unchanged blocks.
 /// Populated by [`queue_edited_chunk_reloads`], drained by
-/// [`start_chunk_reloads`].
+/// [`start_chunk_reloads`]. Each carries the union of the borders every
+/// edit since its last dispatch wrote on (ticket 123): two edits to the same
+/// chunk before it gets a turn collapse into one reload whose completion
+/// re-meshes the neighbours either of them reached.
 #[derive(Resource, Default)]
-pub struct PendingChunkReloads(HashSet<(i32, i32)>);
+pub struct PendingChunkReloads(HashMap<(i32, i32), ChunkBorders>);
 
 impl PendingChunkReloads {
     /// Mirrors [`PendingChunkRemeshes::cancel_out_of_range`]: a coordinate
     /// the camera has since left render distance shouldn't reload.
     pub(crate) fn cancel_out_of_range(&mut self, desired: &HashSet<(i32, i32)>) {
-        self.0.retain(|coord| desired.contains(coord));
+        self.0.retain(|coord, _| desired.contains(coord));
     }
+
+    /// Queues `coord`, folding `borders` into whatever is already queued.
+    fn queue(&mut self, coord: (i32, i32), borders: ChunkBorders) {
+        let queued = self.0.entry(coord).or_default();
+        *queued = queued.union(borders);
+    }
+}
+
+/// One reload in flight: its task, plus the borders the edit that caused it
+/// touched, carried along so [`poll_completed_chunk_reloads`] knows which
+/// neighbours to re-mesh once the fresh column has actually landed.
+struct InFlightReload {
+    task: Task<Option<ChunkLoadResult>>,
+    borders: ChunkBorders,
 }
 
 /// In-flight reload tasks (ticket 034), keyed by chunk coordinate — the
@@ -267,12 +323,58 @@ impl PendingChunkReloads {
 /// everything but which queue triggered it, decoding and meshing the same
 /// way [`load_and_mesh_chunk`] already does.
 #[derive(Resource, Default)]
-pub struct InFlightChunkReloads(HashMap<(i32, i32), Task<Option<ChunkLoadResult>>>);
+pub struct InFlightChunkReloads(HashMap<(i32, i32), InFlightReload>);
 
 impl InFlightChunkReloads {
     /// Mirrors [`InFlightChunkRemeshes::cancel_out_of_range`].
     pub(crate) fn cancel_out_of_range(&mut self, desired: &HashSet<(i32, i32)>) {
         self.0.retain(|coord, _| desired.contains(coord));
+    }
+}
+
+/// How often one chunk may be reloaded (ticket 123). A source of edits that
+/// keeps hitting the same chunk every frame — a mine fast-forwarding
+/// through air at a job per frame, a gallery advancing a block at a time —
+/// would otherwise reload it every frame, each reload a full decode + mesh
+/// plus the neighbour re-meshes, and that alone can saturate the task pool.
+///
+/// Leading-edge with a trailing catch-up: a chunk that hasn't reloaded for
+/// `min_interval` reloads *immediately* (a placed building shows up as fast
+/// as ever); anything queued for it within the interval waits in
+/// [`PendingChunkReloads`] — accumulating borders — and goes out as one
+/// reload when the interval is up. So a chunk is never more than
+/// `min_interval` stale, and never reloads more than `1 / min_interval`
+/// times a second, however many edits land on it.
+#[derive(Resource, Debug, Clone)]
+pub struct ChunkReloadThrottle {
+    pub min_interval: std::time::Duration,
+    /// When each coordinate's last reload was dispatched, on
+    /// [`Time::elapsed`]'s clock. Pruned of entries older than the interval
+    /// on every pass, so it holds at most a recent frame's worth of chunks.
+    last_dispatch: HashMap<(i32, i32), std::time::Duration>,
+}
+
+impl Default for ChunkReloadThrottle {
+    fn default() -> Self {
+        Self {
+            min_interval: std::time::Duration::from_millis(250),
+            last_dispatch: HashMap::new(),
+        }
+    }
+}
+
+impl ChunkReloadThrottle {
+    /// Whether `coord` may reload at `now`; records the dispatch if so.
+    /// Also prunes entries the interval has already expired, since nothing
+    /// will ever consult them again.
+    fn admit(&mut self, coord: (i32, i32), now: std::time::Duration) -> bool {
+        let interval = self.min_interval;
+        self.last_dispatch.retain(|_, at| now.saturating_sub(*at) < interval);
+        if self.last_dispatch.contains_key(&coord) {
+            return false;
+        }
+        self.last_dispatch.insert(coord, now);
+        true
     }
 }
 
@@ -333,6 +435,7 @@ impl Plugin for ChunkLoadPipelinePlugin {
             .init_resource::<PendingChunkReloads>()
             .init_resource::<InFlightChunkReloads>()
             .init_resource::<ChunkReloadBudget>()
+            .init_resource::<ChunkReloadThrottle>()
             .init_resource::<RenderFloor>()
             .add_event::<ChunksEdited>()
             .add_systems(
@@ -608,46 +711,41 @@ pub(crate) fn poll_completed_chunk_remeshes(
 }
 
 /// Reads every [`ChunksEdited`] event fired this frame (ticket 034) and
-/// turns each edit's chunk list into queued work: every edited chunk goes
-/// into [`PendingChunkReloads`] (its own blocks changed, so it needs a full
-/// re-decode); every one of *those* chunks' loaded neighbours that wasn't
-/// itself edited goes into [`PendingChunkRemeshes`] instead (005-f's
-/// existing queue — only its mesh at the shared boundary can have changed).
-/// A neighbour that isn't loaded is left alone here the same way
-/// [`poll_completed_chunk_loads`] leaves one alone: [`start_chunk_remeshes`]
-/// drops anything not actually in [`DecodedWorld`] when it drains the queue.
+/// queues every edited chunk into [`PendingChunkReloads`] — its own blocks
+/// changed, so it needs a full re-decode — with the borders the edit wrote
+/// on. Neighbours are *not* queued here (ticket 123): that's
+/// [`poll_completed_chunk_reloads`]'s job once the fresh column has landed,
+/// so their re-mesh sees the post-edit blocks rather than the stale ones
+/// still in [`DecodedWorld`] at this point.
 pub(crate) fn queue_edited_chunk_reloads(
     mut events: EventReader<ChunksEdited>,
     mut pending_reloads: ResMut<PendingChunkReloads>,
-    mut pending_remeshes: ResMut<PendingChunkRemeshes>,
 ) {
     for ChunksEdited(chunks) in events.read() {
-        let edited: HashSet<(i32, i32)> = chunks.iter().copied().collect();
-        for &coord in chunks {
-            pending_reloads.0.insert(coord);
-            for neighbor in neighbor_coords(coord) {
-                if !edited.contains(&neighbor) {
-                    pending_remeshes.0.insert(neighbor);
-                }
-            }
+        for &(coord, borders) in chunks {
+            pending_reloads.queue(coord, borders);
         }
     }
 }
 
 /// Spawns an [`AsyncComputeTaskPool`] task for every coordinate in
-/// [`PendingChunkReloads`] that isn't already reloading and is currently in
+/// [`PendingChunkReloads`] that isn't already reloading, is currently in
 /// [`DecodedWorld`] (ticket 034) — a coordinate not loaded isn't on screen,
 /// and the next real load will decode it from the already-edited region for
-/// free, so it's dropped rather than queued for later.
+/// free, so it's dropped rather than queued for later — and that
+/// [`ChunkReloadThrottle`] admits (ticket 123).
 ///
-/// Unlike [`start_chunk_remeshes`], a coordinate already in flight is left
-/// in the pending set instead of being dropped: see the ticket's "Watch
-/// out" — a second edit to a chunk mid-reload must still get its own
-/// reload once the first one clears, because nothing else will re-trigger
-/// it the way a later neighbour arrival does for 005-f's frontier case.
+/// Unlike [`start_chunk_remeshes`], a coordinate already in flight (or
+/// throttled) is left in the pending set instead of being dropped: see the
+/// ticket's "Watch out" — a second edit to a chunk mid-reload must still get
+/// its own reload once the first one clears, because nothing else will
+/// re-trigger it the way a later neighbour arrival does for 005-f's
+/// frontier case.
 pub(crate) fn start_chunk_reloads(
     mut pending: ResMut<PendingChunkReloads>,
     mut in_flight: ResMut<InFlightChunkReloads>,
+    mut throttle: ResMut<ChunkReloadThrottle>,
+    time: Res<Time>,
     decoded_world: Res<DecodedWorld>,
     region_cache: Option<Res<SharedRegionCache>>,
     atlas: Option<Res<SharedAtlasIndex>>,
@@ -661,20 +759,21 @@ pub(crate) fn start_chunk_reloads(
         return;
     };
     let floor_policy = render_floor.0;
+    let now = time.elapsed();
 
+    // Dropped-because-unloaded first, so an unloaded chunk never occupies a
+    // throttle slot.
+    pending.0.retain(|coord, _| decoded_world.columns.contains_key(coord));
     let ready: Vec<(i32, i32)> = pending
         .0
-        .iter()
+        .keys()
         .copied()
-        .filter(|coord| !in_flight.0.contains_key(coord))
+        .filter(|coord| !in_flight.0.contains_key(coord) && throttle.admit(*coord, now))
         .collect();
 
     let pool = AsyncComputeTaskPool::get();
     for coord in ready {
-        pending.0.remove(&coord);
-        if !decoded_world.columns.contains_key(&coord) {
-            continue; // Not on screen; the next real load reads the edit for free.
-        }
+        let Some(borders) = pending.0.remove(&coord) else { continue };
 
         let neighbors = owned_neighbors_of(coord, &decoded_world.columns);
         let region_cache = region_cache.0.clone();
@@ -694,7 +793,7 @@ pub(crate) fn start_chunk_reloads(
                 floor_policy,
             )
         });
-        in_flight.0.insert(coord, task);
+        in_flight.0.insert(coord, InFlightReload { task, borders });
     }
 }
 
@@ -706,6 +805,19 @@ pub(crate) fn start_chunk_reloads(
 /// [`poll_completed_chunk_remeshes`]) and applies the mesh update the same
 /// spawn/swap/despawn way a re-mesh does.
 ///
+/// Then (ticket 123) queues the neighbours whose mesh the edit can have
+/// changed, now that the column they'd mesh against is the fresh one: the
+/// loaded neighbour across each border the edit wrote on, or across every
+/// border if the reload moved the column's render floor (a heightmap
+/// recompute after a surface edit) — a neighbour's faces against this
+/// chunk are culled by that floor along the whole shared side, see
+/// `world::mesh::occludes`. A neighbour whose own reload is still in
+/// flight is re-queued for a reload rather than re-meshed: its running
+/// task snapshotted *this* chunk before this reload landed, so its result
+/// is already stale at the border, and a plain re-mesh now would clone its
+/// own not-yet-landed column. The follow-up reload carries no borders of
+/// its own, so the two chunks can't keep re-queuing each other.
+///
 /// A `None` result (the edit somehow left the chunk undecodable) is
 /// dropped with nothing rendered — [`load_and_mesh_chunk`] already logs a
 /// real decode failure; the routine "not fully generated" case can't
@@ -713,6 +825,8 @@ pub(crate) fn start_chunk_reloads(
 /// module, `require_full_status`).
 pub(crate) fn poll_completed_chunk_reloads(
     mut in_flight: ResMut<InFlightChunkReloads>,
+    mut pending_reloads: ResMut<PendingChunkReloads>,
+    mut pending_remeshes: ResMut<PendingChunkRemeshes>,
     mut decoded_world: ResMut<DecodedWorld>,
     mut spawned: ResMut<SpawnedChunkEntities>,
     mut commands: Commands,
@@ -726,20 +840,20 @@ pub(crate) fn poll_completed_chunk_reloads(
     };
 
     let mut completed = Vec::new();
-    for (&coord, task) in in_flight.0.iter_mut() {
-        if let Some(result) = block_on(poll_once(task)) {
-            completed.push((coord, result));
+    for (&coord, reload) in in_flight.0.iter_mut() {
+        if let Some(result) = block_on(poll_once(&mut reload.task)) {
+            completed.push((coord, reload.borders, result));
             if completed.len() >= budget.0 {
                 break;
             }
         }
     }
 
-    for (coord, result) in completed {
+    for (coord, borders, result) in completed {
         in_flight.0.remove(&coord);
         let Some(result) = result else { continue };
 
-        decoded_world.columns.insert(coord, result.column);
+        let previous = decoded_world.columns.insert(coord, result.column);
         apply_mesh_update(
             coord,
             result.mesh,
@@ -749,6 +863,19 @@ pub(crate) fn poll_completed_chunk_reloads(
             &mut mesh_of,
             &material.0,
         );
+
+        let floor_moved = previous.is_some_and(|old| old.floor_y != decoded_world.columns[&coord].floor_y);
+        let borders = if floor_moved { ChunkBorders::ALL } else { borders };
+        for (neighbor, touched) in neighbor_coords(coord).into_iter().zip(borders.as_neighbor_order()) {
+            if !touched || !decoded_world.columns.contains_key(&neighbor) {
+                continue;
+            }
+            if in_flight.0.contains_key(&neighbor) {
+                pending_reloads.queue(neighbor, ChunkBorders::default());
+            } else {
+                pending_remeshes.0.insert(neighbor);
+            }
+        }
     }
 }
 
@@ -873,29 +1000,31 @@ fn load_and_mesh_chunk(
         region.get_chunk(local_x, local_z)?.clone()
     };
 
-    // Both locks taken here, in this order, for the whole decode+mesh —
-    // same rule the module docs already state for `registry` alone, now
-    // extended to `biome_registry` so there's only ever one lock ordering
-    // to reason about.
-    let mut registry = registry.lock().expect("block registry mutex poisoned");
-    let mut biome_registry = biome_registry.lock().expect("biome registry mutex poisoned");
-    let column = match world::decode_chunk(&nbt, &mut registry, &mut biome_registry, floor_policy) {
-        Ok(column) => column,
-        // Not fully generated is routine at the edge of explored terrain —
-        // every real save has plenty of these, so logging it would just be
-        // startup-log noise, not a problem to report (ticket 008 only asks
-        // for genuine failures — corrupt/unexpected NBT — to be logged).
-        Err(world::DecodeError::NotFullyGenerated(_)) => return None,
-        Err(err) => {
-            // Once per chunk coordinate for the whole run (ticket 081), not
-            // once per attempt: a chunk that streams out and back in is the
-            // same corrupt chunk, and re-reporting it every time the camera
-            // revisits the area drowns out everything else.
-            if UNDECODABLE_CHUNK.first_time(&format!("{coord:?}")) {
-                println!("block_viewer: skipping chunk {coord:?} — failed to decode: {err}");
+    // Both locks taken here, in this order, for decode only — the one lock
+    // ordering to reason about — and released (with a snapshot of each
+    // registry taken) before the mesh; see the module docs' "Send boundary".
+    let (column, registry, biome_registry) = {
+        let mut registry = registry.lock().expect("block registry mutex poisoned");
+        let mut biome_registry = biome_registry.lock().expect("biome registry mutex poisoned");
+        let column = match world::decode_chunk(&nbt, &mut registry, &mut biome_registry, floor_policy) {
+            Ok(column) => column,
+            // Not fully generated is routine at the edge of explored terrain —
+            // every real save has plenty of these, so logging it would just be
+            // startup-log noise, not a problem to report (ticket 008 only asks
+            // for genuine failures — corrupt/unexpected NBT — to be logged).
+            Err(world::DecodeError::NotFullyGenerated(_)) => return None,
+            Err(err) => {
+                // Once per chunk coordinate for the whole run (ticket 081), not
+                // once per attempt: a chunk that streams out and back in is the
+                // same corrupt chunk, and re-reporting it every time the camera
+                // revisits the area drowns out everything else.
+                if UNDECODABLE_CHUNK.first_time(&format!("{coord:?}")) {
+                    println!("block_viewer: skipping chunk {coord:?} — failed to decode: {err}");
+                }
+                return None;
             }
-            return None;
-        }
+        };
+        (column, registry.clone(), biome_registry.clone())
     };
     let mesh = mesh_column_with_neighbors(
         &column,
@@ -924,8 +1053,11 @@ fn remesh_chunk_column(
     color_maps: Arc<ColorMaps>,
     neighbors: OwnedNeighbors,
 ) -> ChunkRemeshResult {
-    let registry = registry.lock().expect("block registry mutex poisoned");
-    let biome_registry = biome_registry.lock().expect("biome registry mutex poisoned");
+    // Nothing to intern here — the column is already decoded — so the locks
+    // are held only long enough to snapshot (ticket 123); the mesh itself
+    // never contends with a load task's decode.
+    let registry = registry.lock().expect("block registry mutex poisoned").clone();
+    let biome_registry = biome_registry.lock().expect("biome registry mutex poisoned").clone();
     let mesh = mesh_column_with_neighbors(
         &column,
         &registry,
@@ -1162,6 +1294,132 @@ mod tests {
         assert_eq!((result.column.x, result.column.z), coord);
     }
 
+    /// Throughput probe, not a pass/fail test (`#[ignore]`d): times what one
+    /// background task costs, stage by stage, over a real render-distance
+    /// disc of the real save — the region load, then the region-cache lock
+    /// + NBT clone, decode, and mesh for every chunk — then the same disc
+    /// through the real task body on a pool, which is what ticket 123's
+    /// lock release buys (before it, the pooled number was the serial one).
+    /// Run whenever streaming "feels slow":
+    ///
+    /// `cargo test --lib chunk_pipeline::tests::probe -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn probe_serial_load_throughput_over_a_real_disc() {
+        use mc_anvil::region::REGION_WIDTH_IN_CHUNKS;
+        use std::time::Instant;
+
+        let saves = mc_anvil::get_saves().expect("could not read the Minecraft saves directory");
+        let meta = saves
+            .into_iter()
+            .find(|s| !s.regions.is_empty())
+            .expect("need a save with at least one region");
+        println!("save: {} ({} regions)", meta.name, meta.regions.len());
+        let (rx, rz) = meta.regions[0];
+
+        let region_cache = Arc::new(Mutex::new(RegionCache::new(meta, 25)));
+        let registry = Arc::new(Mutex::new(BlockRegistry::new()));
+        let biome_registry = Arc::new(Mutex::new(world::BiomeRegistry::new()));
+        let atlas = Arc::new(AtlasUvIndex::default());
+        let color_maps = stub_color_maps();
+
+        let half = (REGION_WIDTH_IN_CHUNKS / 2) as i32;
+        let center = (rx * REGION_WIDTH_IN_CHUNKS as i32 + half, rz * REGION_WIDTH_IN_CHUNKS as i32 + half);
+
+        let started = Instant::now();
+        {
+            let mut cache = region_cache.lock().unwrap();
+            cache.get_or_load(chunk_to_region_coord(center)).unwrap();
+        }
+        println!("region load: {:?}", started.elapsed());
+
+        let disc = crate::streaming::desired_chunks(center, 12);
+        let mut coords: Vec<(i32, i32)> = disc.into_iter().collect();
+        coords.sort_unstable();
+
+        let mut fetch = std::time::Duration::ZERO;
+        let mut decode = std::time::Duration::ZERO;
+        let mut mesh = std::time::Duration::ZERO;
+        let mut loaded = 0usize;
+        let total = Instant::now();
+        for coord in &coords {
+            let region_coord = chunk_to_region_coord(*coord);
+            let (lx, lz) = local_chunk_index(*coord, region_coord);
+            let t = Instant::now();
+            let nbt = {
+                let mut cache = region_cache.lock().unwrap();
+                let Ok(region) = cache.get_or_load(region_coord) else { continue };
+                let Some(nbt) = region.get_chunk(lx, lz) else { continue };
+                nbt.clone()
+            };
+            fetch += t.elapsed();
+
+            let t = Instant::now();
+            let mut reg = registry.lock().unwrap();
+            let mut bio = biome_registry.lock().unwrap();
+            let Ok(column) =
+                world::decode_chunk(&nbt, &mut reg, &mut bio, world::decode::FloorPolicy::WholeWorld)
+            else {
+                continue;
+            };
+            decode += t.elapsed();
+
+            let t = Instant::now();
+            let _ = mesh_column_with_neighbors(
+                &column,
+                &reg,
+                &bio,
+                &atlas,
+                &color_maps,
+                &OwnedNeighbors::default(),
+            );
+            mesh += t.elapsed();
+            loaded += 1;
+        }
+        let wall = total.elapsed();
+        println!(
+            "serial: {loaded}/{} chunks in {wall:?}: fetch {fetch:?}, decode {decode:?}, mesh {mesh:?} — {:.2} ms/chunk, registry {} names",
+            coords.len(),
+            wall.as_secs_f64() * 1000.0 / loaded.max(1) as f64,
+            registry.lock().unwrap().len(),
+        );
+
+        // The same disc through the real task body on a pool, the way the
+        // pipeline runs it — what ticket 123's lock release buys. The
+        // registries are shared exactly as `DecodedWorld`'s are.
+        use bevy::tasks::{block_on, AsyncComputeTaskPool, TaskPoolBuilder};
+        let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(8);
+        let pool = AsyncComputeTaskPool::get_or_init(|| TaskPoolBuilder::new().num_threads(threads).build());
+        let total = Instant::now();
+        let tasks: Vec<_> = coords
+            .iter()
+            .map(|&coord| {
+                let (region_cache, registry, biome_registry, atlas, color_maps) =
+                    (region_cache.clone(), registry.clone(), biome_registry.clone(), atlas.clone(), color_maps.clone());
+                pool.spawn(async move {
+                    load_and_mesh_chunk(
+                        coord,
+                        region_cache,
+                        registry,
+                        biome_registry,
+                        atlas,
+                        color_maps,
+                        OwnedNeighbors::default(),
+                        world::decode::FloorPolicy::WholeWorld,
+                    )
+                    .is_some()
+                })
+            })
+            .collect();
+        let loaded = tasks.into_iter().map(block_on).filter(|ok| *ok).count();
+        let wall = total.elapsed();
+        println!(
+            "pooled ({threads} threads): {loaded}/{} chunks in {wall:?} — {:.2} ms/chunk wall",
+            coords.len(),
+            wall.as_secs_f64() * 1000.0 / loaded.max(1) as f64,
+        );
+    }
+
     /// A load for a chunk whose region the save doesn't have should fail
     /// cleanly (`None`), not panic — exercised without a real save by
     /// pointing the cache at an empty [`SaveMeta`].
@@ -1200,8 +1458,9 @@ mod tests {
 
         let pool = AsyncComputeTaskPool::get_or_init(TaskPool::new);
         let mut in_flight = InFlightChunkReloads::default();
-        in_flight.0.insert((0, 0), pool.spawn(async { None }));
-        in_flight.0.insert((5, 5), pool.spawn(async { None }));
+        let reload = |task| InFlightReload { task, borders: ChunkBorders::ALL };
+        in_flight.0.insert((0, 0), reload(pool.spawn(async { None })));
+        in_flight.0.insert((5, 5), reload(pool.spawn(async { None })));
 
         let desired: HashSet<(i32, i32)> = HashSet::from([(0, 0)]);
         in_flight.cancel_out_of_range(&desired);
@@ -1219,40 +1478,192 @@ mod tests {
     #[test]
     fn pending_reloads_cancel_out_of_range_drops_coords_outside_the_desired_set() {
         let mut pending = PendingChunkReloads::default();
-        pending.0.insert((0, 0));
-        pending.0.insert((5, 5));
+        pending.queue((0, 0), ChunkBorders::ALL);
+        pending.queue((5, 5), ChunkBorders::ALL);
 
         let desired: HashSet<(i32, i32)> = HashSet::from([(0, 0)]);
         pending.cancel_out_of_range(&desired);
 
-        assert_eq!(pending.0, HashSet::from([(0, 0)]));
+        assert_eq!(pending.0.keys().copied().collect::<Vec<_>>(), vec![(0, 0)]);
     }
 
-    /// Ticket 034: firing [`ChunksEdited`] for two adjacent chunks queues
-    /// both for a full reload, and queues only the *outer* loaded
-    /// neighbours for a plain re-mesh — the shared boundary between the two
-    /// edited chunks is covered by their own reloads, so it must not also
-    /// land in [`PendingChunkRemeshes`].
+    /// Ticket 034/123: firing [`ChunksEdited`] queues every edited chunk for
+    /// a full reload, folding the borders of repeated edits to the same
+    /// chunk together, and queues *no* re-mesh yet — neighbours wait for
+    /// the reload to land (see [`poll_completed_chunk_reloads`]).
     #[test]
-    fn queue_edited_chunk_reloads_splits_edited_chunks_from_their_outer_neighbours() {
+    fn queue_edited_chunk_reloads_queues_reloads_with_merged_borders_and_no_remeshes() {
         let mut app = App::new();
         app.add_event::<ChunksEdited>()
             .init_resource::<PendingChunkReloads>()
             .init_resource::<PendingChunkRemeshes>()
             .add_systems(Update, queue_edited_chunk_reloads);
 
-        // (0, 0) and (0, 1) are edited and share a boundary; (0, -1) is the
-        // outer neighbour of (0, 0), on the opposite side from (0, 1).
-        app.world_mut()
-            .send_event(ChunksEdited(vec![(0, 0), (0, 1)]));
+        let north = ChunkBorders { north: true, ..Default::default() };
+        let east = ChunkBorders { east: true, ..Default::default() };
+        app.world_mut().send_event(ChunksEdited(vec![((0, 0), north), ((0, 1), ChunkBorders::default())]));
+        app.world_mut().send_event(ChunksEdited(vec![((0, 0), east)]));
         app.update();
 
         let reloads = &app.world().resource::<PendingChunkReloads>().0;
-        assert_eq!(*reloads, HashSet::from([(0, 0), (0, 1)]));
+        assert_eq!(reloads.len(), 2);
+        assert_eq!(reloads[&(0, 0)], ChunkBorders { north: true, east: true, ..Default::default() });
+        assert_eq!(reloads[&(0, 1)], ChunkBorders::default());
+
+        assert!(app.world().resource::<PendingChunkRemeshes>().0.is_empty(), "neighbours are queued on completion, not here");
+    }
+
+    /// Ticket 123: [`ChunksEdited::from_report`] pairs each chunk with its
+    /// borders, and reads every border as touched for a report that has
+    /// none recorded.
+    #[test]
+    fn chunks_edited_from_report_pairs_chunks_with_borders_and_defaults_to_all() {
+        let west = ChunkBorders { west: true, ..Default::default() };
+        let report = EditReport {
+            chunks: vec![(0, 0), (3, 4)],
+            borders: vec![west],
+            ..Default::default()
+        };
+        let edited = ChunksEdited::from_report(&report);
+        assert_eq!(edited.0, vec![((0, 0), west), ((3, 4), ChunkBorders::ALL)]);
+    }
+
+    /// Ticket 123: the throttle admits a chunk's first reload immediately,
+    /// refuses another inside `min_interval`, and admits again once it has
+    /// passed. Other chunks are unaffected.
+    #[test]
+    fn reload_throttle_admits_once_per_interval_per_chunk() {
+        use std::time::Duration;
+        let mut throttle = ChunkReloadThrottle { min_interval: Duration::from_millis(250), ..Default::default() };
+
+        assert!(throttle.admit((0, 0), Duration::from_millis(0)));
+        assert!(!throttle.admit((0, 0), Duration::from_millis(100)), "inside the interval");
+        assert!(throttle.admit((1, 0), Duration::from_millis(100)), "another chunk has its own slot");
+        assert!(throttle.admit((0, 0), Duration::from_millis(250)), "interval elapsed");
+        assert!(!throttle.admit((0, 0), Duration::from_millis(300)));
+        assert_eq!(throttle.last_dispatch.len(), 2);
+        // Entries the interval has expired are pruned on the next pass.
+        assert!(throttle.admit((9, 9), Duration::from_millis(10_000)));
+        assert_eq!(throttle.last_dispatch.len(), 1);
+    }
+
+    /// A [`ChunkColumn`] with nothing in it, at `floor_y` — enough for
+    /// [`poll_completed_chunk_reloads`]'s bookkeeping, which never looks at
+    /// blocks.
+    fn empty_column(coord: (i32, i32), floor_y: i32) -> ChunkColumn {
+        ChunkColumn { x: coord.0, z: coord.1, sections: Vec::new(), floor_y }
+    }
+
+    /// An `App` with just what [`poll_completed_chunk_reloads`] reads and
+    /// writes, `columns` already in [`DecodedWorld`], and one finished
+    /// reload of `coord` (yielding `result`, borders `borders`) waiting to
+    /// be polled.
+    fn reload_poll_app(
+        columns: &[((i32, i32), i32)],
+        coord: (i32, i32),
+        borders: ChunkBorders,
+        result: Option<ChunkLoadResult>,
+        also_in_flight: &[(i32, i32)],
+    ) -> App {
+        use bevy::tasks::{AsyncComputeTaskPool, TaskPool};
+        let pool = AsyncComputeTaskPool::get_or_init(TaskPool::new);
+
+        let mut app = App::new();
+        app.add_plugins(bevy::asset::AssetPlugin::default())
+            .init_asset::<Mesh>()
+            .init_resource::<InFlightChunkReloads>()
+            .init_resource::<PendingChunkReloads>()
+            .init_resource::<PendingChunkRemeshes>()
+            .init_resource::<SpawnedChunkEntities>()
+            .init_resource::<ChunkReloadBudget>()
+            .insert_resource(TerrainMaterial(Handle::default()))
+            .add_systems(Update, poll_completed_chunk_reloads);
+
+        let mut world = DecodedWorld {
+            registry: Arc::new(Mutex::new(BlockRegistry::new())),
+            biomes: Arc::new(Mutex::new(world::BiomeRegistry::new())),
+            columns: HashMap::new(),
+        };
+        for &(c, floor_y) in columns {
+            world.columns.insert(c, empty_column(c, floor_y));
+        }
+        app.insert_resource(world);
+
+        let mut in_flight = app.world_mut().resource_mut::<InFlightChunkReloads>();
+        let task = pool.spawn(async move { result });
+        // Finished tasks poll ready on the first try.
+        in_flight.0.insert(coord, InFlightReload { task, borders });
+        for &other in also_in_flight {
+            let task = pool.spawn(std::future::pending::<Option<ChunkLoadResult>>());
+            in_flight.0.insert(other, InFlightReload { task, borders: ChunkBorders::default() });
+        }
+        app
+    }
+
+    /// Ticket 123: once a reload lands, only the loaded neighbours across
+    /// the borders the edit wrote on are queued for a re-mesh — an unloaded
+    /// one and one across an untouched border are left alone.
+    #[test]
+    fn reload_completion_remeshes_only_loaded_neighbours_across_touched_borders() {
+        let borders = ChunkBorders { north: true, east: true, ..Default::default() };
+        let fresh = ChunkLoadResult { coord: (0, 0), column: empty_column((0, 0), 0), mesh: None };
+        // North (0, -1) and west (-1, 0) loaded; east (1, 0) is not.
+        let mut app = reload_poll_app(&[((0, 0), 0), ((0, -1), 0), ((-1, 0), 0)], (0, 0), borders, Some(fresh), &[]);
+
+        // A finished task may need the pool a moment; poll until it lands.
+        for _ in 0..100 {
+            app.update();
+            if app.world().resource::<InFlightChunkReloads>().0.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
 
         let remeshes = &app.world().resource::<PendingChunkRemeshes>().0;
-        assert!(remeshes.contains(&(0, -1)), "the outer neighbour should be queued for a re-mesh");
-        assert!(!remeshes.contains(&(0, 0)), "an edited chunk gets a reload, not a plain re-mesh");
-        assert!(!remeshes.contains(&(0, 1)), "an edited chunk gets a reload, not a plain re-mesh");
+        assert_eq!(*remeshes, HashSet::from([(0, -1)]), "north is touched and loaded; east touched but unloaded; west untouched");
+        assert!(app.world().resource::<PendingChunkReloads>().0.is_empty());
+    }
+
+    /// Ticket 123: a neighbour whose own reload is still in flight is
+    /// re-queued for a reload (with no borders of its own) rather than
+    /// re-meshed against a column that hasn't landed.
+    #[test]
+    fn reload_completion_requeues_a_neighbour_that_is_itself_reloading() {
+        let borders = ChunkBorders { south: true, ..Default::default() };
+        let fresh = ChunkLoadResult { coord: (0, 0), column: empty_column((0, 0), 0), mesh: None };
+        let mut app = reload_poll_app(&[((0, 0), 0), ((0, 1), 0)], (0, 0), borders, Some(fresh), &[(0, 1)]);
+
+        for _ in 0..100 {
+            app.update();
+            if app.world().resource::<InFlightChunkReloads>().0.len() == 1 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        assert!(app.world().resource::<PendingChunkRemeshes>().0.is_empty());
+        let reloads = &app.world().resource::<PendingChunkReloads>().0;
+        assert_eq!(reloads.get(&(0, 1)), Some(&ChunkBorders::default()));
+    }
+
+    /// Ticket 123: a reload that moved the column's render floor re-meshes
+    /// every loaded neighbour, whatever borders the edit wrote on — the
+    /// floor culls a neighbour's faces along the whole shared side.
+    #[test]
+    fn reload_completion_remeshes_all_neighbours_when_the_render_floor_moved() {
+        let fresh = ChunkLoadResult { coord: (0, 0), column: empty_column((0, 0), 16), mesh: None };
+        let all_four = [((0, 0), 0), ((0, -1), 0), ((0, 1), 0), ((1, 0), 0), ((-1, 0), 0)];
+        let mut app = reload_poll_app(&all_four, (0, 0), ChunkBorders::default(), Some(fresh), &[]);
+
+        for _ in 0..100 {
+            app.update();
+            if app.world().resource::<InFlightChunkReloads>().0.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        let remeshes = &app.world().resource::<PendingChunkRemeshes>().0;
+        assert_eq!(*remeshes, HashSet::from([(0, -1), (0, 1), (1, 0), (-1, 0)]));
     }
 }
