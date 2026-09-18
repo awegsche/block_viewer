@@ -499,7 +499,9 @@ pub fn run() {
         // since the render floor two lines up already keeps ~7 sections per
         // column out of decode, mesh and draw. `recommended_capacity` is
         // flat from 10 to 32 (25 resident regions either way), so the
-        // region cache doesn't grow with it.
+        // region cache doesn't grow with it. Since ticket 122 this is the
+        // radius the fog goes opaque at (256 blocks); the load disc runs
+        // `ChunkPreload` further, ~1000 chunks at the default.
         .insert_resource(RenderDistance(16))
         // Ticket 045, roadmap E1: pan/zoom/rotate over the terrain rather
         // than the viewer's free-flight rig — see `camera::CameraMode::Rts`.

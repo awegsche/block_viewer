@@ -376,6 +376,7 @@ fn setup_world(
     mut images: ResMut<Assets<Image>>,
     loaded_save: Res<LoadedSave>,
     render_distance: Res<streaming::RenderDistance>,
+    preload: Res<streaming::ChunkPreload>,
     sky_palette: Res<sky::SkyPalette>,
     camera_start_mode: Res<camera::CameraStartMode>,
 ) {
@@ -424,7 +425,7 @@ fn setup_world(
     // that used to populate the world here.
     let region_cache = region_cache::RegionCache::new(
         loaded_save.0.meta.clone(),
-        region_cache::recommended_capacity(render_distance.0),
+        region_cache::recommended_capacity(streaming::load_radius(&render_distance, &preload)),
     );
     commands.insert_resource(chunk_pipeline::SharedRegionCache(Arc::new(Mutex::new(
         region_cache,

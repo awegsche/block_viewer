@@ -8,8 +8,8 @@ use bevy_egui::{egui, EguiContexts};
 
 use crate::chunk_pipeline::{InFlightChunkLoads, SharedRegionCache};
 use crate::sky::{self, ShadowSettings, TimeOfDay};
-use crate::streaming::{LingeringChunks, PendingChunkWork, RenderDistance};
-use crate::{world, DecodedWorld};
+use crate::streaming::{self, ChunkPreload, LingeringChunks, PendingChunkWork, RenderDistance};
+use crate::{camera, world, DecodedWorld};
 
 /// Quick-jump buttons (ticket 018's UI section: "what someone actually
 /// wants nine times out of ten") — label paired with the `TimeOfDay::ticks`
@@ -43,6 +43,7 @@ pub(crate) fn status_panel(
     in_flight_loads: Res<InFlightChunkLoads>,
     region_cache: Option<Res<SharedRegionCache>>,
     mut render_distance: ResMut<RenderDistance>,
+    preload: Res<ChunkPreload>,
     mut shadow_settings: ResMut<ShadowSettings>,
     mut time_of_day: ResMut<TimeOfDay>,
 ) {
@@ -104,6 +105,15 @@ pub(crate) fn status_panel(
             ui.label("Render distance");
             ui.add(egui::Slider::new(&mut render_distance.0, 2..=32));
         });
+        // Ticket 122: the slider is what's *visible* (fog opaque at that
+        // many chunks); loading runs a couple of chunks further so the
+        // frontier stays behind the fog. Worth showing, since "Loaded
+        // chunks" above is sized to the load disc, not the slider.
+        ui.label(format!(
+            "(fog opaque at {:.0} blocks; loading {} chunks out)",
+            camera::fog_end_distance(render_distance.0),
+            streaming::load_radius(&render_distance, &preload),
+        ));
 
         // Ticket 017: this is also the fastest way for a human to measure
         // shadows' cost — flip it and watch the FPS label above. The

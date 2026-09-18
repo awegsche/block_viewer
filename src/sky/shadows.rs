@@ -57,7 +57,7 @@ impl Default for ShadowSettings {
 /// Cascade `maximum_distance` for a sun casting shadows out to
 /// `render_distance_chunks` chunks. Deliberately **not**
 /// [`camera::far_plane_distance`] outright: at render distance 32 that's
-/// ~750 blocks, and stretching 4 cascades over 750 blocks makes the near
+/// ~530 blocks, and stretching 4 cascades over 530 blocks makes the near
 /// ones coarse enough that shadow edges crawl as the camera moves. Capping
 /// at [`CASCADE_MAX_DISTANCE_CAP`] keeps the near cascades sharp and leaves
 /// distant terrain unshadowed — `camera::atmosphere_fog` is doing most of

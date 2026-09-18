@@ -1566,3 +1566,98 @@ Y=0 in the world and won't be cleaned up by this fix — see the ticket.
   `world::decode_chunk`/`viewer::paint`/`city::*` are all getting their chunk
   `NbtField` through `ChunkRegion::get_chunk` (the normalization only runs
   there) rather than parsing raw NBT some other way.
+- [ ] **121 palette shape round-trip on write: a building placed into
+  savegame `02` actually survives Minecraft loading and re-saving the
+  world.** (Save `01` turned out to be separately corrupted and was
+  replaced by `02` partway through this ticket — everything below is
+  against `02`.) Original diagnosis without opening the game: buildings the
+  citybuilder placed came back as pure air across their whole footprint,
+  traced to `edit_section` always downgrading an edited section's palette to
+  the legacy shape regardless of which shape it was read in, while leaving
+  the chunk's `DataVersion` unchanged.
+
+  The first fix (record each section's shape at read time, `edit_section`
+  re-emits a `Compact` section's palette compact) shipped a real, *live*
+  regression, caught only by actually running the citybuilder (with the
+  user's explicit one-time override of the "don't run the app" rule): it
+  made the *in-memory* chunk compact-shaped too, not just the on-disk bytes,
+  and every other reader in this crate and in `bevy_minecraft`
+  (`world::decode_chunk`, `blueprint::extract`) assumes legacy. A section's
+  *second* edit in the same session — normal, since mines re-dig the same
+  chunks repeatedly — broke on it, which is what the reported "lags and
+  prints errors" actually was: `block_viewer: extraction: chunk (-11, -19)
+  is unreadable (missing NBT field: Name) — treating it as air`, spamming
+  continuously across many chunks near both mines.
+
+  Redesigned: `edit_section` now always writes legacy in memory again (the
+  pre-121 invariant, restored); the compact re-render moved to
+  `ChunkRegion::save`, on a throwaway clone of each dirty chunk, right before
+  it becomes bytes — `self.chunks` (what every reader sees) never goes
+  compact. New tests cover the regression directly (editing a
+  compact-originated section twice in one session) and the full round trip
+  through a real region file (edit twice, save, read the raw bytes back to
+  confirm they're compact, reload fresh to confirm the blocks are right).
+  `ranvil` `cargo test`: 152 passed. `block_viewer` `cargo test --lib`: 1125
+  passed (the `road_build` ordering flake noted in earlier tickets didn't
+  trigger this run).
+
+  Re-ran the citybuilder against `02` with the redesigned fix (same
+  override): **0 decode/extraction errors** over several minutes, versus
+  continuous spam before. Chunk streaming during the initial load burst was
+  slow in absolute terms (~1 chunk/sec once the mines' jobs were active) —
+  noted as a separate, likely lower-priority performance question (region-
+  cache lock contention between mine simulation and streaming?) rather than
+  chased further, since it's not an error and wasn't what was reported.
+
+  What still needs a human at the game (this session's override was for
+  investigating the reported lag/errors, not for this specific check):
+  place a building in `02` (or a scratch copy — **back the world up
+  first**), click "Save world", quit the citybuilder, open the save in
+  Minecraft, walk near the building so the game loads and later re-saves
+  that chunk, then quit Minecraft and re-open the save in
+  `block_viewer`/`citybuilder`/`ranvil-cli`. Confirm the building's blocks
+  are still there — not air. If it's still air, the palette-shape hypothesis
+  itself (not just the in-memory bug this addendum fixed) is wrong or
+  incomplete. Separately worth a human's eye now that the errors are gone:
+  does the citybuilder still *feel* laggy against `02`, or was that fully
+  the error spam — if it's still slow, the chunk-streaming-vs-mine-
+  simulation contention noted above is the next thing to look at. Ticket:
+  `finished_tickets/121-palette-shape-round-trip-on-write.md`.
+- [ ] **Citybuilder zoom speed retune: scroll zoom no longer feels too fast,
+  especially zoomed out.** Reported symptom: scrolling to zoom out could
+  suddenly jump way out. Cause: `CameraMode::Rts` shared
+  `CameraSettings::orbit_zoom_sensitivity` (0.15) with the block viewer's
+  `Orbit` mode; since the update is multiplicative
+  (`orbit_radius *= 1 - scroll * sensitivity`), the absolute jump per wheel
+  notch grows with the current radius, so it's worst exactly when already
+  zoomed out. Fix: split off a citybuilder-only
+  `CameraSettings::rts_zoom_sensitivity`, lowered to 0.045 (from the shared
+  0.15). `cargo test --lib camera::` passes, but the actual feel needs a
+  human at the window: `cargo run --bin citybuilder` against the real save,
+  scroll in and out across the full zoom range, especially from a
+  zoomed-out state, and confirm it now ramps smoothly rather than lurching.
+  If it's still too fast (or now too slow), `rts_zoom_sensitivity` in
+  `src/camera.rs` is the only knob — it was picked by reasoning about the
+  formula, not tuned by eye. Ticket:
+  `finished_tickets/citybuilder-slower-zoom.md`.
+- [ ] **122 chunk streaming: no visible pop-in at the frontier, no reloads
+  when doubling back.** `cargo run` (viewer) and/or `cargo run --bin
+  citybuilder` against the real save. What changed: the fog now goes fully
+  opaque at exactly `render distance * 16` blocks (was: at the far plane's
+  diagonal reach, so the loaded square's edge sat in ~5-13% fog and every
+  load/unload happened in plain view), chunks load as a *disc* two chunks
+  wider than that, retention keeps ~4x as many columns behind the camera
+  (1024 lingering, 90s grace), and loads dispatch nearest-first. Check:
+  (1) fly in any direction at normal speed — terrain should never visibly
+  *end* or pop in; the frontier should be entirely hidden inside the fog
+  (the status panel's "loading N chunks out" line says how far). (2) Fly
+  ~200-300 blocks away, turn around, fly back — the console should log few
+  or no `to load` pickups on the return; "Loaded chunks (N lingering)" in
+  the status panel should climb on the way out and drain on the way back.
+  (3) Visual: the fog end is now closer than before (viewer rd=10: 160
+  blocks, was 258; citybuilder rd=16: 256, was 394). If it feels too
+  foggy, the render-distance slider is the knob — it's now an honest
+  "chunks you can see", and the cost of raising it is the real chunk
+  count. `ChunkRetention`/`ChunkPreload` defaults are in
+  `src/streaming.rs` if 1024/90s/2 want tuning. Ticket:
+  `finished_tickets/122-chunk-streaming-preload-disc.md`.

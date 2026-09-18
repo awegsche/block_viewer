@@ -13,11 +13,11 @@
 //!   happen. This module recomputes the desired set itself every frame
 //!   (the same cheap `HashSet` build 005-a's own diff does — see
 //!   `streaming`'s module docs) and cancels any in-flight task that's
-//!   fallen outside it — against the retain square (ticket 070), not the
-//!   render-distance square; see [`cancel_out_of_range_in_flight_work`].
+//!   fallen outside it — against the retain disc (ticket 070), not the
+//!   load disc; see [`cancel_out_of_range_in_flight_work`].
 //!
 //! Region cache eviction (005-b) needs no code here: `RegionCache`'s
-//! capacity is already sized to one render distance's worth of regions
+//! capacity is already sized to one load radius's worth of regions
 //! (`region_cache::recommended_capacity`, wired in `lib.rs::setup_world`), so
 //! plain LRU eviction drops regions no loaded chunk still needs — the
 //! simpler of the two options the ticket allows, chosen over a per-region
@@ -43,7 +43,7 @@ use crate::chunk_pipeline::{
     InFlightChunkReloads, InFlightChunkRemeshes, PendingChunkReloads, PendingChunkRemeshes,
     SpawnedChunkEntities,
 };
-use crate::streaming::{self, ChunkRetention, PendingChunkWork, RenderDistance};
+use crate::streaming::{self, ChunkPreload, ChunkRetention, PendingChunkWork, RenderDistance};
 use crate::DecodedWorld;
 
 /// Adds the two unload systems. Ordered `.before()` `chunk_pipeline`'s own
@@ -113,16 +113,17 @@ fn unload_chunks(
 /// to update, respawn one — see [`InFlightChunkRemeshes::cancel_out_of_range`]'s
 /// docs.
 ///
-/// The retain square rather than the render-distance square (ticket 070):
-/// `streaming` keeps columns loaded out to `render_distance + margin`, so a
-/// coordinate that slipped out of render distance mid-load is one the
-/// retain ring is about to hold on to anyway — canceling it there would
-/// throw away work that's already nearly done, and (worse) leave a hole
-/// inside the retained ring that nothing re-queues until the camera comes
-/// back. Anything outside retention is still canceled the same as before.
+/// The retain disc rather than the load disc (ticket 070): `streaming`
+/// keeps columns loaded out to `load_radius + margin`, so a coordinate that
+/// slipped out of the load disc mid-load is one the retain ring is about to
+/// hold on to anyway — canceling it there would throw away work that's
+/// already nearly done, and (worse) leave a hole inside the retained ring
+/// that nothing re-queues until the camera comes back. Anything outside
+/// retention is still canceled the same as before.
 fn cancel_out_of_range_in_flight_work(
     camera: Query<&Transform, With<camera::CameraRig>>,
     render_distance: Res<RenderDistance>,
+    preload: Res<ChunkPreload>,
     retention: Res<ChunkRetention>,
     mut in_flight: ResMut<InFlightChunkLoads>,
     mut in_flight_remeshes: ResMut<InFlightChunkRemeshes>,
@@ -135,8 +136,9 @@ fn cancel_out_of_range_in_flight_work(
     };
 
     let center = streaming::camera_chunk_coord(transform.translation);
+    let load_radius = streaming::load_radius(&render_distance, &preload);
     let retained: HashSet<(i32, i32)> =
-        streaming::desired_chunks(center, retention.retain_radius(render_distance.0));
+        streaming::desired_chunks(center, retention.retain_radius(load_radius));
     in_flight.cancel_out_of_range(&retained);
     in_flight_remeshes.cancel_out_of_range(&retained);
     pending_remeshes.cancel_out_of_range(&retained);

@@ -9,7 +9,7 @@ use crate::chunk_pipeline::{
     InFlightChunkLoads, InFlightChunkRemeshes, PendingChunkRemeshes, SharedRegionCache,
     SpawnedChunkEntities,
 };
-use crate::streaming::{self, PendingChunkWork, RenderDistance};
+use crate::streaming::{self, ChunkPreload, PendingChunkWork, RenderDistance};
 use crate::{
     camera, region_cache, region_center_point, BlockMesh, DecodedWorld, LoadedSave, StartupIssue,
 };
@@ -60,7 +60,7 @@ impl WorldReset<'_, '_> {
     /// startup does (`lib.rs::setup_world`). Every pipeline resource here
     /// derives `Default`, so resetting is just replacing each with a fresh
     /// one rather than draining it field by field.
-    fn switch_save(&mut self, meta: SaveMeta, render_distance: u32) {
+    fn switch_save(&mut self, meta: SaveMeta, load_radius: u32) {
         for (entity, mesh3d) in &self.spawned_meshes {
             self.meshes.remove(&mesh3d.0);
             self.commands.entity(entity).despawn();
@@ -79,7 +79,7 @@ impl WorldReset<'_, '_> {
         *self.lingering = streaming::LingeringChunks::default();
 
         if let Some(shared) = &mut self.shared_region_cache {
-            let capacity = region_cache::recommended_capacity(render_distance);
+            let capacity = region_cache::recommended_capacity(load_radius);
             *shared.0.lock().expect("region cache mutex poisoned") =
                 region_cache::RegionCache::new(meta.clone(), capacity);
         }
@@ -99,6 +99,7 @@ pub(crate) fn save_picker_panel(
     mut contexts: EguiContexts,
     available: Res<AvailableSaves>,
     render_distance: Res<RenderDistance>,
+    preload: Res<ChunkPreload>,
     mut reset: WorldReset,
 ) {
     // Cloned once up front so the egui closure below doesn't need to hold
@@ -163,7 +164,7 @@ pub(crate) fn save_picker_panel(
     // Applied after the window closure returns, so nothing above is still
     // borrowing `available`/`current_meta` while `reset` mutates.
     if let Some(meta) = to_load {
-        reset.switch_save(meta, render_distance.0);
+        reset.switch_save(meta, streaming::load_radius(&render_distance, &preload));
     } else if let Some(target) = to_teleport {
         reset.teleport_camera(target);
     }

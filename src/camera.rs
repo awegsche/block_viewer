@@ -162,6 +162,14 @@ pub struct CameraSettings {
     /// so repeated scroll steps feel consistent at any speed).
     pub speed_scroll_factor: f32,
     pub orbit_zoom_sensitivity: f32,
+    /// [`CameraMode::Rts`]'s own scroll-zoom sensitivity — kept apart from
+    /// `orbit_zoom_sensitivity` (the block viewer's `Orbit` mode) because a
+    /// single OS wheel notch can send several accumulated scroll lines in
+    /// one frame; at the old shared 0.15 that let one notch swing the
+    /// multiplicative `orbit_radius` update by 30-45%, an effect that gets
+    /// more jarring in absolute distance the further the citybuilder camera
+    /// is already zoomed out.
+    pub rts_zoom_sensitivity: f32,
     pub min_orbit_radius: f32,
     /// How far (blocks) the "what's under the cursor" ray-march searches
     /// before giving up and aiming straight ahead instead.
@@ -191,6 +199,7 @@ impl Default for CameraSettings {
             sprint_multiplier: 4.0,
             speed_scroll_factor: 0.2,
             orbit_zoom_sensitivity: 0.15,
+            rts_zoom_sensitivity: 0.045,
             min_orbit_radius: 2.0,
             max_ray_distance: 300.0,
             // Roughly -80°..-11°: always angled down at the terrain, never
@@ -202,13 +211,29 @@ impl Default for CameraSettings {
     }
 }
 
-/// Far clip plane distance (world units) that comfortably covers
-/// `render_distance_chunks` chunks in every horizontal direction, including
-/// the diagonal — wired to the real, tunable
+/// Where the fog is fully opaque (world units): exactly
+/// `render_distance_chunks` chunks out, in every direction. This is what
+/// [`RenderDistance`](crate::streaming::RenderDistance) *means* since ticket
+/// 122 — `streaming` loads a disc a couple of chunks wider than this (its
+/// `ChunkPreload`), so terrain is guaranteed to exist everywhere inside the
+/// fog and the loading frontier is guaranteed to sit behind it. Before 122
+/// the fog ran out to the far plane's diagonal reach while the loaded
+/// square ended `render_distance * 16` out in the cardinal directions, so
+/// chunks streamed in and out at ~5-13% fog, in plain view.
+pub fn fog_end_distance(render_distance_chunks: u32) -> f32 {
+    render_distance_chunks as f32 * world::SECTION_SIZE as f32
+}
+
+/// Far clip plane distance (world units): one chunk past
+/// [`fog_end_distance`]. Everything beyond the fog end is drawn as flat fog
+/// colour — the same colour the skydome shows below the horizon — so
+/// clipping it is invisible, and clipping there lets Bevy's frustum culling
+/// skip the preload ring's chunk meshes rather than shading them to fog.
+/// Wired to the real, tunable
 /// [`RenderDistance`](crate::streaming::RenderDistance) resource (ticket
 /// 005-e) rather than a fixed placeholder.
 pub fn far_plane_distance(render_distance_chunks: u32) -> f32 {
-    render_distance_chunks as f32 * world::SECTION_SIZE as f32 * std::f32::consts::SQRT_2 + 32.0
+    fog_end_distance(render_distance_chunks) + world::SECTION_SIZE as f32
 }
 
 /// The falloff half of [`atmosphere_fog`] — split out so
@@ -219,16 +244,17 @@ pub fn far_plane_distance(render_distance_chunks: u32) -> f32 {
 /// whatever `color` was passed in every time the render-distance slider
 /// moved.
 fn fog_falloff(render_distance_chunks: u32) -> FogFalloff {
-    let far = far_plane_distance(render_distance_chunks);
+    let end = fog_end_distance(render_distance_chunks);
     FogFalloff::Linear {
-        start: far * 0.6,
-        end: far,
+        start: end * 0.6,
+        end,
     }
 }
 
-/// A soft distance fog fading terrain out before the far plane, so chunks
-/// don't visibly pop out of existence at the render-distance edge. `color`
-/// is a caller-supplied starting value (`lib.rs::setup_world` passes
+/// A soft distance fog fading terrain out to fully opaque at
+/// [`fog_end_distance`], so chunks never visibly pop in or out — the loaded
+/// disc's edge is always past that (ticket 122). `color` is a
+/// caller-supplied starting value (`lib.rs::setup_world` passes
 /// [`crate::sky::SkyPalette::horizon_color`]) — `sky::sync_sky_palette`
 /// keeps it in sync with the palette from then on, and
 /// [`sync_render_distance_effects`] never touches it, only the falloff.
@@ -380,7 +406,7 @@ fn drive_camera(
         CameraMode::Rts => {
             if scroll != 0.0 {
                 rig.orbit_radius = (rig.orbit_radius
-                    * (1.0 - scroll * settings.orbit_zoom_sensitivity))
+                    * (1.0 - scroll * settings.rts_zoom_sensitivity))
                     .max(settings.min_orbit_radius);
             }
 
@@ -705,19 +731,41 @@ mod tests {
         let fog = app.world().get::<DistanceFog>(camera).unwrap();
         assert_eq!(fog.color, custom_color, "fog color must not follow RenderDistance");
 
-        let far = far_plane_distance(8);
+        let fog_end = fog_end_distance(8);
         match &fog.falloff {
             FogFalloff::Linear { start, end } => {
-                assert_eq!(*start, far * 0.6);
-                assert_eq!(*end, far);
+                assert_eq!(*start, fog_end * 0.6);
+                assert_eq!(*end, fog_end);
             }
             other => panic!("expected linear falloff, got {other:?}"),
         }
 
         let projection = app.world().get::<Projection>(camera).unwrap();
         match projection {
-            Projection::Perspective(perspective) => assert_eq!(perspective.far, far),
+            Projection::Perspective(perspective) => {
+                assert_eq!(perspective.far, far_plane_distance(8))
+            }
             other => panic!("expected a perspective projection, got {other:?}"),
+        }
+    }
+
+    /// Ticket 122: the fog must be opaque *before* the far plane (a clip
+    /// through unfogged terrain is a visible hard edge), and both must sit
+    /// inside the disc `streaming` loads — `render_distance + preload`
+    /// chunks, cardinal reach `(rd + 2) * 16` at the default preload of 2.
+    #[test]
+    fn fog_goes_opaque_at_render_distance_and_inside_the_loaded_disc() {
+        for rd in [2, 10, 16, 32] {
+            let fog_end = fog_end_distance(rd);
+            let far = far_plane_distance(rd);
+            let loaded_reach = (rd + streaming::ChunkPreload::default().0) as f32
+                * world::SECTION_SIZE as f32;
+            assert_eq!(fog_end, rd as f32 * 16.0);
+            assert!(fog_end < far, "rd {rd}: fog end {fog_end} not before far {far}");
+            assert!(
+                far <= loaded_reach,
+                "rd {rd}: far plane {far} past the loaded disc's cardinal reach {loaded_reach}"
+            );
         }
     }
 
