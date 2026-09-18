@@ -155,3 +155,82 @@ hypothesis was wrong (or incomplete — e.g. the real codec might be pickier
 about the bare-string-list case this fix deliberately doesn't reproduce,
 or the failure might not be palette-shape-related at all), and that check
 is where the next look starts, not back here.
+
+## Addendum — the first version of this fix caused a live regression
+
+The user reported the citybuilder lagging and printing errors continuously
+while actually running it (against save `02` — save `01` turned out to be
+separately corrupted and was replaced). With the user's explicit go-ahead to
+run the game directly for this one investigation (overriding this repo's
+usual "don't run the app yourself" rule), the console was spamming, many
+times a second, across many different chunks:
+
+```
+block_viewer: extraction: chunk (-11, -19) is unreadable (missing NBT field: Name) — treating it as air
+```
+
+Traced (by inspecting the save's raw region bytes directly, and by a
+temporary diagnostic `ranvil` example — both removed after) to a real
+regression in the fix above: **`edit_section`'s compact write made the
+in-memory chunk compact-shaped too, not just the bytes on disk.** Every
+other reader in this crate — `get_block`, `capture_replaced`,
+`BlockState::matches`/`from_palette_entry` — and in `bevy_minecraft` —
+`world::decode_chunk`, `blueprint::extract` — assumes a chunk reached
+through `ChunkRegion::get_chunk` is legacy-shaped, because
+`normalize_palettes` only ever runs once, at `load_chunks` time. The first
+edit to a `Compact` section was fine (it went in legacy, per `palette_of`,
+and came out compact, matching the design above). The *second* edit to that
+same section — the normal case, since a `ChunkRegion` stays resident across
+many placements and mine-dig jobs in one session — called `palette_of`
+again, got back the now-compact palette from the first edit, and every
+"Name"-shaped read inside `edit_section` and every downstream consumer broke
+on it. The citybuilder's mines, which re-survey and re-dig the same chunks
+repeatedly over a session, hit this on nearly every tick, which is also why
+it read as *lag*: each failure still paid for a real (failed) decode
+attempt, at frequency.
+
+### Redesign
+
+Moved the compact-write step from `edit_section` (in-memory) to
+`ChunkRegion::save` (bytes-about-to-be-written only):
+
+- `edit_section` reverted to *always* writing the legacy shape, unconditionally
+  — restoring the invariant every reader depends on. `self.chunks` never
+  becomes compact-shaped, no matter how many times a section is edited or
+  what shape it started in.
+- A new `apply_write_shapes` function does what `edit_section` used to: for
+  each dirty chunk, right before `save` clones it into a `ChunkPayload::Nbt`,
+  it walks the *clone*'s sections and re-renders any section `palette_shapes`
+  marked `Compact` via `render_compact_entry` — the same two-shape rendering
+  as before, just applied once, to a throwaway clone, at the moment it's
+  about to become bytes, never to anything `get_chunk` can still hand out.
+- `PaletteShape`, `palette_shapes`, and `render_compact_entry` are unchanged;
+  only *when* the compact rendering happens moved.
+
+Tests: the two tests that had asserted `edit_section` itself writes compact
+were rewritten to assert it writes legacy instead (`editing_a_compact_
+section_still_writes_legacy_in_memory`, and the existing legacy-section
+test), with their old assertions moved onto new tests of `apply_write_shapes`
+directly. Added the regression's own repro,
+`editing_a_section_twice_succeeds_even_though_it_started_compact` (edits a
+`Compact`-originated section twice in a row with no `ChunkRegion` save in
+between — this is what broke live), and an end-to-end test through a real
+region file, `a_compact_section_edited_twice_then_saved_round_trips_and_
+stays_compact_on_disk`, which edits a compact section twice, saves, reads
+the raw bytes back off disk to confirm they're compact, and reloads through
+a fresh `ChunkRegion` to confirm the blocks are still correct.
+
+`ranvil`: `cargo test` — 152 passed, 0 failed, 1 ignored. `block_viewer`:
+`cargo test --lib` — 1125 passed, 0 failed this run (the `road_build` flake
+noted above didn't trigger this time, consistent with it being ordering-
+dependent and unrelated).
+
+Re-ran the citybuilder against save `02` with the fix (same override, same
+session): 0 decode/extraction errors over several minutes of continuous
+running, versus continuous spam before. Chunk streaming during the initial
+load burst was slow in absolute terms (roughly 1 chunk/second once the mines'
+own jobs were active, well short of stalling but not fast either) — noted as
+a possible separate, lower-priority performance question (likely lock
+contention between mine simulation and chunk streaming over the shared
+region cache) rather than chased further here, since it's not an error and
+wasn't what was reported as broken.
