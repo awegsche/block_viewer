@@ -187,7 +187,10 @@ pub enum ShaftBlock {
     /// but only if what's already there isn't solid (a cave or a lake
     /// behind the wall gets sealed; plain rock is left alone).
     SealIfNotSolid,
-    /// A wall torch on the lining, facing into the shaft.
+    /// A wall torch in the ring's air column two above a step, hanging on
+    /// the lining behind it and facing into the shaft (ticket 127: it used
+    /// to *replace* the lining cell, leaving a niche with raw rock — or a
+    /// cave — behind the torch).
     WallTorch { facing: Side },
     /// Below the bottom, or at `floor_y` on the lining (the blueprint's own
     /// floor is authoritative there) — nothing is written.
@@ -343,10 +346,10 @@ impl MineFrame {
         let lining_min = self.shaft_min - IVec2::ONE;
         let lining_size = self.shaft_size + 2;
         if let Some(index) = perimeter_index(lining_min, lining_size, tile) {
-            return self.lining_target(tile, index, lining_size, bottom, torch_spacing, y);
+            return self.lining_target(tile, index, lining_size, bottom, y);
         }
         if let Some(index) = perimeter_index(self.shaft_min, self.shaft_size, tile) {
-            return self.ring_target(index, bottom, y);
+            return self.ring_target(tile, index, bottom, torch_spacing, y);
         }
         if self.interior_x().contains(&tile.x) && self.interior_z().contains(&tile.y) {
             return self.interior_target(bottom, y);
@@ -354,15 +357,20 @@ impl MineFrame {
         ShaftBlock::Untouched
     }
 
-    fn lining_target(
-        &self,
-        tile: IVec2,
-        index: usize,
-        lining_size: i32,
-        bottom: i32,
-        torch_spacing: i32,
-        y: i32,
-    ) -> ShaftBlock {
+    /// Whether a north/south lining cell at `(x, y)` is part of a level's
+    /// doorway: over the interior width, in the three blocks above a
+    /// level floor at or below `bottom`.
+    fn is_doorway(&self, side: Side, x: i32, bottom: i32, y: i32) -> bool {
+        if !matches!(side, Side::North | Side::South) || !self.interior_x().contains(&x) {
+            return false;
+        }
+        (1..=3).any(|dy| {
+            let level_floor = y - dy;
+            level_floor >= bottom && self.level_at_floor(level_floor).is_some()
+        })
+    }
+
+    fn lining_target(&self, tile: IVec2, index: usize, lining_size: i32, bottom: i32, y: i32) -> ShaftBlock {
         if y == self.floor_y {
             return ShaftBlock::Untouched; // the blueprint owns its own floor
         }
@@ -375,36 +383,28 @@ impl MineFrame {
         if self.level_at_floor(y).is_some() {
             return ShaftBlock::Band;
         }
-        let side = Side::from_index(s);
-        if matches!(side, Side::North | Side::South) && self.interior_x().contains(&tile.x) {
-            for dy in 1..=3 {
-                let level_floor = y - dy;
-                if level_floor >= bottom && self.level_at_floor(level_floor).is_some() {
-                    return ShaftBlock::Doorway;
-                }
-            }
-        }
-        // A torch spot: the ring step this lining cell sits directly behind
-        // (one block outward of ring position `p - 1` on the same side —
-        // the lining is the ring's square grown by one on every side, so a
-        // non-corner lining position `p` sits behind ring position `p - 1`)
-        // is a multiple of `torch_spacing` steps from the top, counted
-        // across revolutions.
-        let ring_index = (s * (self.shaft_size - 1) + (p - 1)) as usize;
-        let step_y = y - 2;
-        if step_y >= bottom
-            && let Some(k) = self.ring_revolution_at(ring_index, step_y)
-        {
-            let ring_len = 4 * (self.shaft_size - 1);
-            let step_number = ring_index as u32 + ring_len as u32 * k;
-            if torch_spacing > 0 && step_number.is_multiple_of(torch_spacing as u32) {
-                return ShaftBlock::WallTorch { facing: side.opposite() };
-            }
+        if self.is_doorway(Side::from_index(s), tile.x, bottom, y) {
+            return ShaftBlock::Doorway;
         }
         ShaftBlock::SealIfNotSolid
     }
 
-    fn ring_target(&self, index: usize, bottom: i32, y: i32) -> ShaftBlock {
+    /// Whether ring tile `index` at height `step_y` is a step whose number
+    /// from the top (counted across revolutions) is a multiple of
+    /// `torch_spacing` — the step a wall torch belongs above.
+    fn is_torch_step(&self, index: usize, bottom: i32, torch_spacing: i32, step_y: i32) -> bool {
+        if torch_spacing <= 0 || step_y < bottom {
+            return false;
+        }
+        let Some(k) = self.ring_revolution_at(index, step_y) else {
+            return false;
+        };
+        let ring_len = 4 * (self.shaft_size - 1);
+        let step_number = index as u32 + ring_len as u32 * k;
+        step_number.is_multiple_of(torch_spacing as u32)
+    }
+
+    fn ring_target(&self, tile: IVec2, index: usize, bottom: i32, torch_spacing: i32, y: i32) -> ShaftBlock {
         if y >= bottom {
             if self.ring_revolution_at(index, y).is_some() {
                 let corner = index as i32 % (self.shaft_size - 1) == 0;
@@ -417,6 +417,17 @@ impl MineFrame {
             }
             if self.ring_revolution_at(index, y + 1).is_some() {
                 return ShaftBlock::Ground; // the support under that step
+            }
+            // Head height above a torch step: the torch hangs on the lining
+            // directly behind this tile, facing back into the shaft —
+            // unless that lining is a level's doorway, which has nothing
+            // to hang it on. Revolutions are `4 * spacing` apart, so this
+            // cell is never also a step or a support.
+            if self.is_torch_step(index, bottom, torch_spacing, y - 2) {
+                let side = Side::from_index(index as i32 / (self.shaft_size - 1));
+                if !self.is_doorway(side, tile.x, bottom, y) {
+                    return ShaftBlock::WallTorch { facing: side.opposite() };
+                }
             }
         }
         if y == bottom {
@@ -900,20 +911,53 @@ mod tests {
         }
     }
 
+    /// Ticket 127: the torch is in the ring's air column, two above every
+    /// `torch_spacing`-th step, facing into the shaft — and the lining cell
+    /// it hangs on is sealed, never a torch itself.
     #[test]
-    fn torch_spots_repeat_every_torch_spacing_steps_and_face_inward() {
+    fn torch_spots_sit_two_above_every_torch_spacing_th_step_and_face_inward() {
         let f = frame(6, 12);
         let bottom = f.floor_y - 200;
-        let mut found = Vec::new();
-        for l in f.lining().filter(|l| !l.corner) {
-            for y in bottom..f.floor_y {
-                if let ShaftBlock::WallTorch { facing } = f.shaft_target(bottom, 8, IVec3::new(l.tile.x, y, l.tile.y)) {
-                    assert_eq!(facing, l.side.opposite());
-                    found.push((l.tile, y));
+        let ring_len = 4 * (f.shaft_size - 1) as u32;
+        let mut found = 0;
+        for r in f.ring() {
+            for y in bottom..=f.floor_y {
+                let at = IVec3::new(r.tile.x, y, r.tile.y);
+                if let ShaftBlock::WallTorch { facing } = f.shaft_target(bottom, 8, at) {
+                    found += 1;
+                    assert_eq!(facing, r.side.opposite(), "{at:?}");
+                    // The step it belongs to is two below and a multiple of 8
+                    // from the top.
+                    let k = f.ring_revolution_at(r.index, y - 2).expect("a step two below the torch");
+                    assert_eq!((r.index as u32 + ring_len * k) % 8, 0, "{at:?}");
+                    // It hangs on solid lining (sealed rock or a level band),
+                    // never on a doorway or another torch.
+                    let behind = match r.side {
+                        Side::North => at + IVec3::new(0, 0, -1),
+                        Side::East => at + IVec3::new(1, 0, 0),
+                        Side::South => at + IVec3::new(0, 0, 1),
+                        Side::West => at + IVec3::new(-1, 0, 0),
+                    };
+                    let behind_target = f.shaft_target(bottom, 8, behind);
+                    assert!(
+                        matches!(behind_target, ShaftBlock::SealIfNotSolid | ShaftBlock::Band | ShaftBlock::Pillar),
+                        "{at:?} hangs on {behind_target:?}"
+                    );
                 }
             }
         }
-        assert!(!found.is_empty());
+        // ~250 steps of shaft, one torch per 8 of them, minus those whose
+        // lining is a doorway.
+        assert!(found >= 10, "found {found} torches");
+        for l in f.lining() {
+            for y in bottom..=f.floor_y {
+                assert!(
+                    !matches!(f.shaft_target(bottom, 8, IVec3::new(l.tile.x, y, l.tile.y)), ShaftBlock::WallTorch { .. }),
+                    "lining cell {:?} y {y} is a torch",
+                    l.tile
+                );
+            }
+        }
     }
 
     #[test]

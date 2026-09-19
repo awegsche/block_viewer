@@ -391,6 +391,10 @@ fn plan_sink(geometry: &SliceGeometry, frame: &MineFrame, new_bottom: i32, mine:
                 }
             }
             ShaftBlock::WallTorch { facing } => {
+                // A ring cell dug like any other (ticket 127), then lit.
+                if matches!(mat, Material::Solid | Material::Ore | Material::Clutter) {
+                    cost += 1;
+                }
                 write_if_needed(&mut edit, sampled, pos, wall_torch_state(facing));
             }
         }

@@ -4,7 +4,7 @@ Not a work item: the design document for the citybuilder game and the shared
 world-edit infrastructure it uses. High-level tasks here get split into
 numbered tickets in this directory when picked up. Companion to `ROADMAP.md`,
 which covers the viewer 001–029, and `RANVIL_CLI_ROADMAP.md`, which claims
-087–103 for a third executable, `ranvil-cli`. **Next free number: 127.**
+087–103 for a third executable, `ranvil-cli`. **Next free number: 128.**
 
 ## The goal
 

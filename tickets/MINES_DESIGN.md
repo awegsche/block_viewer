@@ -159,8 +159,10 @@ flight shares its landing's block Y. Descent per revolution `4(S-2) = 16`.
   `y = L+1 ..= L+3`) is the **doorway** into that level's secondary arms.
 - **Torches**: on the lining wall, facing into the shaft, one every
   `torch_spacing` ring steps, at head height (`stair_y + 2`) above the step
-  they belong to. Wall torches need a solid block behind them; the lining
-  guarantees one.
+  they belong to — in the ring's air column, hanging on the lining behind
+  it (ticket 127; not *in* the lining cell). Wall torches need a solid
+  block behind them; the lining guarantees one, except at a level's
+  doorway, where the torch is skipped.
 
 **Sinking.** The shaft descends one flight (`level_spacing`) per job: bottom
 `B → B - level_spacing`. The interior is excavated `B-1 ..= B-spacing+1`

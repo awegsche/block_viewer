@@ -1714,3 +1714,9 @@ Y=0 in the world and won't be cleaned up by this fix — see the ticket.
   South-arm galleries were already right. Galleries dug before this fix
   keep their floating torches — slices aren't re-run — so check a new row,
   not an old one.
+- [ ] **127 shaft torches hang on the lining, not in it.** Place a fresh
+  mine and walk the primary shaft's spiral stair in Minecraft: every
+  torch should be on the shaft wall at head height above a step, flush
+  with the wall — no one-block niches, no torch missing its wall behind a
+  cave, and none in front of a level's doorway. Shafts sunk before this
+  fix keep their niche torches; check a new mine.
