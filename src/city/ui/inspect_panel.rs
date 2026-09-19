@@ -34,17 +34,22 @@
 use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts};
 
+use crate::blueprint::{BuildingCatalogue, Rotation};
+use crate::DecodedWorld;
+
+use super::super::construction::scan_site;
 use super::super::definition::{BuildingDefinitions, Mine};
 use super::super::economy::EconomyConfig;
 use super::super::gatherer::gatherer_buffer_capacity;
 use super::super::inventory::{short_name, Parcel};
+use super::super::journal::Journal;
 use super::super::mine::layout::{Arm, MineFrame};
 use super::super::mine::progress::{LevelCursor, MineProgress, Phase, RowStep};
 use super::super::mine::{mine_buffer_capacity, MineState};
 use super::super::picking::SelectedBuilding;
 use super::super::placement::rotation_degrees;
 use super::super::production::{buffer_capacity, Producer, ProductionState};
-use super::super::state::{self, PlacedBuilding, WorkArea};
+use super::super::state::{self, BuildingId, PlacedBuilding, WorkArea};
 use super::super::tool::ActiveTool;
 use super::super::warehouse::Coverage;
 
@@ -116,6 +121,38 @@ fn is_gatherer(placed: &PlacedBuilding, definitions: &BuildingDefinitions) -> bo
 /// `(x, z)`, and the tile count.
 fn work_area_line(area: WorkArea) -> String {
     format!("Working area: ({}, {}) - ({}, {}), {} tiles", area.min.x, area.min.y, area.max.x, area.max.y, area.len())
+}
+
+/// Ticket 128: the panel's line for a **site** — `N of M blocks (~x min
+/// left)`. `M` is recounted every frame from the world plus the entry's own
+/// `written` count rather than cached anywhere (`N + written` is invariant
+/// across the site's whole lifetime, since every dig moves exactly one block
+/// from one side of that sum to the other — see `city::construction`'s
+/// module docs and `city::persistence`'s "M is recounted" note). `None` when
+/// `placed` isn't a site, or there's nothing to compute it from (no
+/// catalogue, no matching entry).
+fn site_clearing_line(
+    id: BuildingId,
+    placed: &PlacedBuilding,
+    catalogue: Option<&BuildingCatalogue>,
+    world: &DecodedWorld,
+    journal: &Journal,
+    economy: &EconomyConfig,
+) -> Option<String> {
+    if !placed.under_construction {
+        return None;
+    }
+    let entry = catalogue?.get(&placed.catalogue_id)?;
+    let size = match placed.rotation {
+        Rotation::Deg90 | Rotation::Deg270 => IVec3::new(entry.blueprint.size.z, entry.blueprint.size.y, entry.blueprint.size.x),
+        Rotation::Deg0 | Rotation::Deg180 => entry.blueprint.size,
+    };
+    let remaining = scan_site(placed.origin, size, world).len() as u32;
+    let written = journal.placement_baseline(id).map(|baseline| baseline.written.len()).unwrap_or(0) as u32;
+    let total = remaining + written;
+    let rate = economy.site_clearing_blocks_per_minute.max(f32::MIN_POSITIVE);
+    let minutes_left = remaining as f32 / rate;
+    Some(format!("Clearing site: {remaining} of {total} block(s) (~{minutes_left:.1} min left)"))
 }
 
 /// What the panel's working-area buttons asked for this frame — resolved
@@ -248,6 +285,9 @@ pub(super) fn inspect_panel(
     economy: Res<EconomyConfig>,
     mine_state: Option<Res<MineState>>,
     mut tool: Option<ResMut<ActiveTool>>,
+    catalogue: Option<Res<BuildingCatalogue>>,
+    world: Res<DecodedWorld>,
+    journal: Res<Journal>,
 ) {
     let Some(id) = selected.0 else { return };
     // A stale selection (the building was demolished since) draws nothing —
@@ -264,7 +304,12 @@ pub(super) fn inspect_panel(
         ui.label(format!("Position: ({}, {}, {})", placed.origin.x, placed.origin.y, placed.origin.z));
         ui.label(format!("Rotation: {}°", rotation_degrees(placed.rotation)));
 
-        if let Some(producer) = production.get(id) {
+        // Ticket 128: a site isn't producing anything yet — its line
+        // replaces the producer section rather than sitting beside it.
+        if let Some(line) = site_clearing_line(id, placed, catalogue.as_deref(), &world, &journal, &economy) {
+            ui.separator();
+            ui.label(line);
+        } else if let Some(producer) = production.get(id) {
             ui.separator();
             ui.label(format!("State: {}", producer.state.label()));
 
@@ -369,6 +414,7 @@ mod tests {
             rotation: Rotation::Deg90,
             footprint: IVec2::ONE,
             work_area: None,
+            under_construction: false,
         }
     }
 
@@ -486,6 +532,75 @@ mod tests {
     // Sanity: `ProducerState::label` is what the panel prints for "State:" —
     // pinned here so a relabel doesn't silently drift.
     // --- the working-area section (ticket 111) ---------------------------------------------
+
+    // --- site_clearing_line (ticket 128) --------------------------------------
+
+    fn small_catalogue(id: &str, size: IVec3) -> BuildingCatalogue {
+        let dir = std::env::temp_dir().join(format!("block_viewer_inspect_site_{}_{}", id, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let volume = (size.x * size.y * size.z) as usize;
+        let blueprint = crate::blueprint::Blueprint {
+            size,
+            origin: IVec3::ZERO,
+            palette: vec![crate::blueprint::BlockState::air(), "minecraft:stone".parse().unwrap()],
+            blocks: vec![1; volume],
+            data_version: 0,
+            failed_columns: 0,
+        };
+        crate::blueprint::write_structure_file(&dir.join(format!("{id}.nbt")), &blueprint).unwrap();
+        let (catalogue, _) = crate::blueprint::load_catalogue_dir(&dir);
+        std::fs::remove_dir_all(&dir).ok();
+        catalogue
+    }
+
+    fn empty_world() -> DecodedWorld {
+        DecodedWorld {
+            registry: std::sync::Arc::new(std::sync::Mutex::new(crate::world::BlockRegistry::new())),
+            biomes: std::sync::Arc::new(std::sync::Mutex::new(crate::world::BiomeRegistry::new())),
+            columns: std::collections::HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn site_clearing_line_is_none_for_a_completed_building() {
+        let placed = placement("house01", Some("house01"));
+        let catalogue = small_catalogue("house01", IVec3::new(1, 1, 1));
+        assert!(site_clearing_line(
+            state::BuildingId::from_u64(0),
+            &placed,
+            Some(&catalogue),
+            &empty_world(),
+            &Journal::default(),
+            &EconomyConfig::default(),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn site_clearing_line_reports_the_remaining_and_total_block_count() {
+        let mut placed = placement("house01", Some("house01"));
+        placed.under_construction = true;
+        placed.origin = IVec3::new(500, 64, 500); // an undecoded column: nothing left to clear
+        let catalogue = small_catalogue("house01", IVec3::new(2, 1, 2));
+        let id = state::BuildingId::from_u64(0);
+
+        let mut journal = Journal::default();
+        journal.record_placement(
+            id,
+            placed.clone(),
+            super::super::super::journal::Baseline {
+                written: vec![(IVec3::ZERO, crate::blueprint::BlockState::air())],
+                previous: vec![(IVec3::ZERO, "minecraft:stone".parse().unwrap())],
+                data_version: None,
+            },
+            crate::city::journal::Ledger::default(),
+        );
+
+        let line = site_clearing_line(id, &placed, Some(&catalogue), &empty_world(), &journal, &EconomyConfig::default())
+            .expect("a site under construction has a line");
+        assert_eq!(line, "Clearing site: 0 of 1 block(s) (~0.0 min left)");
+    }
 
     #[test]
     fn work_area_line_names_both_corners_and_the_tile_count() {

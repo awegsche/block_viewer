@@ -43,6 +43,7 @@ use crate::edit::{EditPolicy, EditRefusal, EditReport};
 use crate::region_cache::RegionCache;
 
 use super::commit::apply_building_edit;
+use super::construction::{ConstructionState, SiteId};
 use super::inventory::{Parcel, Stock};
 use super::journal::{Journal, JournalEntry, Ledger};
 use super::loading::GameplaySet;
@@ -176,6 +177,7 @@ fn start_undo(
     region_cache: Option<Res<SharedRegionCache>>,
     mut stock: ResMut<Stock>,
     capacity: Option<Res<StorageCapacity>>,
+    construction: Option<Res<ConstructionState>>,
 ) {
     if !std::mem::take(&mut undo.requested) {
         return;
@@ -185,6 +187,15 @@ fn start_undo(
         undo.state = UndoState::Failed { message: "there is nothing to undo".to_string() };
         return;
     };
+    // Ticket 128: the last entry might be a site still being cleared — undoing
+    // it would race whatever dig is in flight, the same "occupied" refusal
+    // shape `city::demolish`'s own site-cancel precondition uses.
+    if last.placement().under_construction
+        && construction.as_deref().is_some_and(|state| state.is_dig_in_flight(SiteId::Building(last.building())))
+    {
+        undo.state = UndoState::Failed { message: "its site is still clearing".to_string() };
+        return;
+    }
     let definition = last.placement().catalogue_id.clone();
     let kind = match last {
         JournalEntry::Placed { .. } => UndoneKind::Placement,
@@ -305,6 +316,7 @@ mod tests {
             rotation: Rotation::Deg0,
             footprint: IVec2::ONE,
             work_area: None,
+            under_construction: false,
         }
     }
 
@@ -395,6 +407,40 @@ mod tests {
         assert_eq!(overflow.get("minecraft:dirt"), 4, "and the rest comes back to the caller");
     }
 
+    /// Ticket 128: undoing a site whose dig is still in flight would race
+    /// that write — refused, journal and city untouched, same shape
+    /// `city::demolish`'s own precondition uses.
+    #[test]
+    fn undo_of_a_site_with_a_dig_in_flight_is_refused() {
+        let mut app = app();
+        let building = app
+            .world_mut()
+            .resource_mut::<City>()
+            .place_building("house01", None, IVec3::ZERO, Rotation::Deg0, IVec2::ONE)
+            .unwrap();
+        app.world_mut().resource_mut::<City>().mark_under_construction(building);
+        let mut placement = a_placement();
+        placement.under_construction = true;
+        app.world_mut().resource_mut::<Journal>().record_placement(
+            building,
+            placement,
+            super::super::journal::Baseline { written: Vec::new(), previous: Vec::new(), data_version: None },
+            Ledger::default(),
+        );
+        app.init_resource::<super::super::construction::ConstructionState>();
+        app.world_mut()
+            .resource_mut::<super::super::construction::ConstructionState>()
+            .mark_dig_in_flight_for_tests(super::super::construction::SiteId::Building(building));
+
+        app.world_mut().resource_mut::<UndoCommand>().request();
+        run_until_settled(&mut app);
+
+        let undo = app.world().resource::<UndoCommand>();
+        assert!(matches!(undo.state(), UndoState::Failed { message } if message.contains("still clearing")));
+        assert_eq!(app.world().resource::<Journal>().len(), 1, "nothing was touched");
+        assert!(!app.world().resource::<City>().is_empty());
+    }
+
     #[test]
     fn a_request_is_refused_while_another_is_pending() {
         let mut undo = UndoCommand::default();
@@ -423,6 +469,7 @@ mod tests {
             rotation: Rotation::Deg0,
             footprint: IVec2::ONE,
             work_area: None,
+            under_construction: false,
         };
         let baseline = super::super::journal::Baseline {
             written: vec![(IVec3::new(0, 64, 0), BlockState { name: "minecraft:stone".to_string(), properties: Vec::new() })],

@@ -125,6 +125,13 @@ struct EconomyFile {
     /// warehouse. Defaulted for the same reason `stack_size` is.
     #[serde(default = "default_base_storage")]
     base_storage: u64,
+    /// Ticket 128 — blocks per minute of game time dug out of a placement's
+    /// volume (a building's or a road cell's) before its blueprint is
+    /// written. Defaulted for the same reason `stack_size`/`base_storage`
+    /// are: an `economy.ron` written before site clearing existed keeps
+    /// working.
+    #[serde(default = "default_site_clearing_rate")]
+    site_clearing_blocks_per_minute: f32,
     #[serde(default)]
     start_stock: HashMap<String, u64>,
     #[serde(default)]
@@ -150,6 +157,14 @@ fn default_base_storage() -> u64 {
     2048
 }
 
+/// The rate site clearing digs at with no `economy.ron` line for it — six
+/// times the gatherer hut's own 20 blocks/minute: a build site is worked by
+/// a whole crew, not one hut's worth of hands, and a road has to keep up
+/// with a drag. See `city::construction`'s module docs.
+fn default_site_clearing_rate() -> f32 {
+    120.0
+}
+
 /// The loaded economy knobs. [`Default`] is the "no `economy.ron`" config:
 /// no grant, no conversions, and a vanilla stack — exactly the game ticket
 /// 073 shipped, plus the one number ticket 078 needs a value for whether or
@@ -166,6 +181,11 @@ pub struct EconomyConfig {
     /// The city's storage capacity before any warehouse adds to it (ticket
     /// 079) — see [`super::warehouse::StorageCapacity`].
     pub base_storage: u64,
+    /// Blocks per minute of game time [`super::construction`] digs a
+    /// placement's site out at, before its blueprint is written (ticket
+    /// 128). Always `> 0.0` — [`load_economy`] refuses anything else, the
+    /// same way it refuses a zero `stack_size`.
+    pub site_clearing_blocks_per_minute: f32,
     /// What a city with no `stock.ron` is founded with.
     pub start_stock: Parcel,
     /// Applied by [`plan_payment`], in file order — the first conversion
@@ -183,6 +203,7 @@ impl Default for EconomyConfig {
         EconomyConfig {
             stack_size: default_stack_size(),
             base_storage: default_base_storage(),
+            site_clearing_blocks_per_minute: default_site_clearing_rate(),
             start_stock: Parcel::default(),
             conversions: Vec::new(),
             groups: Vec::new(),
@@ -215,6 +236,10 @@ pub enum EconomyError {
     /// `stack_size: 0` (ticket 078) — a buffer measured in stacks of nothing
     /// holds nothing, so every producer would stall on its first tick.
     ZeroStackSize,
+    /// `site_clearing_blocks_per_minute <= 0.0` (ticket 128) — a site that
+    /// clears at zero or negative blocks per minute never finishes, and
+    /// there's no "instant" spelling that number could reasonably mean.
+    NonPositiveSiteClearingRate,
 }
 
 impl std::fmt::Display for EconomyError {
@@ -226,6 +251,7 @@ impl std::fmt::Display for EconomyError {
             EconomyError::EmptyItem(what) => write!(f, "conversion {what} has a blank item name"),
             EconomyError::SelfConversion(item) => write!(f, "{item} is listed as converting to itself"),
             EconomyError::ZeroStackSize => write!(f, "stack_size must be > 0"),
+            EconomyError::NonPositiveSiteClearingRate => write!(f, "site_clearing_blocks_per_minute must be > 0"),
             EconomyError::GroupTooSmall(index) => {
                 write!(f, "interchangeable group {index} has fewer than two materials in it")
             }
@@ -317,10 +343,14 @@ pub fn load_economy(path: &Path) -> Result<EconomyConfig, EconomyError> {
     if file.stack_size == 0 {
         return Err(EconomyError::ZeroStackSize);
     }
+    if file.site_clearing_blocks_per_minute <= 0.0 {
+        return Err(EconomyError::NonPositiveSiteClearingRate);
+    }
 
     Ok(EconomyConfig {
         stack_size: file.stack_size,
         base_storage: file.base_storage,
+        site_clearing_blocks_per_minute: file.site_clearing_blocks_per_minute,
         start_stock,
         conversions,
         groups,
@@ -824,6 +854,27 @@ mod tests {
     fn a_zero_stack_size_is_refused() {
         let err = config_from(r#"(stack_size: 0)"#).expect_err("zero stack size");
         assert!(matches!(err, EconomyError::ZeroStackSize), "{err}");
+    }
+
+    /// Ticket 128: a file with no line for it keeps the default rate.
+    #[test]
+    fn a_file_with_no_site_clearing_rate_gets_the_default() {
+        let config = config_from(r#"(start_stock: {"dirt": 1})"#).expect("loads");
+        assert_eq!(config.site_clearing_blocks_per_minute, 120.0);
+    }
+
+    #[test]
+    fn a_stated_site_clearing_rate_is_read() {
+        let config = config_from(r#"(site_clearing_blocks_per_minute: 60.0)"#).expect("loads");
+        assert_eq!(config.site_clearing_blocks_per_minute, 60.0);
+    }
+
+    #[test]
+    fn a_non_positive_site_clearing_rate_is_refused() {
+        let err = config_from(r#"(site_clearing_blocks_per_minute: 0.0)"#).expect_err("zero rate");
+        assert!(matches!(err, EconomyError::NonPositiveSiteClearingRate), "{err}");
+        let err = config_from(r#"(site_clearing_blocks_per_minute: -5.0)"#).expect_err("negative rate");
+        assert!(matches!(err, EconomyError::NonPositiveSiteClearingRate), "{err}");
     }
 
     #[test]

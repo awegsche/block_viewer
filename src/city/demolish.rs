@@ -71,6 +71,7 @@ use crate::edit::{EditPolicy, EditRefusal, EditReport, WorldEdit};
 use crate::region_cache::RegionCache;
 
 use super::commit::apply_building_edit;
+use super::construction::{ConstructionState, SiteId};
 use super::drops::DropTable;
 use super::inventory::Stock;
 use super::journal::{Baseline, Journal, Ledger};
@@ -91,6 +92,12 @@ struct PendingDemolition {
     /// demolition's own baseline ([`Baseline::capture`] needs the
     /// edit *and* the report it produced) without recomputing it.
     edit: WorldEdit,
+    /// Ticket 128: `Some` for a **site** being cancelled — the entry's own
+    /// ledger, so [`poll_demolish`] can refund it in reverse (debited back
+    /// in, credited clamped back out) the same way `city::undo::settle_reverse`
+    /// does. `None` for an ordinary demolition, whose backfill pays its own
+    /// way instead (see the module docs).
+    site_ledger: Option<Ledger>,
     task: Task<Result<EditReport, EditRefusal>>,
 }
 
@@ -138,14 +145,38 @@ enum DemolitionTarget {
         building: BuildingId,
         placement: PlacedBuilding,
         baseline: Baseline,
+        /// The entry's own ledger — only actually used for a site
+        /// (ticket 128); carried here regardless rather than looked up a
+        /// second time in [`try_demolish`].
+        ledger: Ledger,
     },
+    /// Ticket 128: `building` is a **site** whose clearing dig hasn't
+    /// settled yet — cancelling it now would race that write, the same
+    /// "occupied" refusal shape an in-flight undo already gets.
+    DigInFlight { building: BuildingId },
+}
+
+/// Puts a **site**'s ledger back — debited comes back in (capped by the
+/// city's storage), credited comes back out (clamped) — the mirror image of
+/// `city::undo::settle_reverse` for a cancellation rather than an undo.
+/// Ticket 128. A plain function so it's testable without a loaded save,
+/// the same reason `settle_reverse` is one.
+fn settle_site_cancel(stock: &mut Stock, ledger: &Ledger, capacity: u64) -> super::inventory::Parcel {
+    let overflow = stock.add_parcel_capped(&ledger.debited, capacity);
+    stock.remove_parcel(&ledger.credited);
+    overflow
 }
 
 /// Resolves what `Delete` should demolish at `hovered`'s `(x, z)` tile — a
 /// plain function, not a system, so it's callable directly from a test
 /// against a bare [`City`]/[`Journal`] with no `App` involved, the same split
 /// `city::commit`'s `blueprint_edit`/`apply_building_edit` use.
-fn resolve_demolition_target(hovered: IVec3, city: &City, journal: &Journal) -> DemolitionTarget {
+fn resolve_demolition_target(
+    hovered: IVec3,
+    city: &City,
+    journal: &Journal,
+    construction: Option<&ConstructionState>,
+) -> DemolitionTarget {
     let tile = IVec2::new(hovered.x, hovered.z);
     let Some(Occupant::Building(building)) = city.occupant_at(tile) else {
         return DemolitionTarget::Nothing;
@@ -157,20 +188,29 @@ fn resolve_demolition_target(hovered: IVec3, city: &City, journal: &Journal) -> 
     // lookup below can't miss — the occupancy grid and `buildings` are kept
     // in lockstep by every mutator in `state.rs`.
     let placement = city.building(building).cloned().expect("occupant_at found this building in the same City");
-    DemolitionTarget::Found { building, placement, baseline: baseline.clone() }
+    if placement.under_construction && construction.is_some_and(|state| state.is_dig_in_flight(SiteId::Building(building))) {
+        return DemolitionTarget::DigInFlight { building };
+    }
+    let ledger = journal.placement_ledger(building).cloned().unwrap_or_default();
+    DemolitionTarget::Found { building, placement, baseline: baseline.clone(), ledger }
 }
 
 /// `Delete` on a hovered building: dispatches its restoring apply onto
 /// [`AsyncComputeTaskPool`] — see the module docs for why [`City`]
 /// itself isn't touched here at all.
+#[allow(clippy::too_many_arguments)]
 fn try_demolish(
     keys: Res<ButtonInput<KeyCode>>,
     egui_input: Res<camera::EguiInputCapture>,
     hovered: Res<HoveredBlock>,
-    city: Res<City>,
-    journal: Res<Journal>,
+    mut city: ResMut<City>,
+    mut journal: ResMut<Journal>,
+    construction: Option<Res<ConstructionState>>,
     mut demolish: ResMut<DemolishState>,
     region_cache: Option<Res<SharedRegionCache>>,
+    mut stock: ResMut<Stock>,
+    mut write_status: ResMut<WriteStatus>,
+    capacity: Option<Res<super::warehouse::StorageCapacity>>,
 ) {
     // Same guard `camera.rs`'s own input systems use — a keystroke egui is
     // already handling shouldn't also drive the game underneath it.
@@ -179,25 +219,46 @@ fn try_demolish(
     }
     let Some(hovered) = hovered.0 else { return };
 
-    let (building, placement, baseline) = match resolve_demolition_target(hovered, &city, &journal) {
-        DemolitionTarget::Nothing => return,
-        DemolitionTarget::NoBaseline { building } => {
-            println!(
-                "block_viewer: can't demolish building {building:?}: no placement baseline was recorded for it \
-                 (a save from before ticket 048?)"
-            );
-            return;
-        }
-        DemolitionTarget::Found { building, placement, baseline } => (building, placement, baseline),
-    };
+    let (building, placement, baseline, site_ledger) =
+        match resolve_demolition_target(hovered, &city, &journal, construction.as_deref()) {
+            DemolitionTarget::Nothing => return,
+            DemolitionTarget::NoBaseline { building } => {
+                println!(
+                    "block_viewer: can't demolish building {building:?}: no placement baseline was recorded for it \
+                     (a save from before ticket 048?)"
+                );
+                return;
+            }
+            DemolitionTarget::DigInFlight { building } => {
+                println!("block_viewer: can't cancel building {building:?}: its site is still clearing");
+                return;
+            }
+            DemolitionTarget::Found { building, placement, baseline, ledger } => {
+                let site_ledger = placement.under_construction.then_some(ledger);
+                (building, placement, baseline, site_ledger)
+            }
+        };
 
     let edit = baseline.restore_edit();
     if edit.is_empty() {
-        // A journaled placement with an empty baseline isn't reachable in
-        // practice (`blueprint_edit`'s own "air is written, not skipped"
-        // means every placement's baseline covers at least one position),
-        // but an empty `WorldEdit` is refused by the write path regardless —
-        // better to say nothing than spawn a task doomed to fail.
+        // A journaled *ordinary* placement's baseline is never empty
+        // (`blueprint_edit`'s own "air is written, not skipped" means every
+        // placement covers at least one position) — but a site's genuinely
+        // can be, the instant it's entered and before its first dig has ever
+        // settled (ticket 128). Nothing was ever written to the world, so
+        // there is nothing to restore: cancel synchronously — remove the
+        // `City` row, refund the ledger, drop the journal entry — rather
+        // than spawning a task doomed to fail on `EditRefusal::Empty`.
+        let Some(ledger) = site_ledger else { return };
+        city.remove_building(building);
+        let capacity = super::warehouse::storage_capacity(capacity.as_deref());
+        let overflow = settle_site_cancel(&mut stock, &ledger, capacity);
+        if !overflow.is_empty() {
+            println!("block_viewer: storage full — {overflow} could not be refunded");
+        }
+        journal.remove_site_entry(building);
+        write_status.record_success(WriteKind::Demolished, format!("{} (site cancelled)", placement.catalogue_id), &EditReport::default());
+        println!("block_viewer: cancelled the site for {} — nothing had been dug yet", placement.catalogue_id);
         return;
     }
 
@@ -215,7 +276,7 @@ fn try_demolish(
         apply_building_edit(&mut cache, &task_edit, &policy)
     });
 
-    demolish.pending = Some(PendingDemolition { building, placement, edit, task });
+    demolish.pending = Some(PendingDemolition { building, placement, edit, site_ledger, task });
 }
 
 /// Single non-blocking poll of the in-flight demolition, the same
@@ -234,7 +295,9 @@ fn poll_demolish(
     mut footprints: EventWriter<BuildingFootprintChanged>,
     mut stock: ResMut<Stock>,
     drops: Res<DropTable>,
+    capacity: Option<Res<super::warehouse::StorageCapacity>>,
 ) {
+    let capacity = super::warehouse::storage_capacity(capacity.as_deref());
     let result = {
         let Some(pending) = &mut demolish.pending else { return };
         let Some(result) = block_on(poll_once(&mut pending.task)) else {
@@ -242,7 +305,7 @@ fn poll_demolish(
         };
         result
     };
-    let PendingDemolition { building, placement, edit, .. } = demolish.pending.take().expect("just matched Some above");
+    let PendingDemolition { building, placement, edit, site_ledger, .. } = demolish.pending.take().expect("just matched Some above");
 
     match result {
         Ok(report) => {
@@ -251,6 +314,29 @@ fn poll_demolish(
             city.remove_building(building);
             let blocks = report.blocks_written;
             let chunks = report.chunks.len();
+
+            if let Some(ledger) = site_ledger {
+                // Ticket 128: a site's cancellation is the entry's own
+                // reversal, not a demolition — the dug terrain is put back
+                // (already done, by this very apply), the ledger reverses
+                // (debited back in, credited clamped back out — the same
+                // shape `city::undo::settle_reverse` uses), and the entry is
+                // removed rather than replaced with a demolition record: a
+                // cancelled site never happened.
+                println!(
+                    "block_viewer: cancelled the site for {} ({blocks} block(s) restored across {chunks} chunk(s), not yet saved to disk)",
+                    placement.catalogue_id
+                );
+                let overflow = settle_site_cancel(&mut stock, &ledger, capacity);
+                if !overflow.is_empty() {
+                    println!("block_viewer: storage full — {overflow} could not be refunded");
+                }
+                journal.remove_site_entry(building);
+                write_status.record_success(WriteKind::Demolished, format!("{} (site cancelled)", placement.catalogue_id), &report);
+                edited.send(ChunksEdited::from_report(&report));
+                return;
+            }
+
             println!(
                 "block_viewer: demolished {} ({blocks} block(s) restored across {chunks} chunk(s), not yet saved to disk)",
                 placement.catalogue_id
@@ -289,7 +375,11 @@ fn poll_demolish(
             footprints.send(BuildingFootprintChanged(placement));
         }
         Err(err) => {
-            println!("block_viewer: demolition of {} failed, nothing was changed: {err}", placement.catalogue_id);
+            if site_ledger.is_some() {
+                println!("block_viewer: cancelling the site for {} failed, retrying: {err}", placement.catalogue_id);
+            } else {
+                println!("block_viewer: demolition of {} failed, nothing was changed: {err}", placement.catalogue_id);
+            }
             write_status.record_failure(WriteKind::Demolished, placement.catalogue_id, err.to_string());
         }
     }
@@ -317,6 +407,7 @@ mod tests {
             rotation: Rotation::Deg0,
             footprint: IVec2::new(2, 2),
             work_area: None,
+            under_construction: false,
         }
     }
 
@@ -334,7 +425,7 @@ mod tests {
     fn resolve_demolition_target_is_nothing_on_empty_ground() {
         let city = City::default();
         let journal = Journal::default();
-        let result = resolve_demolition_target(IVec3::new(5, 64, 5), &city, &journal);
+        let result = resolve_demolition_target(IVec3::new(5, 64, 5), &city, &journal, None);
         assert!(matches!(result, DemolitionTarget::Nothing));
     }
 
@@ -344,7 +435,7 @@ mod tests {
         // Cell (0, 0) covers block tiles 0..6 x 0..6, which includes (5, 5).
         city.add_road_cell(IVec2::new(0, 0), "dirt", 64, None, RoadPieceVariant::Surface).unwrap();
         let journal = Journal::default();
-        let result = resolve_demolition_target(IVec3::new(5, 64, 5), &city, &journal);
+        let result = resolve_demolition_target(IVec3::new(5, 64, 5), &city, &journal, None);
         assert!(matches!(result, DemolitionTarget::Nothing));
     }
 
@@ -354,7 +445,7 @@ mod tests {
         let id = city.place_building("house01", None, IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::new(1, 1)).unwrap();
         let journal = Journal::default();
 
-        let result = resolve_demolition_target(IVec3::new(0, 64, 0), &city, &journal);
+        let result = resolve_demolition_target(IVec3::new(0, 64, 0), &city, &journal, None);
         assert!(matches!(result, DemolitionTarget::NoBaseline { building } if building == id));
     }
 
@@ -365,11 +456,52 @@ mod tests {
         let mut journal = Journal::default();
         journal.record_placement(id, a_placement(), a_baseline(), Ledger::default());
 
-        let result = resolve_demolition_target(IVec3::new(0, 64, 0), &city, &journal);
-        let DemolitionTarget::Found { building, placement, baseline } = result else { panic!("expected Found") };
+        let result = resolve_demolition_target(IVec3::new(0, 64, 0), &city, &journal, None);
+        let DemolitionTarget::Found { building, placement, baseline, .. } = result else { panic!("expected Found") };
         assert_eq!(building, id);
         assert_eq!(placement.catalogue_id, "house01");
         assert_eq!(baseline, a_baseline());
+    }
+
+    /// Ticket 128: a site with a dig in flight refuses `Delete` rather than
+    /// racing it.
+    #[test]
+    fn resolve_demolition_target_refuses_a_site_with_a_dig_in_flight() {
+        let mut city = City::default();
+        let id = city.place_building("house01", None, IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::new(1, 1)).unwrap();
+        city.mark_under_construction(id);
+        let mut journal = Journal::default();
+        journal.record_placement(
+            id,
+            a_placement(),
+            Baseline { written: Vec::new(), previous: Vec::new(), data_version: None },
+            Ledger::default(),
+        );
+        let mut construction = super::super::construction::ConstructionState::default();
+        construction.mark_dig_in_flight_for_tests(super::super::construction::SiteId::Building(id));
+
+        let result = resolve_demolition_target(IVec3::new(0, 64, 0), &city, &journal, Some(&construction));
+        assert!(matches!(result, DemolitionTarget::DigInFlight { building } if building == id));
+    }
+
+    /// A site with *no* dig currently in flight is a normal `Found` — the
+    /// player can cancel it even while `city::construction` exists.
+    #[test]
+    fn resolve_demolition_target_finds_a_site_with_no_dig_in_flight() {
+        let mut city = City::default();
+        let id = city.place_building("house01", None, IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::new(1, 1)).unwrap();
+        city.mark_under_construction(id);
+        let mut journal = Journal::default();
+        journal.record_placement(
+            id,
+            a_placement(),
+            Baseline { written: Vec::new(), previous: Vec::new(), data_version: None },
+            Ledger::default(),
+        );
+        let construction = super::super::construction::ConstructionState::default();
+
+        let result = resolve_demolition_target(IVec3::new(0, 64, 0), &city, &journal, Some(&construction));
+        assert!(matches!(result, DemolitionTarget::Found { .. }));
     }
 
     // --- try_demolish / poll_demolish: through a real App -------------------
@@ -424,7 +556,7 @@ mod tests {
         let task = pool().spawn(async move { Ok(report) });
 
         app.world_mut().resource_mut::<DemolishState>().pending =
-            Some(PendingDemolition { building, placement: a_placement(), edit: task_edit, task });
+            Some(PendingDemolition { building, placement: a_placement(), edit: task_edit, site_ledger: None, task });
 
         run_until_settled(&mut app);
 
@@ -485,7 +617,7 @@ mod tests {
         let task_edit = edit.clone();
         let task = pool().spawn(async move { Ok(report) });
         app.world_mut().resource_mut::<DemolishState>().pending =
-            Some(PendingDemolition { building, placement: a_placement(), edit: task_edit, task });
+            Some(PendingDemolition { building, placement: a_placement(), edit: task_edit, site_ledger: None, task });
 
         run_until_settled(&mut app);
 
@@ -523,13 +655,116 @@ mod tests {
         let task_edit = edit.clone();
         let task = pool().spawn(async move { Ok(report) });
         app.world_mut().resource_mut::<DemolishState>().pending =
-            Some(PendingDemolition { building, placement: a_placement(), edit: task_edit, task });
+            Some(PendingDemolition { building, placement: a_placement(), edit: task_edit, site_ledger: None, task });
 
         run_until_settled(&mut app);
 
         assert!(app.world().resource::<City>().is_empty(), "the demolition still went through");
         let ledger = app.world().resource::<Journal>().entries().last().unwrap().ledger().clone();
         assert!(ledger.debited.is_empty(), "the ledger records what was actually taken, which was nothing");
+    }
+
+    // --- ticket 128: cancelling a site --------------------------------------
+
+    fn a_parcel(items: &[(&str, u64)]) -> super::super::inventory::Parcel {
+        let mut parcel = super::super::inventory::Parcel::default();
+        for &(item, count) in items {
+            parcel.add(item, count);
+        }
+        parcel
+    }
+
+    #[test]
+    fn settle_site_cancel_refunds_debited_and_removes_credited() {
+        let mut stock = Stock::default();
+        stock.add("minecraft:cobblestone", 12); // what the dig(s) credited, still in the pile
+        let ledger = Ledger { credited: a_parcel(&[("minecraft:cobblestone", 12)]), debited: a_parcel(&[("minecraft:oak_planks", 40)]) };
+
+        let overflow = settle_site_cancel(&mut stock, &ledger, u64::MAX);
+
+        assert!(overflow.is_empty());
+        assert_eq!(stock.count("minecraft:oak_planks"), 40, "the cost comes back");
+        assert_eq!(stock.count("minecraft:cobblestone"), 0, "what clearing had credited comes back out");
+    }
+
+    #[test]
+    fn settle_site_cancel_clamps_a_credit_already_spent() {
+        let mut stock = Stock::default();
+        let ledger = Ledger { credited: a_parcel(&[("minecraft:cobblestone", 12)]), debited: a_parcel(&[]) };
+        settle_site_cancel(&mut stock, &ledger, u64::MAX);
+        assert_eq!(stock.count("minecraft:cobblestone"), 0, "never goes negative");
+    }
+
+    fn site_test_app() -> App {
+        let mut app = App::new();
+        app.add_plugins(DemolishPlugin).insert_resource(City::default()).insert_resource(Journal::default());
+        app
+    }
+
+    #[test]
+    fn poll_demolish_site_cancel_success_refunds_and_removes_the_entry_not_a_demolition() {
+        let mut app = site_test_app();
+        let building = app
+            .world_mut()
+            .resource_mut::<City>()
+            .place_building("house01", None, IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::new(1, 1))
+            .unwrap();
+        app.world_mut().resource_mut::<City>().mark_under_construction(building);
+        let ledger = Ledger { credited: a_parcel(&[("minecraft:dirt", 3)]), debited: a_parcel(&[("minecraft:oak_planks", 40)]) };
+        app.world_mut().resource_mut::<Journal>().record_placement(
+            building,
+            a_placement(),
+            Baseline { written: vec![(IVec3::new(0, 64, 0), BlockState::air())], previous: vec![(IVec3::new(0, 64, 0), state_named("minecraft:stone"))], data_version: None },
+            ledger.clone(),
+        );
+
+        let mut edit = WorldEdit::new();
+        edit.set(IVec3::new(0, 64, 0), state_named("minecraft:stone"));
+        let report = EditReport {
+            blocks_written: 1,
+            chunks: vec![(0, 0)],
+            regions: vec![(0, 0)],
+            replaced: Some(vec![(IVec3::new(0, 64, 0), BlockState::air())]), ..Default::default()
+        };
+        let task_edit = edit.clone();
+        let task = pool().spawn(async move { Ok(report) });
+        app.world_mut().resource_mut::<DemolishState>().pending =
+            Some(PendingDemolition { building, placement: a_placement(), edit: task_edit, site_ledger: Some(ledger), task });
+
+        run_until_settled(&mut app);
+
+        let city = app.world().resource::<City>();
+        assert!(city.is_empty(), "cancelling a site removes it from City");
+
+        let journal = app.world().resource::<Journal>();
+        assert!(journal.is_empty(), "a cancelled site never happened — no Demolished record either");
+
+        let stock = app.world().resource::<Stock>();
+        assert_eq!(stock.count("minecraft:oak_planks"), 40, "the cost is refunded");
+        assert_eq!(stock.count("minecraft:dirt"), 0, "what clearing had credited is taken back");
+    }
+
+    #[test]
+    fn poll_demolish_site_cancel_failure_retries_without_touching_anything() {
+        let mut app = site_test_app();
+        let building = app
+            .world_mut()
+            .resource_mut::<City>()
+            .place_building("house01", None, IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::new(1, 1))
+            .unwrap();
+        app.world_mut().resource_mut::<City>().mark_under_construction(building);
+        let ledger = Ledger { credited: a_parcel(&[("minecraft:dirt", 3)]), debited: a_parcel(&[("minecraft:oak_planks", 40)]) };
+        app.world_mut().resource_mut::<Journal>().record_placement(building, a_placement(), a_baseline(), ledger.clone());
+
+        let task = pool().spawn(async { Err(EditRefusal::Empty) });
+        app.world_mut().resource_mut::<DemolishState>().pending =
+            Some(PendingDemolition { building, placement: a_placement(), edit: WorldEdit::new(), site_ledger: Some(ledger), task });
+
+        run_until_settled(&mut app);
+
+        assert!(!app.world().resource::<City>().is_empty(), "still standing — the cancel didn't land");
+        assert_eq!(app.world().resource::<Journal>().len(), 1, "the entry is retryable");
+        assert!(app.world().resource::<Stock>().is_empty(), "nothing refunded until the cancel actually succeeds");
     }
 
     #[test]
@@ -543,7 +778,7 @@ mod tests {
 
         let task = pool().spawn(async { Err(EditRefusal::Empty) });
         app.world_mut().resource_mut::<DemolishState>().pending =
-            Some(PendingDemolition { building, placement: a_placement(), edit: WorldEdit::new(), task });
+            Some(PendingDemolition { building, placement: a_placement(), edit: WorldEdit::new(), site_ledger: None, task });
 
         run_until_settled(&mut app);
 

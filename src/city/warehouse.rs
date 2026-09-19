@@ -226,7 +226,9 @@ pub fn compute_coverage(city: &City, definitions: &BuildingDefinitions, road_typ
     let producer_cells: Vec<(BuildingId, HashSet<IVec2>)> = city
         .buildings()
         .filter(|&(id, _)| is_producer(city, definitions, id))
-        .map(|(id, placed)| (id, road::touching_road_cells(city, placed)))
+        .map(|(id, placed)| {
+            (id, road::touching_road_cells(city, placed).into_iter().filter(|&cell| is_usable_road_cell(city, cell)).collect())
+        })
         .collect();
 
     let mut served: HashMap<BuildingId, Served> = HashMap::new();
@@ -234,7 +236,8 @@ pub fn compute_coverage(city: &City, definitions: &BuildingDefinitions, road_typ
         let Some(spec) = warehouse_of(city, definitions, warehouse) else { continue };
         let Some(placed) = city.building(warehouse) else { continue };
 
-        let start = road::touching_road_cells(city, placed);
+        let start: HashSet<IVec2> =
+            road::touching_road_cells(city, placed).into_iter().filter(|&cell| is_usable_road_cell(city, cell)).collect();
         if start.is_empty() {
             continue;
         }
@@ -272,6 +275,17 @@ fn cmp_f32(a: &f32, b: &f32) -> std::cmp::Ordering {
     a.partial_cmp(b).expect("travel times are finite by construction")
 }
 
+/// Whether `cell` is road a warehouse's coverage can actually route through
+/// — a road cell that exists but is still `city::construction`'s site
+/// (ticket 128) reads as *not* road here: a producer isn't connected by a
+/// road that doesn't exist yet, and a warehouse's own touching cell being a
+/// site shouldn't let it serve through it either. Everything else that reads
+/// occupancy (`connections_at`/`select_piece`, a drag's own re-crossing) is
+/// unaffected — see `city::state::RoadCell::under_construction`'s own docs.
+fn is_usable_road_cell(city: &City, cell: IVec2) -> bool {
+    city.road_cell_at(cell).is_some_and(|road| !road.under_construction)
+}
+
 /// Every road cell within `radius` hops of `start`, `start` included — the
 /// coverage half of the pass.
 fn cells_within(city: &City, start: &HashSet<IVec2>, radius: u32) -> HashSet<IVec2> {
@@ -284,7 +298,7 @@ fn cells_within(city: &City, start: &HashSet<IVec2>, radius: u32) -> HashSet<IVe
         }
         for direction in Direction::ALL {
             let next = cell + direction.offset();
-            if city.is_road_cell(next) && covered.insert(next) {
+            if is_usable_road_cell(city, next) && covered.insert(next) {
                 queue.push_back((next, depth + 1));
             }
         }
@@ -633,6 +647,33 @@ mod tests {
         served.sort();
         assert_eq!(served, vec![a, b]);
         assert_eq!(coverage.warehouses(), &[warehouse]);
+    }
+
+    // --- construction sites (ticket 128) --------------------------------------
+
+    #[test]
+    fn coverage_does_not_reach_a_producer_whose_only_road_is_under_construction() {
+        let mut city = City::default();
+        road(&mut city, "dirt", 0, 3, 0);
+        place(&mut city, "warehouse01", IVec2::new(0, 0));
+        let farm = place(&mut city, "farm01", IVec2::new(3, 0));
+        city.set_road_cell_under_construction(IVec2::new(3, 0), true);
+
+        let coverage = compute_coverage(&city, &defs(), &road_types(&[("dirt", 1.0)]));
+        assert!(coverage.served(farm).is_none(), "the farm's only touching cell is still a site");
+    }
+
+    #[test]
+    fn a_warehouse_cannot_serve_through_a_cell_still_under_construction() {
+        let mut city = City::default();
+        road(&mut city, "dirt", 0, 3, 0);
+        place(&mut city, "warehouse01", IVec2::new(0, 0));
+        let farm = place(&mut city, "farm01", IVec2::new(3, 0));
+        // Cutting the road in the middle, mid-clearing.
+        city.set_road_cell_under_construction(IVec2::new(1, 0), true);
+
+        let coverage = compute_coverage(&city, &defs(), &road_types(&[("dirt", 1.0)]));
+        assert!(coverage.served(farm).is_none(), "the path is blocked by a cell that isn't road yet");
     }
 
     // --- storage capacity ----------------------------------------------------

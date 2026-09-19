@@ -313,6 +313,12 @@ Building(
   clearing whatever terrain the fit tolerance left poking into the building.
   On success: `Baseline::capture` + `Journal::record_placement`, then
   `ChunksEdited`. On failure: `City::remove_building` — the transactional half.
+  **Not instant over rough ground** (ticket 128): a volume that isn't already
+  clear is entered as a *site* instead of written outright —
+  `city::construction`'s tick digs it to air over time, at
+  `economy.site_clearing_blocks_per_minute`, before the blueprint write above
+  ever dispatches. A volume that's already clear (or entirely undecoded)
+  keeps taking this instant path unchanged.
 - **`demolish::DemolishPlugin`** — `Delete` on the hovered tile.
   `City::occupant_at` finds the id, `Journal::placement_baseline` finds what
   to restore (refuses when there is none — an older-save edge case), and
@@ -400,7 +406,12 @@ Building(
   otherwise. Commit validates the whole path first, claims every cell in
   `City` synchronously, then batches **one merged `WorldEdit`** across the path
   plus any already-road neighbour needing re-tiling. **Road cells are not
-  journaled** — no undo or demolish for them yet.
+  journaled** — no undo or demolish for them yet. **Not instant over rough
+  ground** (ticket 128): a newly added cell whose own volume isn't already
+  clear is claimed but left out of that batched write — it's a site,
+  cleared by `city::construction`'s tick, and only written once its own
+  scan comes back empty. An already-road neighbour merely being re-tiled
+  is never a site — that's a piece swap, still instant.
 - **Height is a property of the placement, not the cell** (tickets 065/067).
   065 established that a cell's Y is resolved *once* and remembered on
   `state::RoadCell::base_y`, never re-derived — after a piece is written

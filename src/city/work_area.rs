@@ -305,6 +305,7 @@ mod tests {
             rotation: Rotation::Deg0,
             footprint: IVec2::splat(2),
             work_area: None,
+            under_construction: false,
         }
     }
 

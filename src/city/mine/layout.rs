@@ -777,6 +777,7 @@ mod tests {
             rotation,
             footprint,
             work_area: None,
+            under_construction: false,
         }
     }
 

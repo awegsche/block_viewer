@@ -163,6 +163,18 @@ pub struct PlacedBuilding {
     /// free, so demolish-then-undo brings the area back without anyone
     /// learning it exists. Only [`City::set_work_area`] ever writes it.
     pub work_area: Option<WorkArea>,
+    /// Ticket 128: `true` while this placement is still a **site** — its
+    /// blueprint hasn't been written yet because the ground it displaces
+    /// isn't clear (`city::construction`'s clearing tick is digging it out
+    /// first). `false` for an ordinary, already-built placement, and for
+    /// every placement that predates this ticket (see `persistence`'s
+    /// `#[serde(default)]`). Lives on the placement itself, not a side map,
+    /// for the same reason [`work_area`](Self::work_area) does — a site is a
+    /// claimed row in [`City`], and everything that already clones/saves a
+    /// `PlacedBuilding` carries the flag for free. Only
+    /// [`City::mark_under_construction`]/[`City::complete_building`] ever
+    /// write it.
+    pub under_construction: bool,
 }
 
 /// An inclusive axis-aligned rectangle of Minecraft `(x, z)` block tiles —
@@ -284,6 +296,14 @@ pub struct RoadCell {
     /// read, so the write path and the preview keep reading one recorded
     /// answer rather than each taking their own.
     pub variant: super::road::RoadPieceVariant,
+    /// Ticket 128: `true` while this cell is still a **site** — claimed in
+    /// [`City`] (so occupancy, `connections_at`/`select_piece` and a drag's
+    /// own re-crossing all see it as road already) but not yet cleared and
+    /// written. `false` once its piece is actually in the world, and for
+    /// every cell that predates this ticket. `warehouse` coverage is the one
+    /// reader that treats a `true` cell as *not* road — see that module's
+    /// docs. Only [`City::set_road_cell_under_construction`] ever writes it.
+    pub under_construction: bool,
 }
 
 /// What one tile of the occupancy grid holds.
@@ -454,9 +474,47 @@ impl City {
         }
         self.buildings.insert(
             id,
-            PlacedBuilding { catalogue_id: catalogue_id.into(), definition_id, origin, rotation, footprint, work_area: None },
+            PlacedBuilding {
+                catalogue_id: catalogue_id.into(),
+                definition_id,
+                origin,
+                rotation,
+                footprint,
+                work_area: None,
+                under_construction: false,
+            },
         );
         Ok(id)
+    }
+
+    /// Marks `id` a **site** (ticket 128) — its blueprint hasn't been
+    /// written yet, `city::construction` is clearing the ground under it
+    /// first. `false` if `id` isn't a placed building. Called once, by
+    /// `city::commit::try_commit_placement`, right after
+    /// [`place_building`](Self::place_building) claims the tile — see
+    /// [`PlacedBuilding::under_construction`].
+    pub fn mark_under_construction(&mut self, id: BuildingId) -> bool {
+        match self.buildings.get_mut(&id) {
+            Some(building) => {
+                building.under_construction = true;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The inverse of [`mark_under_construction`](Self::mark_under_construction):
+    /// a site's clearing finished and its blueprint has actually been
+    /// written. `false` if `id` isn't a placed building. Called by
+    /// `city::commit::poll_commit`'s site arm once that write succeeds.
+    pub fn complete_building(&mut self, id: BuildingId) -> bool {
+        match self.buildings.get_mut(&id) {
+            Some(building) => {
+                building.under_construction = false;
+                true
+            }
+            None => false,
+        }
     }
 
     /// Sets (or, with `None`, clears) `id`'s [`PlacedBuilding::work_area`]
@@ -517,7 +575,22 @@ impl City {
         self.buildings.get(&id)?.definition_id.as_deref()
     }
 
+    /// Every **completed** placement — a site (ticket 128,
+    /// [`PlacedBuilding::under_construction`]) is excluded, because it isn't
+    /// a building yet: no production/gatherer/mine tick runs for it, it adds
+    /// no storage or coverage, and it unlocks nothing in the build menu. See
+    /// [`placements`](Self::placements) for the unfiltered iterator, which
+    /// the handful of callers that *do* need to see a site (persistence, the
+    /// construction tick, the site marker, the journal's row lookup) use
+    /// instead.
     pub fn buildings(&self) -> impl Iterator<Item = (BuildingId, &PlacedBuilding)> {
+        self.buildings.iter().filter(|(_, b)| !b.under_construction).map(|(&id, b)| (id, b))
+    }
+
+    /// Every placement, completed or still a site — see
+    /// [`buildings`](Self::buildings)'s own docs for the distinction and why
+    /// most callers want that one instead.
+    pub fn placements(&self) -> impl Iterator<Item = (BuildingId, &PlacedBuilding)> {
         self.buildings.iter().map(|(&id, b)| (id, b))
     }
 
@@ -608,8 +681,23 @@ impl City {
         for &tile in &tiles {
             self.occupancy.insert(tile, Occupant::Road);
         }
-        self.road_cells.insert(cell, RoadCell { style: style.into(), base_y, ascent, variant });
+        self.road_cells.insert(cell, RoadCell { style: style.into(), base_y, ascent, variant, under_construction: false });
         Ok(())
+    }
+
+    /// Sets `cell`'s [`RoadCell::under_construction`] flag (ticket 128).
+    /// `false` if `cell` isn't a road cell — the same "no such cell" report
+    /// [`set_road_cell_variant`](Self::set_road_cell_variant) gives with
+    /// `None`, spelled as a `bool` here since no caller needs the old value
+    /// back.
+    pub fn set_road_cell_under_construction(&mut self, cell: IVec2, value: bool) -> bool {
+        match self.road_cells.get_mut(&cell) {
+            Some(road) => {
+                road.under_construction = value;
+                true
+            }
+            None => false,
+        }
     }
 
     /// Repaints an existing road cell's [`RoadCell::variant`] in place
@@ -875,7 +963,10 @@ mod tests {
     fn road_cell_at_reports_the_style_and_height_a_cell_was_built_with() {
         let mut city = City::default();
         city.add_road_cell(IVec2::new(3, -2), "paved", 71, None, RoadPieceVariant::Surface).unwrap();
-        assert_eq!(city.road_cell_at(IVec2::new(3, -2)), Some(&RoadCell { style: "paved".to_string(), base_y: 71, ascent: None, variant: RoadPieceVariant::Surface }));
+        assert_eq!(
+            city.road_cell_at(IVec2::new(3, -2)),
+            Some(&RoadCell { style: "paved".to_string(), base_y: 71, ascent: None, variant: RoadPieceVariant::Surface, under_construction: false })
+        );
         assert_eq!(city.road_cell_at(IVec2::new(0, 0)), None);
     }
 
@@ -1043,6 +1134,43 @@ mod tests {
     fn clamp_to_reach_refuses_a_rectangle_entirely_out_of_reach() {
         let area = WorkArea::new(IVec2::new(5, 0), IVec2::new(9, 0));
         assert_eq!(area.clamp_to_reach(IVec2::ZERO, IVec2::splat(2), 3), None);
+    }
+
+    // --- construction sites (ticket 128) -------------------------------------
+
+    #[test]
+    fn buildings_skips_a_site_but_placements_includes_it() {
+        let mut city = City::default();
+        let a = city.place_building("house01", None, IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::ONE).unwrap();
+        let b = city.place_building("house01", None, IVec3::new(5, 64, 5), Rotation::Deg0, IVec2::ONE).unwrap();
+        assert!(city.mark_under_construction(b));
+
+        let completed: HashSet<BuildingId> = city.buildings().map(|(id, _)| id).collect();
+        assert_eq!(completed, HashSet::from([a]), "a site under construction isn't a building yet");
+
+        let all: HashSet<BuildingId> = city.placements().map(|(id, _)| id).collect();
+        assert_eq!(all, HashSet::from([a, b]), "placements() sees every row, sites included");
+
+        assert!(city.complete_building(b));
+        let completed: HashSet<BuildingId> = city.buildings().map(|(id, _)| id).collect();
+        assert_eq!(completed, HashSet::from([a, b]), "completing the site makes it a building again");
+    }
+
+    #[test]
+    fn mark_and_complete_are_false_for_an_unknown_building() {
+        let mut city = City::default();
+        assert!(!city.mark_under_construction(BuildingId(7)));
+        assert!(!city.complete_building(BuildingId(7)));
+    }
+
+    #[test]
+    fn set_road_cell_under_construction_reports_whether_the_cell_exists() {
+        let mut city = City::default();
+        assert!(!city.set_road_cell_under_construction(IVec2::new(0, 0), true));
+        city.add_road_cell(IVec2::new(0, 0), "dirt", 64, None, RoadPieceVariant::Surface).unwrap();
+        assert!(!city.road_cell_at(IVec2::new(0, 0)).unwrap().under_construction, "a freshly-added cell starts complete");
+        assert!(city.set_road_cell_under_construction(IVec2::new(0, 0), true));
+        assert!(city.road_cell_at(IVec2::new(0, 0)).unwrap().under_construction);
     }
 
     #[test]

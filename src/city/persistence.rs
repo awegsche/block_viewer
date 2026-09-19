@@ -145,6 +145,14 @@ struct SavedBuilding {
     /// [`CURRENT_VERSION`]: see the module docs.
     #[serde(default)]
     work_area: Option<((i32, i32), (i32, i32))>,
+    /// Ticket 128: `true` while this placement is still a site —
+    /// `city::construction` re-enters it as one on load, with carry
+    /// restarting at 0. `#[serde(default)]`, same argument `work_area`
+    /// already makes: every building in a file written before this ticket
+    /// finished its write before it was ever saved, so `false` is the truth
+    /// about it, not a guess.
+    #[serde(default)]
+    under_construction: bool,
 }
 
 /// One saved road cell — cell coordinates plus the style
@@ -166,6 +174,10 @@ struct SavedRoadCell {
     /// Surface or tunnel — [`super::road::RoadPieceVariant`] itself, not a
     /// mirror enum, for the same reason `ascent` carries `Direction`.
     variant: RoadPieceVariant,
+    /// Ticket 128, same `#[serde(default)]`/no-bump argument
+    /// [`SavedBuilding::under_construction`] carries.
+    #[serde(default)]
+    under_construction: bool,
 }
 
 /// Why [`save_city`] or [`load_city`] failed.
@@ -214,8 +226,12 @@ pub fn save_city(city: &City, save_root: &Path) -> Result<(), PersistenceError> 
         fs::create_dir_all(dir).map_err(PersistenceError::Io)?;
     }
 
+    // Ticket 128: `placements()`, not `buildings()` — a site is claimed
+    // ground with a journal entry, and has to survive a save/load round trip
+    // exactly like a completed building does, or reloading mid-clearing
+    // would simply lose it.
     let mut buildings: Vec<SavedBuilding> = city
-        .buildings()
+        .placements()
         .map(|(id, building)| SavedBuilding {
             id: id.as_u64(),
             catalogue_id: building.catalogue_id.clone(),
@@ -224,6 +240,7 @@ pub fn save_city(city: &City, save_root: &Path) -> Result<(), PersistenceError> 
             rotation: building.rotation,
             footprint: (building.footprint.x, building.footprint.y),
             work_area: building.work_area.map(|a| ((a.min.x, a.min.y), (a.max.x, a.max.y))),
+            under_construction: building.under_construction,
         })
         .collect();
     buildings.sort_by_key(|b| b.id);
@@ -237,6 +254,7 @@ pub fn save_city(city: &City, save_root: &Path) -> Result<(), PersistenceError> 
             style: road.style.clone(),
             ascent: road.ascent,
             variant: road.variant,
+            under_construction: road.under_construction,
         })
         .collect();
     road_cells.sort_by_key(|cell| (cell.x, cell.z));
@@ -279,6 +297,7 @@ pub fn load_city(save_root: &Path) -> Result<City, PersistenceError> {
             rotation: saved.rotation,
             footprint: IVec2::new(fx, fz),
             work_area: saved.work_area.map(|((ax, az), (bx, bz))| WorkArea { min: IVec2::new(ax, az), max: IVec2::new(bx, bz) }),
+            under_construction: saved.under_construction,
         };
         city.insert_loaded(BuildingId::from_u64(saved.id), building)
             .map_err(PersistenceError::Corrupt)?;
@@ -287,8 +306,15 @@ pub fn load_city(save_root: &Path) -> Result<City, PersistenceError> {
     let mut road_cells = save.road_cells;
     road_cells.sort_by_key(|cell| (cell.x, cell.z));
     for cell in road_cells {
-        city.add_road_cell(IVec2::new(cell.x, cell.z), cell.style, cell.y, cell.ascent, cell.variant)
+        let coord = IVec2::new(cell.x, cell.z);
+        city.add_road_cell(coord, cell.style, cell.y, cell.ascent, cell.variant)
             .map_err(PersistenceError::Corrupt)?;
+        // Ticket 128: `add_road_cell` always inserts a fresh cell as
+        // complete — re-enter it as a site (carry restarts at 0) if that's
+        // what it was when it was saved.
+        if cell.under_construction {
+            city.set_road_cell_under_construction(coord, true);
+        }
     }
 
     // `insert_loaded` already raised `next_id` past every id it inserted;
@@ -478,6 +504,68 @@ mod tests {
         .unwrap();
         let loaded = load_city(&dir).unwrap();
         assert_eq!(loaded.building(BuildingId::from_u64(0)).unwrap().work_area, None);
+    }
+
+    // --- construction sites (ticket 128) --------------------------------------
+
+    #[test]
+    fn under_construction_round_trips_for_both_buildings_and_road_cells() {
+        let dir = temp_dir("under_construction_round_trip");
+        let mut city = City::default();
+        let site = city.place_building("house01", None, IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::ONE).unwrap();
+        city.mark_under_construction(site);
+        let done = city.place_building("house01", None, IVec3::new(1, 64, 1), Rotation::Deg0, IVec2::ONE).unwrap();
+        // Cells far from both buildings' single-tile footprints.
+        city.add_road_cell(IVec2::new(5, 0), "dirt", 64, None, RoadPieceVariant::Surface).unwrap();
+        city.set_road_cell_under_construction(IVec2::new(5, 0), true);
+        city.add_road_cell(IVec2::new(6, 1), "dirt", 64, None, RoadPieceVariant::Surface).unwrap();
+
+        save_city(&city, &dir).unwrap();
+        let loaded = load_city(&dir).unwrap();
+
+        assert!(loaded.placements().find(|(id, _)| *id == site).unwrap().1.under_construction);
+        assert!(!loaded.placements().find(|(id, _)| *id == done).unwrap().1.under_construction);
+        assert!(loaded.road_cell_at(IVec2::new(5, 0)).unwrap().under_construction);
+        assert!(!loaded.road_cell_at(IVec2::new(6, 1)).unwrap().under_construction);
+        // A site is claimed ground, not a building yet.
+        assert!(loaded.buildings().all(|(id, _)| id != site));
+    }
+
+    #[test]
+    fn a_saved_site_is_still_recorded_even_though_buildings_skips_it() {
+        let dir = temp_dir("site_survives_save");
+        let mut city = City::default();
+        let site = city.place_building("house01", None, IVec3::new(0, 64, 0), Rotation::Deg0, IVec2::ONE).unwrap();
+        city.mark_under_construction(site);
+
+        save_city(&city, &dir).unwrap();
+        let loaded = load_city(&dir).unwrap();
+        assert_eq!(loaded.placements().count(), 1, "the site is still there");
+        assert_eq!(loaded.buildings().count(), 0, "but it isn't a building yet");
+    }
+
+    #[test]
+    fn a_file_without_under_construction_fields_loads_as_false() {
+        let dir = temp_dir("no_under_construction_field");
+        fs::create_dir_all(dir.join("citybuilder")).unwrap();
+        fs::write(
+            dir.join("citybuilder/city.ron"),
+            format!(
+                r#"(
+                version: {CURRENT_VERSION},
+                next_id: 1,
+                buildings: [
+                    (id: 0, catalogue_id: "house01", definition_id: None, origin: (20, 64, 20), rotation: Deg0, footprint: (1, 1)),
+                ],
+                road_cells: [(x: 0, z: 0, y: 64, style: "dirt", ascent: None, variant: Surface)],
+            )"#
+            ),
+        )
+        .unwrap();
+
+        let loaded = load_city(&dir).unwrap();
+        assert!(!loaded.building(BuildingId::from_u64(0)).unwrap().under_construction);
+        assert!(!loaded.road_cell_at(IVec2::new(0, 0)).unwrap().under_construction);
     }
 
     #[test]

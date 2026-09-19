@@ -338,18 +338,39 @@ fn cycle_road_style(
 /// A committed drag's write, in flight — the road-cell counterpart of
 /// `city::commit::PendingCommit`.
 struct PendingRoadBuild {
-    /// Cells *this* drag actually added (excludes an already-road cell it
-    /// merely crossed) — [`City::remove_road_cell`]'s rollback list on a
-    /// failed write. See the module docs' "Not journaled".
+    /// Cells *this* write actually added and wrote (excludes an
+    /// already-road cell it merely crossed, and — ticket 128 — excludes any
+    /// cell that turned into a site rather than being written now) —
+    /// [`City::remove_road_cell`]'s rollback list on a failed write, and
+    /// [`City::set_road_cell_under_construction`]'s "it's built now" list on
+    /// a successful one. See the module docs' "Not journaled".
     newly_added: Vec<IVec2>,
+    /// Ticket 128: `false` for a site's completion write
+    /// ([`dispatch_road_cell_write`]) — the cell was already claimed and
+    /// recorded when it became a site, so a failed completion logs and
+    /// retries next tick rather than un-building it, the same "the hole is
+    /// real" reasoning `city::commit::poll_commit`'s site arm follows.
+    /// `true` for an ordinary drag commit, whose `newly_added` cells really
+    /// were claimed for the first time by *this* write.
+    rollback_on_failure: bool,
     task: Task<Result<EditReport, EditRefusal>>,
 }
 
 /// One road build in flight at a time — the same single-slot backpressure
 /// `city::commit::CommitState`/`city::demolish::DemolishState` already use.
+/// `pub(super)`: `city::construction`'s tick shares this slot for a road
+/// cell site's completion write, and needs to know when it's free.
 #[derive(Resource, Default)]
-struct RoadBuildState {
+pub(super) struct RoadBuildState {
     pending: Option<PendingRoadBuild>,
+}
+
+impl RoadBuildState {
+    /// Whether a write (a drag commit, a reactive re-tile, or — ticket 128 —
+    /// a site's completion) is already in flight.
+    pub(super) fn is_busy(&self) -> bool {
+        self.pending.is_some()
+    }
 }
 
 /// A building's footprint just appeared in, or disappeared from,
@@ -539,7 +560,7 @@ pub(super) const ROAD_PIECE_SUBGRADE_DEPTH: i32 = 1;
 /// Shared by [`road_write_edit`] and the drag preview so the ghost stands
 /// exactly where the blocks will land — before ticket 065 the two disagreed
 /// by the whole height of the world.
-fn cell_write_origin(cell: IVec2, base_y: i32) -> IVec3 {
+pub(super) fn cell_write_origin(cell: IVec2, base_y: i32) -> IVec3 {
     cell_min_corner(cell).with_y(base_y - 1 - ROAD_PIECE_SUBGRADE_DEPTH)
 }
 
@@ -967,7 +988,7 @@ fn plan_connections(plan: &mut [CellPlan], path: &[IVec2], city: &City, catalogu
 /// write path's and the preview's shared answer — see
 /// [`RoadPieceKind::Stair`]'s docs for why a cell's connections alone can
 /// never say "ramp".
-fn piece_for(connections: RoadConnections, ascent: Option<road::Direction>) -> (RoadPieceKind, Rotation) {
+pub(super) fn piece_for(connections: RoadConnections, ascent: Option<road::Direction>) -> (RoadPieceKind, Rotation) {
     match ascent {
         Some(ascent) => (RoadPieceKind::Stair, road::stair_rotation(ascent)),
         None => road::select_piece(connections),
@@ -1379,6 +1400,62 @@ fn road_write_edit(affected: &[IVec2], catalogue: &RoadCatalogue, city: &City) -
     merged
 }
 
+/// A road cell's own volume — the piece it would write's box at
+/// [`cell_write_origin`], tunnel piece included — see the module docs'
+/// "Roads". `None` when `cell` isn't a road cell at all, or the catalogue
+/// has no piece for its `(style, kind, variant)`: either way there's
+/// nothing to clear or write yet, the same "nothing to do" state a building
+/// with no catalogue entry would be in.
+///
+/// `pub(super)`: `city::commit::try_commit_drag` (ticket 128) reads this to
+/// decide whether a newly added cell needs to become a site at all;
+/// `city::construction`'s tick reads it again every tick a site without a
+/// pending write has, on a fresh read.
+pub(super) fn road_site_box(cell: IVec2, city: &City, catalogue: &RoadCatalogue) -> Option<(IVec3, IVec3)> {
+    let road = city.road_cell_at(cell)?;
+    let (kind, rotation) = piece_for(road::connections_at(city, cell), road.ascent);
+    let piece = catalogue.get(&road.style, kind, road.variant)?;
+    let size = match rotation {
+        Rotation::Deg90 | Rotation::Deg270 => IVec3::new(piece.size.z, piece.size.y, piece.size.x),
+        Rotation::Deg0 | Rotation::Deg180 => piece.size,
+    };
+    Some((cell_write_origin(cell, road.base_y), size))
+}
+
+/// A road cell site's completion write (ticket 128): catches up the
+/// connected marker (a building may have appeared beside this cell while it
+/// was clearing, which the reactive re-tile skipped — see [`wanted_variant`]),
+/// then dispatches `road_write_edit` for this cell and its affected
+/// neighbours into [`RoadBuildState::pending`]. Does nothing if a write is
+/// already in flight — the caller (`city::construction`'s tick) checks
+/// [`RoadBuildState::is_busy`] first, the same "a site that finds the slot
+/// busy tries again next tick" rule a building's own completion follows.
+pub(super) fn dispatch_road_cell_write(build: &mut RoadBuildState, region_cache: &SharedRegionCache, cell: IVec2, catalogue: &RoadCatalogue, city: &mut City) {
+    if let Some(road) = city.road_cell_at(cell)
+        && road.variant != RoadPieceVariant::Tunnel
+    {
+        let (kind, _) = piece_for(road::connections_at(city, cell), road.ascent);
+        let wanted = if road::touches_building(city, cell) && catalogue.get(&road.style, kind, RoadPieceVariant::Connected).is_some() {
+            RoadPieceVariant::Connected
+        } else {
+            RoadPieceVariant::Surface
+        };
+        if wanted != road.variant {
+            city.set_road_cell_variant(cell, wanted);
+        }
+    }
+
+    let affected = affected_cells(&[cell], city);
+    let edit = road_write_edit(&affected, catalogue, city);
+    let cache: Arc<Mutex<RegionCache>> = region_cache.0.clone();
+    let policy = EditPolicy { capture_replaced: false, allow_dirty_regions: true, ..EditPolicy::default() };
+    let task = AsyncComputeTaskPool::get().spawn(async move {
+        let mut cache = cache.lock().expect("region cache mutex poisoned");
+        super::commit::apply_building_edit(&mut cache, &edit, &policy)
+    });
+    build.pending = Some(PendingRoadBuild { newly_added: vec![cell], rollback_on_failure: false, task });
+}
+
 /// Left-click release with the road tool active: validates the whole drag,
 /// claims every cell in [`City`] synchronously, and dispatches the write onto
 /// [`AsyncComputeTaskPool`] — see the module docs' "Committing".
@@ -1456,7 +1533,28 @@ fn try_commit_drag(
         }
     }
 
-    let affected = affected_cells(&path, &city);
+    // Ticket 128: a newly added cell whose volume isn't already clear
+    // becomes a site — `city::construction`'s tick clears it over time,
+    // rather than it being written now. See that module's docs' "Roads".
+    let mut sites: Vec<IVec2> = Vec::new();
+    if let Some(catalogue) = catalogue.as_deref() {
+        for &cell in &newly_added {
+            if let Some((origin, size)) = road_site_box(cell, &city, catalogue)
+                && !super::construction::scan_site(origin, size, &world).is_empty()
+            {
+                city.set_road_cell_under_construction(cell, true);
+                sites.push(cell);
+            }
+        }
+    }
+    // Only the cells this write actually writes now — a site is claimed but
+    // not written; a failed write below must not roll one of those back.
+    let written: Vec<IVec2> = newly_added.iter().copied().filter(|cell| !sites.contains(cell)).collect();
+
+    let affected: Vec<IVec2> = affected_cells(&path, &city)
+        .into_iter()
+        .filter(|&cell| !city.road_cell_at(cell).is_some_and(|road| road.under_construction))
+        .collect();
     let Some(catalogue) = catalogue else {
         // No `RoadCatalogue` resource at all — the cells are recorded; there
         // is nothing to mesh or write. See the module docs' "The preview" for
@@ -1466,10 +1564,14 @@ fn try_commit_drag(
     };
     let edit = road_write_edit(&affected, &catalogue, &city);
     if edit.is_empty() {
-        println!(
-            "block_viewer: built {} road cell(s) (no matching road pieces loaded, nothing written to the world)",
-            path.len()
-        );
+        if sites.is_empty() {
+            println!(
+                "block_viewer: built {} road cell(s) (no matching road pieces loaded, nothing written to the world)",
+                path.len()
+            );
+        } else {
+            println!("block_viewer: {} road cell(s) entered as sites, clearing before their pieces are written", sites.len());
+        }
         return;
     }
 
@@ -1487,7 +1589,7 @@ fn try_commit_drag(
         super::commit::apply_building_edit(&mut cache, &task_edit, &policy)
     });
 
-    build.pending = Some(PendingRoadBuild { newly_added, task });
+    build.pending = Some(PendingRoadBuild { newly_added: written, rollback_on_failure: true, task });
 }
 
 /// Single non-blocking poll of the in-flight write, the same
@@ -1507,7 +1609,7 @@ fn poll_road_build(
         };
         result
     };
-    let PendingRoadBuild { newly_added, .. } = build.pending.take().expect("just matched Some above");
+    let PendingRoadBuild { newly_added, rollback_on_failure, .. } = build.pending.take().expect("just matched Some above");
 
     match result {
         Ok(report) => {
@@ -1517,14 +1619,27 @@ fn poll_road_build(
                 "block_viewer: built {} road cell(s) ({blocks} block(s) across {chunks} chunk(s), not yet saved to disk)",
                 newly_added.len()
             );
+            // Ticket 128: a harmless no-op for an ordinary drag's cells
+            // (never marked in the first place) — the real effect is a
+            // site's completion write landing.
+            for &cell in &newly_added {
+                city.set_road_cell_under_construction(cell, false);
+            }
             write_status.record_success(WriteKind::Road, format!("{} road cell(s)", newly_added.len()), &report);
             edited.send(ChunksEdited::from_report(&report));
         }
         Err(err) => {
-            for cell in &newly_added {
-                city.remove_road_cell(*cell);
+            if rollback_on_failure {
+                for cell in &newly_added {
+                    city.remove_road_cell(*cell);
+                }
+                println!("block_viewer: road build failed, rolled back {} cell(s): {err}", newly_added.len());
+            } else {
+                // Ticket 128: a site's completion write — the cell is real
+                // and recorded; it logs and retries next tick rather than
+                // being un-built.
+                println!("block_viewer: road site completion failed, retrying: {err}");
             }
-            println!("block_viewer: road build failed, rolled back {} cell(s): {err}", newly_added.len());
             write_status.record_failure(WriteKind::Road, format!("{} road cell(s)", newly_added.len()), err.to_string());
         }
     }
@@ -1541,7 +1656,10 @@ fn poll_road_build(
 /// docs' "Reactive re-tile" for each rule.
 fn wanted_variant(cell: IVec2, city: &City, catalogue: &RoadCatalogue) -> Option<RoadPieceVariant> {
     let road = city.road_cell_at(cell)?;
-    if road.variant == RoadPieceVariant::Tunnel {
+    if road.variant == RoadPieceVariant::Tunnel || road.under_construction {
+        // Ticket 128: a cell still clearing isn't written yet — its
+        // completion write (`dispatch_road_cell_write`) is what catches the
+        // connected marker up, not this reactive re-tile.
         return None;
     }
     let (kind, _) = piece_for(road::connections_at(city, cell), road.ascent);
@@ -2080,7 +2198,7 @@ mod tests {
         let report = EditReport { blocks_written: 36, chunks: vec![(0, 0)], regions: vec![(0, 0)], replaced: None, ..Default::default() };
         let task = pool().spawn(async move { Ok(report) });
         app.world_mut().resource_mut::<RoadBuildState>().pending =
-            Some(PendingRoadBuild { newly_added: vec![IVec2::new(0, 0)], task });
+            Some(PendingRoadBuild { newly_added: vec![IVec2::new(0, 0)], rollback_on_failure: true, task });
 
         run_until_settled(&mut app);
 
@@ -2103,7 +2221,7 @@ mod tests {
 
         let task = pool().spawn(async { Err(EditRefusal::Empty) });
         app.world_mut().resource_mut::<RoadBuildState>().pending =
-            Some(PendingRoadBuild { newly_added: vec![IVec2::new(1, 0)], task });
+            Some(PendingRoadBuild { newly_added: vec![IVec2::new(1, 0)], rollback_on_failure: true, task });
 
         run_until_settled(&mut app);
 

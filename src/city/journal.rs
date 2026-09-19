@@ -271,9 +271,83 @@ impl Journal {
     /// apart either way.
     ///
     /// Called by `city::commit::poll_commit` (ticket 048, roadmap E4) once a
-    /// placement's write has actually succeeded.
+    /// placement's write has actually succeeded — and, since ticket 128, by
+    /// `city::commit::try_commit_placement` itself the instant a **site** is
+    /// entered, with an empty `baseline` (nothing written yet) and a ledger
+    /// carrying only what the placement's `cost` actually took. See
+    /// [`extend_placement_baseline`](Self::extend_placement_baseline) for how
+    /// a site's entry grows from there, and [`remove_site_entry`](Self::remove_site_entry)
+    /// for cancelling one outright.
     pub fn record_placement(&mut self, building: BuildingId, placement: PlacedBuilding, baseline: Baseline, ledger: Ledger) {
         self.entries.push(JournalEntry::Placed { building, placement, baseline, ledger });
+    }
+
+    /// Ticket 128: merges `more` into `building`'s most recent placement
+    /// entry — one clearing dig's worth of baseline, folded into the site's
+    /// running record — and adds `credited` to its ledger. A no-op if
+    /// `building` has no placement entry (shouldn't happen: a site's entry is
+    /// recorded the instant it's entered, before any clearing dig can settle).
+    ///
+    /// Merged **by position**: a position already recorded keeps its
+    /// `previous` (what stood there before the *first* write ever touched
+    /// it) and takes `more`'s `written` (the latest state); a position new to
+    /// the entry is appended with both halves from `more`. Both vectors stay
+    /// `(y, z, x)`-sorted afterwards so they keep lining up index-for-index,
+    /// the same invariant [`Baseline::capture`] establishes for a single
+    /// edit — this is that same merge, run again each time a site's entry
+    /// grows by one more dig or its final blueprint write.
+    pub fn extend_placement_baseline(&mut self, building: BuildingId, more: Baseline, credited: Parcel) {
+        let Some(entry) = self.entries.iter_mut().rev().find(
+            |entry| matches!(entry, JournalEntry::Placed { building: id, .. } if *id == building),
+        ) else {
+            return;
+        };
+        let JournalEntry::Placed { baseline, ledger, .. } = entry else { unreachable!("just matched Placed above") };
+
+        let mut merged: BTreeMap<(i32, i32, i32), (BlockState, BlockState)> = BTreeMap::new();
+        for (at, state) in baseline.previous.iter().zip(baseline.written.iter()).map(|((at, previous), (_, written))| (*at, (previous.clone(), written.clone()))) {
+            merged.insert((at.y, at.z, at.x), state);
+        }
+        for (at, previous) in &more.previous {
+            let key = (at.y, at.z, at.x);
+            merged.entry(key).or_insert_with(|| (previous.clone(), previous.clone()));
+        }
+        for (at, written) in &more.written {
+            let key = (at.y, at.z, at.x);
+            match merged.get_mut(&key) {
+                Some((_, existing_written)) => *existing_written = written.clone(),
+                None => {
+                    merged.insert(key, (written.clone(), written.clone()));
+                }
+            }
+        }
+
+        let mut previous = Vec::with_capacity(merged.len());
+        let mut written = Vec::with_capacity(merged.len());
+        for ((y, z, x), (prev_state, written_state)) in merged {
+            let at = IVec3::new(x, y, z);
+            previous.push((at, prev_state));
+            written.push((at, written_state));
+        }
+        baseline.previous = previous;
+        baseline.written = written;
+        baseline.data_version = baseline.data_version.or(more.data_version);
+        ledger.credited.add_all(&credited);
+    }
+
+    /// Ticket 128: removes `building`'s placement entry outright — cancelling
+    /// a site, which never became a real building and so has nothing to
+    /// undo. `false` if `building` has no placement entry. `city::demolish`'s
+    /// site-reversal path is the caller, after its restoring write (the
+    /// site's own partial `previous`) has already succeeded.
+    pub fn remove_site_entry(&mut self, building: BuildingId) -> bool {
+        let Some(index) = self.entries.iter().rposition(
+            |entry| matches!(entry, JournalEntry::Placed { building: id, .. } if *id == building),
+        ) else {
+            return false;
+        };
+        self.entries.remove(index);
+        true
     }
 
     /// Appends a demolition entry. `placement` is what [`City::remove_building`]
@@ -317,6 +391,20 @@ impl Journal {
     pub fn placement_baseline(&self, building: BuildingId) -> Option<&Baseline> {
         self.entries.iter().rev().find_map(|entry| match entry {
             JournalEntry::Placed { building: id, baseline, .. } if *id == building => Some(baseline),
+            _ => None,
+        })
+    }
+
+    /// The most recent *placement* [`Ledger`] recorded for `building` — the
+    /// mirror of [`placement_baseline`](Self::placement_baseline) for the
+    /// materials half of the entry. `city::demolish`'s site-reversal path
+    /// (ticket 128) is the real caller: cancelling a site refunds exactly
+    /// what its entry actually moved, the same "settle what was settled, not
+    /// a fresh reading" argument `city::undo` already makes for its own
+    /// ledger reversal.
+    pub fn placement_ledger(&self, building: BuildingId) -> Option<&Ledger> {
+        self.entries.iter().rev().find_map(|entry| match entry {
+            JournalEntry::Placed { building: id, ledger, .. } if *id == building => Some(ledger),
             _ => None,
         })
     }
@@ -624,6 +712,13 @@ struct SavedPlacement {
     /// had none drawn, so `None` is what's true of it.
     #[serde(default)]
     work_area: Option<((i32, i32), (i32, i32))>,
+    /// Ticket 128. `#[serde(default)]` on the same "a file written before
+    /// this existed genuinely wasn't a site" argument `work_area`/`definition_id`
+    /// already make: every placement recorded before this ticket finished
+    /// its write before it was ever journaled, so `false` is the truth about
+    /// it, not a guess.
+    #[serde(default)]
+    under_construction: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -641,6 +736,7 @@ fn saved_placement(placement: &PlacedBuilding) -> SavedPlacement {
         rotation: placement.rotation,
         footprint: (placement.footprint.x, placement.footprint.y),
         work_area: placement.work_area.map(|a| ((a.min.x, a.min.y), (a.max.x, a.max.y))),
+        under_construction: placement.under_construction,
     }
 }
 
@@ -657,6 +753,7 @@ fn placement_from_saved(saved: SavedPlacement) -> PlacedBuilding {
             min: bevy::math::IVec2::new(ax, az),
             max: bevy::math::IVec2::new(bx, bz),
         }),
+        under_construction: saved.under_construction,
     }
 }
 

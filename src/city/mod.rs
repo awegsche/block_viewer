@@ -381,6 +381,7 @@ use std::path::{Path, PathBuf};
 
 mod clock;
 mod commit;
+mod construction;
 mod definition;
 mod demolish;
 mod drops;
@@ -537,6 +538,7 @@ pub fn run() {
         .add_plugins(picking::PickingPlugin)
         .add_plugins(placement::PlacementPlugin)
         .add_plugins(commit::CommitPlugin)
+        .add_plugins(construction::ConstructionPlugin)
         .add_plugins(demolish::DemolishPlugin)
         .add_plugins(road_build::RoadBuildPlugin)
         .add_plugins(terraform::TerraformPlugin)

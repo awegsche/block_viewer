@@ -20,7 +20,15 @@ fn dirt() -> BlockState {
 }
 
 fn placed(definition: &str, origin: IVec3, footprint: IVec2) -> PlacedBuilding {
-    PlacedBuilding { catalogue_id: definition.to_string(), definition_id: None, origin, rotation: Rotation::Deg0, footprint, work_area: None }
+    PlacedBuilding {
+        catalogue_id: definition.to_string(),
+        definition_id: None,
+        origin,
+        rotation: Rotation::Deg0,
+        footprint,
+        work_area: None,
+        under_construction: false,
+    }
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -173,6 +181,70 @@ fn placement_baseline_returns_the_most_recent_record_for_a_building() {
     assert_eq!(journal.placement_baseline(id).unwrap().written, second.written);
 
     assert!(journal.placement_baseline(BuildingId::from_u64(99)).is_none());
+}
+
+// -------------------------------------------------------------------------------------------------
+// ---- site entries (ticket 128) ---------------------------------------------------------------------
+// -------------------------------------------------------------------------------------------------
+
+#[test]
+fn extend_placement_baseline_keeps_the_first_previous_and_takes_the_last_written() {
+    let mut journal = Journal::default();
+    let id = BuildingId::from_u64(0);
+    journal.record_placement(
+        id,
+        placed("house01", IVec3::ZERO, IVec2::ONE),
+        Baseline { written: Vec::new(), previous: Vec::new(), data_version: None },
+        Ledger::default(),
+    );
+
+    // First dig: (0,0,0) stone -> air.
+    journal.extend_placement_baseline(
+        id,
+        Baseline { written: vec![(IVec3::ZERO, BlockState::air())], previous: vec![(IVec3::ZERO, stone())], data_version: None },
+        parcel(&[("minecraft:stone", 1)]),
+    );
+    // Second dig, a different position: (1,0,0) dirt -> air.
+    journal.extend_placement_baseline(
+        id,
+        Baseline { written: vec![(IVec3::new(1, 0, 0), BlockState::air())], previous: vec![(IVec3::new(1, 0, 0), dirt())], data_version: None },
+        parcel(&[("minecraft:dirt", 1)]),
+    );
+    // The blueprint's own final write revisits (0,0,0): its `previous` here
+    // is air (what the first dig left), but the *entry's* previous for that
+    // position must stay stone — what stood there before the site's very
+    // first write.
+    journal.extend_placement_baseline(
+        id,
+        Baseline { written: vec![(IVec3::ZERO, stone())], previous: vec![(IVec3::ZERO, BlockState::air())], data_version: Some(4438) },
+        parcel(&[]),
+    );
+
+    let baseline = journal.placement_baseline(id).unwrap();
+    assert_eq!(baseline.previous, vec![(IVec3::ZERO, stone()), (IVec3::new(1, 0, 0), dirt())]);
+    assert_eq!(baseline.written, vec![(IVec3::ZERO, stone()), (IVec3::new(1, 0, 0), BlockState::air())]);
+    assert_eq!(baseline.data_version, Some(4438));
+
+    let ledger = journal.entries().last().unwrap().ledger();
+    assert_eq!(ledger.credited, parcel(&[("minecraft:stone", 1), ("minecraft:dirt", 1)]));
+}
+
+#[test]
+fn extend_placement_baseline_is_a_no_op_with_no_matching_entry() {
+    let mut journal = Journal::default();
+    journal.extend_placement_baseline(BuildingId::from_u64(0), sample_baseline(), parcel(&[]));
+    assert!(journal.is_empty());
+}
+
+#[test]
+fn remove_site_entry_removes_the_entry_and_reports_whether_one_existed() {
+    let mut journal = Journal::default();
+    let id = BuildingId::from_u64(0);
+    journal.record_placement(id, placed("house01", IVec3::ZERO, IVec2::ONE), sample_baseline(), Ledger::default());
+
+    assert!(journal.remove_site_entry(id));
+    assert!(journal.is_empty(), "a cancelled site never happened");
+    assert!(!journal.remove_site_entry(id), "nothing left to remove the second time");
 }
 
 // -------------------------------------------------------------------------------------------------

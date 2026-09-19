@@ -159,19 +159,43 @@ struct PendingCommit {
     /// verbatim if the apply fails, journaled as the entry's
     /// [`Ledger::debited`] if it succeeds. Kept here rather than looked up
     /// again later: the definition it came from can be hot-reloaded mid-write.
+    /// Empty for a site's completion write (ticket 128) — the cost was
+    /// already paid, and recorded, the instant the site was entered.
     spent: Parcel,
     /// What ticket 074's conversions *produced* on the way to paying —
     /// materials the placement put into the stock, which a failed apply has
     /// to take back out again or the rollback would leave the player with
-    /// planks they never had and a log they no longer do.
+    /// planks they never had and a log they no longer do. Empty for a
+    /// site's completion write, same reason as `spent`.
     gained: Parcel,
+    /// Ticket 128: `true` when this dispatch is a site's completion write
+    /// (`city::construction`'s tick, once its scan finds nothing left to
+    /// clear) rather than a fresh placement over already-clear ground. Both
+    /// go through the same task/apply/poll machinery; this is the one bit
+    /// [`poll_commit`] needs to tell them apart — a site's entry already
+    /// exists (extend it, don't record a new one) and a site's failure
+    /// leaves the hole standing (don't roll `City` back, there's nothing to
+    /// refund).
+    site: bool,
     task: Task<Result<EditReport, EditRefusal>>,
 }
 
-/// One commit at a time — see the module docs.
+/// One commit at a time — see the module docs. `pub(super)`: `city::construction`'s
+/// tick shares this slot for a site's completion write (see
+/// [`PendingCommit::site`]), and needs to know when it's free.
 #[derive(Resource, Default)]
-struct CommitState {
+pub(super) struct CommitState {
     pending: Option<PendingCommit>,
+}
+
+impl CommitState {
+    /// Whether a commit (fresh or a site's completion) is already in
+    /// flight — `city::construction`'s tick checks this before dispatching a
+    /// site's completion write, the same "a site that finds the slot busy
+    /// simply tries again next tick" rule that module's docs describe.
+    pub(super) fn is_busy(&self) -> bool {
+        self.pending.is_some()
+    }
 }
 
 pub struct CommitPlugin;
@@ -249,6 +273,36 @@ pub(super) fn apply_building_edit(cache: &mut RegionCache, edit: &WorldEdit, pol
     crate::edit::apply_routed(edit, cache, policy)
 }
 
+/// Builds `blueprint_edit(blueprint, origin)` and dispatches it onto
+/// `AsyncComputeTaskPool`, into `commit`'s single slot — [`try_commit_placement`]'s
+/// own tail, extracted (ticket 128) so `city::construction`'s tick can call
+/// it a second time, once a site's clearing scan comes back empty. `site`
+/// distinguishes the two callers for [`poll_commit`] — see [`PendingCommit::site`].
+#[allow(clippy::too_many_arguments)]
+pub(super) fn dispatch_blueprint_write(
+    commit: &mut CommitState,
+    region_cache: &SharedRegionCache,
+    building: BuildingId,
+    placement: PlacedBuilding,
+    blueprint: &Blueprint,
+    origin: IVec3,
+    spent: Parcel,
+    gained: Parcel,
+    site: bool,
+) {
+    let edit = blueprint_edit(blueprint, origin);
+    let cache: Arc<Mutex<RegionCache>> = region_cache.0.clone();
+    let policy = EditPolicy { capture_replaced: true, allow_dirty_regions: true, ..EditPolicy::default() };
+    let task_edit = edit.clone();
+
+    let task = AsyncComputeTaskPool::get().spawn(async move {
+        let mut cache = cache.lock().expect("region cache mutex poisoned");
+        apply_building_edit(&mut cache, &task_edit, &policy)
+    });
+
+    commit.pending = Some(PendingCommit { building, placement, edit, spent, gained, site, task });
+}
+
 /// Left-click on a valid placement: claims the tile in [`state::City`]
 /// synchronously, then dispatches the actual write onto
 /// [`AsyncComputeTaskPool`] — see the module docs.
@@ -268,6 +322,7 @@ fn try_commit_placement(
     mut stock: ResMut<Stock>,
     mut write_status: ResMut<WriteStatus>,
     economy: Res<EconomyConfig>,
+    mut journal: ResMut<Journal>,
 ) {
     // Ticket 055, roadmap F2: a left click while the road tool is active is
     // `city::road_build`'s to react to, not this. `Option` and a default of
@@ -380,19 +435,29 @@ fn try_commit_placement(
     let mut spent = stock.spend(&costs).expect("plan_payment said this was affordable, and nothing since has touched the stock");
     spent.add_all(&consumed);
     let gained = produced;
-    let placed =
-        PlacedBuilding { catalogue_id: id, definition_id, origin, rotation: selection.rotation, footprint: entry.footprint, work_area: None };
+    let label = id.clone();
+    let mut placed = PlacedBuilding {
+        catalogue_id: id,
+        definition_id,
+        origin,
+        rotation: selection.rotation,
+        footprint: entry.footprint,
+        work_area: None,
+        under_construction: false,
+    };
 
-    let cache: Arc<Mutex<RegionCache>> = region_cache.0.clone();
-    let policy = EditPolicy { capture_replaced: true, allow_dirty_regions: true, ..EditPolicy::default() };
-    let task_edit = edit.clone();
-
-    let task = AsyncComputeTaskPool::get().spawn(async move {
-        let mut cache = cache.lock().expect("region cache mutex poisoned");
-        apply_building_edit(&mut cache, &task_edit, &policy)
-    });
-
-    commit.pending = Some(PendingCommit { building, placement: placed, edit, spent, gained, task });
+    // Ticket 128: a volume that isn't already clear becomes a site rather
+    // than being written outright — see `city::construction`'s module docs.
+    let non_air = super::construction::scan_site(origin, blueprint.size, &world);
+    if non_air.is_empty() {
+        dispatch_blueprint_write(&mut commit, &region_cache, building, placed, blueprint, origin, spent, gained, false);
+    } else {
+        placed.under_construction = true;
+        city.mark_under_construction(building);
+        let baseline = journal::Baseline { written: Vec::new(), previous: Vec::new(), data_version: Some(blueprint.data_version) };
+        journal.record_placement(building, placed, baseline, Ledger { credited: gained, debited: spent });
+        println!("block_viewer: {label} entered as a site — {} block(s) to clear before it's placed", non_air.len());
+    }
 }
 
 /// Single non-blocking poll of the in-flight commit, the same
@@ -420,7 +485,7 @@ fn poll_commit(
         };
         result
     };
-    let PendingCommit { building, placement, edit, spent, gained, .. } =
+    let PendingCommit { building, placement, edit, spent, gained, site, .. } =
         commit.pending.take().expect("just matched Some above");
 
     match result {
@@ -451,31 +516,50 @@ fn poll_commit(
                 // Ticket 074's conversions are part of the same action: what
                 // they made is already in the stock, and belongs on the
                 // ledger so undo takes it back out with everything else.
+                // Empty for a site's completion write — see `PendingCommit::gained`.
                 credited.add_all(&gained);
-                if !credited.is_empty() || !spent.is_empty() {
-                    println!(
-                        "block_viewer:   paid {} unit(s), recovered {} unit(s) of material",
-                        spent.total(),
-                        credited.total()
-                    );
+                if site {
+                    // Ticket 128: the entry already exists (recorded the
+                    // instant the site was entered) — extend it with
+                    // whatever this last write actually removed (almost
+                    // nothing by now), and the site is a building now.
+                    journal.extend_placement_baseline(building, baseline, credited);
+                    city.complete_building(building);
+                } else {
+                    if !credited.is_empty() || !spent.is_empty() {
+                        println!(
+                            "block_viewer:   paid {} unit(s), recovered {} unit(s) of material",
+                            spent.total(),
+                            credited.total()
+                        );
+                    }
+                    journal.record_placement(building, placement.clone(), baseline, Ledger { credited, debited: spent });
                 }
-                journal.record_placement(building, placement.clone(), baseline, Ledger { credited, debited: spent });
             }
             write_status.record_success(WriteKind::Placed, placement.catalogue_id.clone(), &report);
             edited.send(ChunksEdited::from_report(&report));
             // Ticket 110: a road beside this footprint may now want its
             // connected piece. Only from this arm — a rolled-back placement
-            // never changed what any road cell touches.
+            // never changed what any road cell touches. For a site this is
+            // also the *first* time the footprint is really there.
             footprints.send(BuildingFootprintChanged(placement));
         }
         Err(err) => {
-            city.remove_building(building);
-            // The cost was taken the instant the tile was claimed; both halves
-            // of that claim come back together, conversions included — the
-            // logs return and the planks they became do not.
-            stock.add_parcel(&spent);
-            stock.remove_parcel(&gained);
-            println!("block_viewer: placement of {} failed, rolled back: {err}", placement.catalogue_id);
+            if site {
+                // Ticket 128: the hole is real and journalled — a site's
+                // failed completion write logs and retries next tick rather
+                // than rolling `City` back; the player's way out is cancel
+                // (`city::demolish`'s site-reversal path).
+                println!("block_viewer: site completion for {} failed, retrying: {err}", placement.catalogue_id);
+            } else {
+                city.remove_building(building);
+                // The cost was taken the instant the tile was claimed; both halves
+                // of that claim come back together, conversions included — the
+                // logs return and the planks they became do not.
+                stock.add_parcel(&spent);
+                stock.remove_parcel(&gained);
+                println!("block_viewer: placement of {} failed, rolled back: {err}", placement.catalogue_id);
+            }
             write_status.record_failure(WriteKind::Placed, placement.catalogue_id, err.to_string());
         }
     }
@@ -724,6 +808,7 @@ mod tests {
             rotation: Rotation::Deg0,
             footprint: IVec2::new(2, 2),
             work_area: None,
+            under_construction: false,
         }
     }
 
@@ -748,7 +833,7 @@ mod tests {
         let task = pool().spawn(async move { Ok(report) });
 
         app.world_mut().resource_mut::<CommitState>().pending =
-            Some(PendingCommit { building, placement: a_placement(), edit: task_edit, spent: Parcel::default(), gained: Parcel::default(), task });
+            Some(PendingCommit { building, placement: a_placement(), edit: task_edit, spent: Parcel::default(), gained: Parcel::default(), site: false, task });
 
         run_until_settled(&mut app);
 
@@ -782,7 +867,7 @@ mod tests {
 
         let task = pool().spawn(async { Err(EditRefusal::Empty) });
         app.world_mut().resource_mut::<CommitState>().pending =
-            Some(PendingCommit { building, placement: a_placement(), edit: WorldEdit::new(), spent: Parcel::default(), gained: Parcel::default(), task });
+            Some(PendingCommit { building, placement: a_placement(), edit: WorldEdit::new(), spent: Parcel::default(), gained: Parcel::default(), site: false, task });
 
         run_until_settled(&mut app);
 
@@ -820,7 +905,7 @@ mod tests {
             edit.set(*at, state_named("minecraft:oak_planks"));
         }
         let task = pool().spawn(async move { result });
-        PendingCommit { building, placement: a_placement(), edit, spent, gained: Parcel::default(), task }
+        PendingCommit { building, placement: a_placement(), edit, spent, gained: Parcel::default(), site: false, task }
     }
 
     #[test]

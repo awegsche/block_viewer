@@ -43,6 +43,13 @@
     // before the first warehouse goes up.
     base_storage: 2048,
 
+    // ---- how fast a build site is cleared -----------------------------
+    // Blocks per minute of game time dug out of a placement's volume (a
+    // building's or a road cell's) before its blueprint is written. Six
+    // times the gatherer hut's 20: a build site is worked by a whole crew,
+    // not one hut's worth of hands, and a road has to keep up with a drag.
+    site_clearing_blocks_per_minute: 120.0,
+
     // ---- the founding grant ---------------------------------------------
     // Enough to lay out a first street without terraforming for it: the
     // shipped House costs 40 oak_planks + 20 cobblestone, so this is about
