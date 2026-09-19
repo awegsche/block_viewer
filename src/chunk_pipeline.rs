@@ -205,6 +205,11 @@ impl Default for ChunkRemeshBudget {
 pub struct PendingChunkRemeshes(HashSet<(i32, i32)>);
 
 impl PendingChunkRemeshes {
+    /// Queued re-meshes — for the streaming health line (ticket 125).
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
+
     /// Drops any queued coordinate that has since left render distance —
     /// mirrors [`InFlightChunkRemeshes::cancel_out_of_range`]; called from
     /// the same place (`unload`, 005-d/005-f) for the same reason.
@@ -221,6 +226,11 @@ impl PendingChunkRemeshes {
 pub struct InFlightChunkRemeshes(HashMap<(i32, i32), Task<ChunkRemeshResult>>);
 
 impl InFlightChunkRemeshes {
+    /// Re-mesh tasks in flight — for the streaming health line (ticket 125).
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
+
     /// Cancels (drops) any in-flight re-mesh task whose coordinate has left
     /// render distance since it was queued — same reasoning and mechanism as
     /// [`InFlightChunkLoads::cancel_out_of_range`]: without this, a task that
@@ -296,6 +306,11 @@ impl Default for ChunkReloadBudget {
 pub struct PendingChunkReloads(HashMap<(i32, i32), ChunkBorders>);
 
 impl PendingChunkReloads {
+    /// Queued reloads — for the streaming health line (ticket 125).
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
+
     /// Mirrors [`PendingChunkRemeshes::cancel_out_of_range`]: a coordinate
     /// the camera has since left render distance shouldn't reload.
     pub(crate) fn cancel_out_of_range(&mut self, desired: &HashSet<(i32, i32)>) {
@@ -326,6 +341,11 @@ struct InFlightReload {
 pub struct InFlightChunkReloads(HashMap<(i32, i32), InFlightReload>);
 
 impl InFlightChunkReloads {
+    /// Reload tasks in flight — for the streaming health line (ticket 125).
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
+
     /// Mirrors [`InFlightChunkRemeshes::cancel_out_of_range`].
     pub(crate) fn cancel_out_of_range(&mut self, desired: &HashSet<(i32, i32)>) {
         self.0.retain(|coord, _| desired.contains(coord));

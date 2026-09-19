@@ -1697,3 +1697,13 @@ Y=0 in the world and won't be cleaned up by this fix — see the ticket.
   chunks resolved" on completion, and "Chunk streaming: … to load" lines
   show whether the pipeline is still working or stuck. Ticket:
   `finished_tickets/124-citybuilder-loading-screen.md`.
+- [ ] **125 build menu pricing no longer freezes the frame: 60 fps after the
+  loading screen.** Measured from the console (the new `Streaming health`
+  line) rather than watched: 1 fps -> 60 fps the moment play starts, and
+  the 124 loading screen flow works end to end (screen up ~1.5 s, then
+  "initial 1009 chunks resolved, starting the game"). Still worth eyes:
+  the build menu's rows should read exactly as before (red cost lines,
+  "Converts:" hints, locked rows) — the pricing change is meant to give the
+  same answers faster. Also check the frame stays smooth while mines dig
+  (brief dips to ~40 fps showed up in the console at each job's reload).
+  Ticket: `finished_tickets/125-build-menu-pricing-freezes-the-frame.md`.

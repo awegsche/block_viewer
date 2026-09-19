@@ -32,11 +32,17 @@
 //! `delta` stays at the `Default` zero and nothing downstream can see time
 //! pass.
 
+use std::time::Duration;
+
+use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
 use bevy::prelude::*;
 
 use crate::camera;
-use crate::chunk_pipeline::InFlightChunkLoads;
+use crate::chunk_pipeline::{
+    InFlightChunkLoads, InFlightChunkReloads, InFlightChunkRemeshes, PendingChunkReloads, PendingChunkRemeshes,
+};
 use crate::streaming::{self, ChunkPreload, LastCameraChunk, PendingChunkWork, RenderDistance};
+use crate::DecodedWorld;
 
 /// Which half of the run the citybuilder is in. Starts in `Loading`;
 /// [`track_initial_load`] moves it to `Playing` exactly once, and nothing
@@ -98,6 +104,80 @@ impl Plugin for LoadingPlugin {
             .init_resource::<InitialLoad>()
             .add_systems(Update, track_initial_load.run_if(in_state(CityPhase::Loading)));
     }
+}
+
+/// Adds [`log_streaming_health`]. Its own plugin rather than part of
+/// [`LoadingPlugin`] because it reads the whole pipeline and the frame
+/// diagnostics — everything a real app has and the loading tests don't.
+pub struct StreamingHealthPlugin;
+
+impl Plugin for StreamingHealthPlugin {
+    fn build(&self, app: &mut App) {
+        app.add_systems(Update, log_streaming_health);
+    }
+}
+
+/// How often [`log_streaming_health`] prints while the pipeline is busy.
+const HEALTH_LINE_INTERVAL: Duration = Duration::from_secs(1);
+
+/// One console line a second while any chunk work is queued or in flight
+/// — loads, re-meshes, reloads — with the frame rate alongside, plus one
+/// closing line when it all drains. The citybuilder has no status panel
+/// (the viewer's shows FPS and the load queue), and "the game is laggy
+/// after loading" is unanswerable without seeing which queue is still
+/// working and what the frame time is doing while it does. Silent when
+/// idle, so steady state costs nothing on the console.
+#[allow(clippy::too_many_arguments)]
+fn log_streaming_health(
+    time: Res<Time>,
+    diagnostics: Res<DiagnosticsStore>,
+    phase: Res<State<CityPhase>>,
+    decoded_world: Res<DecodedWorld>,
+    pending: Res<PendingChunkWork>,
+    in_flight_loads: Res<InFlightChunkLoads>,
+    pending_remeshes: Res<PendingChunkRemeshes>,
+    in_flight_remeshes: Res<InFlightChunkRemeshes>,
+    pending_reloads: Res<PendingChunkReloads>,
+    in_flight_reloads: Res<InFlightChunkReloads>,
+    mut since_last: Local<Duration>,
+    mut was_busy: Local<bool>,
+) {
+    let busy = pending.to_load.len()
+        + in_flight_loads.len()
+        + pending_remeshes.len()
+        + in_flight_remeshes.len()
+        + pending_reloads.len()
+        + in_flight_reloads.len()
+        > 0;
+    // `was_busy` means "a busy line has been printed and not yet closed":
+    // work that comes and goes inside one interval (a mine job's few
+    // reloads) never prints at all.
+    *since_last += time.delta();
+    if busy && *since_last < HEALTH_LINE_INTERVAL {
+        return;
+    }
+    if !busy && !*was_busy {
+        *since_last = Duration::ZERO;
+        return;
+    }
+    *since_last = Duration::ZERO;
+    *was_busy = busy;
+
+    let fps = diagnostics.get(&FrameTimeDiagnosticsPlugin::FPS).and_then(|d| d.smoothed()).unwrap_or(0.0);
+    let frame_ms = diagnostics.get(&FrameTimeDiagnosticsPlugin::FRAME_TIME).and_then(|d| d.smoothed()).unwrap_or(0.0);
+    println!(
+        "Streaming health @{:.1}s [{:?}] fps {fps:.0} ({frame_ms:.1} ms): decoded {}, loads {}+{}, remeshes {}+{}, reloads {}+{} (queued+in flight){}",
+        time.elapsed_secs(),
+        phase.get(),
+        decoded_world.columns.len(),
+        pending.to_load.len(),
+        in_flight_loads.len(),
+        pending_remeshes.len(),
+        in_flight_remeshes.len(),
+        pending_reloads.len(),
+        in_flight_reloads.len(),
+        if busy { "" } else { " — idle" },
+    );
 }
 
 /// Measures [`InitialLoad`] against the load disc around the camera and

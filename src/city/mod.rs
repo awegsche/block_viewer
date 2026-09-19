@@ -525,6 +525,7 @@ pub fn run() {
         .insert_resource(hot_reload::RoadTypeSnapshot(road_type_snapshot))
         .insert_resource(definition_errors)
         .add_plugins(loading::LoadingPlugin)
+        .add_plugins(loading::StreamingHealthPlugin)
         .add_plugins(hot_reload::DefinitionHotReloadPlugin)
         .add_plugins(clock::ClockPlugin)
         .add_plugins(warehouse::WarehousePlugin)

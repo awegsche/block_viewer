@@ -51,7 +51,12 @@
 //! Groups are expanded at *lookup* ([`routes_to`]), not at load. A
 //! forty-eight-member group of every log, bark block and stripped variant
 //! would otherwise become 2,256 `Conversion` structs, and `build_menu`
-//! prices every visible row every frame.
+//! prices every visible row every frame. And expanded **once per chain**:
+//! a group is a clique, so once a short item has offered its group-mates
+//! as routes, chasing one of those mates only looks for *conversions* into
+//! it, never its own group-mates again (ticket 125 — walking the clique
+//! once per path through it was ~48⁴ calls per short log cost, a second
+//! and a half of build menu per frame).
 //!
 //! This is what keeps the drop table honest: the pile goes on saying
 //! `birch_log`, because that's what the world gave, and only the *payment*
@@ -402,12 +407,26 @@ struct Route<'a> {
 }
 
 /// Every route that ends in `item`: the explicit conversions first (a stated
-/// ratio beats a synonym), then the item's group-mates at 1:1.
+/// ratio beats a synonym), then the item's group-mates at 1:1 — unless an
+/// `ancestor` (an item further up the chain [`cover`] is working through)
+/// is in the same group, in which case the synonyms are left out.
+///
+/// That exclusion is what keeps a group from being walked once per *path*
+/// through it (ticket 125). A group is a clique: every member is already a
+/// direct route of every other, so when `oak_planks` is short and `cover`
+/// chases its synonym `birch_planks`, the only thing `birch_planks` can
+/// contribute that `oak_planks`' own routes don't is a *conversion* into it
+/// (`birch_log -> birch_planks`) — its own synonyms are the very list the
+/// caller is already walking. Without the exclusion, an item short in the
+/// 48-member log group recursed into 47 synonyms, each into 46, to the
+/// depth cap: millions of [`cover`] calls per priced cost, which the build
+/// menu does once per row per frame — a second and a half a frame with an
+/// empty pile.
 ///
 /// Built per call rather than cached: it's a filter over two small lists, it
 /// happens once per short material rather than once per block, and a cached
 /// index would be one more thing to keep in step with a hot-reloaded config.
-fn routes_to<'a>(item: &str, economy: &'a EconomyConfig) -> Vec<Route<'a>> {
+fn routes_to<'a>(item: &str, economy: &'a EconomyConfig, ancestors: &[String]) -> Vec<Route<'a>> {
     let mut routes: Vec<Route<'a>> = economy
         .conversions
         .iter()
@@ -418,12 +437,15 @@ fn routes_to<'a>(item: &str, economy: &'a EconomyConfig) -> Vec<Route<'a>> {
     // At most one group can hold `item` — `load_economy` refuses a name that
     // appears in two.
     if let Some(group) = economy.groups.iter().find(|group| group.iter().any(|member| member == item)) {
-        routes.extend(
-            group
-                .iter()
-                .filter(|member| member.as_str() != item)
-                .map(|member| Route { from: member.as_str(), count: 1, produces: 1 }),
-        );
+        let group_already_walked = ancestors.iter().any(|ancestor| group.iter().any(|member| member == ancestor));
+        if !group_already_walked {
+            routes.extend(
+                group
+                    .iter()
+                    .filter(|member| member.as_str() != item)
+                    .map(|member| Route { from: member.as_str(), count: 1, produces: 1 }),
+            );
+        }
     }
 
     routes
@@ -487,10 +509,14 @@ fn cover(
     if amount == 0 || depth >= MAX_CONVERSION_DEPTH || covering.iter().any(|held| held == item) {
         return;
     }
+    // The routes are chosen against the chain *above* `item` — see
+    // `routes_to` for why its group-mates are left out when an ancestor
+    // already walked that group.
+    let routes = routes_to(item, economy, covering);
     covering.push(item.to_string());
 
     let mut still_needed = amount;
-    for route in routes_to(item, economy) {
+    for route in routes {
         if still_needed == 0 {
             break;
         }
@@ -883,5 +909,46 @@ mod tests {
             let payment = plan_payment(&stock, &[cost("minecraft:oak_planks", 40)], &config);
             assert!(payment.affordable(), "{wood} should pay for an oak-planks cost: {:?}", payment.shortfall.missing);
         }
+    }
+
+    /// Ticket 125: a synonym group is walked once per chain, not once per
+    /// path through it. Before `routes_to` learned to skip a group an
+    /// ancestor already expanded, a short cost in a group this size recursed
+    /// `n * (n-1) * (n-2) * (n-3)` ways to the depth cap — minutes here, and
+    /// ~1.5 s a frame in the build menu against the shipped 48-log group.
+    /// The answer is unchanged: with nothing in the pile there is nothing
+    /// to convert, and with one synonym in it that synonym pays.
+    #[test]
+    fn a_large_group_is_priced_in_microseconds_not_minutes() {
+        let members: Vec<String> = (0..80).map(|i| format!("minecraft:log_{i}")).collect();
+        let config = EconomyConfig { groups: vec![members.clone()], ..EconomyConfig::default() };
+
+        let started = std::time::Instant::now();
+        let short = plan_payment(&Stock::default(), &[cost("minecraft:log_0", 4)], &config);
+        let paid = plan_payment(&stock_with(&[("minecraft:log_79", 4)]), &[cost("minecraft:log_0", 4)], &config);
+        let elapsed = started.elapsed();
+
+        assert!(!short.affordable());
+        assert!(paid.affordable());
+        assert_eq!(paid.conversion.consumed.get("minecraft:log_79"), 4);
+        assert!(elapsed < std::time::Duration::from_millis(200), "took {elapsed:?}");
+    }
+
+    /// Ticket 125, the actual case: every shipped building priced against
+    /// an empty pile — what the build menu does once per row per frame —
+    /// in well under a frame.
+    #[test]
+    fn the_shipped_buildings_price_against_an_empty_pile_within_a_frame() {
+        let config = load_economy(Path::new("assets/city/economy.ron")).expect("shipped economy.ron should load");
+        let catalogue = crate::blueprint::load_catalogue_dir(Path::new("assets/city/blueprints")).0;
+        let (definitions, _) = super::super::definition::load_definitions_dir(Path::new("assets/city/buildings"), &catalogue);
+        assert!(!definitions.is_empty(), "the shipped definitions should load");
+
+        let started = std::time::Instant::now();
+        for entry in definitions.iter() {
+            plan_payment(&Stock::default(), &entry.building.cost, &config);
+        }
+        let elapsed = started.elapsed();
+        assert!(elapsed < std::time::Duration::from_millis(50), "pricing every row took {elapsed:?}");
     }
 }
