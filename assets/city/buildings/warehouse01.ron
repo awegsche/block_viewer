@@ -23,12 +23,12 @@ Building(
     warehouse: Some((
         // Eight road cells is 48 blocks of road — a few streets, not a
         // district. Reaching further is what warehouse02 is for.
-        radius_cells: 8,
+        radius_cells: 16,
         // One cart. A second farm on the same warehouse waits its turn,
         // which is the pressure to upgrade or to build another warehouse.
-        concurrent_hauls: 1,
+        concurrent_hauls: 4,
         handling_minutes: 0.5,
-        storage: 4096,
+        storage: 8192,
     )),
     integrity: Integrity(
         pristine_above: 0.95,

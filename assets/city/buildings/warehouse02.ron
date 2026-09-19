@@ -18,10 +18,10 @@ Building(
         (block: "minecraft:cobblestone", count: 192),
     ],
     warehouse: Some((
-        radius_cells: 16,
+        radius_cells: 24,
         // Three carts: the reason to upgrade rather than to keep building
         // tier-1 sheds is that one depot keeps six farms moving.
-        concurrent_hauls: 3,
+        concurrent_hauls: 12,
         // And it turns a stack around faster, so it helps its near
         // neighbours too, not only the distant ones.
         handling_minutes: 0.2,
