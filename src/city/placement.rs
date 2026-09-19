@@ -76,6 +76,7 @@ use crate::DecodedWorld;
 
 use super::definition::BuildingDefinitions;
 use super::grid::{self, FootprintFit};
+use super::loading::GameplaySet;
 use super::picking::{HoveredBlock, PickingSet};
 use super::state;
 use super::tool::ActiveTool;
@@ -147,7 +148,7 @@ impl Plugin for PlacementPlugin {
             .init_resource::<GhostState>()
             // After `picking::PickingSet` so this reads *this* frame's
             // `HoveredBlock`, not last frame's — see that set's docs.
-            .add_systems(Update, (cycle_selection, update_ghost_preview).chain().after(PickingSet));
+            .add_systems(Update, (cycle_selection, update_ghost_preview).chain().after(PickingSet).in_set(GameplaySet));
     }
 }
 

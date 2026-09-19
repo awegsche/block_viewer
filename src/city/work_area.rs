@@ -56,6 +56,7 @@ use crate::camera;
 use crate::DecodedWorld;
 
 use super::definition::BuildingDefinitions;
+use super::loading::GameplaySet;
 use super::picking::{HoveredBlock, PickingSet, SelectedBuilding};
 use super::state::{footprint_extent, City, PlacedBuilding, WorkArea};
 use super::tool::ActiveTool;
@@ -91,7 +92,10 @@ impl Plugin for WorkAreaPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<WorkAreaDragState>()
             .insert_gizmo_config(WorkAreaGizmos, GizmoConfig { depth_bias: DEPTH_BIAS, line_width: LINE_WIDTH, ..default() })
-            .add_systems(Update, (update_drag_state, try_commit_drag, cancel_on_escape, draw_outlines).chain().after(PickingSet));
+            .add_systems(
+                Update,
+                (update_drag_state, try_commit_drag, cancel_on_escape, draw_outlines).chain().after(PickingSet).in_set(GameplaySet),
+            );
     }
 }
 

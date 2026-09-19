@@ -391,6 +391,7 @@ mod grid;
 mod hot_reload;
 mod inventory;
 mod journal;
+mod loading;
 mod mine;
 mod persistence;
 mod picking;
@@ -523,6 +524,7 @@ pub fn run() {
         .insert_resource(hot_reload::DefinitionSnapshot(building_snapshot))
         .insert_resource(hot_reload::RoadTypeSnapshot(road_type_snapshot))
         .insert_resource(definition_errors)
+        .add_plugins(loading::LoadingPlugin)
         .add_plugins(hot_reload::DefinitionHotReloadPlugin)
         .add_plugins(clock::ClockPlugin)
         .add_plugins(warehouse::WarehousePlugin)
@@ -547,6 +549,15 @@ pub fn run() {
         // the same two lines `viewer::run` uses `ui::UiPanelSet` for, see
         // that module's own docs for the fuller argument.
         .configure_sets(Update, camera::CameraSet.after(ui::UiPanelSet))
+        // Ticket 124: nothing that is game logic runs until the first disc
+        // of chunks around the camera is in — every city plugin's systems
+        // sit in `GameplaySet` (the clock's in `First`, the rest in
+        // `Update`), and the camera is held still too, so the disc the
+        // loading screen is waiting on doesn't move under it. See
+        // `loading`'s module docs for why a set rather than a flag.
+        .configure_sets(First, loading::GameplaySet.run_if(in_state(loading::CityPhase::Playing)))
+        .configure_sets(Update, loading::GameplaySet.run_if(in_state(loading::CityPhase::Playing)))
+        .configure_sets(Update, camera::CameraSet.run_if(in_state(loading::CityPhase::Playing)))
         // `flush_world_on_exit` first: `city.ron`/`journal.ron` describe
         // buildings whose blocks need to have actually reached disk by the
         // time they're written — see the module docs' "Save world".

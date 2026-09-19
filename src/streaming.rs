@@ -174,9 +174,11 @@ impl LingeringChunks {
 /// force a fresh recompute by resetting this to its `Default` — e.g. after
 /// switching saves, where the camera may land in the same chunk coordinate
 /// it started in (a fresh save's streaming state still needs rebuilding
-/// even though the camera didn't "enter" a new chunk).
+/// even though the camera didn't "enter" a new chunk). The field is
+/// `pub(crate)` too: `Some` is how `city::loading` (ticket 124) tells that
+/// the diff has been published at least once.
 #[derive(Resource, Debug, Default)]
-pub(crate) struct LastCameraChunk(Option<(i32, i32)>);
+pub(crate) struct LastCameraChunk(pub(crate) Option<(i32, i32)>);
 
 /// The chunk load/unload delta computed by [`update_pending_chunk_work`].
 /// Later tickets (005-b onward) drain this to actually load/spawn/unload

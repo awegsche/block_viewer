@@ -47,6 +47,8 @@ use bevy::prelude::*;
 
 use crate::camera;
 
+use super::loading::GameplaySet;
+
 /// The most game time one frame may advance, whatever the real delta was —
 /// see the module docs. A quarter of a second is one 4x frame at 15fps: slow
 /// enough that no ordinary frame is ever clamped, short enough that a hitch
@@ -133,8 +135,12 @@ impl Plugin for ClockPlugin {
             // haulage, and the panel that reports on both — sees the same
             // already-advanced clock rather than racing the system that
             // advances it.
-            .add_systems(First, advance_clock)
-            .add_systems(Update, toggle_pause);
+            // Both in `GameplaySet` (ticket 124): `city::run` holds the set
+            // back until the initial chunks are in, and this system not
+            // running is *how* no game time passes under the loading screen
+            // — `delta` stays at its `Default` zero.
+            .add_systems(First, advance_clock.in_set(GameplaySet))
+            .add_systems(Update, toggle_pause.in_set(GameplaySet));
     }
 }
 

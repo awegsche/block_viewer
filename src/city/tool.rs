@@ -58,6 +58,8 @@ use bevy::prelude::*;
 
 use crate::camera;
 
+use super::loading::GameplaySet;
+
 /// Which tool a click and the hovered tile drive right now.
 #[derive(Resource, Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ActiveTool {
@@ -81,7 +83,7 @@ pub struct ToolPlugin;
 
 impl Plugin for ToolPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<ActiveTool>().add_systems(Update, toggle_tool);
+        app.init_resource::<ActiveTool>().add_systems(Update, toggle_tool.in_set(GameplaySet));
     }
 }
 

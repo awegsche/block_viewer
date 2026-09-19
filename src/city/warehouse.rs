@@ -68,6 +68,7 @@ use bevy::prelude::*;
 
 use super::definition::{BuildingDefinitions, Warehouse};
 use super::economy::EconomyConfig;
+use super::loading::GameplaySet;
 use super::road::{self, Direction};
 use super::road_definition::RoadTypes;
 use super::state::{BuildingId, City};
@@ -148,7 +149,7 @@ impl Plugin for WarehousePlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<Coverage>()
             .init_resource::<StorageCapacity>()
-            .add_systems(Update, recompute.in_set(CoverageSet));
+            .add_systems(Update, recompute.in_set(CoverageSet).in_set(GameplaySet));
     }
 }
 

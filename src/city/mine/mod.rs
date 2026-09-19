@@ -84,6 +84,7 @@ use super::definition::{BuildingDefinitions, Mine};
 use super::drops::DropTable;
 use super::economy::EconomyConfig;
 use super::journal::Baseline;
+use super::loading::GameplaySet;
 use super::production::{Producer, ProducerState, ProductionState};
 use super::state::{BuildingId, City};
 
@@ -194,7 +195,7 @@ impl Plugin for MinePlugin {
             .init_resource::<ProductionState>()
             .init_resource::<DropTable>()
             .add_event::<ChunksEdited>()
-            .add_systems(Update, (dispatch_jobs, poll_jobs).chain());
+            .add_systems(Update, (dispatch_jobs, poll_jobs).chain().in_set(GameplaySet));
     }
 }
 

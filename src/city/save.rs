@@ -39,6 +39,7 @@ use crate::edit::session::{WriteError, WriteSession, WriteSummary};
 use crate::region_cache::RegionCache;
 use crate::LoadedSave;
 
+use super::loading::GameplaySet;
 use super::write_status::WriteStatus;
 
 /// A save's flush, in flight.
@@ -102,7 +103,7 @@ impl Plugin for SavePlugin {
             // Idempotent-either-order, the same shape `WriteStatus` already
             // uses across `city::commit`/`city::demolish`/`city::undo`.
             .init_resource::<WriteStatus>()
-            .add_systems(Update, (start_save, poll_save).chain());
+            .add_systems(Update, (start_save, poll_save).chain().in_set(GameplaySet));
     }
 }
 

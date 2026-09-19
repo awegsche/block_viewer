@@ -115,6 +115,7 @@ use super::drops::DropTable;
 use super::economy::EconomyConfig;
 use super::farm::rect_distance;
 use super::journal::Baseline;
+use super::loading::GameplaySet;
 use super::production::{Producer, ProducerState, ProductionState};
 use super::state::{footprint_extent, BuildingId, City, WorkArea};
 
@@ -321,7 +322,7 @@ impl Plugin for GathererPlugin {
             .init_resource::<ProductionState>()
             .init_resource::<DropTable>()
             .add_event::<ChunksEdited>()
-            .add_systems(Update, (dispatch_digs, poll_digs).chain());
+            .add_systems(Update, (dispatch_digs, poll_digs).chain().in_set(GameplaySet));
     }
 }
 

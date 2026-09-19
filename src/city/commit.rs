@@ -139,6 +139,7 @@ use super::drops::DropTable;
 use super::economy::{self, EconomyConfig};
 use super::inventory::{Parcel, Stock};
 use super::journal::{self, Journal, Ledger};
+use super::loading::GameplaySet;
 use super::picking::{HoveredBlock, PickingSet};
 use super::placement::{self, GhostPlacement, PlacementSelection};
 use super::road_build::BuildingFootprintChanged;
@@ -204,7 +205,7 @@ impl Plugin for CommitPlugin {
             // After `PickingSet` for the same reason ticket 047's ghost
             // preview orders there — `try_commit_placement` needs *this*
             // frame's `HoveredBlock`, not last frame's.
-            .add_systems(Update, (try_commit_placement, poll_commit).chain().after(PickingSet));
+            .add_systems(Update, (try_commit_placement, poll_commit).chain().after(PickingSet).in_set(GameplaySet));
     }
 }
 

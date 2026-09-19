@@ -28,6 +28,7 @@ use bevy::window::PrimaryWindow;
 
 use crate::{camera, DecodedWorld};
 
+use super::loading::GameplaySet;
 use super::state::{self, BuildingId};
 use super::tool::ActiveTool;
 
@@ -61,11 +62,11 @@ impl Plugin for PickingPlugin {
             // once this frame's pan/rotate/zoom has already landed, not the
             // previous frame's — the same reason `viewer::run` orders
             // `CameraSet` relative to the UI panels that read it.
-            .add_systems(Update, update_hovered_block.in_set(PickingSet).after(camera::CameraSet))
+            .add_systems(Update, update_hovered_block.in_set(PickingSet).after(camera::CameraSet).in_set(GameplaySet))
             // After `PickingSet` for the same reason `city::commit`/
             // `city::demolish` order there — this needs *this* frame's
             // `HoveredBlock`, not last frame's.
-            .add_systems(Update, update_selected_building.after(PickingSet));
+            .add_systems(Update, update_selected_building.after(PickingSet).in_set(GameplaySet));
     }
 }
 

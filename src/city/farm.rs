@@ -54,6 +54,7 @@ use bevy::math::IVec2;
 use bevy::prelude::*;
 
 use super::definition::{BuildingDefinitions, Farm};
+use super::loading::GameplaySet;
 use super::state::{footprint_extent, BuildingId, City, PlacedBuilding};
 
 /// How many `farm.tile` instances are within range of each placed hub — see
@@ -93,7 +94,7 @@ pub struct FarmCoverageSet;
 
 impl Plugin for FarmPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<FarmCoverage>().add_systems(Update, recompute.in_set(FarmCoverageSet));
+        app.init_resource::<FarmCoverage>().add_systems(Update, recompute.in_set(FarmCoverageSet).in_set(GameplaySet));
     }
 }
 

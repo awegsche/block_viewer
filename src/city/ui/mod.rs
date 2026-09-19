@@ -32,11 +32,14 @@ mod build_menu;
 mod city_panel;
 mod definition_errors;
 mod inspect_panel;
+mod loading_screen;
 
 use bevy::prelude::*;
 use bevy_egui::{EguiContexts, EguiPlugin};
 
 use crate::camera;
+
+use super::loading::{CityPhase, GameplaySet};
 
 /// [`SystemSet`] both panels run in — [`crate::city::run`] orders
 /// `camera::CameraSet` `.after()` this, the same relationship
@@ -49,6 +52,10 @@ pub struct UiPlugin;
 impl Plugin for UiPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(EguiPlugin)
+            // The game's panels are game logic as far as ticket 124 is
+            // concerned — none of them has anything to say (or any button
+            // that should work) under the loading screen, which is the one
+            // panel drawn instead until `CityPhase::Playing`.
             .add_systems(
                 Update,
                 (
@@ -57,8 +64,10 @@ impl Plugin for UiPlugin {
                     definition_errors::definition_errors_panel,
                     inspect_panel::inspect_panel,
                 )
-                    .in_set(UiPanelSet),
+                    .in_set(UiPanelSet)
+                    .in_set(GameplaySet),
             )
+            .add_systems(Update, loading_screen::loading_screen.in_set(UiPanelSet).run_if(in_state(CityPhase::Loading)))
             .add_systems(Update, sync_egui_input_capture.after(UiPanelSet));
     }
 }

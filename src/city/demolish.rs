@@ -74,6 +74,7 @@ use super::commit::apply_building_edit;
 use super::drops::DropTable;
 use super::inventory::Stock;
 use super::journal::{Baseline, Journal, Ledger};
+use super::loading::GameplaySet;
 use super::picking::{HoveredBlock, PickingSet};
 use super::road_build::BuildingFootprintChanged;
 use super::state::{BuildingId, City, Occupant, PlacedBuilding};
@@ -119,7 +120,7 @@ impl Plugin for DemolishPlugin {
             // After `PickingSet` for the same reason ticket 047's ghost
             // preview and ticket 048's commit both order there —
             // `try_demolish` needs *this* frame's `HoveredBlock`.
-            .add_systems(Update, (try_demolish, poll_demolish).chain().after(PickingSet));
+            .add_systems(Update, (try_demolish, poll_demolish).chain().after(PickingSet).in_set(GameplaySet));
     }
 }
 

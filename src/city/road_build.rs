@@ -272,6 +272,7 @@ use crate::DecodedWorld;
 
 use super::commit::blueprint_edit;
 use super::grid::{self, FootprintFit};
+use super::loading::GameplaySet;
 use super::picking::{HoveredBlock, PickingSet};
 use super::road::{self, RoadConnections, RoadPieceKind, RoadPieceVariant};
 use super::road_catalogue::RoadCatalogue;
@@ -443,7 +444,8 @@ impl Plugin for RoadBuildPlugin {
                     poll_retile,
                 )
                     .chain()
-                    .after(PickingSet),
+                    .after(PickingSet)
+                    .in_set(GameplaySet),
             );
     }
 }

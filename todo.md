@@ -1682,3 +1682,18 @@ Y=0 in the world and won't be cleaned up by this fix — see the ticket.
   inside the shaft, that's the throttle — `ChunkReloadThrottle` in
   `src/chunk_pipeline.rs` is the knob. Ticket:
   `finished_tickets/123-chunk-streaming-starved-by-mine-reloads.md`.
+- [ ] **124 citybuilder loading screen: the game starts only once the
+  first chunks are in, with no game time passed.** `cargo run --bin
+  citybuilder` against the real save. Expect an opaque "Loading world"
+  screen with the save's name and a progress bar counting up to the load
+  disc (~1000 chunks at rd 16 + preload 2); the bar's total includes
+  chunks that turn out not to exist, so it should still reach the end at
+  the edge of generated terrain. Mouse/keyboard should do nothing to the
+  camera under it. When it drops away: the city panel's clock reads
+  `0:00:00`, no production/haulage/mine progress happened meanwhile
+  (compare a stalled producer's buffer with its saved value), and the
+  first chunk you see should already be seamless rather than popping in.
+  If the screen never goes away, watch the console — it prints "initial N
+  chunks resolved" on completion, and "Chunk streaming: … to load" lines
+  show whether the pipeline is still working or stuck. Ticket:
+  `finished_tickets/124-citybuilder-loading-screen.md`.

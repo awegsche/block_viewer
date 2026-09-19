@@ -53,6 +53,7 @@ use bevy::prelude::*;
 use crate::blueprint::BuildingCatalogue;
 
 use super::definition::{self, BuildingDefinitions};
+use super::loading::GameplaySet;
 use super::road_catalogue::RoadCatalogue;
 use super::road_definition::{self, RoadTypes};
 use super::{DEFINITIONS_DIR, ROAD_TYPES_DIR};
@@ -125,7 +126,7 @@ pub struct DefinitionHotReloadPlugin;
 impl Plugin for DefinitionHotReloadPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<ReloadTimer>()
-            .add_systems(Update, poll_definition_reload);
+            .add_systems(Update, poll_definition_reload.in_set(GameplaySet));
     }
 }
 

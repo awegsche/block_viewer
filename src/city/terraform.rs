@@ -79,6 +79,7 @@ use crate::DecodedWorld;
 use super::drops::DropTable;
 use super::inventory::Stock;
 use super::journal::Baseline;
+use super::loading::GameplaySet;
 use super::picking::{HoveredBlock, PickingSet};
 use super::tool::ActiveTool;
 use super::write_status::{WriteKind, WriteStatus};
@@ -165,7 +166,10 @@ impl Plugin for TerraformPlugin {
             .add_event::<ChunksEdited>()
             // After `PickingSet`, same reason every other per-frame reader of
             // `HoveredBlock` orders there.
-            .add_systems(Update, (toggle_mode, update_drag_state, try_commit_terraform, poll_terraform).chain().after(PickingSet));
+            .add_systems(
+                Update,
+                (toggle_mode, update_drag_state, try_commit_terraform, poll_terraform).chain().after(PickingSet).in_set(GameplaySet),
+            );
     }
 }
 

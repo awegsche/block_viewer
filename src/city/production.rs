@@ -123,6 +123,7 @@ use super::definition::{BuildingDefinitions, Farm, Production};
 use super::economy::EconomyConfig;
 use super::farm::{FarmCoverage, FarmCoverageSet};
 use super::inventory::{Parcel, Stock};
+use super::loading::GameplaySet;
 use super::state::{BuildingId, City};
 use super::warehouse::{self, Coverage, CoverageSet, StorageCapacity};
 
@@ -374,7 +375,8 @@ impl Plugin for ProductionPlugin {
         // frame's coverage — a road built this frame should be usable this
         // frame, not next. After `FarmCoverageSet` for the same reason: a
         // tile placed this frame should count toward this frame's output.
-        app.init_resource::<ProductionState>().add_systems(Update, tick.after(CoverageSet).after(FarmCoverageSet));
+        app.init_resource::<ProductionState>()
+            .add_systems(Update, tick.after(CoverageSet).after(FarmCoverageSet).in_set(GameplaySet));
     }
 }
 

@@ -45,6 +45,7 @@ use crate::region_cache::RegionCache;
 use super::commit::apply_building_edit;
 use super::inventory::{Parcel, Stock};
 use super::journal::{Journal, JournalEntry, Ledger};
+use super::loading::GameplaySet;
 use super::road_build::BuildingFootprintChanged;
 use super::state::{BuildingId, City, PlacedBuilding};
 use super::warehouse::{storage_capacity, StorageCapacity};
@@ -137,7 +138,7 @@ impl Plugin for UndoPlugin {
             .add_event::<ChunksEdited>()
             // Ticket 110 — idempotent, same as `ChunksEdited` above.
             .add_event::<BuildingFootprintChanged>()
-            .add_systems(Update, (start_undo, poll_undo).chain());
+            .add_systems(Update, (start_undo, poll_undo).chain().in_set(GameplaySet));
     }
 }
 
