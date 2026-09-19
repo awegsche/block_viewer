@@ -132,7 +132,7 @@ pub struct ChunkUploadBudget(pub usize);
 
 impl Default for ChunkUploadBudget {
     fn default() -> Self {
-        Self(4)
+        Self(16)
     }
 }
 
