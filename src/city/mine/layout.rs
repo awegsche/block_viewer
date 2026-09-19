@@ -709,10 +709,14 @@ pub fn slice_geometry(frame: &MineFrame, mine: &Mine, progress_bottom: i32, leve
             let survey = Box3::new(IVec3::new(x, level.floor, z_min - 1), IVec3::new(x, level.floor + 4, z_max + 1));
             let floor = vec![IVec2::new(x, z[0]), IVec2::new(x, z[1])];
             let torch_spacing = mine.torch_spacing as i32;
+            // The north wall is `z_min - 1`, not `z[0] - 1`: `row_z` runs
+            // outward from the shaft, so on the north arm `z[0]` is the
+            // *south* tile and `z[0] - 1` would be the gallery's own north
+            // tile — a torch hung on a block this same slice digs away.
             let torch = if torch_spacing > 0 && distance.rem_euclid(torch_spacing) == torch_spacing / 2 {
                 Some(TorchSpot {
-                    wall: IVec3::new(x, level.floor + 2, z[0] - 1),
-                    fallback_floor: IVec3::new(x, level.floor + 1, z[0]),
+                    wall: IVec3::new(x, level.floor + 2, z_min - 1),
+                    fallback_floor: IVec3::new(x, level.floor + 1, z_min),
                     facing: Side::South,
                 })
             } else {
@@ -1019,6 +1023,29 @@ mod tests {
             })
             .collect();
         assert_eq!(torch_distances, vec![4, 12]);
+    }
+
+    /// Ticket 126: the torch hangs on the wall *north of* the gallery on
+    /// both arms. `row_z` runs outward from the shaft, so its `[0]` is the
+    /// south tile on the north arm — the wall must come from the row's
+    /// minimum `z`, or the torch ends up on a block the slice digs away.
+    #[test]
+    fn gallery_torch_wall_is_outside_the_excavation_on_both_arms() {
+        let f = frame(6, 12);
+        let mine = mine_with((5, 5), 6, 12, 16);
+        let level = f.level(0);
+        for arm in [Arm::North, Arm::South] {
+            let slice = Slice::Gallery { arm, row: 0, side: GallerySide::East, distance: 4 };
+            let geom = slice_geometry(&f, &mine, f.floor_y, Some(&level), slice);
+            let torch = geom.torch.expect("distance 4 carries a torch");
+            assert!(!geom.excavate.contains(torch.wall), "{arm:?}: wall {:?} is inside {:?}", torch.wall, geom.excavate);
+            assert!(geom.excavate.contains(torch.fallback_floor), "{arm:?}: fallback {:?} is outside {:?}", torch.fallback_floor, geom.excavate);
+            // The wall is the block directly north of the fallback tile, at
+            // head height, and the torch faces away from it.
+            assert_eq!(torch.wall, torch.fallback_floor + IVec3::new(0, 1, -1));
+            assert_eq!(torch.wall.z, geom.excavate.min.z - 1);
+            assert_eq!(torch.facing, Side::South);
+        }
     }
 
     #[test]

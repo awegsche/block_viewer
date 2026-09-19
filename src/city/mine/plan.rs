@@ -649,6 +649,11 @@ mod tests {
         let plan = plan_slice(slice, &geom, &f, f.floor_y, &mine, &sampler);
         let wall_pos = IVec3::new(torch.fallback_floor.x, geom.floor_y + 2, torch.fallback_floor.z);
         assert_eq!(resolved(&plan.edit, wall_pos), Some(wall_torch_state(torch.facing)));
+        // Ticket 126: the block it hangs on is not one this slice writes to
+        // air — `gallery_geometry` uses the north arm, where a torch spot
+        // built from `row_z[0]` put the wall inside the gallery.
+        assert!(!geom.excavate.contains(torch.wall));
+        assert_eq!(resolved(&plan.edit, torch.wall), None, "the torch wall must stay rock");
     }
 
     // --- secondary slice rules -------------------------------------------

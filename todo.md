@@ -1707,3 +1707,10 @@ Y=0 in the world and won't be cleaned up by this fix — see the ticket.
   same answers faster. Also check the frame stays smooth while mines dig
   (brief dips to ~40 fps showed up in the console at each job's reload).
   Ticket: `finished_tickets/125-build-menu-pricing-freezes-the-frame.md`.
+- [ ] **126 gallery torches hang on the north wall on both arms.** Place a
+  fresh mine (or let an existing one open a new gallery row on the *north*
+  arm), open the world in Minecraft and walk a north-arm gallery: every
+  torch should sit on the wall at head height, none floating mid-corridor.
+  South-arm galleries were already right. Galleries dug before this fix
+  keep their floating torches — slices aren't re-run — so check a new row,
+  not an old one.
