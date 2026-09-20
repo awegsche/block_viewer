@@ -56,6 +56,7 @@ pub mod camera;
 pub mod chunk_pipeline;
 pub mod city;
 pub mod edit;
+pub mod model_exporter;
 pub mod ranvil_cli;
 pub mod region_cache;
 pub mod selection;

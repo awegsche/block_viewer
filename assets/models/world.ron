@@ -1,0 +1,25 @@
+// The models world (ticket 131, `MODEL_EXPORTER_ROADMAP.md`): a save name
+// under the instance directory (the same resolution `ranvil-cli --save`
+// does), or a path to one save. Set to the empty world the user provides —
+// `nbt_builder`, confirmed with `ranvil-cli --save nbt_builder column 0,0`.
+ModelWorld(
+    save: "nbt_builder",
+    // Y of the topmost ground block of the flat world (the grass layer).
+    // Confirmed via `ranvil-cli --save nbt_builder column 0,0`:
+    //   -63..-62 minecraft:dirt
+    //   -61..-61 minecraft:grass_block
+    //   -60..319 minecraft:air
+    ground_y: -61,
+    // Models are only ever allocated inside this XZ rectangle (inclusive).
+    area: (min: (x: 0, z: 0), max: (x: 511, z: 511)),
+    // Minimum clear blocks between two models' boxes. The marker ring sits
+    // 1 outside each box, so 3 leaves one empty block between rings.
+    gap: 3,
+    // Candidate origins are scanned on this XZ step — keeps the layout
+    // legible (models line up) without a real packer.
+    grid: 8,
+    // The delimiter block placed around a new slot.
+    marker: "minecraft:orange_terracotta",
+    // Where `export` writes by default, joined with `<name>.nbt`.
+    blueprints_dir: "assets/city/blueprints",
+)
