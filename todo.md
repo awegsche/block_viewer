@@ -1,5 +1,19 @@
 ## TODO
 
+- [ ] **135 model-exporter export, against the real models world.** Back
+  the real models world save up first (or run against a scratch copy).
+  Build something inside a registered slot's marker ring in Minecraft
+  (see the 134 check above for placing one), save & quit, then run
+  `cargo run --bin model-exporter -- export <name>` and confirm it prints
+  `new` and writes `<name>.nbt`. Open the citybuilder (or run
+  `cargo run --bin ranvil-cli -- struct info <name>.nbt`, or
+  `ranvil-cli struct validate <name>.nbt`) and confirm the model matches
+  what was built — the marker ring itself not included, and the
+  foundation layer sitting at `y=0` of the structure. Run `export <name>`
+  again with nothing changed in the world and confirm it now reports
+  `unchanged`; edit the build, save & quit, export a third time and
+  confirm `updated`. Also try `export` (no name) with Minecraft still
+  open and confirm it refuses without `--force`.
 - [ ] **134 model-exporter markers, in the real models world.** Back the
   real models world save up first (or run against a scratch copy). With
   `assets/models/world.ron` pointed at it, run

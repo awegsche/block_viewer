@@ -19,13 +19,15 @@
 //! Ticket 133 added [`allocate`] (the first-fit slot allocator, a pure
 //! function with its own tests) and [`new`] (the thin command wrapped around
 //! it, until this ticket always registering a slot without touching the
-//! world). This ticket (134) adds [`markers`] — the first command that
-//! writes to the models world: `marker_edit`/`marker_positions` (the ring
-//! and corner-pillar geometry as a [`crate::edit::WorldEdit`]), `new` now
+//! world). Ticket 134 added [`markers`] — the first command that writes to
+//! the models world: `marker_edit`/`marker_positions` (the ring and
+//! corner-pillar geometry as a [`crate::edit::WorldEdit`]), `new` now
 //! placing them via [`crate::ranvil_cli::edit::run_write`] unless
 //! `--no-markers`, and `mark <name>` to re-place an already-registered
-//! slot's markers. The rest of the module tree the roadmap lays out
-//! (`export`, `import`, `remove`) arrives in later tickets.
+//! slot's markers. This ticket (135) adds [`export`] — the command the tool
+//! is named for: every registered slot's world box read into its `.nbt` in
+//! one call. The rest of the module tree the roadmap lays out (`import`,
+//! `remove`) arrives in later tickets.
 
 use std::process::ExitCode;
 
@@ -33,6 +35,7 @@ use clap::Parser;
 
 pub mod allocate;
 pub mod cli;
+pub mod export;
 pub mod list;
 pub mod markers;
 pub mod new;
@@ -99,6 +102,11 @@ fn dispatch(cli: &Cli) -> Result<ExitCode, CliError> {
             let result = markers::mark(cli, args)?;
             print(&result, cli.format);
             Ok(ExitCode::SUCCESS)
+        }
+        Command::Export(args) => {
+            let result = export::export(cli, args)?;
+            print(&result, cli.format);
+            Ok(if result.any_failed() { ExitCode::from(1) } else { ExitCode::SUCCESS })
         }
     }
 }

@@ -48,8 +48,8 @@ pub struct Cli {
 
 /// One variant per subcommand. Ticket 132 adds `List`/`Show`, the two
 /// read-only commands that prove the format/error contract end to end;
-/// 133 adds `New`, 134 adds `Mark`; later tickets add `Export`/`Import`/
-/// `Remove`.
+/// 133 adds `New`, 134 adds `Mark`, 135 adds `Export`; later tickets add
+/// `Import`/`Remove`.
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// One row per registered slot: name, origin, size, box, `.nbt` status,
@@ -65,6 +65,9 @@ pub enum Command {
     /// Re-places an already-registered slot's markers — for a `.ron` edited
     /// by hand, after `remove --clear`, or a world reset.
     Mark(MarkArgs),
+    /// Reads every registered slot's world box (or the named ones) into its
+    /// `.nbt` — the command the tool is named for.
+    Export(ExportArgs),
 }
 
 /// `list` takes no arguments of its own — the registry it reads comes from
@@ -128,4 +131,23 @@ pub struct MarkArgs {
     /// Write even though the save looks open in Minecraft.
     #[arg(long)]
     pub force: bool,
+}
+
+/// `export [<name>...] [--force] [--dry-run]`. No names exports every
+/// registered slot, in registry order; one or more names exports only
+/// those (an unknown one refuses the whole command before anything is
+/// read).
+#[derive(Debug, Args)]
+pub struct ExportArgs {
+    /// Which slots to export. Empty means every registered slot.
+    pub names: Vec<String>,
+    /// Read the save even though it looks open in Minecraft — a region
+    /// Minecraft hasn't flushed yet is the one way to export something
+    /// other than what a human sees in game, so without this the whole
+    /// command refuses up front rather than per slot.
+    #[arg(long)]
+    pub force: bool,
+    /// Compute every slot's status and print it without writing any `.nbt`.
+    #[arg(long)]
+    pub dry_run: bool,
 }

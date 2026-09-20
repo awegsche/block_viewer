@@ -78,11 +78,12 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use bevy::math::IVec3;
+use mc_anvil::SaveMeta;
 use serde_json::{json, Value};
 
 use crate::blueprint::{
     extract_blueprint, read_structure_file, rotate_blueprint, run_checks, write_structure_file,
-    BlockState, Blueprint, BlueprintCheck, ExtractProgress, FALLBACK_DATA_VERSION,
+    BlockState, Blueprint, BlueprintCheck, ExtractError, ExtractProgress, FALLBACK_DATA_VERSION,
     LOGGED_PALETTE_ENTRIES, MAX_BLOCKS, STRUCTURE_BLOCK_MAX_SIZE,
 };
 use crate::edit::WorldEdit;
@@ -301,10 +302,35 @@ pub struct StructExportResult {
     pub failed_columns: usize,
 }
 
-/// Runs `struct export`: [`extract_blueprint`] over `args.from`/`args.to`
-/// (the same [`SelectionBounds`]/region-cache-sizing shape
-/// [`super::block::get_area`] builds — see that function's docs), then
-/// [`write_structure_file`] instead of `get-area`'s stdout formatting.
+/// [`extract_blueprint`] over `bounds`, with the [`RegionCache`] sized by
+/// [`region_span`]'s own arithmetic — exactly the regions `bounds`'s chunk
+/// columns span, the same sizing [`super::block::get_area`] applies to its
+/// own cache. This is the read [`export`] performs for its own
+/// `--from`/`--to` box, factored out here so `model_exporter::export`
+/// (ticket 135) — which looks its boxes up from `assets/models/*.ron`
+/// instead of CLI arguments — calls this rather than copying the
+/// cache-sizing arithmetic a second time.
+///
+/// A whole-run, multi-slot export builds its own shared cache instead of
+/// calling this once per slot (see that module's docs): this function's
+/// cache is scoped to one box and dropped when it returns, which is right
+/// for a single `struct export` but would reload every region from scratch
+/// for each additional slot in a batch.
+pub fn extract_box(meta: &SaveMeta, bounds: SelectionBounds) -> Result<Blueprint, ExtractError> {
+    let size = SECTION_SIZE as i32;
+    let (min_cx, min_cz) = (bounds.min.x.div_euclid(size), bounds.min.z.div_euclid(size));
+    let (max_cx, max_cz) = (bounds.max.x.div_euclid(size), bounds.max.z.div_euclid(size));
+    let capacity = region_span(min_cx, max_cx, min_cz, max_cz);
+
+    let cache = Arc::new(Mutex::new(RegionCache::new(meta.clone(), capacity)));
+    let progress = ExtractProgress::default();
+    extract_blueprint(bounds, &cache, &progress)
+}
+
+/// Runs `struct export`: [`extract_box`] over `args.from`/`args.to` (the
+/// same [`SelectionBounds`] shape [`super::block::get_area`] builds — see
+/// that function's docs), then [`write_structure_file`] instead of
+/// `get-area`'s stdout formatting.
 ///
 /// The [`MAX_BLOCKS`] check and the `out`-exists check both happen before
 /// [`resolve_save`] runs, same reasoning [`super::block::get_area`]'s own
@@ -330,16 +356,7 @@ pub fn export(cli: &Cli, args: &StructExportArgs) -> Result<StructExportResult, 
 
     let meta = resolve_save(cli)?;
 
-    // Sized the same way `get_area` sizes its own cache: exactly the regions
-    // this box's chunk columns span.
-    let size = SECTION_SIZE as i32;
-    let (min_cx, min_cz) = (bounds.min.x.div_euclid(size), bounds.min.z.div_euclid(size));
-    let (max_cx, max_cz) = (bounds.max.x.div_euclid(size), bounds.max.z.div_euclid(size));
-    let capacity = region_span(min_cx, max_cx, min_cz, max_cz);
-
-    let cache = Arc::new(Mutex::new(RegionCache::new(meta.clone(), capacity)));
-    let progress = ExtractProgress::default();
-    let blueprint = extract_blueprint(bounds, &cache, &progress).map_err(|e| {
+    let blueprint = extract_box(&meta, bounds).map_err(|e| {
         CliError::Data(format!(
             "could not extract ({}) to ({}): {e}",
             args.from.0, args.to.0
@@ -1074,6 +1091,20 @@ pub struct StructDiffResult {
     /// `scan --limit` uses. Does not affect `render_json`.
     pub limit: usize,
     pub differences: Vec<StructDiffEntry>,
+}
+
+/// Whether two blueprints resolve to the same blocks, position for
+/// position — the same size-then-per-position comparison [`diff`] performs
+/// below, short-circuiting on the first difference (or the size mismatch)
+/// rather than building [`diff`]'s full [`StructDiffEntry`] list, since a
+/// caller that only needs a yes/no (`model_exporter::export`, ticket 135,
+/// deciding `unchanged` versus `updated`) has no use for the positions.
+pub fn blueprints_equal(a: &Blueprint, b: &Blueprint) -> bool {
+    a.size == b.size
+        && a.blocks
+            .iter()
+            .zip(b.blocks.iter())
+            .all(|(&a_index, &b_index)| a.palette[a_index as usize] == b.palette[b_index as usize])
 }
 
 /// Runs `struct diff`: [`read_structure_file`] on both `a` and `b`, refuses
