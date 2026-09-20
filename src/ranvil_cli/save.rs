@@ -198,9 +198,19 @@ impl Render for SavesResult {
 /// that *was* found (the roadmap's exit-code split, and 088's own scope
 /// note).
 pub fn resolve_save(cli: &Cli) -> Result<SaveMeta, CliError> {
-    let instance = cli.instance.clone().unwrap_or_else(default_instance_dir);
+    resolve_save_from(cli.save.as_deref(), cli.instance.as_deref())
+}
 
-    if let Some(path) = cli.save.as_deref().map(Path::new).filter(|path| path.is_dir()) {
+/// [`resolve_save`]'s body, taking `save`/`instance` directly rather than a
+/// whole [`Cli`] — ticket 132's split, so `model_exporter` (whose own `--save`
+/// falls back to `world.ron`'s `save` rather than `ranvil-cli`'s `Cli` shape)
+/// shares this exact resolution logic instead of growing a second one.
+/// `resolve_save` above is the one-line wrapper `ranvil-cli`'s commands keep
+/// calling.
+pub fn resolve_save_from(save: Option<&str>, instance: Option<&Path>) -> Result<SaveMeta, CliError> {
+    let instance = instance.map(Path::to_path_buf).unwrap_or_else(default_instance_dir);
+
+    if let Some(path) = save.map(Path::new).filter(|path| path.is_dir()) {
         return SaveMeta::from_path(path).map_err(|e| {
             CliError::Usage(format!(
                 "{} is not a Minecraft save (no readable region directory): {e}",
@@ -216,7 +226,7 @@ pub fn resolve_save(cli: &Cli) -> Result<SaveMeta, CliError> {
         ))
     })?;
 
-    match cli.save.as_deref() {
+    match save {
         Some(name) => crate::pick_named_save(&saves, name, &instance).map_err(CliError::Usage),
         None => saves.into_iter().next().ok_or_else(|| {
             CliError::Usage(format!("no Minecraft saves found under {}", instance.display()))

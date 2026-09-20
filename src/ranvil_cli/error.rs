@@ -68,9 +68,20 @@ pub fn report(err: &CliError, format: OutputFormat) -> ExitCode {
             println!("{}", serde_json::to_string_pretty(&envelope).unwrap());
         }
         OutputFormat::Text | OutputFormat::Compact => {
-            eprintln!("ranvil-cli: {}", err.message());
+            eprintln!("{}: {}", program_name(), err.message());
         }
     }
 
     err.exit_code()
+}
+
+/// The running executable's own name (`ranvil-cli`, `model-exporter`, ...),
+/// for the `text`/`compact` error line's prefix — this module is shared by
+/// both CLIs (ticket 132), so the prefix can't be a literal `"ranvil-cli"`
+/// without mislabeling `model-exporter`'s own errors.
+fn program_name() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.file_stem().map(|s| s.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "ranvil-cli".to_string())
 }

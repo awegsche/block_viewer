@@ -24,6 +24,10 @@ path = "src/bin/citybuilder.rs"
 name = "ranvil-cli"
 path = "src/bin/ranvil_cli.rs"
 
+[[bin]]
+name = "model-exporter"
+path = "src/bin/model_exporter.rs"
+
 [dependencies]
 bevy = "0.15.0"
 bevy_egui = "0.31.1"
