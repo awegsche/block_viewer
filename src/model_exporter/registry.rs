@@ -69,6 +69,18 @@ pub struct ModelWorld {
     pub blueprints_dir: PathBuf,
 }
 
+impl ModelWorld {
+    /// `area` as a [`Footprint`] — what [`check_area`] and ticket 133's
+    /// allocator both check candidate footprints against, computed once
+    /// rather than each re-deriving `IVec2::new(area.min.x, area.min.z)`.
+    pub fn area_footprint(&self) -> Footprint {
+        Footprint {
+            min: IVec2::new(self.area.min.x, self.area.min.z),
+            max: IVec2::new(self.area.max.x, self.area.max.z),
+        }
+    }
+}
+
 /// Deserializes [`BlockState`] through its existing `name[key=value,...]`
 /// [`FromStr`] parser (ticket 035) rather than a second block-state grammar
 /// — `world.ron`'s `marker` is just a string on the wire.
@@ -259,11 +271,7 @@ fn check_size(slot: &ModelSlot) -> Result<(), RegistryError> {
 }
 
 fn check_area(slot: &ModelSlot, world: &ModelWorld) -> Result<(), RegistryError> {
-    let area = Footprint {
-        min: IVec2::new(world.area.min.x, world.area.min.z),
-        max: IVec2::new(world.area.max.x, world.area.max.z),
-    };
-    if !area.contains(&slot.footprint()) {
+    if !world.area_footprint().contains(&slot.footprint()) {
         return Err(RegistryError::OutsideArea { name: slot.name.clone() });
     }
     Ok(())

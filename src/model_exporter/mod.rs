@@ -10,25 +10,31 @@
 //! `assets/models` directory at once — no CLI, no world I/O, nothing beyond
 //! reading and writing `.ron` files.
 //!
-//! This ticket (132) adds the bin shim, [`cli`] (the `clap` surface) and
-//! [`list`] (`list`/`show`, both read-only over the registry) — the same
-//! shape `ranvil_cli`'s own `run`/`dispatch` take, sharing its error/format
+//! Ticket 132 added the bin shim, [`cli`] (the `clap` surface) and [`list`]
+//! (`list`/`show`, both read-only over the registry) — the same shape
+//! `ranvil_cli`'s own `run`/`dispatch` take, sharing its error/format
 //! contract ([`crate::ranvil_cli::error::CliError`],
-//! [`crate::ranvil_cli::format`]) rather than growing a second one. The rest
-//! of the module tree the roadmap lays out (`allocate`, `markers`, `new`,
+//! [`crate::ranvil_cli::format`]) rather than growing a second one.
+//!
+//! This ticket (133) adds [`allocate`] (the first-fit slot allocator, a pure
+//! function with its own tests) and [`new`] (the thin command wrapped around
+//! it). The rest of the module tree the roadmap lays out (`markers`,
 //! `export`, `import`, `remove`) arrives in later tickets.
 
 use std::process::ExitCode;
 
 use clap::Parser;
 
+pub mod allocate;
 pub mod cli;
 pub mod list;
+pub mod new;
 pub mod registry;
 
 use cli::{Cli, Command};
 use crate::ranvil_cli::error::{report, CliError};
 use crate::ranvil_cli::format::print;
+use allocate::AllocateError;
 use registry::RegistryError;
 
 /// A bad registry is a bad argument, caught before anything is touched —
@@ -36,6 +42,16 @@ use registry::RegistryError;
 /// [`CliError::Data`].
 impl From<RegistryError> for CliError {
     fn from(err: RegistryError) -> Self {
+        CliError::Usage(err.to_string())
+    }
+}
+
+/// [`AllocateError`] is always a bad request too: either the size was wrong
+/// (caught before any read), or `world.area`/generated-chunk coverage can't
+/// fit it right now — both are things the caller needs to change, not a read
+/// that failed against ground that *was* found.
+impl From<AllocateError> for CliError {
+    fn from(err: AllocateError) -> Self {
         CliError::Usage(err.to_string())
     }
 }
@@ -64,6 +80,11 @@ fn dispatch(cli: &Cli) -> Result<ExitCode, CliError> {
         }
         Command::Show(args) => {
             let result = list::show(cli, args)?;
+            print(&result, cli.format);
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::New(args) => {
+            let result = new::new(cli, args)?;
             print(&result, cli.format);
             Ok(ExitCode::SUCCESS)
         }

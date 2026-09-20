@@ -58,6 +58,10 @@ pub enum Command {
     /// One slot, in full: everything `list` shows plus the marker ring's
     /// geometry and the equivalent `ranvil-cli get-area` line.
     Show(ShowArgs),
+    /// Finds a free spot, registers it, and prints where it is. Markers are
+    /// ticket 134's job — until it lands, `new` always behaves as
+    /// `--no-markers` and says so.
+    New(NewArgs),
 }
 
 /// `list` takes no arguments of its own — the registry it reads comes from
@@ -70,4 +74,35 @@ pub struct ListArgs {}
 pub struct ShowArgs {
     /// A registered model's name — its `.ron` file's stem.
     pub name: String,
+}
+
+/// `new <name> <width> <height> <depth> [--below N] [--no-markers]
+/// [--dry-run]`. `width`/`height`/`depth` are the blueprint's `x`/`y`/`z`
+/// extents — the same order `struct new --size x,y,z` takes.
+#[derive(Debug, Args)]
+pub struct NewArgs {
+    /// The model's name: must match `[a-z0-9_]+` (it also becomes the
+    /// `.ron`/`.nbt` file stem) and must not already be registered.
+    pub name: String,
+    /// The blueprint's `x` extent.
+    pub width: i32,
+    /// The blueprint's `y` extent.
+    pub height: i32,
+    /// The blueprint's `z` extent.
+    pub depth: i32,
+    /// Foundation layers under the ground surface: `origin.y = ground_y -
+    /// below`. The default, `1`, is the `ground_level: 1` convention
+    /// `gatherer_hut.ron`/`mine01.ron` already use (the blueprint's `y=0` is
+    /// that foundation layer, the surface is `y=1`); `--below 0` gives
+    /// `house01.ron`'s "y=0 is the surface" shape instead.
+    #[arg(long, default_value_t = 1)]
+    pub below: u32,
+    /// Register the slot without placing marker blocks. This is the only
+    /// mode available until ticket 134 lands — `new` behaves as if this were
+    /// always set, and says so in its output.
+    #[arg(long)]
+    pub no_markers: bool,
+    /// Compute the allocation and print it without writing the `.ron`.
+    #[arg(long)]
+    pub dry_run: bool,
 }

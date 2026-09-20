@@ -79,14 +79,16 @@ impl NbtStatus {
     }
 }
 
-fn box_text(min: IVec3, max: IVec3) -> String {
+/// `pub(super)`: ticket 133's `new` reuses these for its own `text` output
+/// rather than reformatting the box/tp line a second way.
+pub(super) fn box_text(min: IVec3, max: IVec3) -> String {
     format!(
         "({},{},{})..({},{},{})",
         min.x, min.y, min.z, max.x, max.y, max.z
     )
 }
 
-fn tp_text(tp: IVec3) -> String {
+pub(super) fn tp_text(tp: IVec3) -> String {
     format!("/tp @s {} {} {}", tp.x, tp.y, tp.z)
 }
 
