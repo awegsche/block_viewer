@@ -16,10 +16,16 @@
 //! contract ([`crate::ranvil_cli::error::CliError`],
 //! [`crate::ranvil_cli::format`]) rather than growing a second one.
 //!
-//! This ticket (133) adds [`allocate`] (the first-fit slot allocator, a pure
+//! Ticket 133 added [`allocate`] (the first-fit slot allocator, a pure
 //! function with its own tests) and [`new`] (the thin command wrapped around
-//! it). The rest of the module tree the roadmap lays out (`markers`,
-//! `export`, `import`, `remove`) arrives in later tickets.
+//! it, until this ticket always registering a slot without touching the
+//! world). This ticket (134) adds [`markers`] — the first command that
+//! writes to the models world: `marker_edit`/`marker_positions` (the ring
+//! and corner-pillar geometry as a [`crate::edit::WorldEdit`]), `new` now
+//! placing them via [`crate::ranvil_cli::edit::run_write`] unless
+//! `--no-markers`, and `mark <name>` to re-place an already-registered
+//! slot's markers. The rest of the module tree the roadmap lays out
+//! (`export`, `import`, `remove`) arrives in later tickets.
 
 use std::process::ExitCode;
 
@@ -28,6 +34,7 @@ use clap::Parser;
 pub mod allocate;
 pub mod cli;
 pub mod list;
+pub mod markers;
 pub mod new;
 pub mod registry;
 
@@ -85,6 +92,11 @@ fn dispatch(cli: &Cli) -> Result<ExitCode, CliError> {
         }
         Command::New(args) => {
             let result = new::new(cli, args)?;
+            print(&result, cli.format);
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Mark(args) => {
+            let result = markers::mark(cli, args)?;
             print(&result, cli.format);
             Ok(ExitCode::SUCCESS)
         }

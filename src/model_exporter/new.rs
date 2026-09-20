@@ -1,13 +1,15 @@
-//! `model-exporter new` (ticket 133, `MODEL_EXPORTER_ROADMAP.md` "Coordinates
-//! and markers") — the thin command wrapped around [`super::allocate::allocate`]:
-//! validate the name, build a `chunk_generated` predicate from the real save
-//! (the same per-chunk decode [`crate::ranvil_cli::chunk::chunks`] uses),
-//! allocate, then write the `.ron` via [`super::registry::save_slot`].
+//! `model-exporter new` (tickets 133–134, `MODEL_EXPORTER_ROADMAP.md`
+//! "Coordinates and markers") — the thin command wrapped around
+//! [`super::allocate::allocate`]: validate the name, build a
+//! `chunk_generated` predicate from the real save (the same per-chunk
+//! decode [`crate::ranvil_cli::chunk::chunks`] uses), allocate, write the
+//! `.ron` via [`super::registry::save_slot`], then (ticket 134, unless
+//! `--no-markers`) place the marker ring and corner pillars via
+//! [`super::markers::marker_edit`] and
+//! [`crate::ranvil_cli::edit::run_write`] — the first world write this
+//! command makes.
 //!
-//! Marker placement is ticket 134's job — the first command that writes to
-//! the models world. Until it lands, `new` always behaves as if
-//! `--no-markers` were given and says so in its output; `--dry-run` writes
-//! nothing at all.
+//! `--dry-run` writes nothing at all: no `.ron`, no markers.
 
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -16,6 +18,7 @@ use bevy::math::{IVec2, IVec3};
 use serde_json::{json, Value};
 
 use crate::ranvil_cli::chunk::load_chunk_nbt;
+use crate::ranvil_cli::edit::{outcome_json_fields, outcome_summary, run_write, WriteOutcome};
 use crate::ranvil_cli::error::CliError;
 use crate::ranvil_cli::format::Render;
 use crate::ranvil_cli::save::resolve_save_from;
@@ -24,6 +27,7 @@ use crate::region_cache::RegionCache;
 use super::allocate::allocate;
 use super::cli::{Cli, NewArgs};
 use super::list::{box_text, tp_position, tp_text};
+use super::markers::marker_edit;
 use super::registry::{load_registry, save_slot, ModelSlot};
 
 /// A valid model name: non-empty, `[a-z0-9_]+` — the same charset a `.ron`/
@@ -32,13 +36,15 @@ fn is_valid_name(name: &str) -> bool {
     !name.is_empty() && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
 }
 
-/// What `new` did about marker blocks — always [`MarkersStatus::DryRun`] or
-/// [`MarkersStatus::Skipped`] until ticket 134 adds [`MarkersStatus::Placed`]'s
-/// real caller.
+/// What `new` did about marker blocks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MarkersStatus {
+    /// Placed via [`run_write`] — see [`NewResult::outcome`] for the write's
+    /// own report.
     Placed,
+    /// `--no-markers` asked to skip them.
     Skipped,
+    /// `--dry-run`: nothing was written at all, markers included.
     DryRun,
 }
 
@@ -62,15 +68,21 @@ pub struct NewResult {
     pub tp: IVec3,
     pub file: PathBuf,
     pub markers: MarkersStatus,
+    /// [`run_write`]'s own report — `Some` only when [`Self::markers`] is
+    /// [`MarkersStatus::Placed`].
+    pub outcome: Option<WriteOutcome>,
 }
 
 /// Runs `new <name> <width> <height> <depth>`: validates `name`, allocates a
-/// box via [`allocate`], and — unless `--dry-run` — writes `<name>.ron`.
+/// box via [`allocate`], writes `<name>.ron`, then — unless `--no-markers`
+/// — places its markers via [`marker_edit`]/[`run_write`]. `--dry-run` skips
+/// all three: nothing is written.
 ///
 /// Resolves the save (`cli.save` overriding `world.ron`'s own `save` field,
-/// per [`super::cli`]'s doc comment) only to answer `chunk_generated`;
-/// nothing in the models world is written here. Works with Minecraft open,
-/// same as `list`/`show`.
+/// per [`super::cli`]'s doc comment) once, used both to answer
+/// `chunk_generated` for the allocator and, unless markers are skipped, as
+/// the target of the marker write. Works with Minecraft open — `--force`
+/// overrides [`run_write`]'s own lock gate, same as `mark`.
 pub fn new(cli: &Cli, args: &NewArgs) -> Result<NewResult, CliError> {
     if !is_valid_name(&args.name) {
         return Err(CliError::Usage(format!(
@@ -96,7 +108,7 @@ pub fn new(cli: &Cli, args: &NewArgs) -> Result<NewResult, CliError> {
     // the handful of chunk columns a candidate's marker ring touches, never
     // a bulk survey, so there's nothing to size against a render distance
     // (contrast `ranvil_cli::chunk::region_span`).
-    let cache = RefCell::new(RegionCache::new(meta, 8));
+    let cache = RefCell::new(RegionCache::new(meta.clone(), 8));
     let chunk_generated = |chunk: IVec2| -> bool {
         let mut cache = cache.borrow_mut();
         matches!(
@@ -110,12 +122,31 @@ pub fn new(cli: &Cli, args: &NewArgs) -> Result<NewResult, CliError> {
     let slot = ModelSlot { name: args.name.clone(), origin, size, out: None };
     let file = cli.models_dir.join(format!("{}.ron", args.name));
 
-    let markers = if args.dry_run {
-        MarkersStatus::DryRun
+    let (markers, outcome) = if args.dry_run {
+        (MarkersStatus::DryRun, None)
     } else {
         save_slot(&cli.models_dir, &slot)
             .map_err(|e| CliError::Data(format!("could not write {}: {e}", file.display())))?;
-        MarkersStatus::Skipped
+
+        if args.no_markers {
+            (MarkersStatus::Skipped, None)
+        } else {
+            let world = registry.world.clone();
+            let slot_for_edit = slot.clone();
+            let outcome = run_write(&meta, false, args.force, move |_cache| {
+                Ok(marker_edit(&slot_for_edit, &world))
+            })
+            .map_err(|err| {
+                CliError::Data(format!(
+                    "{:?} was registered at {} but placing its markers failed: {err} — once the \
+                     write can succeed, run `model-exporter mark {}`",
+                    slot.name,
+                    file.display(),
+                    slot.name
+                ))
+            })?;
+            (MarkersStatus::Placed, Some(outcome))
+        }
     };
 
     Ok(NewResult {
@@ -127,6 +158,7 @@ pub fn new(cli: &Cli, args: &NewArgs) -> Result<NewResult, CliError> {
         tp: tp_position(&slot, &registry.world),
         file,
         markers,
+        outcome,
     })
 }
 
@@ -143,16 +175,20 @@ impl Render for NewResult {
             self.size.z,
             box_text(self.min, self.max),
         )];
-        lines.push(match self.markers {
+        match self.markers {
             MarkersStatus::Placed => {
-                "  build inside the orange ring, no higher than the pillar tops".to_string()
+                lines.push("  build inside the orange ring, no higher than the pillar tops".to_string());
+                if let Some(outcome) = &self.outcome {
+                    lines.push(format!("  {}", outcome_summary(format!("markers for {}", self.name), outcome)));
+                    lines.push(format!("    backup: {}", outcome.backup_dir.display()));
+                }
             }
-            MarkersStatus::Skipped => format!(
-                "  registered at {} — markers not placed (model-exporter mark isn't implemented yet, ticket 134)",
+            MarkersStatus::Skipped => lines.push(format!(
+                "  registered at {} — markers not placed (--no-markers)",
                 self.file.display()
-            ),
-            MarkersStatus::DryRun => "  dry run: nothing written".to_string(),
-        });
+            )),
+            MarkersStatus::DryRun => lines.push("  dry run: nothing written".to_string()),
+        }
         lines.push(format!("  {}", tp_text(self.tp)));
         lines.join("\n")
     }
@@ -167,6 +203,14 @@ impl Render for NewResult {
             "tp": [self.tp.x, self.tp.y, self.tp.z],
             "file": self.file.display().to_string(),
             "markers": self.markers.as_str(),
+            "outcome": self.outcome.as_ref().map(|outcome| {
+                Value::Object(
+                    outcome_json_fields(outcome)
+                        .into_iter()
+                        .map(|(key, value)| (key.to_string(), value))
+                        .collect(),
+                )
+            }),
         })
     }
 
@@ -192,10 +236,24 @@ mod tests {
     use std::path::Path;
 
     use mc_anvil::region::{ChunkPayload, Region, CHUNKS_PER_REGION, REGION_WIDTH_IN_CHUNKS};
+    use mc_anvil::SaveMeta;
     use rnbt::{NbtField, NbtList, NbtValue};
 
     use super::*;
     use super::super::cli::Command;
+
+    fn block_name_at(meta: &SaveMeta, at: IVec3) -> String {
+        let address = crate::edit::address_of(at);
+        let mut cache = RegionCache::new(meta.clone(), 1);
+        cache
+            .get_or_load(address.region)
+            .expect("resident")
+            .get_block(address.local_x, address.y, address.local_z)
+            .expect("a populated chunk")
+            .get_string("Name")
+            .expect("a palette entry")
+            .clone()
+    }
 
     fn temp_dir(name: &str) -> PathBuf {
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -284,6 +342,30 @@ mod tests {
         (dir, save_dir)
     }
 
+    /// Like [`write_world`], but `ground_y` sits inside [`full_chunk`]'s one
+    /// stone section (block `y` 0..15) and `world.area` starts near `(0, 0)`
+    /// — what a test that actually writes markers (rather than just probing
+    /// `chunk_generated` via `--no-markers`) needs, since [`full_chunk`]
+    /// never populates a section anywhere near a real save's `y = -61`.
+    fn write_world_flat(dir: &Path, save_dir: &Path) {
+        fs::write(
+            dir.join("world.ron"),
+            format!(
+                r#"ModelWorld(
+    save: "{}",
+    ground_y: 5,
+    area: (min: (x: 2, z: 2), max: (x: 29, z: 29)),
+    gap: 1,
+    grid: 8,
+    marker: "minecraft:orange_terracotta",
+    blueprints_dir: "assets/city/blueprints",
+)"#,
+                save_dir.display().to_string().replace('\\', "/")
+            ),
+        )
+        .expect("write world.ron");
+    }
+
     fn cli(dir: &Path) -> Cli {
         Cli {
             models_dir: dir.to_path_buf(),
@@ -303,6 +385,7 @@ mod tests {
             below: 1,
             no_markers: true,
             dry_run: false,
+            force: false,
         }
     }
 
@@ -331,6 +414,38 @@ mod tests {
         new(&cli(&dir), &new_args("barn")).expect("first new should allocate");
         let err = new(&cli(&dir), &new_args("barn")).expect_err("second new should fail");
         assert!(matches!(err, CliError::Usage(_)));
+    }
+
+    /// Without `--no-markers`, `new` actually writes the ring to the world —
+    /// not just to the `.ron`.
+    #[test]
+    fn new_places_markers_unless_no_markers_is_set() {
+        let dir = temp_dir("with_markers");
+        let save_dir = temp_dir("with_markers_save");
+        make_save_dir(&save_dir);
+        write_world_flat(&dir, &save_dir);
+
+        let mut args = new_args("barn");
+        args.width = 3;
+        args.height = 1;
+        args.depth = 3;
+        args.below = 0;
+        args.no_markers = false;
+
+        let result = new(&cli(&dir), &args).expect("should allocate and mark");
+        assert_eq!(result.origin, IVec3::new(2, 5, 2));
+        assert_eq!(result.markers, MarkersStatus::Placed);
+
+        let outcome = result.outcome.expect("an outcome for placed markers");
+        assert!(!outcome.dry_run);
+        // origin (2,5,2) size (3,1,3), below 0: a flat slot flush with the
+        // ground has a ring (2*(3+2)+2*3 = 16) and no pillars.
+        assert_eq!(outcome.report.blocks_written, 16);
+
+        let meta = SaveMeta::from_path(&save_dir).expect("a readable save");
+        assert_eq!(block_name_at(&meta, IVec3::new(1, 5, 1)), "minecraft:orange_terracotta");
+        // Inside the slot's own box: untouched.
+        assert_eq!(block_name_at(&meta, IVec3::new(3, 5, 3)), "minecraft:stone");
     }
 
     #[test]

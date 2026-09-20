@@ -1,5 +1,17 @@
 ## TODO
 
+- [ ] **134 model-exporter markers, in the real models world.** Back the
+  real models world save up first (or run against a scratch copy). With
+  `assets/models/world.ron` pointed at it, run
+  `cargo run --bin model-exporter -- new ring_test 5 4 5` and confirm the
+  printed origin/box/tp line, then `/tp` there in Minecraft and check: an
+  orange terracotta ring flush with the ground, one block outside the 5x4x5
+  footprint on every side; four pillars, three blocks tall, standing on the
+  ring's four corners; nothing placed inside the footprint itself. Then run
+  `model-exporter mark ring_test` again and confirm nothing visibly
+  changes (idempotent re-placement). Once 135 (`export`) exists, export
+  `ring_test` and confirm the ring/pillars are *not* in the resulting
+  `.nbt` — only the footprint's own blocks are.
 - [ ] **130 wheat farm tiles.** Load the citybuilder, unlock and place a
   `farm01` (Wheat Farm), then a `farm01_tile` (Wheat Field) — the build
   menu's `farm01` catalogue row should read "Scales with Wheat Field

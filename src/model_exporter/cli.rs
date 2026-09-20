@@ -48,7 +48,8 @@ pub struct Cli {
 
 /// One variant per subcommand. Ticket 132 adds `List`/`Show`, the two
 /// read-only commands that prove the format/error contract end to end;
-/// later tickets add `New`, `Export`, `Import`, `Remove`, `Mark`.
+/// 133 adds `New`, 134 adds `Mark`; later tickets add `Export`/`Import`/
+/// `Remove`.
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// One row per registered slot: name, origin, size, box, `.nbt` status,
@@ -58,10 +59,12 @@ pub enum Command {
     /// One slot, in full: everything `list` shows plus the marker ring's
     /// geometry and the equivalent `ranvil-cli get-area` line.
     Show(ShowArgs),
-    /// Finds a free spot, registers it, and prints where it is. Markers are
-    /// ticket 134's job — until it lands, `new` always behaves as
-    /// `--no-markers` and says so.
+    /// Finds a free spot, registers it, and (unless `--no-markers`) places
+    /// the marker ring and corner pillars around it.
     New(NewArgs),
+    /// Re-places an already-registered slot's markers — for a `.ron` edited
+    /// by hand, after `remove --clear`, or a world reset.
+    Mark(MarkArgs),
 }
 
 /// `list` takes no arguments of its own — the registry it reads comes from
@@ -97,12 +100,32 @@ pub struct NewArgs {
     /// `house01.ron`'s "y=0 is the surface" shape instead.
     #[arg(long, default_value_t = 1)]
     pub below: u32,
-    /// Register the slot without placing marker blocks. This is the only
-    /// mode available until ticket 134 lands — `new` behaves as if this were
-    /// always set, and says so in its output.
+    /// Register the slot without placing marker blocks — for registering a
+    /// slot in a world one doesn't want to touch yet. Run `mark <name>`
+    /// later to place them.
     #[arg(long)]
     pub no_markers: bool,
-    /// Compute the allocation and print it without writing the `.ron`.
+    /// Compute the allocation and print it without writing the `.ron` or
+    /// touching the world at all.
     #[arg(long)]
     pub dry_run: bool,
+    /// Place markers even though the save looks open in Minecraft —
+    /// `run_write`'s existing gate. Save & quit first if you can; this is
+    /// for when that isn't possible.
+    #[arg(long)]
+    pub force: bool,
+}
+
+/// `mark <name> [--dry-run] [--force]`.
+#[derive(Debug, Args)]
+pub struct MarkArgs {
+    /// An already-registered model's name.
+    pub name: String,
+    /// Plan the write and report what it would do without touching the
+    /// world.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Write even though the save looks open in Minecraft.
+    #[arg(long)]
+    pub force: bool,
 }

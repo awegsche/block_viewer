@@ -16,6 +16,7 @@ use crate::ranvil_cli::error::CliError;
 use crate::ranvil_cli::format::Render;
 
 use super::cli::{Cli, ListArgs, ShowArgs};
+use super::markers::{corner, ring_y};
 use super::registry::{load_registry, ModelSlot, ModelWorld};
 
 /// Where `new barn 14 9 11` (ticket 133) teleports after allocating a slot,
@@ -254,7 +255,6 @@ pub fn show(cli: &Cli, args: &ShowArgs) -> Result<ShowResult, CliError> {
 
     let min = slot.min();
     let max = slot.max();
-    let ring = slot.footprint().expanded(1);
 
     Ok(ShowResult {
         name: slot.name.clone(),
@@ -264,9 +264,9 @@ pub fn show(cli: &Cli, args: &ShowArgs) -> Result<ShowResult, CliError> {
         max,
         out: slot.out_path(&registry.world),
         nbt: NbtStatus::of(slot, &registry.world),
-        ring_y: registry.world.ground_y,
-        ring_min: ring.min,
-        ring_max: ring.max,
+        ring_y: ring_y(&registry.world),
+        ring_min: corner(slot, false, false),
+        ring_max: corner(slot, true, true),
         tp: tp_position(slot, &registry.world),
         get_area: format!(
             "ranvil-cli --save {} get-area {},{},{} {},{},{}",

@@ -155,9 +155,10 @@ pub fn run_write(
 /// unmistakably as a plan rather than a completed write even on a skim, per
 /// the ticket ("a script can't mistake a dry run's JSON for a real one").
 ///
-/// `pub(super)`: `struct import` (ticket 099) shares this rather than
-/// growing a second `WriteOutcome`-to-JSON mapping.
-pub(super) fn outcome_json_fields(outcome: &WriteOutcome) -> Vec<(&'static str, Value)> {
+/// `pub`: `struct import` (ticket 099) and `model_exporter::markers`'s
+/// `mark`/`new` (ticket 134) share this rather than each growing their own
+/// `WriteOutcome`-to-JSON mapping.
+pub fn outcome_json_fields(outcome: &WriteOutcome) -> Vec<(&'static str, Value)> {
     let region_json = |coords: &[(i32, i32)]| {
         json!(coords.iter().map(|&(x, z)| json!([x, z])).collect::<Vec<_>>())
     };
@@ -180,8 +181,9 @@ pub(super) fn outcome_json_fields(outcome: &WriteOutcome) -> Vec<(&'static str, 
 /// shares: `[dry-run]` up front when nothing was actually written — visible
 /// in *every* format, not just `json`, per the ticket.
 ///
-/// `pub(super)`: same reuse as [`outcome_json_fields`], for `struct import`.
-pub(super) fn outcome_summary(prefix: String, outcome: &WriteOutcome) -> String {
+/// `pub`: same reuse as [`outcome_json_fields`], for `struct import` and
+/// `model_exporter::markers`.
+pub fn outcome_summary(prefix: String, outcome: &WriteOutcome) -> String {
     let verb = if outcome.dry_run { "would write" } else { "wrote" };
     let blocks = outcome.report.blocks_written;
     let regions = outcome.report.regions.len();
