@@ -32,8 +32,29 @@ use super::registry::{load_registry, save_slot, ModelSlot};
 
 /// A valid model name: non-empty, `[a-z0-9_]+` — the same charset a `.ron`/
 /// `.nbt` file stem and `blueprint::catalogue`'s name matching both need.
-fn is_valid_name(name: &str) -> bool {
+///
+/// `pub(super)`: [`super::import`] (ticket 136) validates an unregistered
+/// `import <name>` against the same rule before allocating a slot for it.
+pub(super) fn is_valid_name(name: &str) -> bool {
     !name.is_empty() && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// A `chunk_generated` predicate ([`allocate`]'s own parameter) backed by a
+/// real save: a small resident [`RegionCache`] (8 regions — see [`new`]'s own
+/// doc comment on why that's plenty) probed lazily, only for the handful of
+/// chunk columns a candidate's marker ring touches.
+///
+/// `pub(super)`: [`super::import`] builds the same predicate for its own,
+/// unregistered-name `allocate` call, rather than duplicating this closure.
+pub(super) fn chunk_generated_predicate(meta: &mc_anvil::SaveMeta) -> impl Fn(IVec2) -> bool {
+    let cache = RefCell::new(RegionCache::new(meta.clone(), 8));
+    move |chunk: IVec2| -> bool {
+        let mut cache = cache.borrow_mut();
+        matches!(
+            load_chunk_nbt(&mut cache, (chunk.x, chunk.y)),
+            Ok(Some(nbt)) if nbt.get_string("Status").map(String::as_str) == Some("minecraft:full")
+        )
+    }
 }
 
 /// What `new` did about marker blocks.
@@ -104,18 +125,7 @@ pub fn new(cli: &Cli, args: &NewArgs) -> Result<NewResult, CliError> {
 
     let save = cli.save.as_deref().or(Some(registry.world.save.as_str()));
     let meta = resolve_save_from(save, cli.instance.as_deref())?;
-    // A small resident capacity: `chunk_generated` is only ever probed for
-    // the handful of chunk columns a candidate's marker ring touches, never
-    // a bulk survey, so there's nothing to size against a render distance
-    // (contrast `ranvil_cli::chunk::region_span`).
-    let cache = RefCell::new(RegionCache::new(meta.clone(), 8));
-    let chunk_generated = |chunk: IVec2| -> bool {
-        let mut cache = cache.borrow_mut();
-        matches!(
-            load_chunk_nbt(&mut cache, (chunk.x, chunk.y)),
-            Ok(Some(nbt)) if nbt.get_string("Status").map(String::as_str) == Some("minecraft:full")
-        )
-    };
+    let chunk_generated = chunk_generated_predicate(&meta);
 
     let origin = allocate(&registry.world, &registry.slots, size, args.below, chunk_generated)?;
 

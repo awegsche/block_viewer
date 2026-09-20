@@ -451,13 +451,30 @@ pub struct StructImportResult {
     pub outcome: WriteOutcome,
 }
 
+/// Every position of `blueprint`, offset by `at`, as a [`WorldEdit`] — air
+/// included, matching `city::commit`'s own `blueprint_edit` convention (a
+/// placement writes air rather than skipping it, so whatever previously sat
+/// in the target box — a prior import, or a human's abandoned attempt — is
+/// cleared to exactly the blueprint's shape, not merged with it).
+///
+/// Shared by [`import`] and `model_exporter::import` (ticket 136), which
+/// calls this rather than rebuilding the same palette-index-to-`BlockState`
+/// walk a second time.
+pub fn blueprint_edit(blueprint: &Blueprint, at: IVec3) -> WorldEdit {
+    let mut edit = WorldEdit::new().with_data_version(blueprint.data_version);
+    for (index, &palette_index) in blueprint.blocks.iter().enumerate() {
+        let state = blueprint.palette[palette_index as usize].clone();
+        let local = position_of(IVec3::ZERO, blueprint.size, index);
+        edit.set(at + local, state);
+    }
+    edit
+}
+
 /// Runs `struct import`: [`read_structure_file`], then (if `args.rotate` is
 /// given) [`rotate_blueprint`] — 102's function, called rather than
 /// reimplemented, since it already exists (ticket 038) even though `struct
-/// rotate` the CLI command doesn't yet — then a [`WorldEdit`] writing every
-/// position (air included, matching `city::commit`'s own `blueprint_edit`
-/// convention — see that module's docs on why a placement writes air rather
-/// than skipping it) offset by `args.at`, run through [`run_write`].
+/// rotate` the CLI command doesn't yet — then [`blueprint_edit`] offset by
+/// `args.at`, run through [`run_write`].
 ///
 /// `size` is the *rotated* blueprint's size (when `--rotate` was given) —
 /// what actually gets written, not the file's own on-disk size.
@@ -473,20 +490,11 @@ pub fn import(cli: &Cli, args: &StructImportArgs) -> Result<StructImportResult, 
 
     let at = args.at.0;
     let size = blueprint.size;
-    let data_version = blueprint.data_version;
-    let palette = blueprint.palette;
-    let blocks = blueprint.blocks;
 
     let meta = resolve_save(cli)?;
 
     let outcome = run_write(&meta, args.dry_run, args.force, move |_cache| {
-        let mut edit = WorldEdit::new().with_data_version(data_version);
-        for (index, &palette_index) in blocks.iter().enumerate() {
-            let state = palette[palette_index as usize].clone();
-            let local = position_of(IVec3::ZERO, size, index);
-            edit.set(at + local, state);
-        }
-        Ok(edit)
+        Ok(blueprint_edit(&blueprint, at))
     })?;
 
     Ok(StructImportResult {

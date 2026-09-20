@@ -48,8 +48,8 @@ pub struct Cli {
 
 /// One variant per subcommand. Ticket 132 adds `List`/`Show`, the two
 /// read-only commands that prove the format/error contract end to end;
-/// 133 adds `New`, 134 adds `Mark`, 135 adds `Export`; later tickets add
-/// `Import`/`Remove`.
+/// 133 adds `New`, 134 adds `Mark`, 135 adds `Export`, 136 adds `Import`;
+/// a later ticket adds `Remove`.
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// One row per registered slot: name, origin, size, box, `.nbt` status,
@@ -68,6 +68,9 @@ pub enum Command {
     /// Reads every registered slot's world box (or the named ones) into its
     /// `.nbt` — the command the tool is named for.
     Export(ExportArgs),
+    /// Puts a `.nbt` *into* a model's box — the reverse bridge. An
+    /// unregistered name allocates a slot for it first.
+    Import(ImportArgs),
 }
 
 /// `list` takes no arguments of its own — the registry it reads comes from
@@ -150,4 +153,30 @@ pub struct ExportArgs {
     /// Compute every slot's status and print it without writing any `.nbt`.
     #[arg(long)]
     pub dry_run: bool,
+}
+
+/// `import <name> [--from <file.nbt>] [--below N] [--dry-run] [--force]`.
+#[derive(Debug, Args)]
+pub struct ImportArgs {
+    /// The model's name. If already registered, its box is written into
+    /// (unless `--force` is needed for the world's lock, its `.ron` and
+    /// markers are untouched). If not, `--from` is required and a slot is
+    /// allocated for it, sized from the file.
+    pub name: String,
+    /// The `.nbt` to import. Omitted for a registered name means "the
+    /// slot's own `out_path()`" — re-import the last export, e.g. after a
+    /// bad in-game edit. Required for a name that isn't registered yet.
+    #[arg(long)]
+    pub from: Option<PathBuf>,
+    /// Only used when `name` isn't registered yet: foundation layers under
+    /// the ground surface, same meaning and default as `new --below`.
+    #[arg(long, default_value_t = 1)]
+    pub below: u32,
+    /// Compute everything and print it without writing the `.ron`, markers,
+    /// or blocks.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Write even though the save looks open in Minecraft.
+    #[arg(long)]
+    pub force: bool,
 }

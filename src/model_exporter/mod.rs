@@ -24,10 +24,12 @@
 //! corner-pillar geometry as a [`crate::edit::WorldEdit`]), `new` now
 //! placing them via [`crate::ranvil_cli::edit::run_write`] unless
 //! `--no-markers`, and `mark <name>` to re-place an already-registered
-//! slot's markers. This ticket (135) adds [`export`] — the command the tool
-//! is named for: every registered slot's world box read into its `.nbt` in
-//! one call. The rest of the module tree the roadmap lays out (`import`,
-//! `remove`) arrives in later tickets.
+//! slot's markers. Ticket 135 added [`export`] — the command the tool is
+//! named for: every registered slot's world box read into its `.nbt` in one
+//! call. This ticket (136) adds [`import`] — the reverse bridge: a `.nbt`
+//! goes *into* a slot's box, allocating and marking one first if `name`
+//! isn't registered yet. `remove` (137, optional) is the only piece the
+//! roadmap still leaves open.
 
 use std::process::ExitCode;
 
@@ -36,6 +38,7 @@ use clap::Parser;
 pub mod allocate;
 pub mod cli;
 pub mod export;
+pub mod import;
 pub mod list;
 pub mod markers;
 pub mod new;
@@ -107,6 +110,11 @@ fn dispatch(cli: &Cli) -> Result<ExitCode, CliError> {
             let result = export::export(cli, args)?;
             print(&result, cli.format);
             Ok(if result.any_failed() { ExitCode::from(1) } else { ExitCode::SUCCESS })
+        }
+        Command::Import(args) => {
+            let result = import::import(cli, args)?;
+            print(&result, cli.format);
+            Ok(ExitCode::SUCCESS)
         }
     }
 }
