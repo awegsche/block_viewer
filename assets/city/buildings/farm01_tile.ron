@@ -1,0 +1,31 @@
+// Ticket 130, roadmap C1/H2: a farm tile for `farm01.ron`'s Wheat Farm —
+// no production or footprint override of its own, since all it does is
+// count toward the hub's `farm.tiles_for_full_rate` (`city::farm`'s own
+// docs have the mechanism). Requires the hub itself, same as
+// `lumber_farm_01.ron` requires `lumber`: an unplanted field with nothing
+// to feed doesn't belong in the menu until a player has built the thing
+// it feeds.
+//
+// PLACEHOLDER GEOMETRY, same convention `farm01.ron` itself already uses —
+// blueprint points at house01.nbt because that's the only structure export
+// on disk for this shape. `footprint` below is the size this building
+// *should* be; a real farm01_tile.nbt exported over it will look correct
+// without touching this file. See ../../../todo.md.
+Building(
+    name: "Wheat Field",
+    blueprint: "house01.nbt",
+    tier: 1,
+    requires: ["farm01"],
+    category: Production,
+    footprint: Explicit(x: 5, z: 5),
+    // Placeholder geometry — see farm01.ron/warehouse01.ron.
+    ground_level: 0,
+    cost: [
+        (block: "minecraft:oak_planks", count: 4),
+        (block: "minecraft:dirt", count: 16),
+    ],
+    integrity: Integrity(
+        pristine_above: 0.95,
+        ruined_below: 0.60,
+    ),
+)

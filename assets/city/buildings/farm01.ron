@@ -24,6 +24,19 @@ Building(
         // a farm with no warehouse is noticed.
         buffer_stacks: 4,
     )),
+    // Ticket 130: was flat-rate (078's own contrast case against 084's
+    // tile-scaled lumberjack's hut) — now scaled the same way. Zero output
+    // until at least one farm01_tile stands nearby, full rate (the 12.0/min
+    // above) once four do. Radius/count scaled up a little from lumber's
+    // (16 blocks / 3 tiles) to match this hub's bigger 9x9 footprint — see
+    // `city::farm`'s own docs for why the radius is plain straight-line
+    // distance rather than routed through the road network the way a
+    // warehouse's is.
+    farm: Some(Farm(
+        tile: "farm01_tile",
+        radius_blocks: 20,
+        tiles_for_full_rate: 4,
+    )),
     integrity: Integrity(
         pristine_above: 0.95,
         ruined_below: 0.60,
